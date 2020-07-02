@@ -8,7 +8,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::{u64, usize};
 
-/// Number of byes in each entry pair
+/// Number of bytes in each entry pair
 pub const INDEX_ENTRY_BYTES: usize = 8;
 /// Number of bytes contained in the base name of the file.
 pub const INDEX_FILE_NAME_LEN: usize = 20;
@@ -552,7 +552,6 @@ mod tests {
     use env_logger;
     use std::fs;
     use std::path::PathBuf;
-    use test::test::Bencher;
 
     #[test]
     pub fn index() {
@@ -720,7 +719,7 @@ mod tests {
             let meta = fs::metadata(&index_path).unwrap();
             assert!(meta.is_file());
 
-            let mut index = Index::open(&index_path).unwrap();
+            let index = Index::open(&index_path).unwrap();
             assert_eq!(index.next_write_pos, 8);
             assert_eq!(AccessMode::Read, index.mode);
 
@@ -1052,41 +1051,5 @@ mod tests {
         assert_eq!(None, file_len);
         assert_eq!(15, index.next_offset());
         assert_eq!(5 * INDEX_ENTRY_BYTES, index.next_write_pos);
-    }
-
-    #[bench]
-    fn bench_find_exact(b: &mut Bencher) {
-        let dir = TestDir::new();
-        let mut index = Index::new(&dir, 10u64, 9000usize).unwrap();
-
-        for i in 0..10 {
-            let mut buf = IndexBuf::new(20, 10u64);
-            for j in 0..200 {
-                let off = 10u32 + (i * j);
-                buf.push(off as u64, off);
-            }
-            index.append(buf).unwrap();
-        }
-
-        index.flush_sync().unwrap();
-        b.iter(|| {
-            index.find(943).unwrap();
-        })
-    }
-
-    #[bench]
-    fn bench_insert_flush(b: &mut Bencher) {
-        let dir = TestDir::new();
-        let mut index = Index::new(&dir, 10u64, 9000usize).unwrap();
-
-        b.iter(|| {
-            let mut buf = IndexBuf::new(20, 10u64);
-            for j in 0..20 {
-                let off = 10u32 + j;
-                buf.push(off as u64, off);
-            }
-            index.append(buf).unwrap();
-            index.flush_sync().unwrap();
-        })
     }
 }

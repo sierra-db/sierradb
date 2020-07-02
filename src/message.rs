@@ -511,14 +511,13 @@ mod tests {
     use super::*;
     use env_logger;
     use std::io;
-    use test::test::Bencher;
 
     #[test]
     fn message_construction() {
         env_logger::try_init().unwrap_or(());
         let mut msg_buf = MessageBuf::default();
-        msg_buf.push("123456789");
-        msg_buf.push("000000000");
+        msg_buf.push("123456789").unwrap();
+        msg_buf.push("000000000").unwrap();
 
         set_offsets(&mut msg_buf, 100);
 
@@ -546,7 +545,7 @@ mod tests {
     #[test]
     fn message_read() {
         let mut buf = Vec::new();
-        serialize(&mut buf, 120, b"", b"123456789");
+        serialize(&mut buf, 120, b"", b"123456789").unwrap();
         let mut buf_reader = io::BufReader::new(buf.as_slice());
 
         let mut reader = MessageBuf::default();
@@ -562,7 +561,7 @@ mod tests {
     #[test]
     fn message_construction_with_metadata() {
         let mut buf = Vec::new();
-        serialize(&mut buf, 120, b"123", b"456789");
+        serialize(&mut buf, 120, b"123", b"456789").unwrap();
         let res = MessageBuf::from_bytes(buf).unwrap();
         let msg = res.iter().next().unwrap();
         assert_eq!(b"123", msg.metadata());
@@ -572,7 +571,7 @@ mod tests {
     #[test]
     fn message_buf_push_with_meta() {
         let mut buf = MessageBuf::default();
-        buf.push_with_metadata(b"123", b"456789");
+        buf.push_with_metadata(b"123", b"456789").unwrap();
         let msg = buf.iter().next().unwrap();
         assert_eq!(b"123", msg.metadata());
         assert_eq!(b"456789", msg.payload());
@@ -581,7 +580,7 @@ mod tests {
     #[test]
     fn message_read_invalid_hash() {
         let mut buf = Vec::new();
-        serialize(&mut buf, 120, b"", b"123456789");
+        serialize(&mut buf, 120, b"", b"123456789").unwrap();
         // mess with the payload such that the hash does not match
         let last_ind = buf.len() - 1;
         buf[last_ind] ^= buf[last_ind] + 1;
@@ -603,7 +602,7 @@ mod tests {
     #[test]
     fn message_read_invalid_payload_length() {
         let mut buf = Vec::new();
-        serialize(&mut buf, 120, b"", b"123456789");
+        serialize(&mut buf, 120, b"", b"123456789").unwrap();
         // pop the last byte
         buf.pop();
 
@@ -631,9 +630,9 @@ mod tests {
     pub fn messageset_deserialize() {
         let bytes = {
             let mut buf = MessageBuf::default();
-            buf.push("foo");
-            buf.push("bar");
-            buf.push("baz");
+            buf.push("foo").unwrap();
+            buf.push("bar").unwrap();
+            buf.push("baz").unwrap();
             set_offsets(&mut buf, 10);
             buf.into_bytes()
         };
@@ -668,27 +667,5 @@ mod tests {
 
         let n = it.next();
         assert!(n.is_none());
-    }
-
-    #[bench]
-    fn bench_message_construct(b: &mut Bencher) {
-        b.iter(|| {
-            let mut msg_buf = MessageBuf::default();
-            msg_buf.push(
-                "719c3b4556066a1c7a06c9d55959d003d9b4627
-3aabe2eae15ef4ba78321ae2a68b0997a4abbd035a4cdbc8b27d701089a5af63a
-8b81f9dc16a874d0eda0983b79c1a6f79fe3ae61612ba2558562a85595f2f3f07
-fab8faba1b849685b61aad6b131b7041ca79cc662b4c5aad4d1b78fb1034fafa2
-fe4f30207395e399c6d724",
-            );
-            msg_buf.push(
-                "2cea26f165640d448a9b89f1f871e6fca80a125
-5b1daea6752bf99d8c5f90e706deaecddf304b2bf5a5e72e32b29bc7c54018265
-d17317a670ea406fd7e6b485a19f5fb1efe686badb6599d45106b95b55695cd4e
-24729edb312a5dec1bc80e8d8b3ee4b69af1f3a9c801e7fb527e65f7c13c62bb3
-7261c0",
-            );
-            set_offsets(&mut msg_buf, 1250);
-        });
     }
 }

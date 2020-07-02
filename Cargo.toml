@@ -7,6 +7,12 @@ name = "commitlog"
 readme = "README.md"
 repository = "https://github.com/zowens/commitlog"
 version = "0.1.1"
+edition = "2018"
+
+[features]
+# Enable benchmark of the private api. This flag should be used only
+# for benchmarking purposes!
+bench-private = []
 
 [dependencies]
 byteorder = "1.0"
@@ -17,5 +23,24 @@ memmap = "0.7"
 page_size = "0.4.1"
 
 [dev-dependencies]
+criterion = "0.3"
 env_logger = "0.7"
 rand = "0.7"
+
+[[bench]]
+name = "index"
+harness = false
+required-features = ["bench-private"]
+
+[[bench]]
+name = "log-append"
+harness = false
+
+[[bench]]
+name = "message"
+harness = false
+
+[[bench]]
+name = "segment"
+harness = false
+required-features = ["bench-private"]

@@ -37,7 +37,7 @@ impl LogSliceReader for MessageBufReader {
         use std::os::unix::fs::FileExt;
 
         let mut vec = vec![0; bytes];
-        try!(file.read_at(&mut vec, u64::from(file_position)));
+        file.read_at(&mut vec, u64::from(file_position))?;
         MessageBuf::from_bytes(vec)
     }
 }

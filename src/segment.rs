@@ -202,7 +202,6 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
-    use test::Bencher;
 
     #[test]
     pub fn log_append() {
@@ -211,15 +210,15 @@ mod tests {
 
         {
             let mut buf = MessageBuf::default();
-            buf.push("12345");
+            buf.push("12345").unwrap();
             let meta = f.append(&mut buf).unwrap();
             assert_eq!(2, meta.starting_position);
         }
 
         {
             let mut buf = MessageBuf::default();
-            buf.push("66666");
-            buf.push("77777");
+            buf.push("66666").unwrap();
+            buf.push("77777").unwrap();
             let meta = f.append(&mut buf).unwrap();
             assert_eq!(27, meta.starting_position);
 
@@ -241,8 +240,8 @@ mod tests {
         {
             let mut f = Segment::new(&log_dir, 0, 1024).unwrap();
             let mut buf = MessageBuf::default();
-            buf.push("12345");
-            buf.push("66666");
+            buf.push("12345").unwrap();
+            buf.push("66666").unwrap();
             f.append(&mut buf).unwrap();
             f.flush_sync().unwrap();
         }
@@ -269,9 +268,9 @@ mod tests {
 
         {
             let mut buf = MessageBuf::default();
-            buf.push("0123456789");
-            buf.push("aaaaaaaaaa");
-            buf.push("abc");
+            buf.push("0123456789").unwrap();
+            buf.push("aaaaaaaaaa").unwrap();
+            buf.push("abc").unwrap();
             set_offsets(&mut buf, 0);
             f.append(&mut buf).unwrap();
         }
@@ -291,9 +290,9 @@ mod tests {
         let mut f = Segment::new(&log_dir, 0, 1024).unwrap();
 
         let mut buf = MessageBuf::default();
-        buf.push("0123456789");
-        buf.push("aaaaaaaaaa");
-        buf.push("abc");
+        buf.push("0123456789").unwrap();
+        buf.push("aaaaaaaaaa").unwrap();
+        buf.push("abc").unwrap();
         set_offsets(&mut buf, 0);
         let meta = f.append(&mut buf).unwrap();
 
@@ -320,9 +319,9 @@ mod tests {
 
         {
             let mut buf = MessageBuf::default();
-            buf.push("0123456789");
-            buf.push("aaaaaaaaaa");
-            buf.push("abc");
+            buf.push("0123456789").unwrap();
+            buf.push("aaaaaaaaaa").unwrap();
+            buf.push("abc").unwrap();
             set_offsets(&mut buf, 0);
             f.append(&mut buf).unwrap();
         }
@@ -333,7 +332,7 @@ mod tests {
 
         {
             let mut buf = MessageBuf::default();
-            buf.push("foo");
+            buf.push("foo").unwrap();
             set_offsets(&mut buf, 3);
             f.append(&mut buf).unwrap();
         }
@@ -378,9 +377,9 @@ mod tests {
         let mut f = Segment::new(&log_dir, 0, 1024).unwrap();
 
         let mut buf = MessageBuf::default();
-        buf.push("0123456789");
-        buf.push("aaaaaaaaaa");
-        buf.push("abc");
+        buf.push("0123456789").unwrap();
+        buf.push("aaaaaaaaaa").unwrap();
+        buf.push("abc").unwrap();
         set_offsets(&mut buf, 0);
         let meta = f.append(&mut buf).unwrap();
 
@@ -408,7 +407,7 @@ mod tests {
 
         let meta2 = {
             let mut buf = MessageBuf::default();
-            buf.push("zzzzzzzzzz");
+            buf.push("zzzzzzzzzz").unwrap();
             set_offsets(&mut buf, 1);
             f.append(&mut buf).unwrap()
         };
@@ -423,34 +422,5 @@ mod tests {
             .read_slice(&mut reader, 2, f.size() as u32 - 2)
             .expect("Read after second append failed");
         assert_eq!(2, msg_buf.len());
-    }
-
-    #[bench]
-    fn bench_segment_append(b: &mut Bencher) {
-        let path = TestDir::new();
-
-        let mut seg = Segment::new(path, 100u64, 100 * 1024 * 1024).unwrap();
-        let payload = b"01234567891011121314151617181920";
-
-        b.iter(|| {
-            let mut buf = MessageBuf::default();
-            buf.push(payload);
-            seg.append(&mut buf).unwrap();
-        });
-    }
-
-    #[bench]
-    fn bench_segment_append_flush(b: &mut Bencher) {
-        let path = TestDir::new();
-
-        let mut seg = Segment::new(path, 100u64, 100 * 1024 * 1024).unwrap();
-        let payload = b"01234567891011121314151617181920";
-
-        b.iter(|| {
-            let mut buf = MessageBuf::default();
-            buf.push(payload);
-            seg.append(&mut buf).unwrap();
-            seg.flush_sync().unwrap();
-        });
     }
 }
