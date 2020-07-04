@@ -1,6 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
-use commitlog::index::{Index, IndexBuf};
+use commitlog::{Index, IndexBuf};
 use testutil::TestDir;
 
 mod testutil {

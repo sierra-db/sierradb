@@ -11,7 +11,8 @@ pub trait LogSliceReader {
     ///
     /// * `file` - The segment file that contains the slice of the log.
     /// * `file_position` - The offset within the file that starts the slice.
-    /// * `bytes` - Total number of bytes, from the offset, that contains the message set slice.
+    /// * `bytes` - Total number of bytes, from the offset, that contains the
+    ///   message set slice.
     fn read_from(
         &mut self,
         file: &File,

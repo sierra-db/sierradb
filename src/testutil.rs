@@ -1,6 +1,8 @@
 use rand;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 pub struct TestDir {
     path: PathBuf,

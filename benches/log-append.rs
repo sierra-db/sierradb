@@ -1,7 +1,6 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 
-use commitlog::message::MessageBuf;
-use commitlog::{CommitLog, LogOptions};
+use commitlog::{message::MessageBuf, CommitLog, LogOptions};
 use testutil::TestDir;
 
 mod testutil {
@@ -57,9 +56,5 @@ fn commitlog_append_10000_batched(c: &mut Criterion) {
     });
 }
 
-criterion_group!(
-    benches,
-    commitlog_append_10000,
-    commitlog_append_10000_batched
-);
+criterion_group!(benches, commitlog_append_10000, commitlog_append_10000_batched);
 criterion_main!(benches);

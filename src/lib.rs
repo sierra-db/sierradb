@@ -1,17 +1,17 @@
-//! The commit log is an append-only data structure that can be used in a variety
-//! of use-cases, such as tracking sequences of events, transactions
+//! The commit log is an append-only data structure that can be used in a
+//! variety of use-cases, such as tracking sequences of events, transactions
 //! or replicated state machines.
 //!
 //! This implementation of the commit log data structure uses log segments
 //! that roll over at pre-defined maximum size boundaries. The messages appended
-//! to the log have a unique, monotonically increasing offset that can be used as
-//! a pointer to a log entry.
+//! to the log have a unique, monotonically increasing offset that can be used
+//! as a pointer to a log entry.
 //!
 //! The index of the commit log logically stores the offset to a position in a
 //! log segment. The index and segments are separated, in that a
 //! segment file does not necessarily correspond to one particular segment file,
-//! it could contain file pointers to many segment files. In addition, index files
-//! are memory-mapped for efficient read and write access.
+//! it could contain file pointers to many segment files. In addition, index
+//! files are memory-mapped for efficient read and write access.
 //!
 //! ## Example
 //!
@@ -56,31 +56,25 @@ extern crate env_logger;
 extern crate rand;
 
 mod file_set;
-#[cfg(feature = "bench-private")]
-pub mod index;
-#[cfg(not(feature = "bench-private"))]
 mod index;
 pub mod message;
 pub mod reader;
-#[cfg(feature = "bench-private")]
-pub mod segment;
-#[cfg(not(feature = "bench-private"))]
 mod segment;
 #[cfg(test)]
 mod testutil;
 
 use index::*;
 use segment::SegmentAppendError;
-use std::error;
-use std::fmt;
-use std::fs;
-use std::io;
-use std::iter::{DoubleEndedIterator, ExactSizeIterator};
-use std::path::{Path, PathBuf};
+use std::{
+    error, fmt, fs, io,
+    iter::{DoubleEndedIterator, ExactSizeIterator},
+    path::{Path, PathBuf},
+};
 
+#[cfg(feature = "internals")]
+pub use crate::{index::Index, index::IndexBuf, segment::Segment};
 use file_set::FileSet;
-use message::MessageError;
-use message::{MessageBuf, MessageSet, MessageSetMut};
+use message::{MessageBuf, MessageError, MessageSet, MessageSetMut};
 use reader::{LogSliceReader, MessageBufReader};
 
 /// Offset of an appended log segment.
@@ -108,11 +102,7 @@ impl OffsetRange {
 
     /// Iterator containing all offsets within the offset range.
     pub fn iter(&self) -> OffsetRangeIter {
-        OffsetRangeIter {
-            pos: self.0,
-            end: self.0 + (self.1 as u64),
-            size: self.1,
-        }
+        OffsetRangeIter { pos: self.0, end: self.0 + (self.1 as u64), size: self.1 }
     }
 }
 
@@ -172,8 +162,8 @@ pub enum AppendError {
     /// during the append operation. This could point to exhaustion
     /// of machine resources or other I/O issue.
     FreshSegmentNotWritable,
-    /// If a message that is larger than the per message size is tried to be appended
-    /// it will not be allowed an will return an error
+    /// If a message that is larger than the per message size is tried to be
+    /// appended it will not be allowed an will return an error
     MessageSizeExceeded,
     /// The buffer contains an invalid offset value
     InvalidOffset,
@@ -454,11 +444,7 @@ impl CommitLog {
     /// Gets the last written offset.
     pub fn last_offset(&self) -> Option<Offset> {
         let next_off = self.file_set.active_index().next_offset();
-        if next_off == 0 {
-            None
-        } else {
-            Some(next_off - 1)
-        }
+        if next_off == 0 { None } else { Some(next_off - 1) }
     }
 
     /// Gets the latest offset
@@ -467,7 +453,8 @@ impl CommitLog {
         self.file_set.active_index().next_offset()
     }
 
-    /// Reads a portion of the log, starting with the `start` offset, inclusive, up to the limit.
+    /// Reads a portion of the log, starting with the `start` offset, inclusive,
+    /// up to the limit.
     #[inline]
     pub fn read(&self, start: Offset, limit: ReadLimit) -> Result<MessageBuf, ReadError> {
         let mut rd = MessageBufReader;
@@ -477,8 +464,8 @@ impl CommitLog {
         }
     }
 
-    /// Reads a portion of the log, starting with the `start` offset, inclusive, up to the limit
-    /// via the reader.
+    /// Reads a portion of the log, starting with the `start` offset, inclusive,
+    /// up to the limit via the reader.
     pub fn reader<R: LogSliceReader>(
         &self,
         reader: &mut R,
@@ -508,26 +495,19 @@ impl CommitLog {
         if range.bytes() == 0 {
             Ok(None)
         } else {
-            Ok(Some(seg.read_slice(
-                reader,
-                range.file_position(),
-                range.bytes(),
-            )?))
+            Ok(Some(seg.read_slice(reader, range.file_position(), range.bytes())?))
         }
     }
 
-    /// Truncates a file after the offset supplied. The resulting log will contain
-    /// entries up to the offset.
+    /// Truncates a file after the offset supplied. The resulting log will
+    /// contain entries up to the offset.
     pub fn truncate(&mut self, offset: Offset) -> io::Result<()> {
         info!("Truncating log to offset {}", offset);
 
         // remove index/segment files rolled after the offset
         let to_remove = self.file_set.take_after(offset);
         for p in to_remove {
-            trace!(
-                "Removing segment and index starting at {}",
-                p.0.starting_offset()
-            );
+            trace!("Removing segment and index starting at {}", p.0.starting_offset());
             assert!(p.0.starting_offset() > offset);
 
             p.0.remove()?;
@@ -551,12 +531,9 @@ impl CommitLog {
 
 #[cfg(test)]
 mod tests {
-    use super::message::*;
-    use super::testutil::*;
-    use super::*;
+    use super::{message::*, testutil::*, *};
     use env_logger;
-    use std::collections::HashSet;
-    use std::fs;
+    use std::{collections::HashSet, fs};
 
     #[test]
     pub fn offset_range() {
@@ -564,10 +541,7 @@ mod tests {
 
         assert_eq!(vec![2, 3, 4, 5, 6, 7], range.iter().collect::<Vec<u64>>());
 
-        assert_eq!(
-            vec![7, 6, 5, 4, 3, 2],
-            range.iter().rev().collect::<Vec<u64>>()
-        );
+        assert_eq!(vec![7, 6, 5, 4, 3, 2], range.iter().rev().collect::<Vec<u64>>());
     }
 
     #[test]
@@ -647,10 +621,7 @@ mod tests {
             assert_eq!(6, active_index_read.len());
             assert_eq!(
                 vec![82, 83, 84, 85, 86, 87],
-                active_index_read
-                    .iter()
-                    .map(|v| v.offset())
-                    .collect::<Vec<_>>()
+                active_index_read.iter().map(|v| v.offset()).collect::<Vec<_>>()
             );
         }
 
@@ -659,10 +630,7 @@ mod tests {
             assert_eq!(4, old_index_read.len());
             assert_eq!(
                 vec![5, 6, 7, 8],
-                old_index_read
-                    .iter()
-                    .map(|v| v.offset())
-                    .collect::<Vec<_>>()
+                old_index_read.iter().map(|v| v.offset()).collect::<Vec<_>>()
             );
         }
 
@@ -706,10 +674,7 @@ mod tests {
             assert_eq!(4, active_index_read.len());
             assert_eq!(
                 vec![82, 83, 84, 85],
-                active_index_read
-                    .iter()
-                    .map(|v| v.offset())
-                    .collect::<Vec<_>>()
+                active_index_read.iter().map(|v| v.offset()).collect::<Vec<_>>()
             );
 
             let off = log.append_msg("moar data").unwrap();
@@ -769,7 +734,8 @@ mod tests {
             target += 1;
         }
         let res = log.append_msg(value);
-        //will fail if no error is found which means a message greater than the limit passed through
+        //will fail if no error is found which means a message greater than the limit
+        // passed through
         assert!(res.is_err());
         log.flush().unwrap();
     }
@@ -953,20 +919,9 @@ mod tests {
     {
         let dir_files = fs::read_dir(&dir)
             .unwrap()
-            .map(|e| {
-                e.unwrap()
-                    .path()
-                    .file_name()
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .to_string()
-            })
+            .map(|e| e.unwrap().path().file_name().unwrap().to_str().unwrap().to_string())
             .collect::<HashSet<String>>();
-        let expected = files
-            .into_iter()
-            .map(|s| s.to_string())
-            .collect::<HashSet<String>>();
+        let expected = files.into_iter().map(|s| s.to_string()).collect::<HashSet<String>>();
         assert_eq!(
             dir_files.len(),
             expected.len(),

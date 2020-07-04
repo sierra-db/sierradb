@@ -1,13 +1,8 @@
 language: rust
 rust:
   - stable
+  - nightly
 
 script:
-  - |
-    if rustup component add rustfmt;
-    then
-      cargo fmt --version
-      cargo fmt -- --check || (echo "Please reformat your code with 'cargo fmt' (version $(cargo fmt --version))"; false)
-    fi
   - cargo build --verbose
   - cargo test --verbose

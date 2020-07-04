@@ -3,10 +3,11 @@ use super::Offset;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::BufMut;
 use crc32c::{crc32c, crc32c_append};
-use std::io::{self, Read};
-use std::iter::{FromIterator, IntoIterator};
-use std::mem;
-use std::u16;
+use std::{
+    io::{self, Read},
+    iter::{FromIterator, IntoIterator},
+    mem, u16,
+};
 
 /// Error for the message encoding or decoding.
 #[derive(Debug)]
@@ -41,7 +42,7 @@ macro_rules! read_n {
                 return Err(MessageError::IoError(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     $err_msg,
-                )))
+                )));
             }
             Err(e) => return Err(MessageError::IoError(e)),
         }
@@ -264,9 +265,7 @@ impl<'a> Iterator for MessageIter<'a> {
 
         let message_slice = &self.bytes[0..HEADER_SIZE + size];
         self.bytes = &self.bytes[HEADER_SIZE + size..];
-        Some(Message {
-            bytes: message_slice,
-        })
+        Some(Message { bytes: message_slice })
     }
 }
 
@@ -291,9 +290,7 @@ impl<'a> Iterator for MessageMutIter<'a> {
 
         let (message_slice, rest) = slice.split_at_mut(HEADER_SIZE + size);
         self.bytes = rest;
-        Some(MessageMut {
-            bytes: message_slice,
-        })
+        Some(MessageMut { bytes: message_slice })
     }
 }
 
@@ -306,9 +303,7 @@ pub trait MessageSet {
 
     /// Iterator on the messages in the message set.
     fn iter(&self) -> MessageIter {
-        MessageIter {
-            bytes: self.bytes(),
-        }
+        MessageIter { bytes: self.bytes() }
     }
 
     /// Number of messages in the message set.
@@ -343,9 +338,7 @@ pub trait MessageSetMut: MessageSet {
 
     /// Mutable iterator
     fn iter_mut(&mut self) -> MessageMutIter {
-        MessageMutIter {
-            bytes: self.bytes_mut(),
-        }
+        MessageMutIter { bytes: self.bytes_mut() }
     }
 }
 
@@ -384,16 +377,16 @@ impl<R: AsRef<[u8]>> FromIterator<R> for MessageBuf {
     {
         let mut buf = MessageBuf::default();
         for v in iter.into_iter() {
-            buf.push(v)
-                .expect("Total size of messages exceeds usize::MAX");
+            buf.push(v).expect("Total size of messages exceeds usize::MAX");
         }
         buf
     }
 }
 
 impl MessageBuf {
-    /// Creates a message buffer from a previously serialized vector of bytes. Integrity
-    /// checking is performed on the vector to ensure that it was properly serialized.
+    /// Creates a message buffer from a previously serialized vector of bytes.
+    /// Integrity checking is performed on the vector to ensure that it was
+    /// properly serialized.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<MessageBuf, MessageError> {
         let mut msgs = 0usize;
 
@@ -471,7 +464,8 @@ impl MessageBuf {
         Ok(())
     }
 
-    /// Reads a single message. The reader is expected to have a full message serialized.
+    /// Reads a single message. The reader is expected to have a full message
+    /// serialized.
     pub fn read<R: Read>(&mut self, reader: &mut R) -> Result<(), MessageError> {
         let mut buf = [0; HEADER_SIZE];
         read_n!(reader, buf, HEADER_SIZE, "Unable to read header");

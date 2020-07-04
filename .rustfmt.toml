@@ -1,0 +1,8 @@
+version = "Two"
+use_small_heuristics = "Max"
+reorder_imports = true
+wrap_comments = true
+unstable_features = true
+condense_wildcard_suffixes = true
+merge_imports = true
+edition = "2018"
