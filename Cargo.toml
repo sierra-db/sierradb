@@ -17,7 +17,7 @@ bench-private = []
 [dependencies]
 byteorder = "1.0"
 bytes = "0.5.0"
-crc32c = "0.4"
+crc32c = "0.5"
 log = "0.4.1"
 memmap = "0.7"
 page_size = "0.4.1"
