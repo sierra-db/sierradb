@@ -1,5 +1,6 @@
 //! Message encoding used for the on-disk format for the log.
 use super::Offset;
+use log::trace;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::BufMut;
 use crc32c::{crc32c, crc32c_append};

@@ -1,5 +1,3 @@
-extern crate commitlog;
-
 use commitlog::{message::*, *};
 use std::time::{self, SystemTime};
 

@@ -16,8 +16,6 @@
 //! ## Example
 //!
 //! ```rust,ignore
-//! extern crate commitlog;
-//!
 //! use commitlog::*;
 //!
 //! fn main() {
@@ -41,19 +39,7 @@
 //! }
 //! ```
 
-extern crate byteorder;
-extern crate crc32c;
-#[macro_use]
-extern crate log;
-extern crate bytes;
-extern crate memmap;
-extern crate page_size;
-
-#[cfg(test)]
-extern crate env_logger;
-
-#[cfg(test)]
-extern crate rand;
+use log::{trace, info, warn};
 
 mod file_set;
 mod index;

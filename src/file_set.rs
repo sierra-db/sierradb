@@ -1,4 +1,5 @@
 use std::{fs, io, mem::swap};
+use log::{trace, info, warn, error};
 
 use super::{index::*, segment::*, LogOptions};
 use std::collections::BTreeMap;
