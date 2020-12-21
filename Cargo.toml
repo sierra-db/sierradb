@@ -24,7 +24,7 @@ page_size = "0.4.1"
 [dev-dependencies]
 criterion = "0.3"
 env_logger = "0.7"
-rand = "0.7"
+rand = "0.8"
 
 [[bench]]
 name = "index"
