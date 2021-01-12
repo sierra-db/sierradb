@@ -1,4 +1,7 @@
 language: rust
+arch:
+  - amd64
+  - arm64
 rust:
   - stable
   - nightly
@@ -6,3 +9,6 @@ rust:
 script:
   - cargo build --verbose
   - cargo test --verbose
+
+# Cache dependencies to speed up build
+cache: cargo
