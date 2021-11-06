@@ -1,7 +1,7 @@
 use super::Offset;
 use log::{trace, info, warn};
 use byteorder::{ByteOrder, LittleEndian};
-use memmap::MmapMut;
+use memmap2::MmapMut;
 use page_size;
 use std::{
     cmp::Ordering,
