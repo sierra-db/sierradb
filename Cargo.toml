@@ -6,7 +6,7 @@ name = "commitlog"
 readme = "README.md"
 repository = "https://github.com/zowens/commitlog"
 description = "Sequential, disk-backed commit log library."
-version = "0.1.3"
+version = "0.2.0"
 edition = "2018"
 
 [features]
@@ -24,7 +24,7 @@ page_size = "0.4.1"
 
 [dev-dependencies]
 criterion = "0.3"
-env_logger = "0.8"
+env_logger = "0.9"
 rand = "0.8"
 
 [[bench]]
