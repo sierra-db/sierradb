@@ -5,7 +5,10 @@ fn main() {
     // open a directory called 'log' for segment and index storage
     let opts = LogOptions::new(format!(
         ".log{}",
-        SystemTime::now().duration_since(time::UNIX_EPOCH).unwrap().as_secs()
+        SystemTime::now()
+            .duration_since(time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
     ));
     let mut log = CommitLog::new(opts).unwrap();
 
@@ -16,7 +19,11 @@ fn main() {
     // read the messages
     let messages = log.read(0, ReadLimit::default()).unwrap();
     for msg in messages.iter() {
-        println!("{} - {}", msg.offset(), String::from_utf8_lossy(msg.payload()));
+        println!(
+            "{} - {}",
+            msg.offset(),
+            String::from_utf8_lossy(msg.payload())
+        );
     }
 
     // prints:

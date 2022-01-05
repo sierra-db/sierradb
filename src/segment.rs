@@ -69,19 +69,33 @@ impl Segment {
             path_buf
         };
 
-        let mut f = OpenOptions::new().read(true).create_new(true).append(true).open(&log_path)?;
+        let mut f = OpenOptions::new()
+            .read(true)
+            .create_new(true)
+            .append(true)
+            .open(&log_path)?;
 
         // add the magic
         f.write_all(&VERSION_1_MAGIC)?;
 
-        Ok(Segment { file: f, path: log_path, base_offset, write_pos: 2, max_bytes })
+        Ok(Segment {
+            file: f,
+            path: log_path,
+            base_offset,
+            write_pos: 2,
+            max_bytes,
+        })
     }
 
     pub fn open<P>(seg_path: P, max_bytes: usize) -> io::Result<Segment>
     where
         P: AsRef<Path>,
     {
-        let seg_file = OpenOptions::new().read(true).write(true).append(true).open(&seg_path)?;
+        let seg_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .append(true)
+            .open(&seg_path)?;
 
         let filename = seg_path.as_ref().file_name().unwrap().to_str().unwrap();
         let base_offset = match (&filename[0..SEGMENT_FILE_NAME_LEN]).parse::<u64>() {
@@ -142,7 +156,9 @@ impl Segment {
             return Err(SegmentAppendError::LogFull);
         }
 
-        let meta = AppendMetadata { starting_position: self.write_pos };
+        let meta = AppendMetadata {
+            starting_position: self.write_pos,
+        };
 
         self.file.write_all(payload.bytes())?;
         self.write_pos += payload_len;
@@ -290,7 +306,9 @@ mod tests {
 
         // byte max contains message 0
         let mut reader = MessageBufReader;
-        let msgs = f.read_slice(&mut reader, 2, second_msg_start as u32 - 2).unwrap();
+        let msgs = f
+            .read_slice(&mut reader, 2, second_msg_start as u32 - 2)
+            .unwrap();
 
         assert_eq!(1, msgs.len());
     }

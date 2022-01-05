@@ -88,7 +88,11 @@ impl FileSet {
             ind.set_readonly()?;
         }
 
-        Ok(FileSet { active: (ind, seg), closed, opts })
+        Ok(FileSet {
+            active: (ind, seg),
+            closed,
+            opts,
+        })
     }
 
     pub fn active_segment_mut(&mut self) -> &mut Segment {
@@ -106,7 +110,10 @@ impl FileSet {
     pub fn find(&self, offset: u64) -> Option<&(Index, Segment)> {
         let active_seg_start_off = self.active.0.starting_offset();
         if offset >= active_seg_start_off {
-            trace!("Index is contained in the active index for offset {}", offset);
+            trace!(
+                "Index is contained in the active index for offset {}",
+                offset
+            );
             Some(&self.active)
         } else {
             self.closed.range(..=offset).next_back().map(|p| p.1)
@@ -144,7 +151,13 @@ impl FileSet {
         //    [0 5 10 15] => split key 5
         //
         // midpoint  is then used as the active index/segment pair
-        let split_key = match self.closed.range(..=offset).next_back().map(|p| p.0).cloned() {
+        let split_key = match self
+            .closed
+            .range(..=offset)
+            .next_back()
+            .map(|p| p.0)
+            .cloned()
+        {
             Some(key) => {
                 trace!("File set split key for truncation {}", key);
                 key
@@ -160,7 +173,10 @@ impl FileSet {
         let mut after = self.closed.split_off(&split_key);
 
         let mut active = after.remove(&split_key).unwrap();
-        trace!("Setting active to segment starting {}", active.0.starting_offset());
+        trace!(
+            "Setting active to segment starting {}",
+            active.0.starting_offset()
+        );
         assert!(active.0.starting_offset() <= offset);
 
         swap(&mut active, &mut self.active);

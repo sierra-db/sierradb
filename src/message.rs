@@ -266,7 +266,9 @@ impl<'a> Iterator for MessageIter<'a> {
 
         let message_slice = &self.bytes[0..HEADER_SIZE + size];
         self.bytes = &self.bytes[HEADER_SIZE + size..];
-        Some(Message { bytes: message_slice })
+        Some(Message {
+            bytes: message_slice,
+        })
     }
 }
 
@@ -291,7 +293,9 @@ impl<'a> Iterator for MessageMutIter<'a> {
 
         let (message_slice, rest) = slice.split_at_mut(HEADER_SIZE + size);
         self.bytes = rest;
-        Some(MessageMut { bytes: message_slice })
+        Some(MessageMut {
+            bytes: message_slice,
+        })
     }
 }
 
@@ -304,7 +308,9 @@ pub trait MessageSet {
 
     /// Iterator on the messages in the message set.
     fn iter(&self) -> MessageIter {
-        MessageIter { bytes: self.bytes() }
+        MessageIter {
+            bytes: self.bytes(),
+        }
     }
 
     /// Number of messages in the message set.
@@ -339,7 +345,9 @@ pub trait MessageSetMut: MessageSet {
 
     /// Mutable iterator
     fn iter_mut(&mut self) -> MessageMutIter {
-        MessageMutIter { bytes: self.bytes_mut() }
+        MessageMutIter {
+            bytes: self.bytes_mut(),
+        }
     }
 }
 
@@ -378,7 +386,8 @@ impl<R: AsRef<[u8]>> FromIterator<R> for MessageBuf {
     {
         let mut buf = MessageBuf::default();
         for v in iter.into_iter() {
-            buf.push(v).expect("Total size of messages exceeds usize::MAX");
+            buf.push(v)
+                .expect("Total size of messages exceeds usize::MAX");
         }
         buf
     }

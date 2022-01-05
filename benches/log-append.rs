@@ -56,5 +56,9 @@ fn commitlog_append_10000_batched(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, commitlog_append_10000, commitlog_append_10000_batched);
+criterion_group!(
+    benches,
+    commitlog_append_10000,
+    commitlog_append_10000_batched
+);
 criterion_main!(benches);

@@ -88,7 +88,11 @@ impl OffsetRange {
 
     /// Iterator containing all offsets within the offset range.
     pub fn iter(&self) -> OffsetRangeIter {
-        OffsetRangeIter { pos: self.0, end: self.0 + (self.1 as u64), size: self.1 }
+        OffsetRangeIter {
+            pos: self.0,
+            end: self.0 + (self.1 as u64),
+            size: self.1,
+        }
     }
 }
 
@@ -430,7 +434,11 @@ impl CommitLog {
     /// Gets the last written offset.
     pub fn last_offset(&self) -> Option<Offset> {
         let next_off = self.file_set.active_index().next_offset();
-        if next_off == 0 { None } else { Some(next_off - 1) }
+        if next_off == 0 {
+            None
+        } else {
+            Some(next_off - 1)
+        }
     }
 
     /// Gets the latest offset
@@ -481,7 +489,11 @@ impl CommitLog {
         if range.bytes() == 0 {
             Ok(None)
         } else {
-            Ok(Some(seg.read_slice(reader, range.file_position(), range.bytes())?))
+            Ok(Some(seg.read_slice(
+                reader,
+                range.file_position(),
+                range.bytes(),
+            )?))
         }
     }
 
@@ -493,7 +505,10 @@ impl CommitLog {
         // remove index/segment files rolled after the offset
         let to_remove = self.file_set.take_after(offset);
         for p in to_remove {
-            trace!("Removing segment and index starting at {}", p.0.starting_offset());
+            trace!(
+                "Removing segment and index starting at {}",
+                p.0.starting_offset()
+            );
             assert!(p.0.starting_offset() > offset);
 
             p.0.remove()?;
@@ -527,7 +542,10 @@ mod tests {
 
         assert_eq!(vec![2, 3, 4, 5, 6, 7], range.iter().collect::<Vec<u64>>());
 
-        assert_eq!(vec![7, 6, 5, 4, 3, 2], range.iter().rev().collect::<Vec<u64>>());
+        assert_eq!(
+            vec![7, 6, 5, 4, 3, 2],
+            range.iter().rev().collect::<Vec<u64>>()
+        );
     }
 
     #[test]
@@ -607,7 +625,10 @@ mod tests {
             assert_eq!(6, active_index_read.len());
             assert_eq!(
                 vec![82, 83, 84, 85, 86, 87],
-                active_index_read.iter().map(|v| v.offset()).collect::<Vec<_>>()
+                active_index_read
+                    .iter()
+                    .map(|v| v.offset())
+                    .collect::<Vec<_>>()
             );
         }
 
@@ -616,7 +637,10 @@ mod tests {
             assert_eq!(4, old_index_read.len());
             assert_eq!(
                 vec![5, 6, 7, 8],
-                old_index_read.iter().map(|v| v.offset()).collect::<Vec<_>>()
+                old_index_read
+                    .iter()
+                    .map(|v| v.offset())
+                    .collect::<Vec<_>>()
             );
         }
 
@@ -660,7 +684,10 @@ mod tests {
             assert_eq!(4, active_index_read.len());
             assert_eq!(
                 vec![82, 83, 84, 85],
-                active_index_read.iter().map(|v| v.offset()).collect::<Vec<_>>()
+                active_index_read
+                    .iter()
+                    .map(|v| v.offset())
+                    .collect::<Vec<_>>()
             );
 
             let off = log.append_msg("moar data").unwrap();
@@ -905,9 +932,20 @@ mod tests {
     {
         let dir_files = fs::read_dir(&dir)
             .unwrap()
-            .map(|e| e.unwrap().path().file_name().unwrap().to_str().unwrap().to_string())
+            .map(|e| {
+                e.unwrap()
+                    .path()
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            })
             .collect::<HashSet<String>>();
-        let expected = files.into_iter().map(|s| s.to_string()).collect::<HashSet<String>>();
+        let expected = files
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect::<HashSet<String>>();
         assert_eq!(
             dir_files.len(),
             expected.len(),
