@@ -1,6 +1,6 @@
 use super::Offset;
-use log::{trace, info, warn};
 use byteorder::{ByteOrder, LittleEndian};
+use log::{info, trace, warn};
 use memmap2::MmapMut;
 use page_size;
 use std::{

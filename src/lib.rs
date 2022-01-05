@@ -39,7 +39,7 @@
 //! }
 //! ```
 
-use log::{trace, info, warn};
+use log::{info, trace, warn};
 
 mod file_set;
 mod index;
