@@ -7,7 +7,7 @@ use log::trace;
 use std::{
     io::{self, Read},
     iter::{FromIterator, IntoIterator},
-    mem, u16,
+    u16,
 };
 
 /// Error for the message encoding or decoding.
@@ -279,7 +279,7 @@ impl<'a> Iterator for MessageMutIter<'a> {
     type Item = MessageMut<'a>;
 
     fn next(&mut self) -> Option<MessageMut<'a>> {
-        let slice = mem::replace(&mut self.bytes, &mut []);
+        let slice = std::mem::take(&mut self.bytes);
         if slice.len() < HEADER_SIZE {
             return None;
         }
@@ -432,6 +432,10 @@ impl MessageBuf {
     }
 
     /// Clears the message buffer without dropping the contents.
+    ///
+    /// # Safety
+    /// The bytes within the message buffer will remain. Implementations that
+    /// wish to clear the buffer for security reasons should use `clear()`.
     pub unsafe fn unsafe_clear(&mut self) {
         self.bytes.set_len(0);
         self.len = 0;
@@ -632,7 +636,7 @@ mod tests {
             buf.into_bytes()
         };
 
-        let bytes_copy = bytes.clone();
+        let bytes_copy = bytes;
 
         // deserialize it
         let res = MessageBuf::from_bytes(bytes_copy);

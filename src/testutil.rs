@@ -1,4 +1,3 @@
-use rand;
 use std::{
     fs,
     path::{Path, PathBuf},

@@ -2,7 +2,7 @@ use super::Offset;
 use byteorder::{ByteOrder, LittleEndian};
 use log::{info, trace, warn};
 use memmap2::MmapMut;
-use page_size;
+
 use std::{
     cmp::Ordering,
     fs::{self, File, OpenOptions},
@@ -16,7 +16,7 @@ pub const INDEX_ENTRY_BYTES: usize = 8;
 /// Number of bytes contained in the base name of the file.
 pub const INDEX_FILE_NAME_LEN: usize = 20;
 /// File extension for the index file.
-pub static INDEX_FILE_NAME_EXTENSION: &'static str = "index";
+pub static INDEX_FILE_NAME_EXTENSION: &str = "index";
 
 #[inline]
 fn binary_search<F>(index: &[u8], f: F) -> usize
@@ -185,7 +185,7 @@ impl Index {
             OpenOptions::new().read(true).write(true).append(true).open(&index_path)?;
 
         let filename = index_path.as_ref().file_name().unwrap().to_str().unwrap();
-        let base_offset = match u64::from_str_radix(&filename[0..INDEX_FILE_NAME_LEN], 10) {
+        let base_offset = match (&filename[0..INDEX_FILE_NAME_LEN]).parse::<u64>() {
             Ok(v) => v,
             Err(_) => {
                 return Err(io::Error::new(
@@ -519,7 +519,7 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::{super::testutil::*, *};
-    use env_logger;
+
     use std::{fs, path::PathBuf};
 
     #[test]
@@ -657,8 +657,8 @@ mod tests {
 
             let e = index.read_entry(0);
             assert!(e.is_some());
-            assert_eq!(e.unwrap().0, 0 as u64);
-            assert_eq!(e.unwrap().1, 2 as u32);
+            assert_eq!(e.unwrap().0, 0_u64);
+            assert_eq!(e.unwrap().1, 2_u32);
         }
     }
 
@@ -694,8 +694,8 @@ mod tests {
 
             let e = index.read_entry(0);
             assert!(e.is_some());
-            assert_eq!(e.unwrap().0, 0 as u64);
-            assert_eq!(e.unwrap().1, 2 as u32);
+            assert_eq!(e.unwrap().0, 0_u64);
+            assert_eq!(e.unwrap().1, 2_u32);
         }
     }
 

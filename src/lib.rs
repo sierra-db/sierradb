@@ -518,7 +518,7 @@ impl CommitLog {
 #[cfg(test)]
 mod tests {
     use super::{message::*, testutil::*, *};
-    use env_logger;
+
     use std::{collections::HashSet, fs};
 
     #[test]
@@ -702,7 +702,7 @@ mod tests {
             log.flush().unwrap();
         }
         {
-            let log = CommitLog::new(opts.clone()).unwrap();
+            let log = CommitLog::new(opts).unwrap();
             assert_eq!(1, log.next_offset());
         }
     }
@@ -716,7 +716,7 @@ mod tests {
         let mut value = String::new();
         let mut target = 0;
         while target != 2000000 {
-            value.push_str("a");
+            value.push('a');
             target += 1;
         }
         let res = log.append_msg(value);

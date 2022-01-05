@@ -9,7 +9,7 @@ use std::{
 /// Number of bytes contained in the base name of the file.
 pub static SEGMENT_FILE_NAME_LEN: usize = 20;
 /// File extension for the segment file.
-pub static SEGMENT_FILE_NAME_EXTENSION: &'static str = "log";
+pub static SEGMENT_FILE_NAME_EXTENSION: &str = "log";
 
 /// Magic that appears in the header of the segment for version 1.
 ///
@@ -84,7 +84,7 @@ impl Segment {
         let seg_file = OpenOptions::new().read(true).write(true).append(true).open(&seg_path)?;
 
         let filename = seg_path.as_ref().file_name().unwrap().to_str().unwrap();
-        let base_offset = match u64::from_str_radix(&filename[0..SEGMENT_FILE_NAME_LEN], 10) {
+        let base_offset = match (&filename[0..SEGMENT_FILE_NAME_LEN]).parse::<u64>() {
             Ok(v) => v,
             Err(_) => {
                 return Err(io::Error::new(
