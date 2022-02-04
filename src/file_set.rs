@@ -1,7 +1,10 @@
 use log::{error, info, trace, warn};
-use std::{fs, io, mem::swap};
+use std::{
+    fs, io,
+    mem::{replace, swap},
+};
 
-use super::{index::*, segment::*, LogOptions};
+use super::{index::*, segment::*, LogOptions, Offset};
 use std::collections::BTreeMap;
 
 pub struct FileSet {
@@ -107,17 +110,18 @@ impl FileSet {
         &self.active.0
     }
 
-    pub fn find(&self, offset: u64) -> Option<&(Index, Segment)> {
+    pub fn find(&self, offset: u64) -> &(Index, Segment) {
         let active_seg_start_off = self.active.0.starting_offset();
-        if offset >= active_seg_start_off {
+        if offset < active_seg_start_off {
             trace!(
                 "Index is contained in the active index for offset {}",
                 offset
             );
-            Some(&self.active)
-        } else {
-            self.closed.range(..=offset).next_back().map(|p| p.1)
+            if let Some(entry) = self.closed.range(..=offset).next_back().map(|p| p.1) {
+                return entry;
+            }
         }
+        &self.active
     }
 
     pub fn roll_segment(&mut self) -> io::Result<()> {
@@ -139,7 +143,7 @@ impl FileSet {
         Ok(())
     }
 
-    pub fn take_after(&mut self, offset: u64) -> Vec<(Index, Segment)> {
+    pub fn remove_after(&mut self, offset: u64) -> Vec<(Index, Segment)> {
         if offset >= self.active.0.starting_offset() {
             return vec![];
         }
@@ -186,7 +190,41 @@ impl FileSet {
         pairs
     }
 
+    pub fn remove_before(&mut self, offset: u64) -> Vec<(Index, Segment)> {
+        // split such that self.closed contains [..offset), suffix=[offset,...]
+        let split_point = {
+            match self
+                .closed
+                .range(..=offset)
+                .next_back()
+                .map(|e| e.0)
+                .cloned()
+            {
+                Some(off) => off,
+                None => return vec![],
+            }
+        };
+
+        let suffix = self.closed.split_off(&split_point);
+
+        // put the suffix back into the closed segments
+        let prefix = replace(&mut self.closed, suffix);
+        prefix.into_values().collect()
+    }
+
     pub fn log_options(&self) -> &LogOptions {
         &self.opts
+    }
+
+    /// First offset written. This may not be 0 due to removal of the start of
+    /// the log
+    pub fn min_offset(&self) -> Option<Offset> {
+        if let Some(v) = self.closed.keys().next() {
+            Some(*v)
+        } else if !self.active.0.is_empty() {
+            Some(self.active.0.starting_offset())
+        } else {
+            None
+        }
     }
 }

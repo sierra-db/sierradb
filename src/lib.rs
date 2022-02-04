@@ -39,7 +39,7 @@
 //! }
 //! ```
 
-use log::{info, trace, warn};
+use log::{info, trace};
 
 mod file_set;
 mod index;
@@ -463,7 +463,7 @@ impl CommitLog {
     pub fn reader<R: LogSliceReader>(
         &self,
         reader: &mut R,
-        start: Offset,
+        mut start: Offset,
         limit: ReadLimit,
     ) -> Result<Option<R::Result>, ReadError> {
         // TODO: can this be caught at the index level insead?
@@ -471,17 +471,20 @@ impl CommitLog {
             return Ok(None);
         }
 
+        // adjust for the minimum offset (e.g. reader requests an offset that was
+        // truncated)
+        match self.file_set.min_offset() {
+            Some(min_off) if min_off > start => {
+                start = min_off;
+            }
+            None => return Ok(None),
+            _ => {}
+        }
+
         let max_bytes = limit.0 as u32;
 
         // find the correct segment
-        let &(ref ind, ref seg) = match self.file_set.find(start) {
-            Some(v) => v,
-            None => {
-                warn!("No segment found for offset {}", start);
-                return Err(ReadError::NoSuchSegment);
-            }
-        };
-
+        let &(ref ind, ref seg) = self.file_set.find(start);
         let seg_bytes = seg.size() as u32;
 
         // grab the range from the contained index
@@ -503,17 +506,8 @@ impl CommitLog {
         info!("Truncating log to offset {}", offset);
 
         // remove index/segment files rolled after the offset
-        let to_remove = self.file_set.take_after(offset);
-        for p in to_remove {
-            trace!(
-                "Removing segment and index starting at {}",
-                p.0.starting_offset()
-            );
-            assert!(p.0.starting_offset() > offset);
-
-            p.0.remove()?;
-            p.1.remove()?;
-        }
+        let segments_to_remove = self.file_set.remove_after(offset);
+        Self::delete_segments(segments_to_remove)?;
 
         // truncate the current index
         match self.file_set.active_index_mut().truncate(offset) {
@@ -523,10 +517,36 @@ impl CommitLog {
         }
     }
 
+    /// Removes segment files that are before (strictly less than) the specified
+    /// offset. The log might contain some messages before the offset
+    /// provided is in the middle of a segment.
+    pub fn trim_segments_before(&mut self, offset: Offset) -> io::Result<()> {
+        let segments_to_remove = self.file_set.remove_before(offset);
+        Self::delete_segments(segments_to_remove)
+    }
+
+    /// Removes segment files that are read-only.
+    pub fn trim_inactive_segments(&mut self) -> io::Result<()> {
+        let active_offset_start = self.file_set.active_index().starting_offset();
+        self.trim_segments_before(active_offset_start)
+    }
+
     /// Forces a flush of the log.
     pub fn flush(&mut self) -> io::Result<()> {
         self.file_set.active_segment_mut().flush_sync()?;
         self.file_set.active_index_mut().flush_sync()
+    }
+
+    fn delete_segments(segments: Vec<(Index, segment::Segment)>) -> io::Result<()> {
+        for p in segments {
+            trace!(
+                "Removing segment and index starting at {}",
+                p.0.starting_offset()
+            );
+            p.0.remove()?;
+            p.1.remove()?;
+        }
+        Ok(())
     }
 }
 
@@ -924,6 +944,244 @@ mod tests {
                 "00000000000000000006.index",
             ],
         );
+    }
+
+    #[test]
+    pub fn trim_segments_before_removes_segments() {
+        env_logger::try_init().unwrap_or(());
+        let dir = TestDir::new();
+
+        let mut opts = LogOptions::new(&dir);
+        opts.index_max_items(20);
+        opts.segment_max_bytes(52);
+        let mut log = CommitLog::new(opts).unwrap();
+
+        // append 6 messages (4 segments)
+        {
+            for _ in 0..7 {
+                log.append_msg(b"12345").unwrap();
+            }
+        }
+
+        // ensure we have the expected index/logs
+        expect_files(
+            &dir,
+            vec![
+                "00000000000000000000.index",
+                "00000000000000000000.log",
+                "00000000000000000002.log",
+                "00000000000000000002.index",
+                "00000000000000000004.log",
+                "00000000000000000004.index",
+                "00000000000000000006.log",
+                "00000000000000000006.index",
+            ],
+        );
+
+        // remove segments < 3 which is just segment 0
+        log.trim_segments_before(3)
+            .expect("Unable to truncate file");
+
+        assert_eq!(Some(6), log.last_offset());
+
+        // ensure we have the expected index/logs
+        expect_files(
+            &dir,
+            vec![
+                "00000000000000000002.index",
+                "00000000000000000002.log",
+                "00000000000000000004.log",
+                "00000000000000000004.index",
+                "00000000000000000006.log",
+                "00000000000000000006.index",
+            ],
+        );
+
+        // make sure the messages are really gone
+        let reader = log
+            .read(0, ReadLimit::default())
+            .expect("Unabled to grab reader");
+        assert_eq!(2, reader.iter().next().unwrap().offset());
+    }
+
+    #[test]
+    pub fn trim_segments_before_removes_segments_at_boundary() {
+        env_logger::try_init().unwrap_or(());
+        let dir = TestDir::new();
+
+        let mut opts = LogOptions::new(&dir);
+        opts.index_max_items(20);
+        opts.segment_max_bytes(52);
+        let mut log = CommitLog::new(opts).unwrap();
+
+        // append 6 messages (4 segments)
+        {
+            for _ in 0..7 {
+                log.append_msg(b"12345").unwrap();
+            }
+        }
+
+        // ensure we have the expected index/logs
+        expect_files(
+            &dir,
+            vec![
+                "00000000000000000000.index",
+                "00000000000000000000.log",
+                "00000000000000000002.log",
+                "00000000000000000002.index",
+                "00000000000000000004.log",
+                "00000000000000000004.index",
+                "00000000000000000006.log",
+                "00000000000000000006.index",
+            ],
+        );
+
+        // remove segments < 3 which is just segment 0
+        log.trim_segments_before(4)
+            .expect("Unable to truncate file");
+
+        assert_eq!(Some(6), log.last_offset());
+
+        // ensure we have the expected index/logs
+        expect_files(
+            &dir,
+            vec![
+                "00000000000000000004.log",
+                "00000000000000000004.index",
+                "00000000000000000006.log",
+                "00000000000000000006.index",
+            ],
+        );
+
+        // make sure the messages are really gone
+        let reader = log
+            .read(0, ReadLimit::default())
+            .expect("Unabled to grab reader");
+        assert_eq!(4, reader.iter().next().unwrap().offset());
+    }
+
+    #[test]
+    pub fn trim_start_logic_check() {
+        env_logger::try_init().unwrap_or(());
+        const TOTAL_MESSAGES: u64 = 20;
+        const TESTED_TRIM_START: u64 = TOTAL_MESSAGES + 1;
+
+        for trim_off in 0..TESTED_TRIM_START {
+            let dir = TestDir::new();
+            let mut opts = LogOptions::new(&dir);
+            opts.index_max_items(20);
+            opts.segment_max_bytes(52);
+            let mut log = CommitLog::new(opts).unwrap();
+
+            // append the messages
+            {
+                for _ in 0..TOTAL_MESSAGES {
+                    log.append_msg(b"12345").unwrap();
+                }
+            }
+
+            log.trim_segments_before(trim_off)
+                .expect("Unable to truncate file");
+            assert_eq!(Some(TOTAL_MESSAGES - 1), log.last_offset());
+
+            // make sure the messages are really gone
+            let reader = log
+                .read(0, ReadLimit::default())
+                .expect("Unabled to grab reader");
+            let start_off = reader.iter().next().unwrap().offset();
+            assert!(start_off <= trim_off);
+        }
+    }
+
+    #[test]
+    pub fn multiple_trim_start_calls() {
+        env_logger::try_init().unwrap_or(());
+        const TOTAL_MESSAGES: u64 = 20;
+        let dir = TestDir::new();
+        let mut opts = LogOptions::new(&dir);
+        opts.index_max_items(20);
+        opts.segment_max_bytes(52);
+        let mut log = CommitLog::new(opts).unwrap();
+
+        // append the messages
+        {
+            for _ in 0..TOTAL_MESSAGES {
+                log.append_msg(b"12345").unwrap();
+            }
+        }
+
+        log.trim_segments_before(2).unwrap();
+
+        {
+            let reader = log
+                .read(0, ReadLimit::default())
+                .expect("Unabled to grab reader");
+            assert_eq!(2, reader.iter().next().unwrap().offset());
+        }
+
+        log.trim_segments_before(10).unwrap();
+
+        {
+            let reader = log
+                .read(0, ReadLimit::default())
+                .expect("Unabled to grab reader");
+            assert_eq!(10, reader.iter().next().unwrap().offset());
+        }
+    }
+
+    #[test]
+    pub fn trim_inactive_logic_check() {
+        env_logger::try_init().unwrap_or(());
+        const TOTAL_MESSAGES: u64 = 20;
+
+        let dir = TestDir::new();
+        let mut opts = LogOptions::new(&dir);
+        opts.index_max_items(20);
+        opts.segment_max_bytes(52);
+        let mut log = CommitLog::new(opts).unwrap();
+
+        // append the messages
+        {
+            for _ in 0..TOTAL_MESSAGES {
+                log.append_msg(b"12345").unwrap();
+            }
+        }
+
+        log.trim_inactive_segments()
+            .expect("Unable to truncate file");
+        assert_eq!(Some(TOTAL_MESSAGES - 1), log.last_offset());
+
+        // make sure the messages are really gone
+        let reader = log
+            .read(0, ReadLimit::default())
+            .expect("Unabled to grab reader");
+        let start_off = reader.iter().next().unwrap().offset();
+        assert_eq!(16, start_off);
+    }
+
+    #[test]
+    pub fn trim_inactive_logic_check_zero_messages() {
+        env_logger::try_init().unwrap_or(());
+
+        let dir = TestDir::new();
+        let mut opts = LogOptions::new(&dir);
+        opts.index_max_items(20);
+        opts.segment_max_bytes(52);
+        let mut log = CommitLog::new(opts).unwrap();
+
+        log.trim_inactive_segments()
+            .expect("Unable to truncate file");
+        assert_eq!(None, log.last_offset());
+
+        // append the messages
+        log.append_msg(b"12345").unwrap();
+
+        // make sure the messages are really gone
+        let reader = log
+            .read(0, ReadLimit::default())
+            .expect("Unabled to grab reader");
+        let start_off = reader.iter().next().unwrap().offset();
+        assert_eq!(0, start_off);
     }
 
     fn expect_files<P: AsRef<Path>, I>(dir: P, files: I)

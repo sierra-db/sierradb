@@ -2,7 +2,6 @@ use super::Offset;
 use byteorder::{ByteOrder, LittleEndian};
 use log::{info, trace, warn};
 use memmap2::MmapMut;
-
 use std::{
     cmp::Ordering,
     fs::{self, File, OpenOptions},
@@ -252,6 +251,10 @@ impl Index {
     #[inline]
     pub fn starting_offset(&self) -> u64 {
         self.base_offset
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.next_write_pos == 0
     }
 
     #[inline]
