@@ -15,8 +15,9 @@
 //!
 //! ## Example
 //!
-//! ```rust,ignore
+//! ```rust
 //! use commitlog::*;
+//! use commitlog::message::*;
 //!
 //! fn main() {
 //!     // open a directory called 'log' for segment and index storage
@@ -29,7 +30,7 @@
 //!
 //!     // read the messages
 //!     let messages = log.read(0, ReadLimit::default()).unwrap();
-//!     for msg in messages {
+//!     for msg in messages.iter() {
 //!         println!("{} - {}", msg.offset(), String::from_utf8_lossy(msg.payload()));
 //!     }
 //!
@@ -1220,3 +1221,7 @@ mod tests {
         );
     }
 }
+
+#[doc = include_str!("../README.md")]
+#[cfg(doctest)]
+pub struct ReadmeDoctests;

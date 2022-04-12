@@ -8,7 +8,6 @@ Sequential, disk-backed commit log library for Rust. The library can be used in 
 
 [Documentation](https://docs.rs/commitlog/)
 
-
 ## Usage
 
 First, add this to your `Cargo.toml`:
@@ -19,9 +18,8 @@ commitlog = "0.2"
 ```
 
 ```rust
-extern crate commitlog;
-
 use commitlog::*;
+use commitlog::message::*;
 
 fn main() {
     // open a directory called 'log' for segment and index storage
@@ -29,8 +27,8 @@ fn main() {
     let mut log = CommitLog::new(opts).unwrap();
 
     // append to the log
-    log.append("hello world").unwrap(); // offset 0
-    log.append("second message").unwrap(); // offset 1
+    log.append_msg("hello world").unwrap(); // offset 0
+    log.append_msg("second message").unwrap(); // offset 1
 
     // read the messages
     let messages = log.read(0, ReadLimit::default()).unwrap();
@@ -46,5 +44,6 @@ fn main() {
 ```
 
 ## Prior Art
-* [Apache Kafka](https://kafka.apache.org/)
-* [Jocko](https://github.com/travisjeffery/jocko) + [EXCELLENT Blog Post](https://medium.com/the-hoard/how-kafkas-storage-internals-work-3a29b02e026)
+
+- [Apache Kafka](https://kafka.apache.org/)
+- [Jocko](https://github.com/travisjeffery/jocko) + [EXCELLENT Blog Post](https://medium.com/the-hoard/how-kafkas-storage-internals-work-3a29b02e026)
