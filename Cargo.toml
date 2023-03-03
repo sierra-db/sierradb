@@ -20,7 +20,7 @@ bytes = "1"
 crc32c = "0.6"
 log = "0.4.1"
 memmap2 = "0.5"
-page_size = "0.4.1"
+page_size = "0.5.0"
 
 [dev-dependencies]
 criterion = "0.4"
