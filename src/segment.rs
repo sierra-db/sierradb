@@ -166,7 +166,8 @@ impl Segment {
     }
 
     pub fn flush_sync(&mut self) -> io::Result<()> {
-        self.file.flush()
+        self.file.flush()?;
+        self.file.sync_all()
     }
 
     pub fn read_slice<T: LogSliceReader>(
