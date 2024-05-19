@@ -43,6 +43,7 @@
 use log::{info, trace};
 
 mod file_set;
+mod fixed_size_hashmap;
 mod index;
 pub mod message;
 pub mod reader;
@@ -59,7 +60,9 @@ use std::{
 };
 
 #[cfg(feature = "internals")]
-pub use crate::{index::Index, index::IndexBuf, segment::Segment};
+pub use crate::{
+    fixed_size_hashmap::FixedSizeHashMap, index::Index, index::IndexBuf, segment::Segment,
+};
 use file_set::FileSet;
 use message::{MessageBuf, MessageError, MessageSet, MessageSetMut};
 use reader::{LogSliceReader, MessageBufReader};

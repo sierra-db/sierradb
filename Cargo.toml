@@ -7,7 +7,7 @@ readme = "README.md"
 repository = "https://github.com/zowens/commitlog"
 description = "Sequential, disk-backed commit log library."
 version = "0.2.0"
-edition = "2018"
+edition = "2021"
 
 [features]
 # Enable benchmark of the private api. This flag should be used only
@@ -29,6 +29,11 @@ rand = "0.8"
 
 [[bench]]
 name = "index"
+harness = false
+required-features = ["internals"]
+
+[[bench]]
+name = "fixed_size_hashmap"
 harness = false
 required-features = ["internals"]
 
