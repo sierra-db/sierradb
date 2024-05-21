@@ -27,8 +27,8 @@ pub enum SegmentAppendError {
 
 impl From<io::Error> for SegmentAppendError {
     #[inline]
-    fn from(e: io::Error) -> SegmentAppendError {
-        SegmentAppendError::IoError(e)
+    fn from(err: io::Error) -> SegmentAppendError {
+        SegmentAppendError::IoError(err)
     }
 }
 

@@ -15,6 +15,7 @@ fn commitlog_append_10000(c: &mut Criterion) {
         b.iter(|| {
             for _ in 0..10_000 {
                 log.append_msg(
+                    "my_stream",
                     "719c3b4556066a1c7a06c9d55959d003d9b46273aabe2 \
                  eae15ef4ba78321ae2a68b0997a4abbd035a4cdbc8b27d701089a5af63a8b \
                  81f9dc16a874d0eda0983b79c1a6f79fe3ae61612ba2558562a85595f2f3f \
@@ -46,7 +47,7 @@ fn commitlog_append_10000_batched(c: &mut Criterion) {
                     )
                     .unwrap();
                 }
-                log.append(&mut buf).unwrap();
+                log.append("my_stream", &mut buf).unwrap();
                 unsafe {
                     buf.unsafe_clear();
                 }

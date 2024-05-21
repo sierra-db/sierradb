@@ -25,8 +25,8 @@
 //!     let mut log = CommitLog::new(opts).unwrap();
 //!
 //!     // append to the log
-//!     log.append_msg("hello world").unwrap(); // offset 0
-//!     log.append_msg("second message").unwrap(); // offset 1
+//!     log.append_msg("my_stream", "hello world").unwrap(); // offset 0
+//!     log.append_msg("my_stream", "second message").unwrap(); // offset 1
 //!
 //!     // read the messages
 //!     let messages = log.read(0, ReadLimit::default()).unwrap();
@@ -40,32 +40,33 @@
 //! }
 //! ```
 
-use log::{info, trace};
-
 mod file_set;
-mod fixed_size_hashmap;
 mod index;
 pub mod message;
 pub mod reader;
 mod segment;
+mod stream_index;
+
 #[cfg(test)]
 mod testutil;
 
-use index::*;
-use segment::SegmentAppendError;
 use std::{
     error, fmt, fs, io,
     iter::{DoubleEndedIterator, ExactSizeIterator},
     path::{Path, PathBuf},
 };
 
-#[cfg(feature = "internals")]
-pub use crate::{
-    fixed_size_hashmap::FixedSizeHashMap, index::Index, index::IndexBuf, segment::Segment,
-};
-use file_set::FileSet;
+use index::{IndexBuf, RangeFindError, INDEX_ENTRY_BYTES};
+use log::{info, trace};
+use serde::de::DeserializeOwned;
+
+use file_set::{FileSet, SegmentSet};
 use message::{MessageBuf, MessageError, MessageSet, MessageSetMut};
 use reader::{LogSliceReader, MessageBufReader};
+use segment::SegmentAppendError;
+
+#[cfg(feature = "internals")]
+pub use crate::{index::Index, index::IndexBuf, segment::Segment, stream_index::StreamIndex};
 
 /// Offset of an appended log segment.
 pub type Offset = u64;
@@ -164,8 +165,8 @@ pub enum AppendError {
 }
 
 impl From<io::Error> for AppendError {
-    fn from(e: io::Error) -> AppendError {
-        AppendError::Io(e)
+    fn from(err: io::Error) -> AppendError {
+        AppendError::Io(err)
     }
 }
 
@@ -187,8 +188,8 @@ impl error::Error for AppendError {
     }
 
     fn cause(&self) -> Option<&dyn error::Error> {
-        match *self {
-            AppendError::Io(ref e) => Some(e),
+        match self {
+            AppendError::Io(err) => Some(err),
             _ => None,
         }
     }
@@ -215,6 +216,8 @@ pub enum ReadError {
     CorruptLog,
     /// Offset supplied was not invalid.
     NoSuchSegment,
+    /// Failed to deserialize message.
+    Deserialize(bincode::Error),
 }
 
 /// Batch size limitation on read.
@@ -236,16 +239,17 @@ impl Default for ReadLimit {
 
 impl error::Error for ReadError {
     fn description(&self) -> &str {
-        match *self {
+        match self {
             ReadError::Io(_) => "File IO error occurred while reading to the log",
             ReadError::CorruptLog => "Corrupt log segment has been detected",
             ReadError::NoSuchSegment => "The offset requested does not exist in the log",
+            ReadError::Deserialize(_) => "Message deserialization failed",
         }
     }
 
     fn cause(&self) -> Option<&dyn error::Error> {
-        match *self {
-            ReadError::Io(ref e) => Some(e),
+        match self {
+            ReadError::Io(err) => Some(err),
             _ => None,
         }
     }
@@ -253,32 +257,33 @@ impl error::Error for ReadError {
 
 impl fmt::Display for ReadError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
+        match self {
             ReadError::Io(_) => write!(f, "IO Error"),
             ReadError::CorruptLog => write!(f, "Corrupt Log Error"),
             ReadError::NoSuchSegment => write!(f, "Offset does not exist"),
+            ReadError::Deserialize(_) => write!(f, "Deserialize failed"),
         }
     }
 }
 
 impl From<io::Error> for ReadError {
-    fn from(e: io::Error) -> ReadError {
-        ReadError::Io(e)
+    fn from(err: io::Error) -> ReadError {
+        ReadError::Io(err)
     }
 }
 
 impl From<MessageError> for ReadError {
-    fn from(e: MessageError) -> ReadError {
-        match e {
-            MessageError::IoError(e) => ReadError::Io(e),
+    fn from(err: MessageError) -> ReadError {
+        match err {
+            MessageError::IoError(err) => ReadError::Io(err),
             MessageError::InvalidHash | MessageError::InvalidPayloadLength => ReadError::CorruptLog,
         }
     }
 }
 
 impl From<RangeFindError> for ReadError {
-    fn from(e: RangeFindError) -> ReadError {
-        match e {
+    fn from(err: RangeFindError) -> ReadError {
+        match err {
             RangeFindError::OffsetNotAppended => ReadError::NoSuchSegment,
             RangeFindError::MessageExceededMaxBytes => ReadError::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -294,6 +299,7 @@ impl From<RangeFindError> for ReadError {
 pub struct LogOptions {
     log_dir: PathBuf,
     log_max_bytes: usize,
+    log_max_entries: u64,
     index_max_bytes: usize,
     message_max_bytes: usize,
 }
@@ -302,8 +308,8 @@ impl LogOptions {
     /// Creates minimal log options value with a directory containing the log.
     ///
     /// The default values are:
-    /// - *segment_max_bytes*: 1GB
-    /// - *index_max_entries*: 100,000
+    /// - *segment_max_bytes*: 256MB
+    /// - *index_max_entries*: 800,000
     /// - *message_max_bytes*: 1mb
     pub fn new<P>(log_dir: P) -> LogOptions
     where
@@ -311,7 +317,8 @@ impl LogOptions {
     {
         LogOptions {
             log_dir: log_dir.as_ref().to_owned(),
-            log_max_bytes: 1_000_000_000,
+            log_max_bytes: 256 * 1024 * 1024,
+            log_max_entries: 256_000,
             index_max_bytes: 800_000,
             message_max_bytes: 1_000_000,
         }
@@ -321,6 +328,13 @@ impl LogOptions {
     #[inline]
     pub fn segment_max_bytes(&mut self, bytes: usize) -> &mut LogOptions {
         self.log_max_bytes = bytes;
+        self
+    }
+
+    /// Bounds the size of a log segment to a number of bytes.
+    #[inline]
+    pub fn segment_max_entries(&mut self, entries: u64) -> &mut LogOptions {
+        self.log_max_entries = entries;
         self
     }
 
@@ -358,29 +372,37 @@ impl CommitLog {
 
     /// Appends a single message to the log, returning the offset appended.
     #[inline]
-    pub fn append_msg<B: AsRef<[u8]>>(&mut self, payload: B) -> Result<Offset, AppendError> {
+    pub fn append_msg<B: AsRef<[u8]>>(
+        &mut self,
+        stream_name: &str,
+        payload: B,
+    ) -> Result<Offset, AppendError> {
         let mut buf = MessageBuf::default();
         buf.push(payload).expect("Payload size exceeds usize::MAX");
-        let res = self.append(&mut buf)?;
+        let res = self.append(stream_name, &mut buf)?;
         assert_eq!(res.len(), 1);
         Ok(res.first())
     }
 
     /// Appends log entrites to the commit log, returning the offsets appended.
     #[inline]
-    pub fn append<T>(&mut self, buf: &mut T) -> Result<OffsetRange, AppendError>
+    pub fn append<T>(&mut self, stream_name: &str, buf: &mut T) -> Result<OffsetRange, AppendError>
     where
         T: MessageSetMut,
     {
         let start_off = self.file_set.active_index_mut().next_offset();
         message::set_offsets(buf, start_off);
-        self.append_with_offsets(buf)
+        self.append_with_offsets(stream_name, buf)
     }
 
     /// Appends log entrites to the commit log, returning the offsets appended.
     ///
     /// The offsets are expected to already be set within the buffer.
-    pub fn append_with_offsets<T>(&mut self, buf: &T) -> Result<OffsetRange, AppendError>
+    pub fn append_with_offsets<T>(
+        &mut self,
+        stream_name: &str,
+        buf: &T,
+    ) -> Result<OffsetRange, AppendError>
     where
         T: MessageSet,
     {
@@ -389,7 +411,7 @@ impl CommitLog {
             return Ok(OffsetRange(0, 0));
         }
 
-        //Check if given message exceeded the max size
+        // Check if given message exceeded the max size
         if buf.bytes().len() > self.file_set.log_options().message_max_bytes {
             return Err(AppendError::MessageSizeExceeded);
         }
@@ -400,6 +422,13 @@ impl CommitLog {
         // check to make sure the first message matches the starting offset
         if buf.iter().next().unwrap().offset() != start_off {
             return Err(AppendError::InvalidOffset);
+        }
+
+        // Check to make sure we aren't exceeding the log max entries
+        let starting_offset = self.file_set.active_index().starting_offset();
+        let ending_offset = start_off + buf.len() as u64;
+        if ending_offset - starting_offset > self.file_set.log_options().log_max_entries {
+            self.file_set.roll_segment()?;
         }
 
         let meta = match self.file_set.active_segment_mut().append(buf) {
@@ -415,7 +444,7 @@ impl CommitLog {
                     .append(buf)
                     .map_err(|_| AppendError::FreshSegmentNotWritable)?
             }
-            Err(SegmentAppendError::IoError(e)) => return Err(AppendError::Io(e)),
+            Err(SegmentAppendError::IoError(err)) => return Err(AppendError::Io(err)),
         };
 
         // write to the index
@@ -430,6 +459,14 @@ impl CommitLog {
             }
             // TODO: what happens when this errors out? Do we truncate the log...?
             index.append(index_pos_buf)?;
+        }
+
+        // write to the stream index
+        {
+            let stream_index = self.file_set.active_stream_index_mut();
+            for m in buf.iter() {
+                stream_index.insert(stream_name, m.offset())?;
+            }
         }
 
         Ok(OffsetRange(start_off, buf_len))
@@ -449,6 +486,62 @@ impl CommitLog {
     #[inline]
     pub fn next_offset(&self) -> Offset {
         self.file_set.active_index().next_offset()
+    }
+
+    pub fn read_last_stream_msg<T: DeserializeOwned>(
+        &self,
+        stream_name: &str,
+    ) -> Result<Option<T>, ReadError> {
+        let Some(last_offset) = self
+            .file_set
+            .active_stream_index()
+            .get(stream_name)?
+            .last()
+            .copied()
+            .map(Ok)
+            .or_else(|| {
+                self.file_set.closed().values().rev().find_map(
+                    |SegmentSet { stream_index, .. }| match stream_index.get(stream_name) {
+                        Ok(offsets) => offsets.last().copied().map(Ok),
+                        Err(err) => Some(Err(err)),
+                    },
+                )
+            })
+            .transpose()?
+        else {
+            return Ok(None);
+        };
+
+        let buf = self.read(last_offset, ReadLimit::default())?;
+        let msg = buf.iter().next().ok_or(ReadError::CorruptLog)?;
+        let event = bincode::deserialize::<T>(msg.payload()).map_err(ReadError::Deserialize)?;
+        Ok(Some(event))
+    }
+
+    pub fn read_stream<T: DeserializeOwned>(&self, stream_name: &str) -> Result<Vec<T>, ReadError> {
+        // Iterate stream indexes
+        let mut offsets: Vec<_> = self
+            .file_set
+            .closed()
+            .values()
+            .map(|SegmentSet { stream_index, .. }| stream_index.get(stream_name))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+        offsets.extend_from_slice(&self.file_set.active_stream_index().get(stream_name)?);
+
+        let log: Vec<_> = offsets
+            .into_iter()
+            .map(|offset| {
+                self.read(offset, ReadLimit::default()).and_then(|buf| {
+                    let msg = buf.iter().next().ok_or(ReadError::CorruptLog)?;
+                    bincode::deserialize::<T>(msg.payload()).map_err(ReadError::Deserialize)
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(log)
     }
 
     /// Reads a portion of the log, starting with the `start` offset, inclusive,
@@ -488,15 +581,15 @@ impl CommitLog {
         let max_bytes = limit.0 as u32;
 
         // find the correct segment
-        let &(ref ind, ref seg) = self.file_set.find(start);
-        let seg_bytes = seg.size() as u32;
+        let SegmentSet { segment, index, .. } = self.file_set.find(start);
+        let seg_bytes = segment.size() as u32;
 
         // grab the range from the contained index
-        let range = ind.find_segment_range(start, max_bytes, seg_bytes)?;
+        let range = index.find_segment_range(start, max_bytes, seg_bytes)?;
         if range.bytes() == 0 {
             Ok(None)
         } else {
-            Ok(Some(seg.read_slice(
+            Ok(Some(segment.read_slice(
                 reader,
                 range.file_position(),
                 range.bytes(),
@@ -538,17 +631,20 @@ impl CommitLog {
     /// Forces a flush of the log.
     pub fn flush(&mut self) -> io::Result<()> {
         self.file_set.active_segment_mut().flush_sync()?;
-        self.file_set.active_index_mut().flush_sync()
+        self.file_set.active_index_mut().flush_sync()?;
+        self.file_set.active_stream_index_mut().flush_sync()?;
+        Ok(())
     }
 
-    fn delete_segments(segments: Vec<(Index, segment::Segment)>) -> io::Result<()> {
+    fn delete_segments(segments: Vec<SegmentSet>) -> io::Result<()> {
         for p in segments {
             trace!(
                 "Removing segment and index starting at {}",
-                p.0.starting_offset()
+                p.segment.starting_offset()
             );
-            p.0.remove()?;
-            p.1.remove()?;
+            p.segment.remove()?;
+            p.index.remove()?;
+            p.stream_index.remove()?;
         }
         Ok(())
     }
@@ -576,10 +672,10 @@ mod tests {
     pub fn append() {
         let dir = TestDir::new();
         let mut log = CommitLog::new(LogOptions::new(&dir)).unwrap();
-        assert_eq!(log.append_msg("123456").unwrap(), 0);
-        assert_eq!(log.append_msg("abcdefg").unwrap(), 1);
-        assert_eq!(log.append_msg("foobarbaz").unwrap(), 2);
-        assert_eq!(log.append_msg("bing").unwrap(), 3);
+        assert_eq!(log.append_msg("my_stream", "123456").unwrap(), 0);
+        assert_eq!(log.append_msg("my_stream", "abcdefg").unwrap(), 1);
+        assert_eq!(log.append_msg("my_stream", "foobarbaz").unwrap(), 2);
+        assert_eq!(log.append_msg("my_stream", "bing").unwrap(), 3);
         log.flush().unwrap();
     }
 
@@ -594,7 +690,7 @@ mod tests {
             buf.push(b"345678").unwrap();
             buf
         };
-        let range = log.append(&mut buf).unwrap();
+        let range = log.append("my_stream", &mut buf).unwrap();
         assert_eq!(0, range.first());
         assert_eq!(3, range.len());
         assert_eq!(vec![0, 1, 2], range.iter().collect::<Vec<u64>>());
@@ -609,11 +705,11 @@ mod tests {
         {
             let mut log = CommitLog::new(opts).unwrap();
             // first 2 entries fit (both 30 bytes with encoding)
-            log.append_msg("0123456789").unwrap();
-            log.append_msg("0123456789").unwrap();
+            log.append_msg("my_stream", "0123456789").unwrap();
+            log.append_msg("my_stream", "0123456789").unwrap();
 
             // this one should roll the log
-            log.append_msg("0123456789").unwrap();
+            log.append_msg("my_stream", "0123456789").unwrap();
             log.flush().unwrap();
         }
 
@@ -622,8 +718,10 @@ mod tests {
             vec![
                 "00000000000000000000.index",
                 "00000000000000000000.log",
+                "00000000000000000000.streams",
                 "00000000000000000002.log",
                 "00000000000000000002.index",
+                "00000000000000000002.streams",
             ],
         );
     }
@@ -640,7 +738,7 @@ mod tests {
 
         for i in 0..100 {
             let s = format!("-data {}", i);
-            log.append_msg(s.as_str()).unwrap();
+            log.append_msg("my_stream", s.as_str()).unwrap();
         }
         log.flush().unwrap();
 
@@ -694,7 +792,7 @@ mod tests {
 
             for i in 0..99 {
                 let s = format!("some data {}", i);
-                let off = log.append_msg(s.as_str()).unwrap();
+                let off = log.append_msg("my_stream", s.as_str()).unwrap();
                 assert_eq!(i, off);
             }
             log.flush().unwrap();
@@ -714,7 +812,7 @@ mod tests {
                     .collect::<Vec<_>>()
             );
 
-            let off = log.append_msg("moar data").unwrap();
+            let off = log.append_msg("my_stream", "moar data").unwrap();
             assert_eq!(99, off);
         }
     }
@@ -749,7 +847,7 @@ mod tests {
         let opts = LogOptions::new(&dir);
         {
             let mut log = CommitLog::new(opts.clone()).unwrap();
-            log.append_msg("Test").unwrap();
+            log.append_msg("my_stream", "Test").unwrap();
             log.flush().unwrap();
         }
         {
@@ -770,7 +868,7 @@ mod tests {
             value.push('a');
             target += 1;
         }
-        let res = log.append_msg(value);
+        let res = log.append_msg("my_stream", value);
         //will fail if no error is found which means a message greater than the limit
         // passed through
         assert!(res.is_err());
@@ -790,7 +888,7 @@ mod tests {
             buf.push(b"345678").unwrap();
             buf.push(b"aaaaaa").unwrap();
             buf.push(b"bbbbbb").unwrap();
-            log.append(&mut buf).unwrap();
+            log.append("my_stream", &mut buf).unwrap();
         }
 
         // truncate to offset 2 (should remove 2 messages)
@@ -812,7 +910,7 @@ mod tests {
         // append 6 messages (4 segments)
         {
             for _ in 0..7 {
-                log.append_msg(b"12345").unwrap();
+                log.append_msg("my_stream", b"12345").unwrap();
             }
         }
 
@@ -822,11 +920,15 @@ mod tests {
             vec![
                 "00000000000000000000.index",
                 "00000000000000000000.log",
+                "00000000000000000000.streams",
                 "00000000000000000002.log",
+                "00000000000000000002.streams",
                 "00000000000000000002.index",
                 "00000000000000000004.log",
+                "00000000000000000004.streams",
                 "00000000000000000004.index",
                 "00000000000000000006.log",
+                "00000000000000000006.streams",
                 "00000000000000000006.index",
             ],
         );
@@ -842,8 +944,10 @@ mod tests {
             vec![
                 "00000000000000000000.index",
                 "00000000000000000000.log",
+                "00000000000000000000.streams",
                 "00000000000000000002.log",
                 "00000000000000000002.index",
+                "00000000000000000002.streams",
             ],
         );
     }
@@ -861,7 +965,7 @@ mod tests {
         // append 6 messages (4 segments)
         {
             for _ in 0..7 {
-                log.append_msg(b"12345").unwrap();
+                log.append_msg("my_stream", b"12345").unwrap();
             }
         }
 
@@ -871,12 +975,16 @@ mod tests {
             vec![
                 "00000000000000000000.index",
                 "00000000000000000000.log",
+                "00000000000000000000.streams",
                 "00000000000000000002.log",
                 "00000000000000000002.index",
+                "00000000000000000002.streams",
                 "00000000000000000004.log",
                 "00000000000000000004.index",
+                "00000000000000000004.streams",
                 "00000000000000000006.log",
                 "00000000000000000006.index",
+                "00000000000000000006.streams",
             ],
         );
 
@@ -891,8 +999,10 @@ mod tests {
             vec![
                 "00000000000000000000.index",
                 "00000000000000000000.log",
+                "00000000000000000000.streams",
                 "00000000000000000002.log",
                 "00000000000000000002.index",
+                "00000000000000000002.streams",
             ],
         );
     }
@@ -910,7 +1020,7 @@ mod tests {
         // append 6 messages (4 segments)
         {
             for _ in 0..7 {
-                log.append_msg(b"12345").unwrap();
+                log.append_msg("my_stream", b"12345").unwrap();
             }
         }
 
@@ -920,11 +1030,15 @@ mod tests {
             vec![
                 "00000000000000000000.index",
                 "00000000000000000000.log",
+                "00000000000000000000.streams",
                 "00000000000000000002.log",
+                "00000000000000000002.streams",
                 "00000000000000000002.index",
                 "00000000000000000004.log",
+                "00000000000000000004.streams",
                 "00000000000000000004.index",
                 "00000000000000000006.log",
+                "00000000000000000006.streams",
                 "00000000000000000006.index",
             ],
         );
@@ -940,12 +1054,16 @@ mod tests {
             vec![
                 "00000000000000000000.index",
                 "00000000000000000000.log",
+                "00000000000000000000.streams",
                 "00000000000000000002.log",
                 "00000000000000000002.index",
+                "00000000000000000002.streams",
                 "00000000000000000004.log",
                 "00000000000000000004.index",
+                "00000000000000000004.streams",
                 "00000000000000000006.log",
                 "00000000000000000006.index",
+                "00000000000000000006.streams",
             ],
         );
     }
@@ -963,7 +1081,7 @@ mod tests {
         // append 6 messages (4 segments)
         {
             for _ in 0..7 {
-                log.append_msg(b"12345").unwrap();
+                log.append_msg("my_stream", b"12345").unwrap();
             }
         }
 
@@ -973,12 +1091,16 @@ mod tests {
             vec![
                 "00000000000000000000.index",
                 "00000000000000000000.log",
+                "00000000000000000000.streams",
                 "00000000000000000002.log",
                 "00000000000000000002.index",
+                "00000000000000000002.streams",
                 "00000000000000000004.log",
                 "00000000000000000004.index",
+                "00000000000000000004.streams",
                 "00000000000000000006.log",
                 "00000000000000000006.index",
+                "00000000000000000006.streams",
             ],
         );
 
@@ -994,10 +1116,13 @@ mod tests {
             vec![
                 "00000000000000000002.index",
                 "00000000000000000002.log",
+                "00000000000000000002.streams",
                 "00000000000000000004.log",
                 "00000000000000000004.index",
+                "00000000000000000004.streams",
                 "00000000000000000006.log",
                 "00000000000000000006.index",
+                "00000000000000000006.streams",
             ],
         );
 
@@ -1021,7 +1146,7 @@ mod tests {
         // append 6 messages (4 segments)
         {
             for _ in 0..7 {
-                log.append_msg(b"12345").unwrap();
+                log.append_msg("my_stream", b"12345").unwrap();
             }
         }
 
@@ -1031,12 +1156,16 @@ mod tests {
             vec![
                 "00000000000000000000.index",
                 "00000000000000000000.log",
+                "00000000000000000000.streams",
                 "00000000000000000002.log",
                 "00000000000000000002.index",
+                "00000000000000000002.streams",
                 "00000000000000000004.log",
                 "00000000000000000004.index",
+                "00000000000000000004.streams",
                 "00000000000000000006.log",
                 "00000000000000000006.index",
+                "00000000000000000006.streams",
             ],
         );
 
@@ -1052,8 +1181,10 @@ mod tests {
             vec![
                 "00000000000000000004.log",
                 "00000000000000000004.index",
+                "00000000000000000004.streams",
                 "00000000000000000006.log",
                 "00000000000000000006.index",
+                "00000000000000000006.streams",
             ],
         );
 
@@ -1080,7 +1211,7 @@ mod tests {
             // append the messages
             {
                 for _ in 0..TOTAL_MESSAGES {
-                    log.append_msg(b"12345").unwrap();
+                    log.append_msg("my_stream", b"12345").unwrap();
                 }
             }
 
@@ -1110,7 +1241,7 @@ mod tests {
         // append the messages
         {
             for _ in 0..TOTAL_MESSAGES {
-                log.append_msg(b"12345").unwrap();
+                log.append_msg("my_stream", b"12345").unwrap();
             }
         }
 
@@ -1147,7 +1278,7 @@ mod tests {
         // append the messages
         {
             for _ in 0..TOTAL_MESSAGES {
-                log.append_msg(b"12345").unwrap();
+                log.append_msg("my_stream", b"12345").unwrap();
             }
         }
 
@@ -1178,7 +1309,7 @@ mod tests {
         assert_eq!(None, log.last_offset());
 
         // append the messages
-        log.append_msg(b"12345").unwrap();
+        log.append_msg("my_stream", b"12345").unwrap();
 
         // make sure the messages are really gone
         let reader = log
@@ -1194,8 +1325,8 @@ mod tests {
     {
         let dir_files = fs::read_dir(&dir)
             .unwrap()
-            .map(|e| {
-                e.unwrap()
+            .map(|res| {
+                res.unwrap()
                     .path()
                     .file_name()
                     .unwrap()

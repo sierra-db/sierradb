@@ -22,7 +22,8 @@ fn main() {
         let mut buf = (0..BATCH_SIZE)
             .map(|j| format!("{}-{}", i, j))
             .collect::<MessageBuf>();
-        log.append(&mut buf).expect("Unable to append batch");
+        log.append("my_stream", &mut buf)
+            .expect("Unable to append batch");
 
         if i == 99 || i == 50 {
             log.flush().expect("Unable to flush");

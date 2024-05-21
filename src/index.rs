@@ -1,5 +1,4 @@
 use super::Offset;
-use byteorder::{ByteOrder, LittleEndian};
 use log::{info, trace, warn};
 use memmap2::MmapMut;
 use std::{
@@ -33,8 +32,8 @@ where
 
         // read the relative offset at the midpoint
         let mi = m * INDEX_ENTRY_BYTES;
-        let rel_off = LittleEndian::read_u32(&index[mi..mi + 4]);
-        let file_pos = LittleEndian::read_u32(&index[mi + 4..mi + 8]);
+        let rel_off = u32::from_le_bytes(index[mi..mi + 4].try_into().unwrap());
+        let file_pos = u32::from_le_bytes(index[mi + 4..mi + 8].try_into().unwrap());
 
         match f(rel_off, file_pos) {
             Ordering::Equal => return m,
@@ -52,8 +51,8 @@ where
 macro_rules! entry {
     ($mem:ident, $pos:expr) => {
         (
-            LittleEndian::read_u32(&$mem[($pos)..($pos) + 4]),
-            LittleEndian::read_u32(&$mem[($pos) + 4..($pos) + 8]),
+            u32::from_le_bytes($mem[($pos)..($pos) + 4].try_into().unwrap()),
+            u32::from_le_bytes($mem[($pos) + 4..($pos) + 8].try_into().unwrap()),
         )
     };
 }
@@ -122,8 +121,8 @@ impl IndexBuf {
         );
 
         let mut tmp_buf = [0u8; INDEX_ENTRY_BYTES];
-        LittleEndian::write_u32(&mut tmp_buf[0..4], (abs_offset - self.1) as u32);
-        LittleEndian::write_u32(&mut tmp_buf[4..], position);
+        tmp_buf[0..4].copy_from_slice(&((abs_offset - self.1) as u32).to_le_bytes());
+        tmp_buf[4..].copy_from_slice(&position.to_le_bytes());
         self.0.extend_from_slice(&tmp_buf);
     }
 }
@@ -142,7 +141,7 @@ impl Index {
         P: AsRef<Path>,
     {
         // open the file, expecting to create it
-        let index_path = {
+        let path = {
             let mut path_buf = PathBuf::new();
             path_buf.push(&log_dir);
             path_buf.push(format!("{:020}", base_offset));
@@ -150,27 +149,27 @@ impl Index {
             path_buf
         };
 
-        info!("Creating index file {:?}", &index_path);
+        info!("Creating index file {:?}", &path);
 
-        let index_file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .append(true)
             .create_new(true)
-            .open(&index_path)?;
+            .open(&path)?;
 
         // read the metadata and truncate
-        let meta = index_file.metadata()?;
+        let meta = file.metadata()?;
         let len = meta.len();
         if len == 0 {
-            index_file.set_len(file_bytes as u64)?;
+            file.set_len(file_bytes as u64)?;
         }
 
-        let mmap = unsafe { MmapMut::map_mut(&index_file)? };
+        let mmap = unsafe { MmapMut::map_mut(&file)? };
 
         Ok(Index {
-            file: index_file,
-            path: index_path,
+            file,
+            path,
             mmap,
             mode: AccessMode::ReadWrite,
             next_write_pos: 0,
@@ -316,10 +315,10 @@ impl Index {
             if self.next_write_pos < self.mmap.len() {
                 // TODO: fix restrict
                 // self.mmap.restrict(0, self.next_write_pos)?;
-                if let Err(e) = self.file.set_len(self.next_write_pos as u64) {
+                if let Err(err) = self.file.set_len(self.next_write_pos as u64) {
                     warn!(
                         "Unable to truncate index file {:020}.{} to proper length: {:?}",
-                        self.base_offset, INDEX_FILE_NAME_EXTENSION, e
+                        self.base_offset, INDEX_FILE_NAME_EXTENSION, err
                     );
                 }
             }
@@ -418,11 +417,11 @@ impl Index {
 
         let mem_slice = &self.mmap[..];
         let start = i * INDEX_ENTRY_BYTES;
-        let offset = LittleEndian::read_u32(&mem_slice[start..start + 4]);
+        let offset = u32::from_le_bytes(mem_slice[start..start + 4].try_into().unwrap());
         if offset == 0 && i > 0 {
             None
         } else {
-            let pos = LittleEndian::read_u32(&mem_slice[start + 4..start + 8]);
+            let pos = u32::from_le_bytes(mem_slice[start + 4..start + 8].try_into().unwrap());
             Some((u64::from(offset) + self.base_offset, pos))
         }
     }
@@ -479,6 +478,7 @@ impl Index {
 
         let search_range = &mem_slice[start_ind_pos..self.next_write_pos];
         if search_range.is_empty() {
+            println!("uh oh");
             return Err(RangeFindError::MessageExceededMaxBytes);
         }
 
@@ -501,6 +501,7 @@ impl Index {
 
         let bytes = pos - start_file_pos;
         if bytes == 0 || bytes > max_bytes {
+            println!("NOOO: {bytes}");
             Err(RangeFindError::MessageExceededMaxBytes)
         } else {
             trace!("Found slice range {}..{}", start_file_pos, pos);
@@ -528,7 +529,8 @@ impl Index {
             trace!("Attempting to read offset from exact location");
             // read exact entry
             let entry_pos = rel_offset as usize * INDEX_ENTRY_BYTES;
-            let rel_offset_val = LittleEndian::read_u32(&mem_slice[entry_pos..entry_pos + 4]);
+            let rel_offset_val =
+                u32::from_le_bytes(mem_slice[entry_pos..entry_pos + 4].try_into().unwrap());
             trace!(
                 "Found relative offset. rel_offset = {}, entry offset = {}",
                 rel_offset,
@@ -647,10 +649,10 @@ mod tests {
             let index = Index::open(&index_path).unwrap();
 
             for i in 0..5usize {
-                let e = index.read_entry(i);
-                assert!(e.is_some());
-                assert_eq!(e.unwrap().0, (i + 10) as u64);
-                assert_eq!(e.unwrap().1, (i * 10) as u32);
+                let entry = index.read_entry(i);
+                assert!(entry.is_some());
+                assert_eq!(entry.unwrap().0, (i + 10) as u64);
+                assert_eq!(entry.unwrap().1, (i * 10) as u32);
             }
         }
     }
@@ -691,10 +693,10 @@ mod tests {
 
             assert_eq!(index.next_write_pos, 16);
 
-            let e = index.read_entry(0);
-            assert!(e.is_some());
-            assert_eq!(e.unwrap().0, 0_u64);
-            assert_eq!(e.unwrap().1, 2_u32);
+            let entry = index.read_entry(0);
+            assert!(entry.is_some());
+            assert_eq!(entry.unwrap().0, 0_u64);
+            assert_eq!(entry.unwrap().1, 2_u32);
         }
     }
 
@@ -728,10 +730,10 @@ mod tests {
             assert_eq!(index.next_write_pos, 8);
             assert_eq!(AccessMode::Read, index.mode);
 
-            let e = index.read_entry(0);
-            assert!(e.is_some());
-            assert_eq!(e.unwrap().0, 0_u64);
-            assert_eq!(e.unwrap().1, 2_u32);
+            let entry = index.read_entry(0);
+            assert!(entry.is_some());
+            assert_eq!(entry.unwrap().0, 0_u64);
+            assert_eq!(entry.unwrap().1, 2_u32);
         }
     }
 
