@@ -3,10 +3,12 @@ use log::{info, trace, warn};
 use memmap2::MmapMut;
 use std::{
     cmp::Ordering,
-    fs::{self, File, OpenOptions},
-    io::{self, Write},
     path::{Path, PathBuf},
     u64, usize,
+};
+use tokio::{
+    fs::{self, File, OpenOptions},
+    io::{self, AsyncWriteExt},
 };
 
 /// Number of bytes in each entry pair
@@ -136,7 +138,7 @@ fn to_page_size(size: usize) -> usize {
 }
 
 impl Index {
-    pub fn new<P>(log_dir: P, base_offset: u64, file_bytes: usize) -> io::Result<Index>
+    pub async fn new<P>(log_dir: P, base_offset: u64, file_bytes: usize) -> io::Result<Index>
     where
         P: AsRef<Path>,
     {
@@ -156,13 +158,14 @@ impl Index {
             .write(true)
             .append(true)
             .create_new(true)
-            .open(&path)?;
+            .open(&path)
+            .await?;
 
         // read the metadata and truncate
-        let meta = file.metadata()?;
+        let meta = file.metadata().await?;
         let len = meta.len();
         if len == 0 {
-            file.set_len(file_bytes as u64)?;
+            file.set_len(file_bytes as u64).await?;
         }
 
         let mmap = unsafe { MmapMut::map_mut(&file)? };
@@ -178,17 +181,18 @@ impl Index {
         })
     }
 
-    pub fn open<P>(index_path: P) -> io::Result<Index>
+    pub async fn open<P>(path: P) -> io::Result<Index>
     where
         P: AsRef<Path>,
     {
-        let index_file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .append(true)
-            .open(&index_path)?;
+            .open(&path)
+            .await?;
 
-        let filename = index_path.as_ref().file_name().unwrap().to_str().unwrap();
+        let filename = path.as_ref().file_name().unwrap().to_str().unwrap();
         let base_offset = match (&filename[0..INDEX_FILE_NAME_LEN]).parse::<u64>() {
             Ok(v) => v,
             Err(_) => {
@@ -199,7 +203,7 @@ impl Index {
             }
         };
 
-        let mmap = unsafe { MmapMut::map_mut(&index_file)? };
+        let mmap = unsafe { MmapMut::map_mut(&file)? };
 
         let (next_write_pos, mode) = {
             let index = &mmap[..];
@@ -237,8 +241,8 @@ impl Index {
         );
 
         Ok(Index {
-            file: index_file,
-            path: index_path.as_ref().to_path_buf(),
+            file,
+            path: path.as_ref().to_path_buf(),
             mmap,
             mode,
             next_write_pos,
@@ -262,7 +266,7 @@ impl Index {
     }
 
     // TODO: use memremap on linux
-    fn resize(&mut self) -> io::Result<()> {
+    async fn resize(&mut self) -> io::Result<()> {
         // increase length by 50% -= 7 for alignment
         let new_len = {
             let l = self.size();
@@ -273,12 +277,12 @@ impl Index {
 
         // unmap the file (Set to dummy anonymous map)
         self.mmap = MmapMut::map_anon(32)?;
-        self.file.set_len(new_len as u64)?;
+        self.file.set_len(new_len as u64).await?;
         self.mmap = unsafe { MmapMut::map_mut(&self.file)? };
         Ok(())
     }
 
-    pub fn append(&mut self, offsets: IndexBuf) -> io::Result<()> {
+    pub async fn append(&mut self, offsets: IndexBuf) -> io::Result<()> {
         // TODO: trace
         //trace!("Index append: {:?}", abs_offset, position);
 
@@ -294,20 +298,19 @@ impl Index {
 
         // check if we need to resize
         if self.size() < (self.next_write_pos + offsets.0.len()) {
-            self.resize()?;
+            self.resize().await?;
         }
 
-        let mem_slice: &mut [u8] = &mut self.mmap[..];
         let start = self.next_write_pos;
         let end = start + offsets.0.len();
 
-        mem_slice[start..end].copy_from_slice(&offsets.0);
+        self.mmap[start..end].copy_from_slice(&offsets.0);
 
         self.next_write_pos = end;
         Ok(())
     }
 
-    pub fn set_readonly(&mut self) -> io::Result<()> {
+    pub async fn set_readonly(&mut self) -> io::Result<()> {
         if self.mode != AccessMode::Read {
             self.mode = AccessMode::Read;
 
@@ -315,7 +318,7 @@ impl Index {
             if self.next_write_pos < self.mmap.len() {
                 // TODO: fix restrict
                 // self.mmap.restrict(0, self.next_write_pos)?;
-                if let Err(err) = self.file.set_len(self.next_write_pos as u64) {
+                if let Err(err) = self.file.set_len(self.next_write_pos as u64).await {
                     warn!(
                         "Unable to truncate index file {:020}.{} to proper length: {:?}",
                         self.base_offset, INDEX_FILE_NAME_EXTENSION, err
@@ -323,18 +326,18 @@ impl Index {
                 }
             }
 
-            self.flush_sync()
+            self.flush().await
         } else {
             Ok(())
         }
     }
 
-    pub fn remove(self) -> io::Result<()> {
+    pub async fn remove(self) -> io::Result<()> {
         let path = self.path.clone();
         drop(self);
 
         info!("Removing index file {}", path.display());
-        fs::remove_file(path)
+        fs::remove_file(path).await
     }
 
     /// Truncates to an offset, inclusive. The file length of the
@@ -386,17 +389,17 @@ impl Index {
 
     /// Flush the index at page boundaries. This may leave some indexed values
     /// not flushed during crash, which will be rehydrated on restart.
-    pub fn flush_sync(&mut self) -> io::Result<()> {
+    pub async fn flush(&mut self) -> io::Result<()> {
         let start = to_page_size(self.last_flush_end_pos);
         let end = to_page_size(self.next_write_pos);
 
         if end > start {
             self.mmap.flush_range(start, end - start)?;
             self.last_flush_end_pos = end;
-            self.file.flush()
-        } else {
-            Ok(())
+            self.file.flush().await?;
         }
+
+        Ok(())
     }
 
     pub fn next_offset(&self) -> Offset {
@@ -560,18 +563,18 @@ mod tests {
 
     use std::{fs, path::PathBuf};
 
-    #[test]
-    pub fn index() {
+    #[tokio::test]
+    pub async fn index() {
         let path = TestDir::new();
-        let mut index = Index::new(&path, 9u64, 1000usize).unwrap();
+        let mut index = Index::new(&path, 9u64, 1000usize).await.unwrap();
 
         assert_eq!(1000, index.size());
 
         let mut buf = IndexBuf::new(2, 9u64);
         buf.push(11u64, 0xffff);
         buf.push(12u64, 0xeeee);
-        index.append(buf).unwrap();
-        index.flush_sync().unwrap();
+        index.append(buf).await.unwrap();
+        index.flush().await.unwrap();
 
         let e0 = index.read_entry(0).unwrap();
         assert_eq!(11u64, e0.0);
@@ -586,19 +589,19 @@ mod tests {
         assert_eq!(None, e2);
     }
 
-    #[test]
-    pub fn index_set_readonly() {
+    #[tokio::test]
+    pub async fn index_set_readonly() {
         let path = TestDir::new();
-        let mut index = Index::new(&path, 10u64, 1000usize).unwrap();
+        let mut index = Index::new(&path, 10u64, 1000usize).await.unwrap();
 
         let mut buf = IndexBuf::new(2, 10u64);
         buf.push(11u64, 0xffff);
         buf.push(12u64, 0xeeee);
-        index.append(buf).unwrap();
-        index.flush_sync().unwrap();
+        index.append(buf).await.unwrap();
+        index.flush().await.unwrap();
 
         // set_readonly it
-        index.set_readonly().expect("Unable to set readonly");
+        index.set_readonly().await.expect("Unable to set readonly");
 
         assert_eq!(AccessMode::Read, index.mode);
 
@@ -611,30 +614,30 @@ mod tests {
         assert_eq!(None, e2);
     }
 
-    #[test]
-    pub fn open_index() {
+    #[tokio::test]
+    pub async fn open_index() {
         let dir = TestDir::new();
         // issue some writes
         {
-            let mut index = Index::new(&dir, 10u64, 1000usize).unwrap();
+            let mut index = Index::new(&dir, 10u64, 1000usize).await.unwrap();
 
             {
                 let mut buf = IndexBuf::new(3, 10u64);
                 buf.push(10, 0);
                 buf.push(11, 10);
                 buf.push(12, 20);
-                index.append(buf).unwrap();
+                index.append(buf).await.unwrap();
             }
 
             {
                 let mut buf = IndexBuf::new(2, 10u64);
                 buf.push(13, 30);
                 buf.push(14, 40);
-                index.append(buf).unwrap();
+                index.append(buf).await.unwrap();
             }
 
-            index.flush_sync().unwrap();
-            index.set_readonly().unwrap();
+            index.flush().await.unwrap();
+            index.set_readonly().await.unwrap();
         }
 
         // now open it
@@ -646,7 +649,7 @@ mod tests {
             let meta = fs::metadata(&index_path).unwrap();
             assert!(meta.is_file());
 
-            let index = Index::open(&index_path).unwrap();
+            let index = Index::open(&index_path).await.unwrap();
 
             for i in 0..5usize {
                 let entry = index.read_entry(i);
@@ -657,20 +660,20 @@ mod tests {
         }
     }
 
-    #[test]
-    pub fn open_index_with_one_message() {
+    #[tokio::test]
+    pub async fn open_index_with_one_message() {
         let dir = TestDir::new();
         // issue some writes
         {
-            let mut index = Index::new(&dir, 0u64, 1000usize).unwrap();
+            let mut index = Index::new(&dir, 0u64, 1000usize).await.unwrap();
 
             {
                 let mut buf = IndexBuf::new(1, 0u64);
                 buf.push(0, 2);
-                index.append(buf).unwrap();
+                index.append(buf).await.unwrap();
             }
 
-            index.flush_sync().unwrap();
+            index.flush().await.unwrap();
         }
 
         // now open it
@@ -682,13 +685,13 @@ mod tests {
             let meta = fs::metadata(&index_path).unwrap();
             assert!(meta.is_file());
 
-            let mut index = Index::open(&index_path).unwrap();
+            let mut index = Index::open(&index_path).await.unwrap();
 
             // Issue a new write, to make sure we're not overwriting things
             {
                 let mut buf = IndexBuf::new(1, 0u64);
                 buf.push(1, 3);
-                index.append(buf).unwrap();
+                index.append(buf).await.unwrap();
             }
 
             assert_eq!(index.next_write_pos, 16);
@@ -700,21 +703,21 @@ mod tests {
         }
     }
 
-    #[test]
-    pub fn open_index_with_one_message_closed() {
+    #[tokio::test]
+    pub async fn open_index_with_one_message_closed() {
         let dir = TestDir::new();
         // issue some writes
         {
-            let mut index = Index::new(&dir, 0u64, 1000usize).unwrap();
+            let mut index = Index::new(&dir, 0u64, 1000usize).await.unwrap();
 
             {
                 let mut buf = IndexBuf::new(1, 0u64);
                 buf.push(0, 2);
-                index.append(buf).unwrap();
+                index.append(buf).await.unwrap();
             }
 
-            index.flush_sync().unwrap();
-            index.set_readonly().unwrap();
+            index.flush().await.unwrap();
+            index.set_readonly().await.unwrap();
         }
 
         // now open it
@@ -726,7 +729,7 @@ mod tests {
             let meta = fs::metadata(&index_path).unwrap();
             assert!(meta.is_file());
 
-            let index = Index::open(&index_path).unwrap();
+            let index = Index::open(&index_path).await.unwrap();
             assert_eq!(index.next_write_pos, 8);
             assert_eq!(AccessMode::Read, index.mode);
 
@@ -737,10 +740,10 @@ mod tests {
         }
     }
 
-    #[test]
-    pub fn find() {
+    #[tokio::test]
+    pub async fn find() {
         let dir = TestDir::new();
-        let mut index = Index::new(&dir, 10u64, 1000usize).unwrap();
+        let mut index = Index::new(&dir, 10u64, 1000usize).await.unwrap();
         let mut buf = IndexBuf::new(8, 10u64);
         buf.push(10, 1);
         buf.push(11, 2);
@@ -750,19 +753,19 @@ mod tests {
         buf.push(17, 6);
         buf.push(18, 7);
         buf.push(20, 8);
-        index.append(buf).unwrap();
+        index.append(buf).await.unwrap();
 
         let res = index.find(16).unwrap();
         assert_eq!(16, res.0);
         assert_eq!(5, res.1);
     }
 
-    #[test]
-    pub fn find_exact() {
+    #[tokio::test]
+    pub async fn find_exact() {
         env_logger::try_init().unwrap_or(());
 
         let dir = TestDir::new();
-        let mut index = Index::new(&dir, 10u64, 1000usize).unwrap();
+        let mut index = Index::new(&dir, 10u64, 1000usize).await.unwrap();
         let mut buf = IndexBuf::new(8, 10u64);
         buf.push(10, 1);
         buf.push(11, 2);
@@ -772,17 +775,17 @@ mod tests {
         buf.push(15, 6);
         buf.push(16, 7);
         buf.push(17, 8);
-        index.append(buf).unwrap();
+        index.append(buf).await.unwrap();
 
         let res = index.find(16).unwrap();
         assert_eq!(16, res.0);
         assert_eq!(7, res.1);
     }
 
-    #[test]
-    pub fn find_nonexistant_value_finds_next() {
+    #[tokio::test]
+    pub async fn find_nonexistant_value_finds_next() {
         let dir = TestDir::new();
-        let mut index = Index::new(&dir, 10u64, 1000usize).unwrap();
+        let mut index = Index::new(&dir, 10u64, 1000usize).await.unwrap();
         let mut buf = IndexBuf::new(8, 10u64);
         buf.push(10, 1);
         buf.push(11, 2);
@@ -792,17 +795,17 @@ mod tests {
         buf.push(17, 6);
         buf.push(18, 7);
         buf.push(20, 8);
-        index.append(buf).unwrap();
+        index.append(buf).await.unwrap();
 
         let res = index.find(14).unwrap();
         assert_eq!(15, res.0);
         assert_eq!(4, res.1);
     }
 
-    #[test]
-    pub fn find_nonexistant_value_greater_than_max() {
+    #[tokio::test]
+    pub async fn find_nonexistant_value_greater_than_max() {
         let dir = TestDir::new();
-        let mut index = Index::new(&dir, 10u64, 1000usize).unwrap();
+        let mut index = Index::new(&dir, 10u64, 1000usize).await.unwrap();
         let mut buf = IndexBuf::new(8, 10u64);
         buf.push(10, 1);
         buf.push(11, 2);
@@ -812,16 +815,16 @@ mod tests {
         buf.push(17, 6);
         buf.push(18, 7);
         buf.push(20, 8);
-        index.append(buf).unwrap();
+        index.append(buf).await.unwrap();
 
         let res = index.find(21);
         assert!(res.is_none());
     }
 
-    #[test]
-    pub fn find_out_of_bounds() {
+    #[tokio::test]
+    pub async fn find_out_of_bounds() {
         let dir = TestDir::new();
-        let mut index = Index::new(&dir, 10u64, 1000usize).unwrap();
+        let mut index = Index::new(&dir, 10u64, 1000usize).await.unwrap();
         let mut buf = IndexBuf::new(8, 10u64);
         buf.push(10, 1);
         buf.push(11, 2);
@@ -831,30 +834,30 @@ mod tests {
         buf.push(17, 6);
         buf.push(18, 7);
         buf.push(20, 8);
-        index.append(buf).unwrap();
+        index.append(buf).await.unwrap();
 
         let res = index.find(2);
         assert!(res.is_none());
     }
 
-    #[test]
-    pub fn reopen_partial_index() {
+    #[tokio::test]
+    pub async fn reopen_partial_index() {
         env_logger::try_init().unwrap_or(());
         let dir = TestDir::new();
         {
-            let mut index = Index::new(&dir, 10u64, 1000usize).unwrap();
+            let mut index = Index::new(&dir, 10u64, 1000usize).await.unwrap();
             let mut buf = IndexBuf::new(8, 10u64);
             buf.push(10, 1);
             buf.push(11, 2);
-            index.append(buf).unwrap();
-            index.flush_sync().unwrap();
+            index.append(buf).await.unwrap();
+            index.flush().await.unwrap();
         }
 
         {
             let mut index_path = PathBuf::new();
             index_path.push(&dir);
             index_path.push("00000000000000000010.index");
-            let index = Index::open(&index_path).unwrap();
+            let index = Index::open(&index_path).await.unwrap();
 
             let e0 = index.find(10);
             assert!(e0.is_some());
@@ -874,24 +877,24 @@ mod tests {
         }
     }
 
-    #[test]
-    pub fn reopen_full_index() {
+    #[tokio::test]
+    pub async fn reopen_full_index() {
         env_logger::try_init().unwrap_or(());
         let dir = TestDir::new();
         {
-            let mut index = Index::new(&dir, 10u64, 16usize).unwrap();
+            let mut index = Index::new(&dir, 10u64, 16usize).await.unwrap();
             let mut buf = IndexBuf::new(2, 10u64);
             buf.push(10, 1);
             buf.push(11, 2);
-            index.append(buf).unwrap();
-            index.flush_sync().unwrap();
+            index.append(buf).await.unwrap();
+            index.flush().await.unwrap();
         }
 
         {
             let mut index_path = PathBuf::new();
             index_path.push(&dir);
             index_path.push("00000000000000000010.index");
-            let index = Index::open(&index_path).unwrap();
+            let index = Index::open(&index_path).await.unwrap();
 
             let e0 = index.find(10);
             assert!(e0.is_some());
@@ -908,11 +911,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn find_segment_range_offset() {
+    #[tokio::test]
+    async fn asyncfind_segment_range_offset() {
         env_logger::try_init().unwrap_or(());
         let dir = TestDir::new();
-        let mut index = Index::new(&dir, 10u64, 40usize).unwrap();
+        let mut index = Index::new(&dir, 10u64, 40usize).await.unwrap();
         // -----
         // INSERTION POINT
         //  => 5 messages, each 10 bytes
@@ -923,7 +926,7 @@ mod tests {
         buf.push(12, 30);
         buf.push(13, 40);
         buf.push(14, 50);
-        index.append(buf).unwrap();
+        index.append(buf).await.unwrap();
 
         // test offset not in index
         let res = index.find_segment_range(9, 50, 60);
@@ -964,23 +967,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn index_resize() {
+    #[tokio::test]
+    async fn asyncindex_resize() {
         env_logger::try_init().unwrap_or(());
         let dir = TestDir::new();
-        let mut index = Index::new(&dir, 10u64, 32usize).unwrap();
+        let mut index = Index::new(&dir, 10u64, 32usize).await.unwrap();
         assert_eq!(32, index.size());
         let mut buf = IndexBuf::new(4, 10u64);
         buf.push(10, 10);
         buf.push(11, 20);
         buf.push(12, 30);
         buf.push(13, 40);
-        index.append(buf).unwrap();
+        index.append(buf).await.unwrap();
         assert_eq!(32, index.size());
 
         let mut buf = IndexBuf::new(1, 10u64);
         buf.push(14, 50);
-        assert!(index.append(buf).is_ok());
+        assert!(index.append(buf).await.is_ok());
 
         // make sure the index was resized
         assert_eq!(48, index.size());
@@ -988,11 +991,11 @@ mod tests {
         assert_eq!(50, index.find(14).unwrap().1);
     }
 
-    #[test]
-    fn index_remove() {
+    #[tokio::test]
+    async fn asyncindex_remove() {
         env_logger::try_init().unwrap_or(());
         let dir = TestDir::new();
-        let index = Index::new(&dir, 0u64, 32usize).unwrap();
+        let index = Index::new(&dir, 0u64, 32usize).await.unwrap();
 
         let ind_exists = fs::read_dir(&dir)
             .unwrap()
@@ -1004,7 +1007,7 @@ mod tests {
         assert!(ind_exists, "Index file does not exist?");
 
         // remove the index
-        index.remove().expect("Unable to remove file");
+        index.remove().await.expect("Unable to remove file");
 
         let ind_exists = fs::read_dir(&dir)
             .unwrap()
@@ -1016,18 +1019,18 @@ mod tests {
         assert!(!ind_exists, "Index should not exist");
     }
 
-    #[test]
-    fn index_truncate() {
+    #[tokio::test]
+    async fn asyncindex_truncate() {
         env_logger::try_init().unwrap_or(());
         let dir = TestDir::new();
-        let mut index = Index::new(&dir, 10u64, 128usize).unwrap();
+        let mut index = Index::new(&dir, 10u64, 128usize).await.unwrap();
         let mut buf = IndexBuf::new(5, 10u64);
         buf.push(10, 10);
         buf.push(11, 20);
         buf.push(12, 30);
         buf.push(13, 40);
         buf.push(14, 50);
-        index.append(buf).unwrap();
+        index.append(buf).await.unwrap();
 
         let file_len = index.truncate(12);
         assert_eq!(Some(40), file_len);
@@ -1041,18 +1044,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn index_truncate_at_boundary() {
+    #[tokio::test]
+    async fn asyncindex_truncate_at_boundary() {
         env_logger::try_init().unwrap_or(());
         let dir = TestDir::new();
-        let mut index = Index::new(&dir, 10u64, 128usize).unwrap();
+        let mut index = Index::new(&dir, 10u64, 128usize).await.unwrap();
         let mut buf = IndexBuf::new(5, 10u64);
         buf.push(10, 10);
         buf.push(11, 20);
         buf.push(12, 30);
         buf.push(13, 40);
         buf.push(14, 50);
-        index.append(buf).unwrap();
+        index.append(buf).await.unwrap();
 
         let file_len = index.truncate(14);
         assert_eq!(None, file_len);

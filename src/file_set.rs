@@ -15,6 +15,21 @@ pub struct SegmentSet {
     pub stream_index: StreamIndex,
 }
 
+impl SegmentSet {
+    pub async fn new(opts: &LogOptions, next_offset: u64) -> io::Result<Self> {
+        let (segment, index, stream_index) = tokio::try_join!(
+            Segment::new(&opts.log_dir, next_offset, opts.log_max_bytes),
+            Index::new(&opts.log_dir, next_offset, opts.index_max_bytes),
+            StreamIndex::new(&opts.log_dir, next_offset, opts.log_max_entries),
+        )?;
+        Ok(SegmentSet {
+            segment,
+            index,
+            stream_index,
+        })
+    }
+}
+
 pub struct FileSet {
     active: SegmentSet,
     closed: BTreeMap<u64, SegmentSet>,
@@ -22,7 +37,7 @@ pub struct FileSet {
 }
 
 impl FileSet {
-    pub fn load_log(opts: LogOptions) -> io::Result<FileSet> {
+    pub async fn load_log(opts: LogOptions) -> io::Result<FileSet> {
         let mut segments = BTreeMap::new();
         let mut indexes = BTreeMap::new();
         let mut stream_indexes = BTreeMap::new();
@@ -36,7 +51,7 @@ impl FileSet {
         for f in files {
             match f.path().extension() {
                 Some(ext) if SEGMENT_FILE_NAME_EXTENSION.eq(ext) => {
-                    let segment = match Segment::open(f.path(), opts.log_max_bytes) {
+                    let segment = match Segment::open(f.path(), opts.log_max_bytes).await {
                         Ok(seg) => seg,
                         Err(err) => {
                             error!("Unable to open segment {:?}: {}", f.path(), err);
@@ -48,7 +63,7 @@ impl FileSet {
                     segments.insert(offset, segment);
                 }
                 Some(ext) if INDEX_FILE_NAME_EXTENSION.eq(ext) => {
-                    let index = match Index::open(f.path()) {
+                    let index = match Index::open(f.path()).await {
                         Ok(index) => index,
                         Err(err) => {
                             error!("Unable to open index {:?}: {}", f.path(), err);
@@ -62,7 +77,7 @@ impl FileSet {
                     // index)
                 }
                 Some(ext) if STREAM_INDEX_FILE_NAME_EXTENSION.eq(ext) => {
-                    let stream_index = match StreamIndex::open(&f.path()) {
+                    let stream_index = match StreamIndex::open(&f.path()).await {
                         Ok(stream_index) => stream_index,
                         Err(err) => {
                             error!("Unable to open stream index {:?}: {}", f.path(), err);
@@ -108,20 +123,13 @@ impl FileSet {
             }
             None => {
                 info!("Starting new index and segment at offset 0");
-                let segment = Segment::new(&opts.log_dir, 0, opts.log_max_bytes)?;
-                let index = Index::new(&opts.log_dir, 0, opts.index_max_bytes)?;
-                let stream_index = StreamIndex::new(&opts.log_dir, 0, opts.log_max_entries)?;
-                SegmentSet {
-                    segment,
-                    index,
-                    stream_index,
-                }
+                SegmentSet::new(&opts, 0).await?
             }
         };
 
         // mark all closed indexes as readonly (indexes are not opened as readonly)
         for SegmentSet { index, .. } in closed.values_mut() {
-            index.set_readonly()?;
+            index.set_readonly().await?;
         }
 
         Ok(FileSet {
@@ -151,41 +159,31 @@ impl FileSet {
         &self.active.stream_index
     }
 
-    pub fn find(&self, offset: u64) -> &SegmentSet {
+    pub fn find(&mut self, offset: u64) -> &mut SegmentSet {
         let active_seg_start_off = self.active.segment.starting_offset();
         if offset < active_seg_start_off {
             trace!(
                 "Index is contained in the active index for offset {}",
                 offset
             );
-            if let Some(entry) = self.closed.range(..=offset).next_back().map(|p| p.1) {
+            if let Some(entry) = self.closed.range_mut(..=offset).next_back().map(|p| p.1) {
                 return entry;
             }
         }
-        &self.active
+        &mut self.active
     }
 
-    pub fn roll_segment(&mut self) -> io::Result<()> {
-        self.active.index.set_readonly()?; // Setting to read only flushes already
-        self.active.segment.flush_sync()?;
-        self.active.stream_index.flush_sync()?;
+    pub async fn roll_segment(&mut self) -> io::Result<()> {
+        self.active.index.set_readonly().await?; // Setting to read only flushes already
+        self.active.segment.flush().await?;
+        self.active.stream_index.flush()?;
 
         let next_offset = self.active.index.next_offset();
 
         info!("Starting new segment and index at offset {}", next_offset);
 
         // set the segment and index to the new active index/seg
-        let mut p = {
-            let segment = Segment::new(&self.opts.log_dir, next_offset, self.opts.log_max_bytes)?;
-            let index = Index::new(&self.opts.log_dir, next_offset, self.opts.index_max_bytes)?;
-            let stream_index =
-                StreamIndex::new(&self.opts.log_dir, next_offset, self.opts.log_max_entries)?;
-            SegmentSet {
-                segment,
-                index,
-                stream_index,
-            }
-        };
+        let mut p = SegmentSet::new(&self.opts, next_offset).await?;
         swap(&mut p, &mut self.active);
         self.closed.insert(p.index.starting_offset(), p);
         Ok(())

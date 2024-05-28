@@ -1,21 +1,28 @@
-use std::collections::hash_map::DefaultHasher;
-use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::io;
 use std::mem;
 use std::path::{Path, PathBuf};
 
 use log::info;
 use memmap2::MmapMut;
+use tokio::fs::{self, OpenOptions};
+use tokio::io;
+use twox_hash::Xxh3Hash64;
 
 pub static STREAM_INDEX_FILE_NAME_EXTENSION: &str = "streams";
 pub static SEGMENT_FILE_NAME_LEN: usize = 20;
 
 const KEY_SIZE: usize = 64;
 const OFFSET_SIZE: usize = mem::size_of::<u64>();
-const INDEX_ENTRY_SIZE: usize = KEY_SIZE + OFFSET_SIZE + OFFSET_SIZE; // 64 (key) + 8 (head offset) + 8 (next entry offset)
-                                                                      // const MAX_ENTRIES: usize = 100_000;
+const INDEX_ENTRY_SIZE: usize = KEY_SIZE + OFFSET_SIZE + OFFSET_SIZE + OFFSET_SIZE; // 64 (key) + 8 (head offset) + 8 (tail offset) + 8 (next entry offset)
+                                                                                    // const MAX_ENTRIES: usize = 100_000;
 const VALUE_BLOCK_SIZE: usize = OFFSET_SIZE + OFFSET_SIZE; // 8 (value) + 8 (next offset)
+
+const HEAD_OFFSET: usize = KEY_SIZE;
+const HEAD_SIZE: usize = OFFSET_SIZE;
+const TAIL_OFFSET: usize = HEAD_OFFSET + HEAD_SIZE;
+const TAIL_SIZE: usize = OFFSET_SIZE;
+const NEXT_ENTRY_OFFSET: usize = TAIL_OFFSET + TAIL_SIZE;
+const NEXT_ENTRY_SIZE: usize = OFFSET_SIZE;
 
 /// `FixedSizeHashMap` is a memory-mapped file-based fixed-size hashmap implementation.
 ///
@@ -67,7 +74,6 @@ const VALUE_BLOCK_SIZE: usize = OFFSET_SIZE + OFFSET_SIZE; // 8 (value) + 8 (nex
 ///     Ok(())
 /// }
 /// ```
-#[derive(Debug)]
 pub struct StreamIndex {
     data: MmapMut,
     path: PathBuf,
@@ -91,7 +97,7 @@ impl StreamIndex {
     /// # Returns
     ///
     /// * `io::Result<Self>` - A result containing the new `FixedSizeHashMap` instance or an I/O error.
-    pub fn new(log_dir: &Path, base_offset: u64, max_entries: u64) -> io::Result<Self> {
+    pub async fn new(log_dir: &Path, base_offset: u64, max_entries: u64) -> io::Result<Self> {
         let initial_space = max_entries as usize * INDEX_ENTRY_SIZE + OFFSET_SIZE;
 
         let path = {
@@ -118,12 +124,16 @@ impl StreamIndex {
             .read(true)
             .write(true)
             .create_new(true)
-            .open(&path)?;
-        file.set_len(Self::total_size(max_entries) as u64)?;
+            .open(&path)
+            .await?;
+        file.set_len(Self::total_size(max_entries) as u64).await?;
 
         let mut data = unsafe { MmapMut::map_mut(&file)? };
         data[0..OFFSET_SIZE].copy_from_slice(&max_entries.to_ne_bytes());
-        data.flush()?;
+        let (res, data) = tokio::task::spawn_blocking(move || (data.flush(), data))
+            .await
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+        res?;
 
         Ok(Self {
             data,
@@ -135,7 +145,7 @@ impl StreamIndex {
         })
     }
 
-    pub fn open(path: impl Into<PathBuf>) -> io::Result<Self> {
+    pub async fn open(path: impl Into<PathBuf>) -> io::Result<Self> {
         let path = path.into();
         let filename = path.file_name().unwrap().to_str().unwrap();
         let base_offset = match (&filename[0..SEGMENT_FILE_NAME_LEN]).parse::<u64>() {
@@ -148,7 +158,11 @@ impl StreamIndex {
             }
         };
 
-        let file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .await?;
 
         let data = unsafe { MmapMut::map_mut(&file)? };
         let max_entries = u64::from_ne_bytes(data[0..OFFSET_SIZE].try_into().unwrap());
@@ -194,13 +208,13 @@ impl StreamIndex {
 
         // Check if the key already exists and append value if so
         if let Some(existing_offset) = self.find_key_offset(key) {
-            let head_offset = u64::from_ne_bytes(
-                self.data[existing_offset + KEY_SIZE..existing_offset + KEY_SIZE + OFFSET_SIZE]
+            let tail_offset = u64::from_ne_bytes(
+                self.data[existing_offset + TAIL_OFFSET..existing_offset + TAIL_OFFSET + TAIL_SIZE]
                     .try_into()
                     .unwrap(),
             );
 
-            self.append_value(head_offset, value)?;
+            self.append_value(existing_offset, tail_offset as usize, value)?;
 
             return Ok(());
         }
@@ -209,8 +223,7 @@ impl StreamIndex {
         let mut offset = initial_offset;
         while &self.data[offset..offset + KEY_SIZE] != &[0; KEY_SIZE] {
             let next_entry_offset = u64::from_ne_bytes(
-                self.data[offset + KEY_SIZE + OFFSET_SIZE
-                    ..offset + KEY_SIZE + OFFSET_SIZE + OFFSET_SIZE]
+                self.data[offset + NEXT_ENTRY_OFFSET..offset + NEXT_ENTRY_OFFSET + NEXT_ENTRY_SIZE]
                     .try_into()
                     .unwrap(),
             );
@@ -223,8 +236,7 @@ impl StreamIndex {
         let new_offset = self.get_next_offset(index_size)?;
 
         if &self.data[offset..offset + KEY_SIZE] != &[0; KEY_SIZE] {
-            self.data
-                [offset + KEY_SIZE + OFFSET_SIZE..offset + KEY_SIZE + OFFSET_SIZE + OFFSET_SIZE]
+            self.data[offset + NEXT_ENTRY_OFFSET..offset + NEXT_ENTRY_OFFSET + NEXT_ENTRY_SIZE]
                 .copy_from_slice(&(new_offset as u64).to_ne_bytes());
             offset = new_offset; // Update offset to new offset
             self.next_index_offset += INDEX_ENTRY_SIZE;
@@ -237,9 +249,11 @@ impl StreamIndex {
         self.data[value_offset + OFFSET_SIZE..value_offset + OFFSET_SIZE + OFFSET_SIZE]
             .copy_from_slice(&0u64.to_ne_bytes());
 
-        self.data[offset + KEY_SIZE..offset + KEY_SIZE + OFFSET_SIZE]
+        self.data[offset + HEAD_OFFSET..offset + HEAD_OFFSET + HEAD_SIZE]
             .copy_from_slice(&value_offset.to_ne_bytes());
-        self.data[offset + KEY_SIZE + OFFSET_SIZE..offset + KEY_SIZE + OFFSET_SIZE + OFFSET_SIZE]
+        self.data[offset + TAIL_OFFSET..offset + TAIL_OFFSET + TAIL_SIZE]
+            .copy_from_slice(&value_offset.to_ne_bytes());
+        self.data[offset + NEXT_ENTRY_OFFSET..offset + NEXT_ENTRY_OFFSET + NEXT_ENTRY_SIZE]
             .copy_from_slice(&0u64.to_ne_bytes());
 
         self.next_value_offset += VALUE_BLOCK_SIZE;
@@ -262,7 +276,7 @@ impl StreamIndex {
 
         if let Some(offset) = self.find_key_offset(key) {
             let value_head_offset = u64::from_ne_bytes(
-                self.data[offset + KEY_SIZE..offset + KEY_SIZE + 8]
+                self.data[offset + HEAD_OFFSET..offset + HEAD_OFFSET + HEAD_SIZE]
                     .try_into()
                     .unwrap(),
             );
@@ -293,15 +307,15 @@ impl StreamIndex {
         Ok(vec![])
     }
 
-    pub fn flush_sync(&mut self) -> io::Result<()> {
+    pub fn flush(&mut self) -> io::Result<()> {
         self.data.flush()?;
         Ok(())
     }
 
     /// Removes the stream index file.
-    pub fn remove(self) -> io::Result<()> {
+    pub async fn remove(self) -> io::Result<()> {
         info!("Removing stream index file {}", self.path.display());
-        fs::remove_file(self.path)
+        fs::remove_file(self.path).await
     }
 
     fn total_size(max_entries: u64) -> usize {
@@ -359,7 +373,7 @@ impl StreamIndex {
     }
 
     fn calculate_offset(&self, key: &str) -> usize {
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = Xxh3Hash64::with_seed(0);
         key.hash(&mut hasher);
         (hasher.finish() as usize % self.max_entries as usize) * INDEX_ENTRY_SIZE + OFFSET_SIZE
     }
@@ -375,8 +389,7 @@ impl StreamIndex {
 
             // Read the next entry offset
             let next_entry_offset = u64::from_ne_bytes(
-                self.data[offset + KEY_SIZE + OFFSET_SIZE
-                    ..offset + KEY_SIZE + OFFSET_SIZE + OFFSET_SIZE]
+                self.data[offset + NEXT_ENTRY_OFFSET..offset + NEXT_ENTRY_OFFSET + NEXT_ENTRY_SIZE]
                     .try_into()
                     .unwrap(),
             );
@@ -397,22 +410,12 @@ impl StreamIndex {
         padded_key
     }
 
-    fn append_value(&mut self, head_offset: u64, value: u64) -> io::Result<()> {
-        let mut current_offset = head_offset as usize;
-
-        loop {
-            let next_offset = u64::from_ne_bytes(
-                self.data[current_offset + OFFSET_SIZE..current_offset + OFFSET_SIZE + OFFSET_SIZE]
-                    .try_into()
-                    .unwrap(),
-            );
-
-            if next_offset == 0 {
-                break;
-            }
-            current_offset = next_offset as usize;
-        }
-
+    fn append_value(
+        &mut self,
+        entry_offset: usize,
+        tail_offset: usize,
+        value: u64,
+    ) -> io::Result<()> {
         // Write the new value block
         self.data[self.next_value_offset..self.next_value_offset + OFFSET_SIZE]
             .copy_from_slice(&value.to_ne_bytes());
@@ -421,8 +424,12 @@ impl StreamIndex {
             .copy_from_slice(&0u64.to_ne_bytes());
 
         // Update the next_offset of the last block to point to the new block
-        self.data[current_offset + OFFSET_SIZE..current_offset + OFFSET_SIZE + OFFSET_SIZE]
+        self.data[tail_offset + OFFSET_SIZE..tail_offset + OFFSET_SIZE + OFFSET_SIZE]
             .copy_from_slice(&(self.next_value_offset as u64).to_ne_bytes());
+
+        // Update the tail offset of the entry to the new block
+        self.data[entry_offset + TAIL_OFFSET..entry_offset + TAIL_OFFSET + TAIL_SIZE]
+            .copy_from_slice(&self.next_value_offset.to_ne_bytes());
 
         self.next_value_offset += VALUE_BLOCK_SIZE;
 
@@ -437,10 +444,12 @@ mod tests {
     use super::*;
     use std::iter;
 
-    fn setup() -> StreamIndex {
+    async fn setup() -> StreamIndex {
         let dir = TestDir::new();
 
-        StreamIndex::new(dir.as_ref(), 0, 100).expect("Failed to create FixedSizeHashMap")
+        StreamIndex::new(dir.as_ref(), 0, 100)
+            .await
+            .expect("Failed to create FixedSizeHashMap")
     }
 
     fn find_collision(map: &StreamIndex, base_str: &str) -> (String, String, String) {
@@ -492,9 +501,9 @@ mod tests {
         (key1, key2, key3)
     }
 
-    #[test]
-    fn test_insert_and_retrieve_single_key_value() {
-        let mut map = setup();
+    #[tokio::test]
+    async fn test_insert_and_retrieve_single_key_value() {
+        let mut map = setup().await;
 
         map.insert("key1", 42).expect("Insert failed");
         let values = map.get("key1").expect("Get failed");
@@ -502,9 +511,9 @@ mod tests {
         assert_eq!(values, vec![42]);
     }
 
-    #[test]
-    fn test_insert_and_retrieve_single_key_multiple_values() {
-        let mut map = setup();
+    #[tokio::test]
+    async fn test_insert_and_retrieve_single_key_multiple_values() {
+        let mut map = setup().await;
 
         map.insert("key1", 28).expect("Insert failed");
         map.insert("key1", 42).expect("Insert failed");
@@ -515,9 +524,9 @@ mod tests {
         assert_eq!(values, vec![28, 42, 96]);
     }
 
-    #[test]
-    fn test_insert_and_retrieve_multiple_key_values() {
-        let mut map = setup();
+    #[tokio::test]
+    async fn test_insert_and_retrieve_multiple_key_values() {
+        let mut map = setup().await;
 
         map.insert("key1", 42).expect("Insert failed");
         map.insert("key2", 84).expect("Insert failed");
@@ -529,9 +538,9 @@ mod tests {
         assert_eq!(values2, vec![84]);
     }
 
-    #[test]
-    fn test_insert_and_retrieve_with_collisions() {
-        let mut map = setup();
+    #[tokio::test]
+    async fn test_insert_and_retrieve_with_collisions() {
+        let mut map = setup().await;
 
         // Keys that are different but should produce the same hash index
         let (key1, key2, key3) = find_collision(&map, "key");
@@ -553,9 +562,9 @@ mod tests {
         assert_eq!(values3, vec![92]);
     }
 
-    #[test]
-    fn test_update_existing_key_with_additional_values() {
-        let mut map = setup();
+    #[tokio::test]
+    async fn test_update_existing_key_with_additional_values() {
+        let mut map = setup().await;
 
         map.insert("key1", 42).expect("Insert failed");
         map.insert("key1", 84).expect("Insert failed");
@@ -565,9 +574,9 @@ mod tests {
         assert_eq!(values, vec![42, 84]);
     }
 
-    #[test]
-    fn test_handle_maximum_key_size() {
-        let mut map = setup();
+    #[tokio::test]
+    async fn test_handle_maximum_key_size() {
+        let mut map = setup().await;
 
         let max_key: String = iter::repeat('a').take(KEY_SIZE).collect();
         map.insert(&max_key, 42).expect("Insert failed");
@@ -577,9 +586,9 @@ mod tests {
         assert_eq!(values, vec![42]);
     }
 
-    #[test]
-    fn test_non_existent_key_retrieval() {
-        let mut map = setup();
+    #[tokio::test]
+    async fn test_non_existent_key_retrieval() {
+        let mut map = setup().await;
 
         map.insert("key1", 42).expect("Insert failed");
 
@@ -588,9 +597,9 @@ mod tests {
         assert_eq!(values, vec![]);
     }
 
-    #[test]
-    fn test_sequential_insertions_and_deletions() {
-        let mut map = setup();
+    #[tokio::test]
+    async fn test_sequential_insertions_and_deletions() {
+        let mut map = setup().await;
 
         // Insert and then delete the same key multiple times
         for i in 0..10 {
@@ -607,9 +616,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_overwriting_values() {
-        let mut map = setup();
+    #[tokio::test]
+    async fn test_overwriting_values() {
+        let mut map = setup().await;
 
         map.insert("key1", 42).expect("Insert failed");
         map.insert("key1", 84).expect("Insert failed");
@@ -626,9 +635,9 @@ mod tests {
         assert_eq!(updated_values, vec![42, 84, 100]);
     }
 
-    #[test]
-    fn test_boundary_conditions() {
-        let mut map = setup();
+    #[tokio::test]
+    async fn test_boundary_conditions() {
+        let mut map = setup().await;
 
         let max_entries = map.max_entries;
 
@@ -646,13 +655,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_next_index_offset_loading() {
+    #[tokio::test]
+    async fn test_next_index_offset_loading() {
         let dir = TestDir::new();
 
         let (next_index_offset, next_value_offset, key1) = {
-            let mut map =
-                StreamIndex::new(dir.as_ref(), 0, 100).expect("Failed to create FixedSizeHashMap");
+            let mut map = StreamIndex::new(dir.as_ref(), 0, 100)
+                .await
+                .expect("Failed to create FixedSizeHashMap");
 
             let (key1, key2, key3) = find_collision(&map, "key");
 
@@ -660,7 +670,7 @@ mod tests {
             map.insert(&key2, 84).expect("Insert failed");
             map.insert(&key3, 11).expect("Insert failed");
 
-            map.flush_sync().expect("Flush failed");
+            map.flush().expect("Flush failed");
             (map.next_index_offset, map.next_value_offset, key1)
         };
 
@@ -668,6 +678,7 @@ mod tests {
             &dir.as_ref()
                 .join(format!("{:020}.{}", 0, STREAM_INDEX_FILE_NAME_EXTENSION)),
         )
+        .await
         .expect("Failed to create FixedSizeHashMap");
         assert_eq!(map.get(&key1).unwrap(), vec![42]);
 
@@ -675,11 +686,11 @@ mod tests {
         assert_eq!(map.next_value_offset, next_value_offset);
     }
 
-    #[test]
-    fn test_max_entries_loading() {
+    #[tokio::test]
+    async fn test_max_entries_loading() {
         let dir = TestDir::new();
         {
-            let map = StreamIndex::new(dir.as_ref(), 0, 24).unwrap();
+            let map = StreamIndex::new(dir.as_ref(), 0, 24).await.unwrap();
             assert_eq!(map.max_entries, 24);
         }
         {
@@ -687,6 +698,7 @@ mod tests {
                 &dir.as_ref()
                     .join(format!("{:020}.{}", 0, STREAM_INDEX_FILE_NAME_EXTENSION)),
             )
+            .await
             .unwrap();
             assert_eq!(map.max_entries, 24);
         }

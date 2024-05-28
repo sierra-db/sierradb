@@ -21,17 +21,18 @@ commitlog = "0.2"
 use commitlog::*;
 use commitlog::message::*;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     // open a directory called 'log' for segment and index storage
     let opts = LogOptions::new("log");
-    let mut log = CommitLog::new(opts).unwrap();
+    let mut log = CommitLog::new(opts).await.unwrap();
 
     // append to the log
-    log.append_msg("my_stream", "hello world").unwrap(); // offset 0
-    log.append_msg("my_stream", "second message").unwrap(); // offset 1
+    log.append_msg("my_stream", "hello world").await.unwrap(); // offset 0
+    log.append_msg("my_stream", "second message").await.unwrap(); // offset 1
 
     // read the messages
-    let messages = log.read(0, ReadLimit::default()).unwrap();
+    let messages = log.read(0, ReadLimit::default()).await.unwrap();
     for msg in messages.iter() {
         println!("{} - {}", msg.offset(), String::from_utf8_lossy(msg.payload()));
     }

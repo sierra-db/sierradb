@@ -2,7 +2,8 @@ use commitlog::*;
 use serde::{Deserialize, Serialize};
 use std::time::{self, SystemTime};
 
-fn main() {
+#[tokio::main]
+async fn main() {
     // open a directory called 'log' for segment and index storage
     let mut opts = LogOptions::new(format!(
         ".log{}",
@@ -12,7 +13,7 @@ fn main() {
             .as_secs()
     ));
     opts.segment_max_entries(256_000);
-    let mut log = CommitLog::new(opts).unwrap();
+    let mut log = CommitLog::new(opts).await.unwrap();
 
     #[derive(Serialize, Deserialize)]
     struct Event {
@@ -28,6 +29,7 @@ fn main() {
             })
             .unwrap(),
         )
+        .await
         .unwrap(); // offset 0
         log.append_msg(
             "key2",
@@ -36,6 +38,7 @@ fn main() {
             })
             .unwrap(),
         )
+        .await
         .unwrap(); // offset 1
         log.append_msg(
             "key2",
@@ -44,6 +47,7 @@ fn main() {
             })
             .unwrap(),
         )
+        .await
         .unwrap(); // offset 2
         log.append_msg(
             "key1",
@@ -52,6 +56,7 @@ fn main() {
             })
             .unwrap(),
         )
+        .await
         .unwrap(); // offset 2
         log.append_msg(
             "key2",
@@ -60,6 +65,7 @@ fn main() {
             })
             .unwrap(),
         )
+        .await
         .unwrap(); // offset 2
         log.append_msg(
             "key1",
@@ -68,20 +74,21 @@ fn main() {
             })
             .unwrap(),
         )
+        .await
         .unwrap(); // offset 2
     }
 
-    let msgs = log.read_stream::<Event>("key1").unwrap();
-    for msg in msgs {
-        println!("{:?}", msg.foo);
-    }
+    // let msgs = log.read_stream("key1").await.unwrap();
+    // for msg in msgs {
+    //     println!("{:?}", msg.foo);
+    // }
 
-    println!("---");
+    // println!("---");
 
-    let msgs = log.read_stream::<Event>("key2").unwrap();
-    for msg in msgs {
-        println!("{:?}", msg.foo);
-    }
+    // let msgs = log.read_stream("key2").await.unwrap();
+    // for msg in msgs {
+    //     println!("{:?}", msg.foo);
+    // }
 
     // prints:
     //    0 - hello world

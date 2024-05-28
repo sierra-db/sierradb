@@ -1,6 +1,13 @@
 //! Custom log reading.
+use std::io::SeekFrom;
+
+use futures::Future;
+use tokio::{
+    fs::File,
+    io::{AsyncReadExt, AsyncSeekExt, BufWriter},
+};
+
 use super::message::{MessageBuf, MessageError};
-use std::fs::File;
 
 /// Trait that allows reading from a slice of the log.
 pub trait LogSliceReader {
@@ -15,10 +22,10 @@ pub trait LogSliceReader {
     ///   message set slice.
     fn read_from(
         &mut self,
-        file: &File,
+        file: &mut BufWriter<File>,
         file_position: u32,
         bytes: usize,
-    ) -> Result<Self::Result, MessageError>;
+    ) -> impl Future<Output = Result<Self::Result, MessageError>> + Send;
 }
 
 #[cfg(unix)]
@@ -29,16 +36,15 @@ pub struct MessageBufReader;
 impl LogSliceReader for MessageBufReader {
     type Result = MessageBuf;
 
-    fn read_from(
+    async fn read_from(
         &mut self,
-        file: &File,
+        file: &mut BufWriter<File>,
         file_position: u32,
         bytes: usize,
     ) -> Result<Self::Result, MessageError> {
-        use std::os::unix::fs::FileExt;
-
         let mut vec = vec![0; bytes];
-        file.read_at(&mut vec, u64::from(file_position))?;
+        file.seek(SeekFrom::Start(file_position as u64)).await?;
+        file.read_exact(&mut vec).await?;
         MessageBuf::from_bytes(vec)
     }
 }
