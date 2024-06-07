@@ -50,7 +50,7 @@ async fn main() {
             .read(pos, ReadLimit::max_bytes(10_240))
             .await
             .expect("Unable to read messages from the log");
-        match entries.iter().last().map(|m| m.offset()) {
+        match entries.iter().last().map(|m| m.id) {
             Some(off) => {
                 iterations += 1;
                 total += entries.len();

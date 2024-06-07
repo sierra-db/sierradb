@@ -1,12 +1,10 @@
+use std::path::Path;
+
 use rusqlite::{params, Connection, OptionalExtension, Result};
 
-pub struct Subscription {
-    pub subscriber_id: String,
-    pub last_event_id: u64,
-}
-
-pub fn setup_db() -> Result<Connection> {
-    let conn = Connection::open("subscriptions.db")?;
+pub fn setup_db(dir: impl AsRef<Path>) -> Result<Connection> {
+    let path = dir.as_ref().join("subscriptions.db");
+    let conn = Connection::open(path)?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS subscriptions (
             subscriber_id TEXT PRIMARY KEY,

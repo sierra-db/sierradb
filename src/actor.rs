@@ -22,7 +22,7 @@ impl Actor for CommitLog {
         tokio::task::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(100)).await;
-                if let Err(_) = actor_ref.send(Flush {}).await {
+                if let Err(_) = actor_ref.send(Flush).await {
                     let _ = actor_ref.stop_gracefully();
                     return;
                 }
@@ -32,13 +32,14 @@ impl Actor for CommitLog {
     }
 }
 
-pub struct Flush {}
+pub struct Flush;
 
 impl Message<Flush> for CommitLog {
     type Reply = io::Result<()>;
 
     async fn handle(&mut self, _msg: Flush, _ctx: Context<'_, Self, Self::Reply>) -> Self::Reply {
         self.flush().await
+        // Ok(())
     }
 }
 
@@ -63,7 +64,7 @@ impl Message<AppendToStream> for CommitLog {
     }
 }
 
-pub struct Subscribe {}
+pub struct Subscribe;
 
 impl Message<Subscribe> for CommitLog {
     type Reply = broadcast::Receiver<Vec<Event<'static>>>;
@@ -78,7 +79,7 @@ impl Message<Subscribe> for CommitLog {
 }
 
 pub struct LoadSubscription {
-    pub id: String,
+    pub subscriber_id: String,
 }
 
 impl Message<LoadSubscription> for CommitLog {
@@ -89,7 +90,7 @@ impl Message<LoadSubscription> for CommitLog {
         msg: LoadSubscription,
         _ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
-        self.load_subscription(&msg.id).await
+        self.load_subscription(&msg.subscriber_id).await
     }
 }
 
@@ -115,26 +116,14 @@ pub struct ReadBatch {
     pub read_limit: ReadLimit,
 }
 
-// impl Message<ReadBatch> for CommitLog {
-//     type Reply = Result<Vec<Event<'static>>, ReadError>;
-
-//     fn handle(
-//         &mut self,
-//         msg: ReadBatch,
-//         _ctx: Context<'_, Self, Self::Reply>,
-//     ) -> impl Future<Output = Self::Reply> + Send {
-//         async move { self.read(msg.start_offset, msg.read_limit).await }
-//     }
-// }
-
 impl Message<ReadBatch> for CommitLog {
     type Reply = Result<Vec<Event<'static>>, ReadError>;
 
-    async fn handle(
+    fn handle(
         &mut self,
         msg: ReadBatch,
         _ctx: Context<'_, Self, Self::Reply>,
-    ) -> Self::Reply {
-        self.read(msg.start_offset, msg.read_limit).await
+    ) -> impl Future<Output = Self::Reply> + Send {
+        async move { self.read(msg.start_offset, msg.read_limit).await }
     }
 }

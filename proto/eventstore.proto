@@ -5,6 +5,19 @@ package eventstore;
 import "google/protobuf/timestamp.proto";
 import "google/protobuf/empty.proto";
 
+// Append Events
+message AppendToStreamRequest {
+    string stream_id = 1;
+    ExpectedVersion expected_version = 2;
+    repeated NewEvent events = 3;
+}
+
+message NewEvent {
+    string event_name = 1;
+    bytes event_data = 2;
+    bytes metadata = 3;
+}
+
 message Event {
     uint64 id = 1;
     string stream_id = 2;
@@ -15,55 +28,48 @@ message Event {
     google.protobuf.Timestamp timestamp = 7;
 }
 
-message NewEvent {
-    string event_name = 1;
-    bytes event_data = 2;
-    bytes metadata = 3;
+message ExpectedVersion {
+    oneof version {
+        google.protobuf.Empty any = 1;
+        google.protobuf.Empty stream_exists = 2;
+        google.protobuf.Empty no_stream = 3;
+        uint64 exact = 4;
+    }
 }
+// message Any {}
+// message StreamExists {}
+// message NoStream {}
+// message Exact {
+//     uint64 value = 1;
+// }
 
-message AppendEventsRequest {
-    string stream_id = 1;
-    ExpectedVersion expected_version = 2;
-    repeated NewEvent events = 3;
-}
-
+// Subscribe
 message SubscribeRequest {
-    string subscriber_id = 1;
-    optional uint64 start_from_global_id = 2;
+    oneof start_from {
+        string subscriber_id = 1;
+        uint64 event_id = 2;
+    }
 }
+// message StartFromSubscriberId {
+//     string subscriber_id = 1;
+// }
+// message StartFromEventId {
+//     uint64 event_id = 1;
+// }
 
 message EventBatch {
     repeated Event events = 1;
 }
 
+// Acknowledge
 message AcknowledgeRequest {
     string subscriber_id = 1;
     uint64 last_event_id = 2;
 }
 
-message ExpectedVersion {
-    oneof version {
-        Any any = 1;
-        StreamExists stream_exists = 2;
-        NoStream no_stream = 3;
-        Exact exact = 4;
-    }
-}
-
-message Any {}
-
-message StreamExists {}
-
-message NoStream {}
-
-message Exact {
-    uint64 value = 1;
-}
-
+// Service
 service EventStore {
-    rpc AppendEvents(AppendEventsRequest) returns (google.protobuf.Empty);
-
+    rpc AppendToStream(AppendToStreamRequest) returns (google.protobuf.Empty);
     rpc Subscribe(SubscribeRequest) returns (stream EventBatch);
-    
     rpc Acknowledge(AcknowledgeRequest) returns (google.protobuf.Empty);
 }

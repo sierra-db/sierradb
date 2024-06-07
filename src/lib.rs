@@ -41,7 +41,7 @@
 //! }
 //! ```
 
-mod actor;
+pub mod actor;
 mod file_set;
 mod index;
 pub mod message;
@@ -56,12 +56,14 @@ mod testutil;
 
 use std::{
     borrow::Cow,
+    io::Write,
     iter::{DoubleEndedIterator, ExactSizeIterator},
     mem,
     path::{Path, PathBuf},
 };
 
 use chrono::{DateTime, Utc};
+use futures::{future::BoxFuture, Future};
 use index::{IndexBuf, RangeFindError, INDEX_ENTRY_BYTES};
 use log::{info, trace};
 use serde::{Deserialize, Serialize};
@@ -316,9 +318,12 @@ impl CommitLog {
     /// Creates or opens an existing commit log.
     pub async fn new(opts: LogOptions) -> io::Result<CommitLog> {
         let _ = fs::create_dir_all(&opts.log_dir).await;
-        let conn = tokio::task::spawn_blocking(move || subscription_store::setup_db())
-            .await?
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+        let conn = tokio::task::spawn_blocking({
+            let dir = opts.log_dir.clone();
+            move || subscription_store::setup_db(&dir)
+        })
+        .await?
+        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
 
         info!("Opening log in directory {:?}", &opts.log_dir.to_str());
 
@@ -377,6 +382,7 @@ impl CommitLog {
         event: NewEvent<'static>,
     ) -> Result<Offset, AppendError> {
         let id = self.file_set.active_index_mut().next_offset();
+        // println!("{id}");
         let event = Event {
             id,
             stream_id: Cow::Owned(stream_id),
@@ -522,33 +528,48 @@ impl CommitLog {
         self.file_set.active_index().next_offset()
     }
 
-    pub async fn read_last_stream_msg(
-        &mut self,
-        stream_name: &str,
-    ) -> Result<Option<Event>, ReadError> {
-        let Some(last_offset) = self
-            .file_set
-            .active_stream_index()
-            .get(stream_name)?
-            .last()
-            .copied()
-            .map(Ok)
-            .or_else(|| {
-                self.file_set.closed().values().rev().find_map(
-                    |SegmentSet { stream_index, .. }| match stream_index.get(stream_name) {
-                        Ok(offsets) => offsets.last().copied().map(Ok),
-                        Err(err) => Some(Err(err)),
-                    },
-                )
-            })
-            .transpose()?
-        else {
-            return Ok(None);
-        };
+    pub fn read_last_stream_msg<'a>(
+        &'a mut self,
+        stream_name: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Event>, ReadError>> {
+        Box::pin(async move {
+            let Some(last_offset) = self
+                .file_set
+                .active_stream_index()
+                .get(stream_name)?
+                .last()
+                .copied()
+                .map(Ok)
+                .or_else(|| {
+                    self.file_set.closed().values().rev().find_map(
+                        |SegmentSet { stream_index, .. }| match stream_index.get(stream_name) {
+                            Ok(offsets) => offsets.last().copied().map(Ok),
+                            Err(err) => Some(Err(err)),
+                        },
+                    )
+                })
+                .transpose()?
+            else {
+                return Ok(None);
+            };
 
-        let events = self.read(last_offset, ReadLimit::default()).await?;
-        let event = events.into_iter().next().ok_or(ReadError::CorruptLog)?;
-        Ok(Some(event))
+            if last_offset >= self.file_set.active_index().next_offset() {}
+
+            let events = self.read(last_offset, ReadLimit::default()).await?;
+            let event = match events.into_iter().next() {
+                Some(event) => event,
+                None => {
+                    // In this case the active stream index was flushed before the segment file
+                    // (memory mapped files can automatically flush). And so we need to truncate this stream at the next offset - 1.
+                    // TODO: ...
+                    // Then call read_last_stream_msg again after truncating
+                    // todo!();
+                    // return self.read_last_stream_msg(stream_name).await;
+                    return Err(ReadError::CorruptLog);
+                }
+            };
+            Ok(Some(event))
+        })
     }
 
     pub async fn read_stream(&mut self, stream_name: &str) -> Result<Vec<Event>, ReadError> {
@@ -581,15 +602,14 @@ impl CommitLog {
         start: Offset,
         limit: ReadLimit,
     ) -> Result<Vec<Event<'static>>, ReadError> {
-        todo!()
-        // let mut rd = MessageBufReader;
-        // match self.reader(&mut rd, start, limit).await? {
-        //     Some(buf) => buf
-        //         .iter()
-        //         .map(|msg| rmp_serde::from_slice(msg.payload()).map_err(ReadError::Deserialize))
-        //         .collect(),
-        //     None => Ok(vec![]),
-        // }
+        let mut rd = MessageBufReader;
+        match self.reader(&mut rd, start, limit).await? {
+            Some(buf) => buf
+                .iter()
+                .map(|msg| rmp_serde::from_slice(msg.payload()).map_err(ReadError::Deserialize))
+                .collect(),
+            None => Ok(vec![]),
+        }
     }
 
     /// Reads a portion of the log, starting with the `start` offset, inclusive,
@@ -667,10 +687,14 @@ impl CommitLog {
 
     /// Forces a flush of the log.
     pub async fn flush(&mut self) -> io::Result<()> {
-        self.file_set.active_segment_mut().flush().await?;
+        if self.unflushed.is_empty() {
+            return Ok(());
+        }
         self.file_set.active_index_mut().flush().await?;
         self.file_set.active_stream_index_mut().flush()?;
+        self.file_set.active_segment_mut().flush().await?; // After this line, the events are considered as persisted.
         let _ = self.broadcaster.send(mem::take(&mut self.unflushed));
+        assert!(self.unflushed.is_empty());
         Ok(())
     }
 
@@ -905,10 +929,7 @@ mod tests {
             assert_eq!(6, active_index_read.len());
             assert_eq!(
                 vec![82, 83, 84, 85, 86, 87],
-                active_index_read
-                    .iter()
-                    .map(|v| v.offset())
-                    .collect::<Vec<_>>()
+                active_index_read.iter().map(|v| v.id).collect::<Vec<_>>()
             );
         }
 
@@ -917,10 +938,7 @@ mod tests {
             assert_eq!(4, old_index_read.len());
             assert_eq!(
                 vec![5, 6, 7, 8],
-                old_index_read
-                    .iter()
-                    .map(|v| v.offset())
-                    .collect::<Vec<_>>()
+                old_index_read.iter().map(|v| v.id).collect::<Vec<_>>()
             );
         }
 
@@ -931,7 +949,7 @@ mod tests {
             assert_eq!(3, boundary_read.len());
             assert_eq!(
                 vec![33, 34, 35],
-                boundary_read.iter().map(|v| v.offset()).collect::<Vec<_>>()
+                boundary_read.iter().map(|v| v.id).collect::<Vec<_>>()
             );
         }
     }
@@ -964,10 +982,7 @@ mod tests {
             assert_eq!(4, active_index_read.len());
             assert_eq!(
                 vec![82, 83, 84, 85],
-                active_index_read
-                    .iter()
-                    .map(|v| v.offset())
-                    .collect::<Vec<_>>()
+                active_index_read.iter().map(|v| v.id).collect::<Vec<_>>()
             );
 
             let off = log.append_msg("my_stream", "moar data").await.unwrap();
@@ -1294,7 +1309,7 @@ mod tests {
             .read(0, ReadLimit::default())
             .await
             .expect("Unabled to grab reader");
-        assert_eq!(2, reader.iter().next().unwrap().offset());
+        assert_eq!(2, reader.iter().next().unwrap().id);
     }
 
     #[tokio::test]
@@ -1358,7 +1373,7 @@ mod tests {
             .read(0, ReadLimit::default())
             .await
             .expect("Unabled to grab reader");
-        assert_eq!(4, reader.iter().next().unwrap().offset());
+        assert_eq!(4, reader.iter().next().unwrap().id);
     }
 
     #[tokio::test]
@@ -1391,7 +1406,7 @@ mod tests {
                 .read(0, ReadLimit::default())
                 .await
                 .expect("Unabled to grab reader");
-            let start_off = reader.iter().next().unwrap().offset();
+            let start_off = reader.iter().next().unwrap().id;
             assert!(start_off <= trim_off);
         }
     }
@@ -1420,7 +1435,7 @@ mod tests {
                 .read(0, ReadLimit::default())
                 .await
                 .expect("Unabled to grab reader");
-            assert_eq!(2, reader.iter().next().unwrap().offset());
+            assert_eq!(2, reader.iter().next().unwrap().id);
         }
 
         log.trim_segments_before(10).await.unwrap();
@@ -1430,7 +1445,7 @@ mod tests {
                 .read(0, ReadLimit::default())
                 .await
                 .expect("Unabled to grab reader");
-            assert_eq!(10, reader.iter().next().unwrap().offset());
+            assert_eq!(10, reader.iter().next().unwrap().id);
         }
     }
 
@@ -1462,7 +1477,7 @@ mod tests {
             .read(0, ReadLimit::default())
             .await
             .expect("Unabled to grab reader");
-        let start_off = reader.iter().next().unwrap().offset();
+        let start_off = reader.iter().next().unwrap().id;
         assert_eq!(16, start_off);
     }
 
@@ -1489,7 +1504,7 @@ mod tests {
             .read(0, ReadLimit::default())
             .await
             .expect("Unabled to grab reader");
-        let start_off = reader.iter().next().unwrap().offset();
+        let start_off = reader.iter().next().unwrap().id;
         assert_eq!(0, start_off);
     }
 

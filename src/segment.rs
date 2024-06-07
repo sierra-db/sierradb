@@ -49,16 +49,12 @@ pub struct AppendMetadata {
 pub struct Segment {
     /// File descriptor
     file: BufWriter<File>,
-
     /// Path to the file
     path: PathBuf,
-
     /// Base offset of the log
     base_offset: u64,
-
     /// current file position for the write
     write_pos: usize,
-
     /// Maximum number of bytes permitted to be appended to the log
     max_bytes: usize,
 }

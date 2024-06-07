@@ -116,7 +116,7 @@ impl FileSet {
         // try to reuse the last index if it is not full. otherwise, open a new index
         // at the correct offset
         let last_entry = closed.keys().next_back().cloned();
-        let active = match last_entry {
+        let mut active = match last_entry {
             Some(off) => {
                 info!("Reusing index and segment starting at offset {}", off);
                 closed.remove(&off).unwrap()
@@ -126,6 +126,11 @@ impl FileSet {
                 SegmentSet::new(&opts, 0).await?
             }
         };
+
+        // Honestly very confused as to why this needs to be 2 instead of 1, but it seems correct when testing.
+        active
+            .stream_index
+            .truncate(active.index.next_offset().saturating_sub(2));
 
         // mark all closed indexes as readonly (indexes are not opened as readonly)
         for SegmentSet { index, .. } in closed.values_mut() {

@@ -8,15 +8,15 @@ use tokio::fs::{self, OpenOptions};
 use tokio::io;
 use twox_hash::Xxh3Hash64;
 
+use crate::Offset;
+
 pub static STREAM_INDEX_FILE_NAME_EXTENSION: &str = "streams";
 pub static SEGMENT_FILE_NAME_LEN: usize = 20;
 
 const KEY_SIZE: usize = 64;
 const OFFSET_SIZE: usize = mem::size_of::<u64>();
 const INDEX_ENTRY_SIZE: usize = KEY_SIZE + OFFSET_SIZE + OFFSET_SIZE + OFFSET_SIZE; // 64 (key) + 8 (head offset) + 8 (tail offset) + 8 (next entry offset)
-                                                                                    // const MAX_ENTRIES: usize = 100_000;
 const VALUE_BLOCK_SIZE: usize = OFFSET_SIZE + OFFSET_SIZE; // 8 (value) + 8 (next offset)
-
 const HEAD_OFFSET: usize = KEY_SIZE;
 const HEAD_SIZE: usize = OFFSET_SIZE;
 const TAIL_OFFSET: usize = HEAD_OFFSET + HEAD_SIZE;
@@ -214,7 +214,7 @@ impl StreamIndex {
                     .unwrap(),
             );
 
-            self.append_value(existing_offset, tail_offset as usize, value)?;
+            self.append_value(existing_offset, tail_offset as usize, value + 1)?;
 
             return Ok(());
         }
@@ -245,7 +245,8 @@ impl StreamIndex {
         self.data[offset..offset + KEY_SIZE].copy_from_slice(&padded_key);
 
         let value_offset = self.next_value_offset;
-        self.data[value_offset..value_offset + OFFSET_SIZE].copy_from_slice(&value.to_ne_bytes());
+        self.data[value_offset..value_offset + OFFSET_SIZE]
+            .copy_from_slice(&(value + 1).to_ne_bytes());
         self.data[value_offset + OFFSET_SIZE..value_offset + OFFSET_SIZE + OFFSET_SIZE]
             .copy_from_slice(&0u64.to_ne_bytes());
 
@@ -285,11 +286,15 @@ impl StreamIndex {
             let mut value_offset = value_head_offset as usize;
 
             loop {
-                values.push(u64::from_ne_bytes(
+                let stored_value = u64::from_ne_bytes(
                     self.data[value_offset..value_offset + OFFSET_SIZE]
                         .try_into()
                         .unwrap(),
-                ));
+                );
+                if stored_value == 0 {
+                    break; // Skip invalid or cleared entries
+                }
+                values.push(stored_value - 1);
                 value_offset = u64::from_ne_bytes(
                     self.data[value_offset + OFFSET_SIZE..value_offset + OFFSET_SIZE + OFFSET_SIZE]
                         .try_into()
@@ -318,10 +323,215 @@ impl StreamIndex {
         fs::remove_file(self.path).await
     }
 
+    /// Truncates to an offset, inclusive. The file length of the
+    /// segment for truncation is returned.
+    // pub fn truncate(&mut self, offset: u64) -> io::Result<()> {
+    //     let mut found_free = false;
+
+    //     // Iterate over each index entry
+    //     for i in 0..self.max_entries {
+    //         let entry_offset = OFFSET_SIZE + i as usize * INDEX_ENTRY_SIZE;
+    //         let head_offset = u64::from_ne_bytes(
+    //             self.data[entry_offset + HEAD_OFFSET..entry_offset + HEAD_OFFSET + HEAD_SIZE]
+    //                 .try_into()
+    //                 .unwrap(),
+    //         ) as usize;
+
+    //         // Skip empty entries
+    //         if head_offset == 0 {
+    //             continue;
+    //         }
+
+    //         // Traverse the linked list of values
+    //         let mut current_offset = head_offset;
+    //         let mut prev_offset: Option<usize> = None;
+
+    //         while current_offset != 0 {
+    //             let value_block = &mut self.data[current_offset..current_offset + VALUE_BLOCK_SIZE];
+    //             let value = u64::from_ne_bytes(value_block[0..OFFSET_SIZE].try_into().unwrap());
+    //             let next_offset = u64::from_ne_bytes(
+    //                 value_block[OFFSET_SIZE..OFFSET_SIZE + OFFSET_SIZE]
+    //                     .try_into()
+    //                     .unwrap(),
+    //             ) as usize;
+
+    //             if value > offset {
+    //                 // Clear the value block and mark the offset as free
+    //                 value_block.fill(0);
+
+    //                 if let Some(prev) = prev_offset {
+    //                     // Update the previous block's next offset
+    //                     let prev_block = &mut self.data[prev..prev + VALUE_BLOCK_SIZE];
+    //                     prev_block[OFFSET_SIZE..OFFSET_SIZE + OFFSET_SIZE]
+    //                         .copy_from_slice(&(next_offset as u64).to_ne_bytes());
+    //                 } else {
+    //                     // Update the head offset of the entry
+    //                     self.data
+    //                         [entry_offset + HEAD_OFFSET..entry_offset + HEAD_OFFSET + HEAD_SIZE]
+    //                         .copy_from_slice(&(next_offset as u64).to_ne_bytes());
+    //                 }
+
+    //                 if next_offset == 0 {
+    //                     // Update the tail offset if this was the tail
+    //                     self.data
+    //                         [entry_offset + TAIL_OFFSET..entry_offset + TAIL_OFFSET + TAIL_SIZE]
+    //                         .copy_from_slice(&(prev_offset.unwrap_or(0) as u64).to_ne_bytes());
+    //                 }
+
+    //                 // Update the next_value_offset if a free block is found earlier
+    //                 if current_offset < self.next_value_offset {
+    //                     self.next_value_offset = current_offset;
+    //                     found_free = true;
+    //                 }
+    //             } else {
+    //                 // Stop truncating when we reach a value <= truncate_value
+    //                 break;
+    //             }
+
+    //             prev_offset = Some(current_offset);
+    //             current_offset = next_offset;
+    //         }
+
+    //         // If head_offset is 0 after truncation, reset the entry
+    //         let new_head_offset = u64::from_ne_bytes(
+    //             self.data[entry_offset + HEAD_OFFSET..entry_offset + HEAD_OFFSET + HEAD_SIZE]
+    //                 .try_into()
+    //                 .unwrap(),
+    //         );
+    //         if new_head_offset == 0 {
+    //             self.data[entry_offset..entry_offset + INDEX_ENTRY_SIZE].fill(0);
+    //         }
+    //     }
+
+    //     // Reset next_value_offset to the original end if no free block is found
+    //     if !found_free {
+    //         self.next_value_offset = Self::values_start_offset(self.max_entries);
+    //     }
+
+    //     Ok(())
+    // }
+    pub fn truncate(&mut self, offset: Offset) {
+        let values_start_offset = Self::values_start_offset(self.max_entries);
+
+        // Step 1: Clear values that are greater than the truncate offset
+        for i in (0..((self.next_value_offset - values_start_offset) / VALUE_BLOCK_SIZE)).rev() {
+            let current = values_start_offset + (VALUE_BLOCK_SIZE * i);
+            let stored_value = u64::from_ne_bytes(
+                self.data[current..current + OFFSET_SIZE]
+                    .try_into()
+                    .unwrap(),
+            );
+            if stored_value == 0 {
+                continue; // Skip invalid or cleared entries
+            }
+            let value = stored_value - 1;
+            if value <= offset {
+                // Reset next offset to zeros
+                self.data[current + OFFSET_SIZE..current + OFFSET_SIZE + OFFSET_SIZE]
+                    .copy_from_slice(&[0u8; OFFSET_SIZE]);
+
+                // Update the next value offset to the current position
+                self.next_value_offset = current + VALUE_BLOCK_SIZE;
+                break;
+            }
+
+            // Clear value block entirely
+            self.data[current..current + VALUE_BLOCK_SIZE]
+                .copy_from_slice(&[0u8; VALUE_BLOCK_SIZE]);
+        }
+
+        // Step 2: Iterate entries to reset any head and tail offsets
+        for i in 0..self.max_entries as usize {
+            let entry_offset = OFFSET_SIZE + i * INDEX_ENTRY_SIZE;
+            let head_offset = u64::from_ne_bytes(
+                self.data[entry_offset + HEAD_OFFSET..entry_offset + HEAD_OFFSET + HEAD_SIZE]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+
+            if head_offset == 0 {
+                continue; // Skip empty entries
+            }
+
+            let mut current_offset = head_offset;
+            let mut prev_offset: Option<usize> = None;
+            let mut new_tail_offset: Option<u64> = None;
+            let mut new_head_offset: Option<u64> = None;
+
+            while current_offset != 0 {
+                let value_block = &mut self.data[current_offset..current_offset + VALUE_BLOCK_SIZE];
+                let stored_value =
+                    u64::from_ne_bytes(value_block[0..OFFSET_SIZE].try_into().unwrap());
+                if stored_value == 0 {
+                    break; // Skip invalid or cleared entries
+                }
+                let value = stored_value - 1;
+                let next_offset = u64::from_ne_bytes(
+                    value_block[OFFSET_SIZE..OFFSET_SIZE + OFFSET_SIZE]
+                        .try_into()
+                        .unwrap(),
+                ) as usize;
+
+                if value > offset {
+                    // Clear the value block and mark the offset as free
+                    value_block.fill(0);
+
+                    if let Some(prev) = prev_offset {
+                        // Update the previous block's next offset
+                        let prev_block = &mut self.data[prev..prev + VALUE_BLOCK_SIZE];
+                        prev_block[OFFSET_SIZE..OFFSET_SIZE + OFFSET_SIZE]
+                            .copy_from_slice(&(next_offset as u64).to_ne_bytes());
+                    } else {
+                        // Update the new head offset
+                        new_head_offset = Some(next_offset as u64);
+                    }
+
+                    // Update the next_value_offset if a free block is found earlier
+                    if current_offset < self.next_value_offset {
+                        self.next_value_offset = current_offset;
+                    }
+                } else {
+                    if new_head_offset.is_none() {
+                        new_head_offset = Some(current_offset as u64);
+                    }
+                    new_tail_offset = Some(current_offset as u64);
+                    prev_offset = Some(current_offset);
+                }
+
+                current_offset = next_offset;
+            }
+
+            // Update the head and tail offsets of the entry
+            if let Some(new_head) = new_head_offset {
+                self.data[entry_offset + HEAD_OFFSET..entry_offset + HEAD_OFFSET + HEAD_SIZE]
+                    .copy_from_slice(&new_head.to_ne_bytes());
+            } else {
+                // If all values are truncated, clear the entire entry
+                self.data[entry_offset..entry_offset + INDEX_ENTRY_SIZE].fill(0);
+                continue;
+            }
+
+            if let Some(new_tail) = new_tail_offset {
+                self.data[entry_offset + TAIL_OFFSET..entry_offset + TAIL_OFFSET + TAIL_SIZE]
+                    .copy_from_slice(&new_tail.to_ne_bytes());
+
+                // Ensure head offset is set correctly if it was cleared initially
+                if self.data[entry_offset + HEAD_OFFSET..entry_offset + HEAD_OFFSET + HEAD_SIZE]
+                    == [0; HEAD_SIZE]
+                {
+                    self.data[entry_offset + HEAD_OFFSET..entry_offset + HEAD_OFFSET + HEAD_SIZE]
+                        .copy_from_slice(&new_tail.to_ne_bytes());
+                }
+            } else {
+                // If no valid tail is found, clear the tail offset
+                self.data[entry_offset + TAIL_OFFSET..entry_offset + TAIL_OFFSET + TAIL_SIZE]
+                    .copy_from_slice(&[0u8; TAIL_SIZE]);
+            }
+        }
+    }
+
     fn total_size(max_entries: u64) -> usize {
-        OFFSET_SIZE
-            + Self::values_start_offset(max_entries)
-            + (VALUE_BLOCK_SIZE * max_entries as usize)
+        Self::values_start_offset(max_entries) + (VALUE_BLOCK_SIZE * max_entries as usize)
     }
 
     fn values_start_offset(max_entries: u64) -> usize {
@@ -355,6 +565,7 @@ impl StreamIndex {
     }
 
     fn find_next_zeros(index: &MmapMut, start: usize, step_by: usize) -> io::Result<usize> {
+        // TODO: This could perhaps be done with a binary search
         let index_len = index.len();
 
         // Iterate through the index file from the starting point
@@ -702,5 +913,176 @@ mod tests {
             .unwrap();
             assert_eq!(map.max_entries, 24);
         }
+    }
+
+    #[tokio::test]
+    async fn test_truncate_simple_case() {
+        let mut map = setup().await;
+
+        // Insert values
+        map.insert("key1", 10).expect("Insert failed");
+        map.insert("key1", 20).expect("Insert failed");
+        map.insert("key1", 30).expect("Insert failed");
+
+        // Truncate at value 20
+        map.truncate(20);
+
+        let values = map.get("key1").expect("Get failed");
+        assert_eq!(
+            values,
+            vec![10, 20],
+            "Values after truncation are not as expected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_truncate_with_multiple_keys() {
+        let mut map = setup().await;
+
+        // Insert values for multiple keys
+        map.insert("key1", 10).expect("Insert failed");
+        map.insert("key1", 20).expect("Insert failed");
+        map.insert("key2", 15).expect("Insert failed");
+        map.insert("key2", 25).expect("Insert failed");
+        map.insert("key2", 35).expect("Insert failed");
+
+        // Truncate at value 20
+        map.truncate(20);
+
+        let values1 = map.get("key1").expect("Get failed");
+        let values2 = map.get("key2").expect("Get failed");
+
+        assert_eq!(
+            values1,
+            vec![10, 20],
+            "Values for key1 after truncation are not as expected"
+        );
+        assert_eq!(
+            values2,
+            vec![15],
+            "Values for key2 after truncation are not as expected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_truncate_with_collisions() {
+        let mut map = setup().await;
+
+        // Keys that are different but should produce the same hash index
+        let (key1, key2, key3) = find_collision(&map, "key");
+
+        // Insert colliding keys
+        map.insert(&key1, 10).expect("Insert failed");
+        map.insert(&key2, 20).expect("Insert failed");
+        map.insert(&key3, 30).expect("Insert failed");
+
+        // Truncate at value 20
+        map.truncate(20);
+
+        let values1 = map.get(&key1).expect("Get failed");
+        let values2 = map.get(&key2).expect("Get failed");
+        let values3 = map.get(&key3).expect("Get failed");
+
+        assert_eq!(
+            values1,
+            vec![10],
+            "Values for key1 after truncation are not as expected"
+        );
+        assert_eq!(
+            values2,
+            vec![20],
+            "Values for key2 after truncation are not as expected"
+        );
+        assert_eq!(
+            values3,
+            vec![],
+            "Values for key3 after truncation are not as expected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_truncate_with_fragmented_index() {
+        let mut map = setup().await;
+
+        // Insert values
+        map.insert("key1", 10).expect("Insert failed");
+        map.insert("key1", 20).expect("Insert failed");
+        map.insert("key2", 30).expect("Insert failed");
+
+        // Truncate at value 20
+        map.truncate(20);
+
+        let values1_after_truncate = map.get("key1").expect("Get failed");
+        let values2_after_truncate = map.get("key2").expect("Get failed");
+
+        // Validate values after truncation
+        assert_eq!(
+            values1_after_truncate,
+            vec![10, 20],
+            "Values for key1 after truncation are not as expected"
+        );
+        assert_eq!(
+            values2_after_truncate,
+            vec![],
+            "Values for key2 after truncation are not as expected"
+        );
+
+        // Insert new values
+        map.insert("key1", 25).expect("Insert failed");
+        map.insert("key2", 35).expect("Insert failed");
+
+        let values1_after_insert = map.get("key1").expect("Get failed");
+        let values2_after_insert = map.get("key2").expect("Get failed");
+
+        // Validate values after re-insertion
+        assert_eq!(
+            values1_after_insert,
+            vec![10, 20, 25],
+            "Values for key1 after re-insertion are not as expected"
+        );
+        assert_eq!(
+            values2_after_insert,
+            vec![35],
+            "Values for key2 after re-insertion are not as expected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_truncate_boundary_case() {
+        let mut map = setup().await;
+
+        // Insert values
+        map.insert("key1", 10).expect("Insert failed");
+        map.insert("key1", 20).expect("Insert failed");
+        map.insert("key1", 30).expect("Insert failed");
+
+        // Truncate at value 30 (boundary case)
+        map.truncate(30);
+
+        let values = map.get("key1").expect("Get failed");
+        assert_eq!(
+            values,
+            vec![10, 20, 30],
+            "Values after boundary truncation are not as expected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_truncate_no_effect() {
+        let mut map = setup().await;
+
+        // Insert values
+        map.insert("key1", 10).expect("Insert failed");
+        map.insert("key1", 20).expect("Insert failed");
+
+        // Truncate at value 30 (no values should be removed)
+        map.truncate(30);
+
+        let values = map.get("key1").expect("Get failed");
+        assert_eq!(
+            values,
+            vec![10, 20],
+            "Values after no-effect truncation are not as expected"
+        );
     }
 }

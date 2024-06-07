@@ -1,22 +1,22 @@
 use futures::stream::BoxStream;
 use futures::StreamExt;
-use kameo::actor::{Actor, ActorRef};
-use kameo::error::{BoxError, SendError};
+use kameo::actor::ActorRef;
+use kameo::error::SendError;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{mpsc, oneshot};
-use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
-use tonic::{transport::Server, Request, Response, Status};
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{Request, Response, Status};
 
-use eventstore::event_store_server::{EventStore, EventStoreServer};
-use eventstore::{
-    AcknowledgeRequest, Any, AppendEventsRequest, Event, Exact, NewEvent, NoStream, StreamExists,
-    SubscribeRequest,
-};
+use eventstore::event_store_server::EventStore;
+use eventstore::{AcknowledgeRequest, AppendToStreamRequest, Event, SubscribeRequest};
 
 use crate::actor::{AppendToStream, LoadSubscription, ReadBatch, Subscribe, UpdateSubscription};
-use crate::{subscription_store, AppendError, CommitLog, ReadLimit};
+use crate::{AppendError, CommitLog, ReadLimit};
 
+use self::eventstore::subscribe_request::StartFrom;
 use self::eventstore::EventBatch;
+
+const BATCH_SIZE: usize = 65_536; // 65KB
 
 pub mod eventstore {
     use std::{borrow::Cow, time::UNIX_EPOCH};
@@ -39,7 +39,7 @@ pub mod eventstore {
                     Version::Any(_) => crate::ExpectedVersion::Any,
                     Version::StreamExists(_) => crate::ExpectedVersion::StreamExists,
                     Version::NoStream(_) => crate::ExpectedVersion::NoStream,
-                    Version::Exact(Exact { value }) => crate::ExpectedVersion::Exact(value),
+                    Version::Exact(version) => crate::ExpectedVersion::Exact(version),
                 },
                 Some(ExpectedVersion { version: None }) | None => crate::ExpectedVersion::Any,
             }
@@ -120,13 +120,19 @@ pub struct DefaultEventStoreServer {
     log: ActorRef<CommitLog>,
 }
 
+impl DefaultEventStoreServer {
+    pub fn new(log: ActorRef<CommitLog>) -> Self {
+        DefaultEventStoreServer { log }
+    }
+}
+
 #[tonic::async_trait]
 impl EventStore for DefaultEventStoreServer {
     type SubscribeStream = BoxStream<'static, Result<EventBatch, Status>>;
 
-    async fn append_events(
+    async fn append_to_stream(
         &self,
-        request: Request<AppendEventsRequest>,
+        request: Request<AppendToStreamRequest>,
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
         let res = self
@@ -154,55 +160,58 @@ impl EventStore for DefaultEventStoreServer {
         request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
         let req = request.into_inner();
-        let (tx, mut rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::channel(64);
 
-        let mut start_offset = self
-            .log
-            .send(LoadSubscription {
-                id: req.subscriber_id,
-            })
-            .await
-            .map_err(|err| Status::internal(err.to_string()))?
-            .unwrap_or(0);
+        let mut start_offset = match req.start_from {
+            Some(StartFrom::SubscriberId(subscriber_id)) => self
+                .log
+                .send(LoadSubscription { subscriber_id })
+                .await
+                .map_err_internal()?
+                .map(|last| last + 1)
+                .unwrap_or(0),
+            Some(StartFrom::EventId(event_id)) => event_id,
+            None => 0,
+        };
 
         let log = self.log.clone();
         tokio::spawn(async move {
             // Subscribe, and save to a buffer
-            let (oneshot_tx, oneshot_rx) = oneshot::channel();
+            let (oneshot_tx, mut oneshot_rx) =
+                oneshot::channel::<(Sender<Vec<crate::Event<'static>>>, u64)>();
+
             tokio::spawn({
                 let log = log.clone();
                 async move {
-                    let buffer = Vec::new();
-
-                    let mut subscription = log.send(Subscribe {}).await.map_err_internal()?;
+                    let mut buffer = Vec::new();
+                    let mut subscription = log.send(Subscribe).await.map_err_internal()?;
 
                     // Consume into buffer whilst serving historical events
-                    let tx: Sender<Vec<crate::Event<'static>>>;
-                    let last_offset: u64;
                     loop {
                         tokio::select! {
                             res = subscription.recv() => {
                                 buffer.push(res.map_err_internal()?);
                             }
-                            res = oneshot_rx => {
-                                (tx, last_offset) = res.map_err_internal()?;
+                            res = &mut oneshot_rx => {
+                                let (tx, last_offset) = res.map_err_internal()?;
+
+                                // Serve buffer
+                                for mut batch in buffer {
+                                    batch.retain(|event| event.id > last_offset);
+                                    tx.send(batch).await.map_err_internal()?;
+                                }
+
+                                // Serve from subscription
+                                while let Ok(batch) = subscription.recv().await {
+                                    tx.send(batch).await.map_err_internal()?;
+                                }
+
                                 break;
                             }
                         }
                     }
 
-                    // Serve buffer
-                    for batch in buffer {
-                        batch.retain(|event| event.id > last_offset);
-                        tx.send(batch).await.map_err_internal()?;
-                    }
-
-                    // Serve from subscription
-                    while let Ok(batch) = subscription.recv().await {
-                        tx.send(batch).await.map_err_internal()?;
-                    }
-
-                    Ok::<_, Status>(buffer)
+                    Ok::<_, Status>(())
                 }
             });
 
@@ -211,7 +220,7 @@ impl EventStore for DefaultEventStoreServer {
                 let Ok(batch) = log
                     .send(ReadBatch {
                         start_offset,
-                        read_limit: ReadLimit(10_240),
+                        read_limit: ReadLimit(BATCH_SIZE),
                     })
                     .await
                 else {
@@ -222,18 +231,17 @@ impl EventStore for DefaultEventStoreServer {
                     break;
                 }
 
-                start_offset = batch.last().map(|ev| ev.id).unwrap_or(start_offset);
+                start_offset = batch.last().map(|ev| ev.id).unwrap_or(start_offset) + 1;
 
                 if tx.send(batch).await.is_err() {
                     break;
                 }
             }
 
-            // Stop saving subscription to buffer
-            oneshot_tx.send((tx, start_offset));
-
-            // Serve buffer
-            // Serve from subscription
+            // Switch from buffer to live events
+            if let Err(_) = oneshot_tx.send((tx, start_offset)) {
+                return;
+            }
         });
 
         let stream = ReceiverStream::new(rx).map(|events| {

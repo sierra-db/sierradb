@@ -481,7 +481,6 @@ impl Index {
 
         let search_range = &mem_slice[start_ind_pos..self.next_write_pos];
         if search_range.is_empty() {
-            println!("uh oh");
             return Err(RangeFindError::MessageExceededMaxBytes);
         }
 
@@ -504,7 +503,6 @@ impl Index {
 
         let bytes = pos - start_file_pos;
         if bytes == 0 || bytes > max_bytes {
-            println!("NOOO: {bytes}");
             Err(RangeFindError::MessageExceededMaxBytes)
         } else {
             trace!("Found slice range {}..{}", start_file_pos, pos);
@@ -912,7 +910,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn asyncfind_segment_range_offset() {
+    async fn find_segment_range_offset() {
         env_logger::try_init().unwrap_or(());
         let dir = TestDir::new();
         let mut index = Index::new(&dir, 10u64, 40usize).await.unwrap();
@@ -968,7 +966,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn asyncindex_resize() {
+    async fn index_resize() {
         env_logger::try_init().unwrap_or(());
         let dir = TestDir::new();
         let mut index = Index::new(&dir, 10u64, 32usize).await.unwrap();
@@ -992,7 +990,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn asyncindex_remove() {
+    async fn index_remove() {
         env_logger::try_init().unwrap_or(());
         let dir = TestDir::new();
         let index = Index::new(&dir, 0u64, 32usize).await.unwrap();
@@ -1020,7 +1018,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn asyncindex_truncate() {
+    async fn index_truncate() {
         env_logger::try_init().unwrap_or(());
         let dir = TestDir::new();
         let mut index = Index::new(&dir, 10u64, 128usize).await.unwrap();
@@ -1045,7 +1043,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn asyncindex_truncate_at_boundary() {
+    async fn index_truncate_at_boundary() {
         env_logger::try_init().unwrap_or(());
         let dir = TestDir::new();
         let mut index = Index::new(&dir, 10u64, 128usize).await.unwrap();
