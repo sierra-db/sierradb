@@ -36,12 +36,12 @@ message ExpectedVersion {
         uint64 exact = 4;
     }
 }
-// message Any {}
-// message StreamExists {}
-// message NoStream {}
-// message Exact {
-//     uint64 value = 1;
-// }
+
+// Get Stream Events
+message GetStreamEventsRequest {
+    string stream_id = 1;
+    uint64 stream_version = 2;
+}
 
 // Subscribe
 message SubscribeRequest {
@@ -50,12 +50,6 @@ message SubscribeRequest {
         uint64 event_id = 2;
     }
 }
-// message StartFromSubscriberId {
-//     string subscriber_id = 1;
-// }
-// message StartFromEventId {
-//     uint64 event_id = 1;
-// }
 
 message EventBatch {
     repeated Event events = 1;
@@ -70,6 +64,7 @@ message AcknowledgeRequest {
 // Service
 service EventStore {
     rpc AppendToStream(AppendToStreamRequest) returns (google.protobuf.Empty);
+    rpc GetStreamEvents(GetStreamEventsRequest) returns (stream Event);
     rpc Subscribe(SubscribeRequest) returns (stream EventBatch);
     rpc Acknowledge(AcknowledgeRequest) returns (google.protobuf.Empty);
 }

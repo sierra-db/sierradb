@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use commitlog::{
-    actor::AppendToStream,
+    actor::{AppendToStream, Flush},
     server::{eventstore::event_store_server::EventStoreServer, DefaultEventStoreServer},
     CommitLog, ExpectedVersion, LogOptions, NewEvent,
 };
@@ -14,16 +14,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "[::1]:50051".parse()?;
 
     let opts = LogOptions::new(".log");
-    let log = CommitLog::new(opts).await.unwrap();
+    let log = CommitLog::new(opts).unwrap();
 
-    let log_actor = kameo::actor::spawn_unsync(log);
+    let log_actor = kameo::actor::spawn_unsync_in_thread(log);
     // tokio::spawn({
     //     let log_actor = log_actor.clone();
     //     async move {
     //         loop {
     //             tokio::time::sleep(Duration::from_millis(500)).await;
     //             log_actor
-    //                 .send(AppendToStream {
+    //                 .tell(AppendToStream {
     //                     stream_id: "user-123".to_string(),
     //                     expected_version: ExpectedVersion::Any,
     //                     events: vec![NewEvent {
@@ -32,6 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //                         metadata: vec![].into(),
     //                     }],
     //                 })
+    //                 .send()
     //                 .await
     //                 .unwrap();
     //         }
@@ -52,7 +53,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     signal::ctrl_c().await.expect("failed to listen for event");
     println!("shutting down...");
 
-    log_actor.stop_gracefully()?;
+    log_actor.tell(Flush).send().await?;
+    log_actor.stop_gracefully().await?;
     log_actor.wait_for_stop().await;
 
     println!("goodbye.");

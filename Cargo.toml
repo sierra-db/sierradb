@@ -20,8 +20,9 @@ bytes = "1"
 chrono = { version = "0.4.38", features = ["serde"] }
 crc32c = "0.6"
 futures = "0.3.30"
-kameo = "0.8.1"
-# kameo = { path = "../kameo/crates/kameo" }
+itertools = "0.13.0"
+# kameo = "0.8.1"
+kameo = { path = "../kameo/crates/kameo" }
 log = "0.4.1"
 memmap2 = "0.9"
 page_size = "0.6"

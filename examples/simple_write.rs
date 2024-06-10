@@ -13,7 +13,7 @@ async fn main() {
             .as_secs()
     ));
     opts.segment_max_entries(256_000);
-    let mut log = CommitLog::new(opts).await.unwrap();
+    let mut log = CommitLog::new(opts).unwrap();
 
     #[derive(Serialize, Deserialize)]
     struct Event {
@@ -29,7 +29,6 @@ async fn main() {
             })
             .unwrap(),
         )
-        .await
         .unwrap(); // offset 0
         log.append_msg(
             "key2",
@@ -38,7 +37,6 @@ async fn main() {
             })
             .unwrap(),
         )
-        .await
         .unwrap(); // offset 1
         log.append_msg(
             "key2",
@@ -47,7 +45,6 @@ async fn main() {
             })
             .unwrap(),
         )
-        .await
         .unwrap(); // offset 2
         log.append_msg(
             "key1",
@@ -56,7 +53,6 @@ async fn main() {
             })
             .unwrap(),
         )
-        .await
         .unwrap(); // offset 2
         log.append_msg(
             "key2",
@@ -65,7 +61,6 @@ async fn main() {
             })
             .unwrap(),
         )
-        .await
         .unwrap(); // offset 2
         log.append_msg(
             "key1",
@@ -74,7 +69,6 @@ async fn main() {
             })
             .unwrap(),
         )
-        .await
         .unwrap(); // offset 2
     }
 

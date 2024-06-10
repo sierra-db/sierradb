@@ -16,7 +16,7 @@ async fn main() {
             .unwrap()
             .as_secs()
     ));
-    let mut log = CommitLog::new(opts).await.unwrap();
+    let mut log = CommitLog::new(opts).unwrap();
 
     let start = SystemTime::now();
     for i in 0..BATCHES {
@@ -24,11 +24,10 @@ async fn main() {
             .map(|j| format!("{}-{}", i, j))
             .collect::<MessageBuf>();
         log.append("my_stream", &mut buf)
-            .await
             .expect("Unable to append batch");
 
         if i == 99 || i == 50 {
-            log.flush().await.expect("Unable to flush");
+            log.flush().expect("Unable to flush");
         }
         // println!("appended batch");
     }
@@ -48,7 +47,6 @@ async fn main() {
     loop {
         let entries = log
             .read(pos, ReadLimit::max_bytes(10_240))
-            .await
             .expect("Unable to read messages from the log");
         match entries.iter().last().map(|m| m.id) {
             Some(off) => {

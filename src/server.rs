@@ -1,4 +1,4 @@
-use futures::stream::BoxStream;
+use futures::stream::{self, BoxStream};
 use futures::StreamExt;
 use kameo::actor::ActorRef;
 use kameo::error::SendError;
@@ -8,9 +8,13 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use eventstore::event_store_server::EventStore;
-use eventstore::{AcknowledgeRequest, AppendToStreamRequest, Event, SubscribeRequest};
+use eventstore::{
+    AcknowledgeRequest, AppendToStreamRequest, Event, GetStreamEventsRequest, SubscribeRequest,
+};
 
-use crate::actor::{AppendToStream, LoadSubscription, ReadBatch, Subscribe, UpdateSubscription};
+use crate::actor::{
+    AppendToStream, GetStreamEvents, LoadSubscription, ReadBatch, Subscribe, UpdateSubscription,
+};
 use crate::{AppendError, CommitLog, ReadLimit};
 
 use self::eventstore::subscribe_request::StartFrom;
@@ -28,20 +32,38 @@ pub mod eventstore {
 
     tonic::include_proto!("eventstore");
 
+    #[derive(Clone, Copy, Debug)]
     pub struct InvalidTimestamp;
 
-    impl From<Option<ExpectedVersion>> for crate::ExpectedVersion {
-        fn from(v: Option<ExpectedVersion>) -> Self {
-            match v {
-                Some(ExpectedVersion {
-                    version: Some(version),
-                }) => match version {
+    impl From<ExpectedVersion> for crate::ExpectedVersion {
+        fn from(v: ExpectedVersion) -> Self {
+            match v.version {
+                Some(version) => match version {
                     Version::Any(_) => crate::ExpectedVersion::Any,
                     Version::StreamExists(_) => crate::ExpectedVersion::StreamExists,
                     Version::NoStream(_) => crate::ExpectedVersion::NoStream,
                     Version::Exact(version) => crate::ExpectedVersion::Exact(version),
                 },
-                Some(ExpectedVersion { version: None }) | None => crate::ExpectedVersion::Any,
+                None => crate::ExpectedVersion::Any,
+            }
+        }
+    }
+
+    impl From<crate::ExpectedVersion> for ExpectedVersion {
+        fn from(v: crate::ExpectedVersion) -> Self {
+            match v {
+                crate::ExpectedVersion::Any => ExpectedVersion {
+                    version: Some(Version::Any(())),
+                },
+                crate::ExpectedVersion::StreamExists => ExpectedVersion {
+                    version: Some(Version::StreamExists(())),
+                },
+                crate::ExpectedVersion::NoStream => ExpectedVersion {
+                    version: Some(Version::NoStream(())),
+                },
+                crate::ExpectedVersion::Exact(version) => ExpectedVersion {
+                    version: Some(Version::Exact(version)),
+                },
             }
         }
     }
@@ -128,6 +150,7 @@ impl DefaultEventStoreServer {
 
 #[tonic::async_trait]
 impl EventStore for DefaultEventStoreServer {
+    type GetStreamEventsStream = BoxStream<'static, Result<Event, Status>>;
     type SubscribeStream = BoxStream<'static, Result<EventBatch, Status>>;
 
     async fn append_to_stream(
@@ -137,11 +160,15 @@ impl EventStore for DefaultEventStoreServer {
         let req = request.into_inner();
         let res = self
             .log
-            .send(AppendToStream {
+            .ask(AppendToStream {
                 stream_id: req.stream_id,
-                expected_version: req.expected_version.into(),
+                expected_version: req
+                    .expected_version
+                    .map(crate::ExpectedVersion::from)
+                    .unwrap_or(crate::ExpectedVersion::Any),
                 events: req.events.into_iter().map(|event| event.into()).collect(),
             })
+            .send()
             .await;
         match res {
             Ok(_) => Ok(Response::new(())),
@@ -155,6 +182,27 @@ impl EventStore for DefaultEventStoreServer {
         }
     }
 
+    async fn get_stream_events(
+        &self,
+        request: Request<GetStreamEventsRequest>,
+    ) -> Result<Response<Self::GetStreamEventsStream>, Status> {
+        let req = request.into_inner();
+        let events = self
+            .log
+            .ask(GetStreamEvents {
+                stream_id: req.stream_id,
+                stream_version: req.stream_version,
+            })
+            .send()
+            .await
+            .map_err_internal()?;
+        let stream = stream::iter(events.into_iter().map(|event| {
+            Event::try_from(event).map_err(|_| Status::internal("invalid timestamp"))
+        }));
+
+        Ok(Response::new(Box::pin(stream)))
+    }
+
     async fn subscribe(
         &self,
         request: Request<SubscribeRequest>,
@@ -165,7 +213,8 @@ impl EventStore for DefaultEventStoreServer {
         let mut start_offset = match req.start_from {
             Some(StartFrom::SubscriberId(subscriber_id)) => self
                 .log
-                .send(LoadSubscription { subscriber_id })
+                .ask(LoadSubscription { subscriber_id })
+                .send()
                 .await
                 .map_err_internal()?
                 .map(|last| last + 1)
@@ -184,7 +233,7 @@ impl EventStore for DefaultEventStoreServer {
                 let log = log.clone();
                 async move {
                     let mut buffer = Vec::new();
-                    let mut subscription = log.send(Subscribe).await.map_err_internal()?;
+                    let mut subscription = log.ask(Subscribe).send().await.map_err_internal()?;
 
                     // Consume into buffer whilst serving historical events
                     loop {
@@ -218,10 +267,11 @@ impl EventStore for DefaultEventStoreServer {
             // Start streaming from history
             loop {
                 let Ok(batch) = log
-                    .send(ReadBatch {
+                    .ask(ReadBatch {
                         start_offset,
                         read_limit: ReadLimit(BATCH_SIZE),
                     })
+                    .send()
                     .await
                 else {
                     break;
@@ -262,10 +312,11 @@ impl EventStore for DefaultEventStoreServer {
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
         self.log
-            .send(UpdateSubscription {
+            .ask(UpdateSubscription {
                 id: req.subscriber_id,
                 last_event_id: req.last_event_id,
             })
+            .send()
             .await
             .map_err(|err| Status::internal(err.to_string()))?;
 

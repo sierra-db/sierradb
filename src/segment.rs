@@ -1,13 +1,10 @@
 use std::{
-    io::SeekFrom,
+    fs::{self, File, OpenOptions},
+    io::{self, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
 use log::info;
-use tokio::{
-    fs::{self, File, OpenOptions},
-    io::{self, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter},
-};
 
 use crate::{
     message::{MessageError, MessageSet},
@@ -48,7 +45,7 @@ pub struct AppendMetadata {
 /// written until the maximum size is reached.
 pub struct Segment {
     /// File descriptor
-    file: BufWriter<File>,
+    writer: BufWriter<File>,
     /// Path to the file
     path: PathBuf,
     /// Base offset of the log
@@ -60,7 +57,7 @@ pub struct Segment {
 }
 
 impl Segment {
-    pub async fn new<P>(log_dir: P, base_offset: u64, max_bytes: usize) -> io::Result<Segment>
+    pub fn new<P>(log_dir: P, base_offset: u64, max_bytes: usize) -> io::Result<Segment>
     where
         P: AsRef<Path>,
     {
@@ -73,18 +70,17 @@ impl Segment {
             path_buf
         };
 
-        let mut f = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .read(true)
             .create_new(true)
             .append(true)
-            .open(&log_path)
-            .await?;
+            .open(&log_path)?;
 
         // add the magic
-        f.write_all(&VERSION_1_MAGIC).await?;
+        file.write_all(&VERSION_1_MAGIC)?;
 
         Ok(Segment {
-            file: BufWriter::new(f),
+            writer: BufWriter::new(file),
             path: log_path,
             base_offset,
             write_pos: 2,
@@ -92,7 +88,7 @@ impl Segment {
         })
     }
 
-    pub async fn open<P>(path: P, max_bytes: usize) -> io::Result<Segment>
+    pub fn open<P>(path: P, max_bytes: usize) -> io::Result<Segment>
     where
         P: AsRef<Path>,
     {
@@ -100,8 +96,7 @@ impl Segment {
             .read(true)
             .write(true)
             .append(true)
-            .open(&path)
-            .await?;
+            .open(&path)?;
 
         let filename = path.as_ref().file_name().unwrap().to_str().unwrap();
         let base_offset = match (&filename[0..SEGMENT_FILE_NAME_LEN]).parse::<u64>() {
@@ -114,14 +109,14 @@ impl Segment {
             }
         };
 
-        let meta = file.metadata().await?;
+        let meta = file.metadata()?;
 
         // check the magic
         {
             let mut bytes = [0u8; 2];
-            file.seek(SeekFrom::Start(0)).await?;
-            let size = file.read_exact(&mut bytes).await?;
-            if size < 2 || bytes != VERSION_1_MAGIC {
+            file.seek(SeekFrom::Start(0))?;
+            file.read_exact(&mut bytes)?;
+            if bytes != VERSION_1_MAGIC {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
@@ -136,7 +131,7 @@ impl Segment {
         info!("Opened segment {}", filename);
 
         Ok(Segment {
-            file: BufWriter::new(file),
+            writer: BufWriter::new(file),
             path: path.as_ref().to_path_buf(),
             write_pos: meta.len() as usize,
             base_offset,
@@ -153,7 +148,7 @@ impl Segment {
         self.base_offset
     }
 
-    pub async fn append<T: MessageSet>(
+    pub fn append<T: MessageSet>(
         &mut self,
         payload: &T,
     ) -> Result<AppendMetadata, SegmentAppendError> {
@@ -167,7 +162,7 @@ impl Segment {
             starting_position: self.write_pos,
         };
 
-        self.file.write_all(payload.bytes()).await?;
+        self.writer.write_all(payload.bytes())?;
         self.write_pos += payload_len;
         Ok(meta)
     }
@@ -177,36 +172,35 @@ impl Segment {
     //     self.file.sync_all()
     // }
 
-    pub async fn flush(&mut self) -> tokio::io::Result<()> {
-        self.file.flush().await?;
-        self.file.get_ref().sync_all().await?;
+    pub fn flush(&mut self) -> tokio::io::Result<()> {
+        self.writer.flush()?;
+        self.writer.get_ref().sync_all()?;
         Ok(())
     }
 
-    pub async fn read_slice<T: LogSliceReader>(
+    pub fn read_slice<T: LogSliceReader>(
         &mut self,
         reader: &mut T,
         file_pos: u32,
         bytes: u32,
     ) -> Result<T::Result, MessageError> {
-        reader
-            .read_from(&mut self.file, file_pos, bytes as usize)
-            .await
+        self.writer.flush()?;
+        reader.read_from(self.writer.get_ref(), file_pos, bytes as usize)
     }
 
     /// Removes the segment file.
-    pub async fn remove(self) -> io::Result<()> {
+    pub fn remove(self) -> io::Result<()> {
         let path = self.path.clone();
         drop(self);
 
         info!("Removing segment file {}", path.display());
-        fs::remove_file(path).await
+        fs::remove_file(path)
     }
 
     /// Truncates the segment file to desired length. Other methods should
     /// ensure that the truncation is at the message boundary.
-    pub async fn truncate(&mut self, length: u32) -> io::Result<()> {
-        self.file.get_mut().set_len(length as u64).await?;
+    pub fn truncate(&mut self, length: u32) -> io::Result<()> {
+        self.writer.get_ref().set_len(length as u64)?;
         self.write_pos = length as usize;
         Ok(())
     }
@@ -222,15 +216,15 @@ mod tests {
     };
     use std::{fs, path::PathBuf};
 
-    #[tokio::test]
-    pub async fn log_append() {
+    #[test]
+    pub fn log_append() {
         let path = TestDir::new();
-        let mut f = Segment::new(path, 0, 1024).await.unwrap();
+        let mut f = Segment::new(path, 0, 1024).unwrap();
 
         {
             let mut buf = MessageBuf::default();
             buf.push("12345").unwrap();
-            let meta = f.append(&mut buf).await.unwrap();
+            let meta = f.append(&mut buf).unwrap();
             assert_eq!(2, meta.starting_position);
         }
 
@@ -238,7 +232,7 @@ mod tests {
             let mut buf = MessageBuf::default();
             buf.push("66666").unwrap();
             buf.push("77777").unwrap();
-            let meta = f.append(&mut buf).await.unwrap();
+            let meta = f.append(&mut buf).unwrap();
             assert_eq!(27, meta.starting_position);
 
             let mut it = buf.iter();
@@ -249,20 +243,20 @@ mod tests {
             assert_eq!(p1.total_bytes(), 25);
         }
 
-        f.flush().await.unwrap();
+        f.flush().unwrap();
     }
 
-    #[tokio::test]
-    pub async fn log_open() {
+    #[test]
+    pub fn log_open() {
         let log_dir = TestDir::new();
 
         {
-            let mut f = Segment::new(&log_dir, 0, 1024).await.unwrap();
+            let mut f = Segment::new(&log_dir, 0, 1024).unwrap();
             let mut buf = MessageBuf::default();
             buf.push("12345").unwrap();
             buf.push("66666").unwrap();
-            f.append(&mut buf).await.unwrap();
-            f.flush().await.unwrap();
+            f.append(&mut buf).unwrap();
+            f.flush().unwrap();
         }
 
         // open it
@@ -272,7 +266,7 @@ mod tests {
             path_buf.push(format!("{:020}", 0));
             path_buf.set_extension(SEGMENT_FILE_NAME_EXTENSION);
 
-            let res = Segment::open(&path_buf, 1024).await;
+            let res = Segment::open(&path_buf, 1024);
             assert!(res.is_ok(), "Err {:?}", res.err());
 
             let f = res.unwrap();
@@ -280,10 +274,10 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    pub async fn log_read() {
+    #[test]
+    pub fn log_read() {
         let log_dir = TestDir::new();
-        let mut f = Segment::new(&log_dir, 0, 1024).await.unwrap();
+        let mut f = Segment::new(&log_dir, 0, 1024).unwrap();
 
         {
             let mut buf = MessageBuf::default();
@@ -291,11 +285,11 @@ mod tests {
             buf.push("aaaaaaaaaa").unwrap();
             buf.push("abc").unwrap();
             set_offsets(&mut buf, 0);
-            f.append(&mut buf).await.unwrap();
+            f.append(&mut buf).unwrap();
         }
 
         let mut reader = MessageBufReader;
-        let msgs = f.read_slice(&mut reader, 2, 83).await.unwrap();
+        let msgs = f.read_slice(&mut reader, 2, 83).unwrap();
         assert_eq!(3, msgs.len());
 
         for (i, m) in msgs.iter().enumerate() {
@@ -303,17 +297,17 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    pub async fn log_read_with_size_limit() {
+    #[test]
+    pub fn log_read_with_size_limit() {
         let log_dir = TestDir::new();
-        let mut f = Segment::new(&log_dir, 0, 1024).await.unwrap();
+        let mut f = Segment::new(&log_dir, 0, 1024).unwrap();
 
         let mut buf = MessageBuf::default();
         buf.push("0123456789").unwrap();
         buf.push("aaaaaaaaaa").unwrap();
         buf.push("abc").unwrap();
         set_offsets(&mut buf, 0);
-        let meta = f.append(&mut buf).await.unwrap();
+        let meta = f.append(&mut buf).unwrap();
 
         let second_msg_start = {
             let mut it = buf.iter();
@@ -326,16 +320,15 @@ mod tests {
         let mut reader = MessageBufReader;
         let msgs = f
             .read_slice(&mut reader, 2, second_msg_start as u32 - 2)
-            .await
             .unwrap();
 
         assert_eq!(1, msgs.len());
     }
 
-    #[tokio::test]
-    pub async fn log_read_from_write() {
+    #[test]
+    pub fn log_read_from_write() {
         let log_dir = TestDir::new();
-        let mut f = Segment::new(&log_dir, 0, 1024).await.unwrap();
+        let mut f = Segment::new(&log_dir, 0, 1024).unwrap();
 
         {
             let mut buf = MessageBuf::default();
@@ -343,21 +336,21 @@ mod tests {
             buf.push("aaaaaaaaaa").unwrap();
             buf.push("abc").unwrap();
             set_offsets(&mut buf, 0);
-            f.append(&mut buf).await.unwrap();
+            f.append(&mut buf).unwrap();
         }
 
         let mut reader = MessageBufReader;
-        let msgs = f.read_slice(&mut reader, 2, 83).await.unwrap();
+        let msgs = f.read_slice(&mut reader, 2, 83).unwrap();
         assert_eq!(3, msgs.len());
 
         {
             let mut buf = MessageBuf::default();
             buf.push("foo").unwrap();
             set_offsets(&mut buf, 3);
-            f.append(&mut buf).await.unwrap();
+            f.append(&mut buf).unwrap();
         }
 
-        let msgs = f.read_slice(&mut reader, 2, 106).await.unwrap();
+        let msgs = f.read_slice(&mut reader, 2, 106).unwrap();
         assert_eq!(4, msgs.len());
 
         for (i, m) in msgs.iter().enumerate() {
@@ -365,10 +358,10 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    pub async fn log_remove() {
+    #[test]
+    pub fn log_remove() {
         let log_dir = TestDir::new();
-        let f = Segment::new(&log_dir, 0, 1024).await.unwrap();
+        let f = Segment::new(&log_dir, 0, 1024).unwrap();
 
         let seg_exists = fs::read_dir(&log_dir)
             .unwrap()
@@ -379,7 +372,7 @@ mod tests {
             .is_some();
         assert!(seg_exists, "Segment file does not exist?");
 
-        f.remove().await.unwrap();
+        f.remove().unwrap();
 
         let seg_exists = fs::read_dir(&log_dir)
             .unwrap()
@@ -391,22 +384,21 @@ mod tests {
         assert!(!seg_exists, "Segment file should have been removed");
     }
 
-    #[tokio::test]
-    pub async fn log_truncate() {
+    #[test]
+    pub fn log_truncate() {
         let log_dir = TestDir::new();
-        let mut f = Segment::new(&log_dir, 0, 1024).await.unwrap();
+        let mut f = Segment::new(&log_dir, 0, 1024).unwrap();
 
         let mut buf = MessageBuf::default();
         buf.push("0123456789").unwrap();
         buf.push("aaaaaaaaaa").unwrap();
         buf.push("abc").unwrap();
         set_offsets(&mut buf, 0);
-        let meta = f.append(&mut buf).await.unwrap();
+        let meta = f.append(&mut buf).unwrap();
 
         let mut reader = MessageBufReader;
         let msg_buf = f
             .read_slice(&mut reader, 2, f.size() as u32 - 2)
-            .await
             .expect("Read after first append failed");
         assert_eq!(3, msg_buf.len());
 
@@ -419,7 +411,7 @@ mod tests {
         };
 
         // truncate to first message
-        f.truncate(second_msg_start as u32).await.unwrap();
+        f.truncate(second_msg_start as u32).unwrap();
 
         assert_eq!(second_msg_start, f.size());
 
@@ -430,11 +422,11 @@ mod tests {
             let mut buf = MessageBuf::default();
             buf.push("zzzzzzzzzz").unwrap();
             set_offsets(&mut buf, 1);
-            f.append(&mut buf).await.unwrap()
+            f.append(&mut buf).unwrap()
         };
         assert_eq!(second_msg_start, meta2.starting_position);
 
-        f.flush().await.unwrap();
+        f.flush().unwrap();
         let size = fs::metadata(&f.path).unwrap().len();
         assert_eq!(f.size() as u64, size);
 
@@ -442,7 +434,6 @@ mod tests {
         let mut reader = MessageBufReader;
         let msg_buf = f
             .read_slice(&mut reader, 2, f.size() as u32 - 2)
-            .await
             .expect("Read after second append failed");
         assert_eq!(2, msg_buf.len());
     }

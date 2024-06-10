@@ -12,517 +12,517 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create a client connection to the EventStore service
     let mut client = EventStoreClient::connect("http://[::1]:50051").await?;
 
-    let start = Instant::now();
-    for _ in 0..10_000 {
-        let request = Request::new(AppendToStreamRequest {
-            stream_id: "remote".to_string(),
-            expected_version: None,
-            events: vec![
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-                NewEvent {
-                    event_name: "OogaBooga".to_string(),
-                    event_data: vec![],
-                    metadata: vec![],
-                },
-            ],
-        });
-        client.append_to_stream(request).await?;
-    }
-    println!("{} ms", start.elapsed().as_millis());
+    // let start = Instant::now();
+    // for _ in 0..10_000 {
+    //     let request = Request::new(AppendToStreamRequest {
+    //         stream_id: "remote".to_string(),
+    //         expected_version: None,
+    //         events: vec![
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //             NewEvent {
+    //                 event_name: "OogaBooga".to_string(),
+    //                 event_data: vec![],
+    //                 metadata: vec![],
+    //             },
+    //         ],
+    //     });
+    //     client.append_to_stream(request).await?;
+    // }
+    // println!("{} ms", start.elapsed().as_millis());
 
     // Create a subscribe request
     let request = Request::new(SubscribeRequest {
