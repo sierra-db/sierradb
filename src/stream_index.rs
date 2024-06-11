@@ -1,11 +1,10 @@
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::mem;
 use std::path::{Path, PathBuf};
+use std::{io, mem};
 
-use log::info;
 use memmap2::MmapMut;
-use tokio::io;
+use tracing::{debug, info};
 use twox_hash::Xxh3Hash64;
 
 use crate::Offset;
@@ -165,6 +164,8 @@ impl StreamIndex {
         let next_value_offset =
             Self::load_next_value_offset(max_entries, &data)?.unwrap_or_default();
 
+        debug!(%filename, "opening stream index");
+
         Ok(Self {
             data,
             path,
@@ -266,45 +267,29 @@ impl StreamIndex {
     /// # Returns
     ///
     /// * `io::Result<Vec<u64>>` - A result containing the list of values or an I/O error.
-    pub fn get(&self, key: &str) -> io::Result<Vec<u64>> {
+    pub fn get(&self, key: &str) -> Vec<u64> {
+        self.iter(key).collect()
+    }
+
+    /// Iterates offsets for a given key.
+    pub fn iter(&self, key: &str) -> StreamIndexIter<'_> {
         assert!(key.len() <= KEY_SIZE, "Key length exceeds limit");
         assert!(!key.is_empty(), "Empty keys are not supported");
 
+        let mut value_offset = 0;
+
         if let Some(offset) = self.find_key_offset(key) {
-            let value_head_offset = u64::from_ne_bytes(
+            value_offset = u64::from_ne_bytes(
                 self.data[offset + HEAD_OFFSET..offset + HEAD_OFFSET + HEAD_SIZE]
                     .try_into()
                     .unwrap(),
-            );
-
-            let mut values = Vec::new();
-            let mut value_offset = value_head_offset as usize;
-
-            loop {
-                let stored_value = u64::from_ne_bytes(
-                    self.data[value_offset..value_offset + OFFSET_SIZE]
-                        .try_into()
-                        .unwrap(),
-                );
-                if stored_value == 0 {
-                    break; // Skip invalid or cleared entries
-                }
-                values.push(stored_value - 1);
-                value_offset = u64::from_ne_bytes(
-                    self.data[value_offset + OFFSET_SIZE..value_offset + OFFSET_SIZE + OFFSET_SIZE]
-                        .try_into()
-                        .unwrap(),
-                ) as usize;
-
-                if value_offset == 0 {
-                    break;
-                }
-            }
-
-            return Ok(values);
+            ) as usize;
         }
 
-        Ok(vec![])
+        StreamIndexIter {
+            data: &self.data,
+            value_offset,
+        }
     }
 
     pub fn last(&self, key: &str) -> io::Result<Option<u64>> {
@@ -581,6 +566,38 @@ impl StreamIndex {
     }
 }
 
+pub struct StreamIndexIter<'a> {
+    data: &'a MmapMut,
+    value_offset: usize,
+}
+
+impl<'a> Iterator for StreamIndexIter<'a> {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.value_offset == 0 {
+            return None;
+        }
+
+        let stored_value = u64::from_ne_bytes(
+            self.data[self.value_offset..self.value_offset + OFFSET_SIZE]
+                .try_into()
+                .unwrap(),
+        );
+        if stored_value == 0 {
+            return None; // Skip invalid or cleared entries
+        }
+        self.value_offset = u64::from_ne_bytes(
+            self.data
+                [self.value_offset + OFFSET_SIZE..self.value_offset + OFFSET_SIZE + OFFSET_SIZE]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+
+        Some(stored_value - 1)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::testutil::TestDir;
@@ -648,7 +665,7 @@ mod tests {
         let mut map = setup();
 
         map.insert("key1", 42).expect("Insert failed");
-        let values = map.get("key1").expect("Get failed");
+        let values = map.get("key1");
 
         assert_eq!(values, vec![42]);
     }
@@ -661,7 +678,7 @@ mod tests {
         map.insert("key1", 42).expect("Insert failed");
         map.insert("key1", 96).expect("Insert failed");
 
-        let values = map.get("key1").expect("Get failed");
+        let values = map.get("key1");
 
         assert_eq!(values, vec![28, 42, 96]);
     }
@@ -673,8 +690,8 @@ mod tests {
         map.insert("key1", 42).expect("Insert failed");
         map.insert("key2", 84).expect("Insert failed");
 
-        let values1 = map.get("key1").expect("Get failed");
-        let values2 = map.get("key2").expect("Get failed");
+        let values1 = map.get("key1");
+        let values2 = map.get("key2");
 
         assert_eq!(values1, vec![42]);
         assert_eq!(values2, vec![84]);
@@ -695,9 +712,9 @@ mod tests {
         map.insert(&key2, 84).expect("Insert failed");
         map.insert(&key3, 92).expect("Insert failed");
 
-        let values1 = map.get(&key1).expect("Get failed");
-        let values2 = map.get(&key2).expect("Get failed");
-        let values3 = map.get(&key3).expect("Get failed");
+        let values1 = map.get(&key1);
+        let values2 = map.get(&key2);
+        let values3 = map.get(&key3);
 
         assert_eq!(values1, vec![42]);
         assert_eq!(values2, vec![84]);
@@ -711,7 +728,7 @@ mod tests {
         map.insert("key1", 42).expect("Insert failed");
         map.insert("key1", 84).expect("Insert failed");
 
-        let values = map.get("key1").expect("Get failed");
+        let values = map.get("key1");
 
         assert_eq!(values, vec![42, 84]);
     }
@@ -723,7 +740,7 @@ mod tests {
         let max_key: String = iter::repeat('a').take(KEY_SIZE).collect();
         map.insert(&max_key, 42).expect("Insert failed");
 
-        let values = map.get(&max_key).expect("Get failed");
+        let values = map.get(&max_key);
 
         assert_eq!(values, vec![42]);
     }
@@ -734,7 +751,7 @@ mod tests {
 
         map.insert("key1", 42).expect("Insert failed");
 
-        let values = map.get("non_existent_key").expect("Get failed");
+        let values = map.get("non_existent_key");
 
         assert_eq!(values, vec![]);
     }
@@ -747,14 +764,14 @@ mod tests {
         for i in 0..10 {
             let key = format!("key{}", i);
             map.insert(&key, i as u64).expect("Insert failed");
-            let values = map.get(&key).expect("Get failed");
+            let values = map.get(&key);
             assert_eq!(values, vec![i as u64]);
         }
 
         // Ensure deleted keys are not retrievable
         for i in 0..10 {
             let key = format!("key{}", i);
-            let _ = map.get(&key).expect("Get failed");
+            let _ = map.get(&key);
         }
     }
 
@@ -765,14 +782,14 @@ mod tests {
         map.insert("key1", 42).expect("Insert failed");
         map.insert("key1", 84).expect("Insert failed");
 
-        let values = map.get("key1").expect("Get failed");
+        let values = map.get("key1");
 
         assert_eq!(values, vec![42, 84]);
 
         // Overwrite the value
         map.insert("key1", 100).expect("Insert failed");
 
-        let updated_values = map.get("key1").expect("Get failed");
+        let updated_values = map.get("key1");
 
         assert_eq!(updated_values, vec![42, 84, 100]);
     }
@@ -792,7 +809,7 @@ mod tests {
         // Ensure all entries are retrievable
         for i in 0..max_entries {
             let key = format!("key{}", i);
-            let values = map.get(&key).expect("Get failed");
+            let values = map.get(&key);
             assert_eq!(values, vec![i as u64], "assert failed for key: {key}");
         }
     }
@@ -820,7 +837,7 @@ mod tests {
                 .join(format!("{:020}.{}", 0, STREAM_INDEX_FILE_NAME_EXTENSION)),
         )
         .expect("Failed to create FixedSizeHashMap");
-        assert_eq!(map.get(&key1).unwrap(), vec![42]);
+        assert_eq!(map.get(&key1), vec![42]);
 
         assert_eq!(map.next_index_offset, next_index_offset);
         assert_eq!(map.next_value_offset, next_value_offset);
@@ -855,7 +872,7 @@ mod tests {
         // Truncate at value 20
         map.truncate(20);
 
-        let values = map.get("key1").expect("Get failed");
+        let values = map.get("key1");
         assert_eq!(
             values,
             vec![10, 20],
@@ -877,8 +894,8 @@ mod tests {
         // Truncate at value 20
         map.truncate(20);
 
-        let values1 = map.get("key1").expect("Get failed");
-        let values2 = map.get("key2").expect("Get failed");
+        let values1 = map.get("key1");
+        let values2 = map.get("key2");
 
         assert_eq!(
             values1,
@@ -907,9 +924,9 @@ mod tests {
         // Truncate at value 20
         map.truncate(20);
 
-        let values1 = map.get(&key1).expect("Get failed");
-        let values2 = map.get(&key2).expect("Get failed");
-        let values3 = map.get(&key3).expect("Get failed");
+        let values1 = map.get(&key1);
+        let values2 = map.get(&key2);
+        let values3 = map.get(&key3);
 
         assert_eq!(
             values1,
@@ -940,8 +957,8 @@ mod tests {
         // Truncate at value 20
         map.truncate(20);
 
-        let values1_after_truncate = map.get("key1").expect("Get failed");
-        let values2_after_truncate = map.get("key2").expect("Get failed");
+        let values1_after_truncate = map.get("key1");
+        let values2_after_truncate = map.get("key2");
 
         // Validate values after truncation
         assert_eq!(
@@ -959,8 +976,8 @@ mod tests {
         map.insert("key1", 25).expect("Insert failed");
         map.insert("key2", 35).expect("Insert failed");
 
-        let values1_after_insert = map.get("key1").expect("Get failed");
-        let values2_after_insert = map.get("key2").expect("Get failed");
+        let values1_after_insert = map.get("key1");
+        let values2_after_insert = map.get("key2");
 
         // Validate values after re-insertion
         assert_eq!(
@@ -987,7 +1004,7 @@ mod tests {
         // Truncate at value 30 (boundary case)
         map.truncate(30);
 
-        let values = map.get("key1").expect("Get failed");
+        let values = map.get("key1");
         assert_eq!(
             values,
             vec![10, 20, 30],
@@ -1006,7 +1023,7 @@ mod tests {
         // Truncate at value 30 (no values should be removed)
         map.truncate(30);
 
-        let values = map.get("key1").expect("Get failed");
+        let values = map.get("key1");
         assert_eq!(
             values,
             vec![10, 20],

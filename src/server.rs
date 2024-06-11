@@ -1,4 +1,5 @@
-use futures::stream::{self, BoxStream};
+use async_stream::stream;
+use futures::stream::BoxStream;
 use futures::StreamExt;
 use kameo::actor::ActorRef;
 use kameo::error::SendError;
@@ -150,7 +151,7 @@ impl DefaultEventStoreServer {
 
 #[tonic::async_trait]
 impl EventStore for DefaultEventStoreServer {
-    type GetStreamEventsStream = BoxStream<'static, Result<Event, Status>>;
+    type GetStreamEventsStream = BoxStream<'static, Result<EventBatch, Status>>;
     type SubscribeStream = BoxStream<'static, Result<EventBatch, Status>>;
 
     async fn append_to_stream(
@@ -187,20 +188,35 @@ impl EventStore for DefaultEventStoreServer {
         request: Request<GetStreamEventsRequest>,
     ) -> Result<Response<Self::GetStreamEventsStream>, Status> {
         let req = request.into_inner();
-        let events = self
-            .log
-            .ask(GetStreamEvents {
-                stream_id: req.stream_id,
-                stream_version: req.stream_version,
-            })
-            .send()
-            .await
-            .map_err_internal()?;
-        let stream = stream::iter(events.into_iter().map(|event| {
-            Event::try_from(event).map_err(|_| Status::internal("invalid timestamp"))
-        }));
 
-        Ok(Response::new(Box::pin(stream)))
+        let log = self.log.clone();
+        let mut stream_version = req.stream_version;
+        let s = stream! {
+            loop {
+                let events = log
+                    .ask(GetStreamEvents {
+                        stream_id: req.stream_id.clone(),
+                        stream_version,
+                        batch_size: req.batch_size as usize,
+                    })
+                    .send()
+                    .await
+                    .map_err_internal()?;
+                if events.is_empty() {
+                    break;
+                }
+
+                stream_version = events.last().unwrap().stream_version + 1;
+
+                let batch = events.into_iter().map(|event| {
+                    Event::try_from(event).map_err(|_| Status::internal("invalid timestamp"))
+                }).collect::<Result<_, _>>().map(|events| EventBatch { events });
+
+                yield batch;
+            }
+        };
+
+        Ok(Response::new(Box::pin(s)))
     }
 
     async fn subscribe(

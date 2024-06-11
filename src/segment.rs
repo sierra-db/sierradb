@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use log::info;
+use tracing::{debug, info};
 
 use crate::{
     message::{MessageError, MessageSet},
@@ -128,7 +128,7 @@ impl Segment {
             }
         }
 
-        info!("Opened segment {}", filename);
+        debug!(%filename, "opening segment");
 
         Ok(Segment {
             writer: BufWriter::new(file),
@@ -172,19 +172,22 @@ impl Segment {
     //     self.file.sync_all()
     // }
 
-    pub fn flush(&mut self) -> tokio::io::Result<()> {
+    pub fn flush(&mut self) -> io::Result<()> {
         self.writer.flush()?;
         self.writer.get_ref().sync_all()?;
         Ok(())
     }
 
+    pub fn flush_writer(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+
     pub fn read_slice<T: LogSliceReader>(
-        &mut self,
+        &self,
         reader: &mut T,
         file_pos: u32,
         bytes: u32,
     ) -> Result<T::Result, MessageError> {
-        self.writer.flush()?;
         reader.read_from(self.writer.get_ref(), file_pos, bytes as usize)
     }
 

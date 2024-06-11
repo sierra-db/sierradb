@@ -42,13 +42,14 @@
 //! ```
 
 pub mod actor;
+pub mod cli;
 mod file_set;
 mod index;
 pub mod message;
 pub mod reader;
 mod segment;
 pub mod server;
-mod stream_index;
+pub mod stream_index;
 mod subscription_store;
 
 #[cfg(test)]
@@ -60,20 +61,18 @@ use std::{
     iter::{DoubleEndedIterator, ExactSizeIterator},
     mem,
     path::{Path, PathBuf},
-    time::Instant,
 };
 
 use chrono::{DateTime, Utc};
-use index::{IndexBuf, RangeFindError, INDEX_ENTRY_BYTES};
-use log::{info, trace};
-use serde::{Deserialize, Serialize};
-
 use file_set::{FileSet, SegmentSet};
+use index::{IndexBuf, RangeFindError, INDEX_ENTRY_BYTES};
 use message::{MessageBuf, MessageError, MessageSet, MessageSetMut};
 use reader::{LogSliceReader, MessageBufReader};
 use segment::SegmentAppendError;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::broadcast;
+use tracing::{debug, info, trace};
 
 #[cfg(feature = "internals")]
 pub use crate::{index::Index, index::IndexBuf, segment::Segment, stream_index::StreamIndex};
@@ -321,7 +320,10 @@ impl CommitLog {
         let conn = subscription_store::setup_db(&opts.log_dir)
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
 
-        info!("Opening log in directory {:?}", &opts.log_dir.to_str());
+        debug!(
+            "opening log in directory {:?}",
+            &opts.log_dir.to_str().unwrap_or_default()
+        );
 
         let fs = FileSet::load_log(opts)?;
         Ok(CommitLog {
@@ -474,6 +476,7 @@ impl CommitLog {
             }
             Err(SegmentAppendError::IoError(err)) => return Err(AppendError::Io(err)),
         };
+        self.file_set.active_segment_mut().flush_writer()?;
 
         // write to the index
         {
@@ -557,47 +560,29 @@ impl CommitLog {
         Ok(Some(event))
     }
 
-    pub fn read_stream(
-        &mut self,
-        stream_name: &str,
-        stream_version: u64,
-    ) -> Result<Vec<Event<'static>>, ReadError> {
-        // Iterate stream indexes
-        let mut offsets: Vec<_> = self
+    pub fn read_stream<'a>(
+        &'a self,
+        stream_name: &'a str,
+        stream_version_start: u64,
+    ) -> ReadStreamIter<'a, impl Iterator<Item = u64> + 'a> {
+        let stream_index_iter = self
             .file_set
             .closed()
             .values()
-            .filter(|SegmentSet { stream_index, .. }| {
-                stream_index.starting_offset() >= stream_version
-            })
-            .map(|SegmentSet { stream_index, .. }| stream_index.get(stream_name))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .flatten()
-            .collect();
-        offsets.extend_from_slice(&self.file_set.active_stream_index().get(stream_name)?);
+            .flat_map(|SegmentSet { stream_index, .. }| stream_index.iter(stream_name))
+            .chain(self.file_set.active_stream_index().iter(stream_name))
+            .skip(stream_version_start as usize);
 
-        let mut log = Vec::with_capacity(offsets.len());
-        for offset in offsets {
-            let event = self.read(offset, ReadLimit::default())?.into_iter().next();
-            if let Some(event) = event {
-                if event.stream_version >= stream_version {
-                    log.push(event);
-                }
-            }
+        ReadStreamIter {
+            commitlog: self,
+            stream_index_iter,
         }
-
-        Ok(log)
     }
 
     /// Reads a portion of the log, starting with the `start` offset, inclusive,
     /// up to the limit.
     #[inline]
-    pub fn read(
-        &mut self,
-        start: Offset,
-        limit: ReadLimit,
-    ) -> Result<Vec<Event<'static>>, ReadError> {
+    pub fn read(&self, start: Offset, limit: ReadLimit) -> Result<Vec<Event<'static>>, ReadError> {
         let mut rd = MessageBufReader;
         match self.reader(&mut rd, start, limit)? {
             Some(buf) => buf
@@ -611,7 +596,7 @@ impl CommitLog {
     /// Reads a portion of the log, starting with the `start` offset, inclusive,
     /// up to the limit via the reader.
     pub fn reader<R: LogSliceReader>(
-        &mut self,
+        &self,
         reader: &mut R,
         mut start: Offset,
         limit: ReadLimit,
@@ -686,6 +671,7 @@ impl CommitLog {
         if self.unflushed.is_empty() {
             return Ok(());
         }
+        info!("flushing {} events", self.unflushed.len());
         self.file_set.active_index_mut().flush()?;
         self.file_set.active_stream_index_mut().flush()?;
         self.file_set.active_segment_mut().flush()?; // After this line, the events are considered as persisted.
@@ -828,30 +814,25 @@ impl fmt::Display for CurrentVersion {
     }
 }
 
-// impl<'a, T> AsRef<EventRef<'a, T>> for Event<T> {
-//     fn as_ref(&self) -> &EventRef<'a, T> {
-//         &EventRef {
-//             id: self.id,
-//             stream_id: &self.stream_id,
-//             stream_version: self.stream_version,
-//             event_name: &self.event_name,
-//             event_data: &self.event_data,
-//             metadata: &self.metadata,
-//             timestamp: self.timestamp,
-//         }
-//     }
-// }
+pub struct ReadStreamIter<'a, I> {
+    commitlog: &'a CommitLog,
+    stream_index_iter: I,
+}
 
-// #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-// pub struct EventRef<'a, T> {
-//     pub id: u64,
-//     pub stream_id: &'a str,
-//     pub stream_version: u64,
-//     pub event_name: &'a str,
-//     pub event_data: &'a T,
-//     pub metadata: &'a [u8],
-//     pub timestamp: DateTime<Utc>,
-// }
+impl<'a, I> Iterator for ReadStreamIter<'a, I>
+where
+    I: Iterator<Item = u64>,
+{
+    type Item = Result<Event<'static>, ReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let offset = self.stream_index_iter.next()?;
+        self.commitlog
+            .read(offset, ReadLimit::default())
+            .map(|read| read.into_iter().next())
+            .transpose()
+    }
+}
 
 #[cfg(test)]
 mod tests {

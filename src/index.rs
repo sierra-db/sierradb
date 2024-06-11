@@ -6,8 +6,8 @@ use std::{
     u64, usize,
 };
 
-use log::{info, trace, warn};
 use memmap2::MmapMut;
+use tracing::{debug, info, trace, warn};
 
 use super::Offset;
 
@@ -233,9 +233,9 @@ impl Index {
             }
         };
 
-        info!(
-            "Opening index {}, next write pos {}, mode {:?}",
-            filename, next_write_pos, mode
+        debug!(
+            %filename, %next_write_pos, ?mode,
+            "opening index",
         );
 
         Ok(Index {

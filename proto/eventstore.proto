@@ -41,6 +41,7 @@ message ExpectedVersion {
 message GetStreamEventsRequest {
     string stream_id = 1;
     uint64 stream_version = 2;
+    uint32 batch_size = 3;
 }
 
 // Subscribe
@@ -64,7 +65,7 @@ message AcknowledgeRequest {
 // Service
 service EventStore {
     rpc AppendToStream(AppendToStreamRequest) returns (google.protobuf.Empty);
-    rpc GetStreamEvents(GetStreamEventsRequest) returns (stream Event);
+    rpc GetStreamEvents(GetStreamEventsRequest) returns (stream EventBatch);
     rpc Subscribe(SubscribeRequest) returns (stream EventBatch);
     rpc Acknowledge(AcknowledgeRequest) returns (google.protobuf.Empty);
 }

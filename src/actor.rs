@@ -8,10 +8,11 @@ use kameo::{
 };
 use tokio::{io, sync::broadcast};
 
-const FLUSH_FREQUENCY_MS: u64 = 100;
+// const FLUSH_FREQUENCY_MS: u64 = 100;
 
 use crate::{
-    AppendError, CommitLog, Event, ExpectedVersion, NewEvent, OffsetRange, ReadError, ReadLimit,
+    cli::ARGS, AppendError, CommitLog, Event, ExpectedVersion, NewEvent, OffsetRange, ReadError,
+    ReadLimit,
 };
 
 impl Actor for CommitLog {
@@ -22,9 +23,15 @@ impl Actor for CommitLog {
     }
 
     async fn on_start(&mut self, actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
-        tokio::task::spawn(async move {
+        // tokio::task::Builder::new()
+        //     .name("flusher")
+        tokio::spawn(async move {
+            let flush_interval = ARGS
+                .get()
+                .map(|args| args.flush_interval)
+                .unwrap_or_else(|| Duration::from_millis(100));
             loop {
-                tokio::time::sleep(Duration::from_millis(FLUSH_FREQUENCY_MS)).await;
+                tokio::time::sleep(flush_interval).await;
                 if let Err(_) = actor_ref.tell(Flush).send().await {
                     return;
                 }
@@ -67,6 +74,7 @@ impl Message<AppendToStream> for CommitLog {
 pub struct GetStreamEvents {
     pub stream_id: String,
     pub stream_version: u64,
+    pub batch_size: usize,
 }
 
 impl Message<GetStreamEvents> for CommitLog {
@@ -78,6 +86,8 @@ impl Message<GetStreamEvents> for CommitLog {
         _ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
         self.read_stream(&msg.stream_id, msg.stream_version)
+            .take(msg.batch_size)
+            .collect()
     }
 }
 

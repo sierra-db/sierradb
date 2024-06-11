@@ -1,9 +1,10 @@
-use log::{error, info, trace, warn};
 use std::collections::BTreeMap;
 use std::{
     fs, io,
     mem::{replace, swap},
 };
+
+use tracing::{debug, error, info, trace, warn};
 
 use crate::stream_index::{StreamIndex, STREAM_INDEX_FILE_NAME_EXTENSION};
 
@@ -117,11 +118,11 @@ impl FileSet {
         let last_entry = closed.keys().next_back().cloned();
         let mut active = match last_entry {
             Some(off) => {
-                info!("Reusing index and segment starting at offset {}", off);
+                debug!("reusing index and segment starting at offset {}", off);
                 closed.remove(&off).unwrap()
             }
             None => {
-                info!("Starting new index and segment at offset 0");
+                debug!("starting new index and segment at offset 0");
                 SegmentSet::new(&opts, 0)?
             }
         };
@@ -163,18 +164,18 @@ impl FileSet {
         &self.active.stream_index
     }
 
-    pub fn find(&mut self, offset: u64) -> &mut SegmentSet {
+    pub fn find(&self, offset: u64) -> &SegmentSet {
         let active_seg_start_off = self.active.segment.starting_offset();
         if offset < active_seg_start_off {
             trace!(
                 "Index is contained in the active index for offset {}",
                 offset
             );
-            if let Some(entry) = self.closed.range_mut(..=offset).next_back().map(|p| p.1) {
+            if let Some(entry) = self.closed.range(..=offset).next_back().map(|p| p.1) {
                 return entry;
             }
         }
-        &mut self.active
+        &self.active
     }
 
     pub fn roll_segment(&mut self) -> io::Result<()> {
