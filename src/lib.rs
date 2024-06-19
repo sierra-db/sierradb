@@ -339,6 +339,7 @@ impl CommitLog {
         stream_id: impl Into<String>,
         expected_version: ExpectedVersion,
         events: Vec<NewEvent<'static>>,
+        timestamp: DateTime<Utc>,
     ) -> Result<OffsetRange, AppendError> {
         let mut offsets = OffsetRange(0, 0);
 
@@ -359,7 +360,8 @@ impl CommitLog {
                 CurrentVersion::Current(n) => n + 1 + i,
                 CurrentVersion::NoStream => i,
             };
-            let offset = self.append_to_stream_single(stream_id.clone(), stream_version, event)?;
+            let offset =
+                self.append_to_stream_single(stream_id.clone(), stream_version, event, timestamp)?;
             if offsets.is_empty() {
                 offsets = OffsetRange(offset, 1);
             } else {
@@ -376,6 +378,7 @@ impl CommitLog {
         stream_id: String,
         stream_version: u64,
         event: NewEvent<'static>,
+        timestamp: DateTime<Utc>,
     ) -> Result<Offset, AppendError> {
         let id = self.file_set.active_index_mut().next_offset();
         let event = Event {
@@ -385,7 +388,7 @@ impl CommitLog {
             event_name: Cow::Owned(event.event_name.into_owned()),
             event_data: Cow::Owned(event.event_data.into_owned()),
             metadata: Cow::Owned(event.metadata.into_owned()),
-            timestamp: Utc::now(),
+            timestamp,
         };
         let bytes = rmp_serde::to_vec(&event)?;
         let mut buf = MessageBuf::default();

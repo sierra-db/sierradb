@@ -1,4 +1,5 @@
 use async_stream::stream;
+use chrono::Timelike;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use kameo::actor::ActorRef;
@@ -19,7 +20,7 @@ use crate::actor::{
 use crate::{AppendError, CommitLog, ReadLimit};
 
 use self::eventstore::subscribe_request::StartFrom;
-use self::eventstore::EventBatch;
+use self::eventstore::{AppendToStreamResponse, EventBatch};
 
 const BATCH_SIZE: usize = 65_536; // 65KB
 
@@ -157,7 +158,7 @@ impl EventStore for DefaultEventStoreServer {
     async fn append_to_stream(
         &self,
         request: Request<AppendToStreamRequest>,
-    ) -> Result<Response<()>, Status> {
+    ) -> Result<Response<AppendToStreamResponse>, Status> {
         let req = request.into_inner();
         let res = self
             .log
@@ -172,7 +173,13 @@ impl EventStore for DefaultEventStoreServer {
             .send()
             .await;
         match res {
-            Ok(_) => Ok(Response::new(())),
+            Ok((offset, timestamp)) => Ok(Response::new(AppendToStreamResponse {
+                first_id: offset.first(),
+                timestamp: Some(prost_types::Timestamp {
+                    seconds: timestamp.timestamp(),
+                    nanos: timestamp.nanosecond().try_into().unwrap(),
+                }),
+            })),
             Err(SendError::HandlerError(AppendError::MessageSizeExceeded)) => {
                 Err(Status::failed_precondition("message size exceeded"))
             }

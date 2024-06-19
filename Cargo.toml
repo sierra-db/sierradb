@@ -16,7 +16,6 @@ internals = []
 
 [dependencies]
 async-stream = "0.3.5"
-bincode = "1.3.3"
 bytes = "1"
 chrono = { version = "0.4.38", features = ["serde"] }
 clap = { version = "4.5.7", features = ["derive", "env"] }

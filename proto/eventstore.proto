@@ -37,6 +37,11 @@ message ExpectedVersion {
     }
 }
 
+message AppendToStreamResponse {
+    uint64 first_id = 1;
+    google.protobuf.Timestamp timestamp = 2;
+}
+
 // Get Stream Events
 message GetStreamEventsRequest {
     string stream_id = 1;
@@ -64,7 +69,7 @@ message AcknowledgeRequest {
 
 // Service
 service EventStore {
-    rpc AppendToStream(AppendToStreamRequest) returns (google.protobuf.Empty);
+    rpc AppendToStream(AppendToStreamRequest) returns (AppendToStreamResponse);
     rpc GetStreamEvents(GetStreamEventsRequest) returns (stream EventBatch);
     rpc Subscribe(SubscribeRequest) returns (stream EventBatch);
     rpc Acknowledge(AcknowledgeRequest) returns (google.protobuf.Empty);

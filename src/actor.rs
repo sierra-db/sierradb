@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use kameo::{
     actor::{ActorRef, BoundedMailbox},
     error::BoxError,
@@ -59,15 +60,17 @@ pub struct AppendToStream {
 }
 
 impl Message<AppendToStream> for CommitLog {
-    type Reply = Result<OffsetRange, AppendError>;
+    type Reply = Result<(OffsetRange, DateTime<Utc>), AppendError>;
 
     async fn handle(
         &mut self,
         msg: AppendToStream,
         _ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
-        let offsets = self.append_to_stream(msg.stream_id, msg.expected_version, msg.events)?;
-        Ok(offsets)
+        let timestamp = Utc::now();
+        let offsets =
+            self.append_to_stream(msg.stream_id, msg.expected_version, msg.events, timestamp)?;
+        Ok((offsets, timestamp))
     }
 }
 
