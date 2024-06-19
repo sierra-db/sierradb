@@ -1,15 +1,15 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 
-// use commitlog::{message::MessageBuf, CommitLog, LogOptions};
+// use eventus::{message::MessageBuf, EventLog, LogOptions};
 // use testutil::TestDir;
 
 // mod testutil {
 //     include!("../src/testutil.rs");
 // }
 
-// fn commitlog_append_10000(c: &mut Criterion) {
+// fn append_10000(c: &mut Criterion) {
 //     let dir = TestDir::new();
-//     let mut log = CommitLog::new(LogOptions::new(&dir)).unwrap();
+//     let mut log = EventLog::new(LogOptions::new(&dir)).unwrap();
 
 //     c.bench_function("append 10000", |b| {
 //         b.iter(|| {
@@ -29,9 +29,9 @@ use criterion::{criterion_group, criterion_main, Criterion};
 //     });
 // }
 
-// fn commitlog_append_10000_batched(c: &mut Criterion) {
+// fn append_10000_batched(c: &mut Criterion) {
 //     let dir = TestDir::new();
-//     let mut log = CommitLog::new(LogOptions::new(&dir)).unwrap();
+//     let mut log = EventLog::new(LogOptions::new(&dir)).unwrap();
 
 //     c.bench_function("append 10000 batched", |b| {
 //         b.iter(|| {
@@ -60,7 +60,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 fn foo(_: &mut Criterion) {}
 
 criterion_group!(
-    benches, foo // commitlog_append_10000,
-        // commitlog_append_10000_batched
+    benches, foo // append_10000,
+        // append_10000_batched
 );
 criterion_main!(benches);

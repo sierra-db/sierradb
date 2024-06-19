@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use commitlog::server::eventstore::{
+use eventus::server::eventstore::{
     event_store_client::EventStoreClient, subscribe_request::StartFrom, AcknowledgeRequest,
     AppendToStreamRequest, EventBatch, NewEvent, SubscribeRequest,
 };

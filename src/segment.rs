@@ -41,7 +41,7 @@ pub struct AppendMetadata {
     pub starting_position: usize,
 }
 
-/// A segment is a portion of the commit log. Segments are append-only logs
+/// A segment is a portion of the event log. Segments are append-only logs
 /// written until the maximum size is reached.
 pub struct Segment {
     /// File descriptor

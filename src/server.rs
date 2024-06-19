@@ -17,7 +17,7 @@ use eventstore::{
 use crate::actor::{
     AppendToStream, GetStreamEvents, LoadSubscription, ReadBatch, Subscribe, UpdateSubscription,
 };
-use crate::{AppendError, CommitLog, ReadLimit};
+use crate::{AppendError, EventLog, ReadLimit};
 
 use self::eventstore::subscribe_request::StartFrom;
 use self::eventstore::{AppendToStreamResponse, EventBatch};
@@ -141,11 +141,11 @@ pub mod eventstore {
 
 #[derive(Debug)]
 pub struct DefaultEventStoreServer {
-    log: ActorRef<CommitLog>,
+    log: ActorRef<EventLog>,
 }
 
 impl DefaultEventStoreServer {
-    pub fn new(log: ActorRef<CommitLog>) -> Self {
+    pub fn new(log: ActorRef<EventLog>) -> Self {
         DefaultEventStoreServer { log }
     }
 }

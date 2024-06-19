@@ -12,15 +12,15 @@ use tokio::{io, sync::broadcast};
 // const FLUSH_FREQUENCY_MS: u64 = 100;
 
 use crate::{
-    cli::ARGS, AppendError, CommitLog, Event, ExpectedVersion, NewEvent, OffsetRange, ReadError,
+    cli::ARGS, AppendError, Event, EventLog, ExpectedVersion, NewEvent, OffsetRange, ReadError,
     ReadLimit,
 };
 
-impl Actor for CommitLog {
+impl Actor for EventLog {
     type Mailbox = BoundedMailbox<Self>;
 
     fn name() -> &'static str {
-        "CommitLog"
+        "EventLog"
     }
 
     async fn on_start(&mut self, actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
@@ -45,7 +45,7 @@ impl Actor for CommitLog {
 
 pub struct Flush;
 
-impl Message<Flush> for CommitLog {
+impl Message<Flush> for EventLog {
     type Reply = io::Result<()>;
 
     async fn handle(&mut self, _msg: Flush, _ctx: Context<'_, Self, Self::Reply>) -> Self::Reply {
@@ -59,7 +59,7 @@ pub struct AppendToStream {
     pub events: Vec<NewEvent<'static>>,
 }
 
-impl Message<AppendToStream> for CommitLog {
+impl Message<AppendToStream> for EventLog {
     type Reply = Result<(OffsetRange, DateTime<Utc>), AppendError>;
 
     async fn handle(
@@ -80,7 +80,7 @@ pub struct GetStreamEvents {
     pub batch_size: usize,
 }
 
-impl Message<GetStreamEvents> for CommitLog {
+impl Message<GetStreamEvents> for EventLog {
     type Reply = Result<Vec<Event<'static>>, ReadError>;
 
     async fn handle(
@@ -96,7 +96,7 @@ impl Message<GetStreamEvents> for CommitLog {
 
 pub struct Subscribe;
 
-impl Message<Subscribe> for CommitLog {
+impl Message<Subscribe> for EventLog {
     type Reply = broadcast::Receiver<Vec<Event<'static>>>;
 
     async fn handle(
@@ -112,7 +112,7 @@ pub struct LoadSubscription {
     pub subscriber_id: String,
 }
 
-impl Message<LoadSubscription> for CommitLog {
+impl Message<LoadSubscription> for EventLog {
     type Reply = rusqlite::Result<Option<u64>>;
 
     async fn handle(
@@ -129,7 +129,7 @@ pub struct UpdateSubscription {
     pub last_event_id: u64,
 }
 
-impl Message<UpdateSubscription> for CommitLog {
+impl Message<UpdateSubscription> for EventLog {
     type Reply = rusqlite::Result<()>;
 
     async fn handle(
@@ -146,7 +146,7 @@ pub struct ReadBatch {
     pub read_limit: ReadLimit,
 }
 
-impl Message<ReadBatch> for CommitLog {
+impl Message<ReadBatch> for EventLog {
     type Reply = Result<Vec<Event<'static>>, ReadError>;
 
     async fn handle(

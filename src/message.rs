@@ -355,7 +355,7 @@ pub trait MessageSetMut: MessageSet {
 /// Mutable message buffer.
 ///
 /// The buffer will handle the serialization of the message into the proper
-/// format expected by the `CommitLog`.
+/// format expected by the `EventLog`.
 #[derive(Default)]
 pub struct MessageBuf {
     bytes: Vec<u8>,

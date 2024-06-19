@@ -1,8 +1,8 @@
-use commitlog::{
+use eventus::{
     actor::Flush,
     cli::init_args,
     server::{eventstore::event_store_server::EventStoreServer, DefaultEventStoreServer},
-    CommitLog, LogOptions,
+    EventLog, LogOptions,
 };
 use tokio::signal;
 use tonic::transport::Server;
@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let opts = LogOptions::new(".log");
-    let log = CommitLog::new(opts).unwrap();
+    let log = EventLog::new(opts).unwrap();
 
     let log_actor = kameo::actor::spawn_unsync_in_thread(log);
 

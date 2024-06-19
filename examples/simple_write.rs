@@ -1,4 +1,4 @@
-use commitlog::*;
+use eventus::*;
 use serde::{Deserialize, Serialize};
 use std::time::{self, SystemTime};
 
@@ -13,7 +13,7 @@ async fn main() {
             .as_secs()
     ));
     opts.segment_max_entries(256_000);
-    let mut log = CommitLog::new(opts).unwrap();
+    let mut log = EventLog::new(opts).unwrap();
 
     #[derive(Serialize, Deserialize)]
     struct Event {

@@ -1,5 +1,5 @@
-use commitlog::StreamIndex;
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+use eventus::StreamIndex;
 use testutil::TestDir;
 
 mod testutil {

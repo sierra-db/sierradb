@@ -1,13 +1,13 @@
-//! The commit log is an append-only data structure that can be used in a
+//! The event log is an append-only data structure that can be used in a
 //! variety of use-cases, such as tracking sequences of events, transactions
 //! or replicated state machines.
 //!
-//! This implementation of the commit log data structure uses log segments
+//! This implementation of the event log data structure uses log segments
 //! that roll over at pre-defined maximum size boundaries. The messages appended
 //! to the log have a unique, monotonically increasing offset that can be used
 //! as a pointer to a log entry.
 //!
-//! The index of the commit log logically stores the offset to a position in a
+//! The index of the event log logically stores the offset to a position in a
 //! log segment. The index and segments are separated, in that a
 //! segment file does not necessarily correspond to one particular segment file,
 //! it could contain file pointers to many segment files. In addition, index
@@ -16,14 +16,14 @@
 //! ## Example
 //!
 //! ```rust
-//! use commitlog::*;
-//! use commitlog::message::*;
+//! use eventus::*;
+//! use eventus::message::*;
 //!
 //! #[tokio::main]
 //! fn main() {
 //!     // open a directory called 'log' for segment and index storage
 //!     let opts = LogOptions::new("log");
-//!     let mut log = CommitLog::new(opts).unwrap();
+//!     let mut log = EventLog::new(opts).unwrap();
 //!
 //!     // append to the log
 //!     log.append_msg("my_stream", "hello world").unwrap(); // offset 0
@@ -153,7 +153,7 @@ impl DoubleEndedIterator for OffsetRangeIter {
     }
 }
 
-/// Error enum for commit log Append operation.
+/// Error enum for event log Append operation.
 #[derive(Error, Debug)]
 pub enum AppendError {
     /// The underlying file operations failed during the append attempt.
@@ -189,7 +189,7 @@ pub enum AppendError {
     },
 }
 
-/// Error enum for commit log read operation.
+/// Error enum for event log read operation.
 #[derive(Error, Debug)]
 pub enum ReadError {
     /// Underlying IO error encountered by reading from the log
@@ -244,8 +244,7 @@ impl From<RangeFindError> for ReadError {
     }
 }
 
-/// Commit log options allow customization of the commit
-/// log behavior.
+/// Event log options allow customization of the event log behavior.
 #[derive(Clone, Debug)]
 pub struct LogOptions {
     log_dir: PathBuf,
@@ -305,17 +304,17 @@ impl LogOptions {
     }
 }
 
-/// The commit log is an append-only sequence of messages.
-pub struct CommitLog {
+/// The event log is an append-only sequence of messages.
+pub struct EventLog {
     file_set: FileSet,
     unflushed: Vec<Event<'static>>,
     broadcaster: broadcast::Sender<Vec<Event<'static>>>,
     conn: rusqlite::Connection,
 }
 
-impl CommitLog {
-    /// Creates or opens an existing commit log.
-    pub fn new(opts: LogOptions) -> io::Result<CommitLog> {
+impl EventLog {
+    /// Creates or opens an existing event log.
+    pub fn new(opts: LogOptions) -> io::Result<EventLog> {
         let _ = fs::create_dir_all(&opts.log_dir);
         let conn = subscription_store::setup_db(&opts.log_dir)
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
@@ -326,7 +325,7 @@ impl CommitLog {
         );
 
         let fs = FileSet::load_log(opts)?;
-        Ok(CommitLog {
+        Ok(EventLog {
             file_set: fs,
             unflushed: Vec::with_capacity(256),
             broadcaster: broadcast::channel(32).0,
@@ -417,7 +416,7 @@ impl CommitLog {
         Ok(res.first())
     }
 
-    /// Appends log entrites to the commit log, returning the offsets appended.
+    /// Appends log entrites to the event log, returning the offsets appended.
     #[inline]
     pub fn append<T>(&mut self, stream_name: &str, buf: &mut T) -> Result<OffsetRange, AppendError>
     where
@@ -428,7 +427,7 @@ impl CommitLog {
         self.append_with_offsets(stream_name, buf)
     }
 
-    /// Appends log entrites to the commit log, returning the offsets appended.
+    /// Appends log entrites to the event log, returning the offsets appended.
     ///
     /// The offsets are expected to already be set within the buffer.
     pub fn append_with_offsets<T>(
@@ -577,7 +576,7 @@ impl CommitLog {
             .skip(stream_version_start as usize);
 
         ReadStreamIter {
-            commitlog: self,
+            log: self,
             stream_index_iter,
         }
     }
@@ -818,7 +817,7 @@ impl fmt::Display for CurrentVersion {
 }
 
 pub struct ReadStreamIter<'a, I> {
-    commitlog: &'a CommitLog,
+    log: &'a EventLog,
     stream_index_iter: I,
 }
 
@@ -830,7 +829,7 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         let offset = self.stream_index_iter.next()?;
-        self.commitlog
+        self.log
             .read(offset, ReadLimit::default())
             .map(|read| read.into_iter().next())
             .transpose()
@@ -858,7 +857,7 @@ mod tests {
     #[test]
     pub fn append() {
         let dir = TestDir::new();
-        let mut log = CommitLog::new(LogOptions::new(&dir)).unwrap();
+        let mut log = EventLog::new(LogOptions::new(&dir)).unwrap();
         assert_eq!(log.append_msg("my_stream", "123456").unwrap(), 0);
         assert_eq!(log.append_msg("my_stream", "abcdefg").unwrap(), 1);
         assert_eq!(log.append_msg("my_stream", "foobarbaz").unwrap(), 2);
@@ -869,7 +868,7 @@ mod tests {
     #[test]
     pub fn append_multiple() {
         let dir = TestDir::new();
-        let mut log = CommitLog::new(LogOptions::new(&dir)).unwrap();
+        let mut log = EventLog::new(LogOptions::new(&dir)).unwrap();
         let mut buf = {
             let mut buf = MessageBuf::default();
             buf.push(b"123456").unwrap();
@@ -890,7 +889,7 @@ mod tests {
         opts.segment_max_bytes(62);
 
         {
-            let mut log = CommitLog::new(opts).unwrap();
+            let mut log = EventLog::new(opts).unwrap();
             // first 2 entries fit (both 30 bytes with encoding)
             log.append_msg("my_stream", "0123456789").unwrap();
             log.append_msg("my_stream", "0123456789").unwrap();
@@ -921,7 +920,7 @@ mod tests {
         let mut opts = LogOptions::new(&dir);
         opts.index_max_items(20);
         opts.segment_max_bytes(1000);
-        let mut log = CommitLog::new(opts).unwrap();
+        let mut log = EventLog::new(opts).unwrap();
 
         for i in 0..100 {
             let s = format!("-data {}", i);
@@ -969,7 +968,7 @@ mod tests {
         opts.segment_max_bytes(1000);
 
         {
-            let mut log = CommitLog::new(opts.clone()).unwrap();
+            let mut log = EventLog::new(opts.clone()).unwrap();
 
             for i in 0..99 {
                 let s = format!("some data {}", i);
@@ -980,7 +979,7 @@ mod tests {
         }
 
         {
-            let mut log = CommitLog::new(opts).unwrap();
+            let mut log = EventLog::new(opts).unwrap();
 
             let active_index_read = log.read(82, ReadLimit::max_bytes(130)).unwrap();
 
@@ -1005,16 +1004,16 @@ mod tests {
         opts.segment_max_bytes(1000);
 
         {
-            let mut log = CommitLog::new(opts.clone()).unwrap();
+            let mut log = EventLog::new(opts.clone()).unwrap();
             log.flush().unwrap();
         }
 
         {
-            CommitLog::new(opts.clone()).expect("Should be able to reopen log without writes");
+            EventLog::new(opts.clone()).expect("Should be able to reopen log without writes");
         }
 
         {
-            CommitLog::new(opts).expect("Should be able to reopen log without writes");
+            EventLog::new(opts).expect("Should be able to reopen log without writes");
         }
     }
 
@@ -1024,12 +1023,12 @@ mod tests {
         let dir = TestDir::new();
         let opts = LogOptions::new(&dir);
         {
-            let mut log = CommitLog::new(opts.clone()).unwrap();
+            let mut log = EventLog::new(opts.clone()).unwrap();
             log.append_msg("my_stream", "Test").unwrap();
             log.flush().unwrap();
         }
         {
-            let log = CommitLog::new(opts).unwrap();
+            let log = EventLog::new(opts).unwrap();
             assert_eq!(1, log.next_offset());
         }
     }
@@ -1037,7 +1036,7 @@ mod tests {
     #[test]
     pub fn append_message_greater_than_max() {
         let dir = TestDir::new();
-        let mut log = CommitLog::new(LogOptions::new(&dir)).unwrap();
+        let mut log = EventLog::new(LogOptions::new(&dir)).unwrap();
         //create vector with 1.2mb of size, u8 = 1 byte thus,
         //1mb = 1000000 bytes, 1200000 items needed
         let mut value = String::new();
@@ -1056,7 +1055,7 @@ mod tests {
     #[test]
     pub fn truncate_from_active() {
         let dir = TestDir::new();
-        let mut log = CommitLog::new(LogOptions::new(&dir)).unwrap();
+        let mut log = EventLog::new(LogOptions::new(&dir)).unwrap();
 
         // append 5 messages
         {
@@ -1083,7 +1082,7 @@ mod tests {
         let mut opts = LogOptions::new(&dir);
         opts.index_max_items(20);
         opts.segment_max_bytes(52);
-        let mut log = CommitLog::new(opts).unwrap();
+        let mut log = EventLog::new(opts).unwrap();
 
         // append 6 messages (4 segments)
         {
@@ -1138,7 +1137,7 @@ mod tests {
         let mut opts = LogOptions::new(&dir);
         opts.index_max_items(20);
         opts.segment_max_bytes(52);
-        let mut log = CommitLog::new(opts).unwrap();
+        let mut log = EventLog::new(opts).unwrap();
 
         // append 6 messages (4 segments)
         {
@@ -1193,7 +1192,7 @@ mod tests {
         let mut opts = LogOptions::new(&dir);
         opts.index_max_items(20);
         opts.segment_max_bytes(52);
-        let mut log = CommitLog::new(opts).unwrap();
+        let mut log = EventLog::new(opts).unwrap();
 
         // append 6 messages (4 segments)
         {
@@ -1254,7 +1253,7 @@ mod tests {
         let mut opts = LogOptions::new(&dir);
         opts.index_max_items(20);
         opts.segment_max_bytes(52);
-        let mut log = CommitLog::new(opts).unwrap();
+        let mut log = EventLog::new(opts).unwrap();
 
         // append 6 messages (4 segments)
         {
@@ -1319,7 +1318,7 @@ mod tests {
         let mut opts = LogOptions::new(&dir);
         opts.index_max_items(20);
         opts.segment_max_bytes(52);
-        let mut log = CommitLog::new(opts).unwrap();
+        let mut log = EventLog::new(opts).unwrap();
 
         // append 6 messages (4 segments)
         {
@@ -1384,7 +1383,7 @@ mod tests {
             let mut opts = LogOptions::new(&dir);
             opts.index_max_items(20);
             opts.segment_max_bytes(52);
-            let mut log = CommitLog::new(opts).unwrap();
+            let mut log = EventLog::new(opts).unwrap();
 
             // append the messages
             {
@@ -1414,7 +1413,7 @@ mod tests {
         let mut opts = LogOptions::new(&dir);
         opts.index_max_items(20);
         opts.segment_max_bytes(52);
-        let mut log = CommitLog::new(opts).unwrap();
+        let mut log = EventLog::new(opts).unwrap();
 
         // append the messages
         {
@@ -1451,7 +1450,7 @@ mod tests {
         let mut opts = LogOptions::new(&dir);
         opts.index_max_items(20);
         opts.segment_max_bytes(52);
-        let mut log = CommitLog::new(opts).unwrap();
+        let mut log = EventLog::new(opts).unwrap();
 
         // append the messages
         {
@@ -1480,7 +1479,7 @@ mod tests {
         let mut opts = LogOptions::new(&dir);
         opts.index_max_items(20);
         opts.segment_max_bytes(52);
-        let mut log = CommitLog::new(opts).unwrap();
+        let mut log = EventLog::new(opts).unwrap();
 
         log.trim_inactive_segments()
             .expect("Unable to truncate file");

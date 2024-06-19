@@ -1,4 +1,4 @@
-use commitlog::{message::*, *};
+use eventus::{message::*, *};
 use std::time::{self, SystemTime};
 
 const BATCH_SIZE: u32 = 200;
@@ -16,7 +16,7 @@ async fn main() {
             .unwrap()
             .as_secs()
     ));
-    let mut log = CommitLog::new(opts).unwrap();
+    let mut log = EventLog::new(opts).unwrap();
 
     let start = SystemTime::now();
     for i in 0..BATCHES {

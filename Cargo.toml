@@ -1,11 +1,11 @@
 [package]
-authors = ["Zack Owens <zowens2009@gmail.com>"]
-homepage = "https://github.com/zowens/commitlog"
+authors = ["Ari Seyhun <ariseyhun@live.com.au>", "Zack Owens <zowens2009@gmail.com>"]
+homepage = "https://github.com/tqwewe/eventus"
 license = "MIT"
-name = "commitlog"
+name = "eventus"
 readme = "README.md"
-repository = "https://github.com/zowens/commitlog"
-description = "Sequential, disk-backed commit log library."
+repository = "https://github.com/tqwewe/eventus"
+description = "Sequential, disk-backed event log library."
 version = "0.2.0"
 edition = "2021"
 

@@ -1,6 +1,6 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 
-use commitlog::{message::MessageBuf, Segment};
+use eventus::{message::MessageBuf, Segment};
 use testutil::TestDir;
 
 mod testutil {

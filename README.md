@@ -1,12 +1,12 @@
-# Commit Log
+# Eventus
 
-Sequential, disk-backed commit log library for Rust. The library can be used in various higher-level distributed abstractions on top of a distributed log such as [Paxos](https://github.com/zowens/paxos-rs), [Chain Replication](https://github.com/zowens/chain-replication) or Raft.
+Sequential, disk-backed event log library for Rust. The library can be used in various higher-level distributed abstractions on top of a distributed log such as [Paxos](https://github.com/zowens/paxos-rs), [Chain Replication](https://github.com/zowens/chain-replication) or Raft.
 
-[![Crates.io](https://img.shields.io/crates/v/commitlog.svg?maxAge=2592000)](https://crates.io/crates/commitlog)
-[![Docs.rs](https://docs.rs/commitlog/badge.svg)](https://docs.rs/commitlog/)
-[![Travis](https://travis-ci.org/zowens/commitlog.svg?branch=master)](https://travis-ci.org/zowens/commitlog/)
+[![Crates.io](https://img.shields.io/crates/v/eventus.svg?maxAge=2592000)](https://crates.io/crates/eventus)
+[![Docs.rs](https://docs.rs/eventus/badge.svg)](https://docs.rs/eventus/)
+[![Travis](https://travis-ci.org/tqwewe/eventus.svg?branch=master)](https://travis-ci.org/tqwewe/eventus/)
 
-[Documentation](https://docs.rs/commitlog/)
+[Documentation](https://docs.rs/eventus/)
 
 ## Usage
 
@@ -14,17 +14,17 @@ First, add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-commitlog = "0.2"
+eventus = "0.2"
 ```
 
 ```rust
-use commitlog::*;
-use commitlog::message::*;
+use eventus::*;
+use eventus::message::*;
 
 fn main() {
     // open a directory called 'log' for segment and index storage
     let opts = LogOptions::new("log");
-    let mut log = CommitLog::new(opts).unwrap();
+    let mut log = EventLog::new(opts).unwrap();
 
     // append to the log
     log.append_msg("my_stream", "hello world").unwrap(); // offset 0
