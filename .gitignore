@@ -3,3 +3,4 @@ Cargo.lock
 .log*
 .DS_Store
 log
+.direnv

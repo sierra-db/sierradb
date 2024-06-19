@@ -1,13 +1,13 @@
-//! The commit log is an append-only data structure that can be used in a
+//! The event log is an append-only data structure that can be used in a
 //! variety of use-cases, such as tracking sequences of events, transactions
 //! or replicated state machines.
 //!
-//! This implementation of the commit log data structure uses log segments
+//! This implementation of the event log data structure uses log segments
 //! that roll over at pre-defined maximum size boundaries. The messages appended
 //! to the log have a unique, monotonically increasing offset that can be used
 //! as a pointer to a log entry.
 //!
-//! The index of the commit log logically stores the offset to a position in a
+//! The index of the event log logically stores the offset to a position in a
 //! log segment. The index and segments are separated, in that a
 //! segment file does not necessarily correspond to one particular segment file,
 //! it could contain file pointers to many segment files. In addition, index
@@ -16,17 +16,18 @@
 //! ## Example
 //!
 //! ```rust
-//! use commitlog::*;
-//! use commitlog::message::*;
+//! use eventus::*;
+//! use eventus::message::*;
 //!
+//! #[tokio::main]
 //! fn main() {
 //!     // open a directory called 'log' for segment and index storage
 //!     let opts = LogOptions::new("log");
-//!     let mut log = CommitLog::new(opts).unwrap();
+//!     let mut log = EventLog::new(opts).unwrap();
 //!
 //!     // append to the log
-//!     log.append_msg("hello world").unwrap(); // offset 0
-//!     log.append_msg("second message").unwrap(); // offset 1
+//!     log.append_msg("my_stream", "hello world").unwrap(); // offset 0
+//!     log.append_msg("my_stream", "second message").unwrap(); // offset 1
 //!
 //!     // read the messages
 //!     let messages = log.read(0, ReadLimit::default()).unwrap();
@@ -40,29 +41,41 @@
 //! }
 //! ```
 
-use log::{info, trace};
-
+pub mod actor;
+pub mod cli;
 mod file_set;
 mod index;
 pub mod message;
 pub mod reader;
 mod segment;
+pub mod server;
+pub mod stream_index;
+mod subscription_store;
+
 #[cfg(test)]
 mod testutil;
 
-use index::*;
-use segment::SegmentAppendError;
 use std::{
-    error, fmt, fs, io,
+    borrow::Cow,
+    fmt, fs, io,
     iter::{DoubleEndedIterator, ExactSizeIterator},
+    mem,
     path::{Path, PathBuf},
 };
 
-#[cfg(feature = "internals")]
-pub use crate::{index::Index, index::IndexBuf, segment::Segment};
-use file_set::FileSet;
+use chrono::{DateTime, Utc};
+use file_set::{FileSet, SegmentSet};
+use index::{IndexBuf, RangeFindError, INDEX_ENTRY_BYTES};
 use message::{MessageBuf, MessageError, MessageSet, MessageSetMut};
 use reader::{LogSliceReader, MessageBufReader};
+use segment::SegmentAppendError;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::sync::broadcast;
+use tracing::{debug, info, trace};
+
+#[cfg(feature = "internals")]
+pub use crate::{index::Index, index::IndexBuf, segment::Segment, stream_index::StreamIndex};
 
 /// Offset of an appended log segment.
 pub type Offset = u64;
@@ -140,78 +153,57 @@ impl DoubleEndedIterator for OffsetRangeIter {
     }
 }
 
-/// Error enum for commit log Append operation.
-#[derive(Debug)]
+/// Error enum for event log Append operation.
+#[derive(Error, Debug)]
 pub enum AppendError {
     /// The underlying file operations failed during the append attempt.
-    Io(io::Error),
+    #[error(transparent)]
+    Io(#[from] io::Error),
     /// A new index was created, but was unable to receive writes
     /// during the append operation. This could point to exhaustion
     /// of machine resources or other I/O issue.
+    #[error("fresh index not writable")]
     FreshIndexNotWritable,
     /// A new segment was created, but was unable to receive writes
     /// during the append operation. This could point to exhaustion
     /// of machine resources or other I/O issue.
+    #[error("fresh segment not writable")]
     FreshSegmentNotWritable,
     /// If a message that is larger than the per message size is tried to be
-    /// appended it will not be allowed an will return an error
+    /// appended it will not be allowed an will return an error.
+    #[error("maximum message size exceeded")]
     MessageSizeExceeded,
-    /// The buffer contains an invalid offset value
+    /// The buffer contains an invalid offset value.
+    #[error("invalid offset")]
     InvalidOffset,
+    #[error(transparent)]
+    ReadError(#[from] ReadError),
+    /// An event failed to serialize.
+    #[error(transparent)]
+    SerializeEvent(#[from] rmp_serde::encode::Error),
+    /// Wrong expected version
+    #[error("current stream position is {current:?} but expected {expected:?}")]
+    WrongExpectedVersion {
+        current: CurrentVersion,
+        expected: ExpectedVersion,
+    },
 }
 
-impl From<io::Error> for AppendError {
-    fn from(e: io::Error) -> AppendError {
-        AppendError::Io(e)
-    }
-}
-
-impl error::Error for AppendError {
-    fn description(&self) -> &str {
-        match *self {
-            AppendError::Io(_) => "File IO error occurred while appending to the log",
-            AppendError::FreshIndexNotWritable => {
-                "While attempting to create a new index, the new index was not writabe"
-            }
-            AppendError::FreshSegmentNotWritable => {
-                "While attempting to create a new segment, the new segment was not writabe"
-            }
-            AppendError::MessageSizeExceeded => {
-                "While attempting to write a message, the per message size was exceeded"
-            }
-            AppendError::InvalidOffset => "Invalid offsets set on buffer of messages",
-        }
-    }
-
-    fn cause(&self) -> Option<&dyn error::Error> {
-        match *self {
-            AppendError::Io(ref e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl fmt::Display for AppendError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            AppendError::Io(_) => write!(f, "IO Error"),
-            AppendError::FreshIndexNotWritable => write!(f, "Fresh index error"),
-            AppendError::FreshSegmentNotWritable => write!(f, "Fresh segment error"),
-            AppendError::MessageSizeExceeded => write!(f, "Message Size exceeded error"),
-            AppendError::InvalidOffset => write!(f, "Invalid offsets set of buffer of messages"),
-        }
-    }
-}
-
-/// Error enum for commit log read operation.
-#[derive(Debug)]
+/// Error enum for event log read operation.
+#[derive(Error, Debug)]
 pub enum ReadError {
     /// Underlying IO error encountered by reading from the log
-    Io(io::Error),
+    #[error("transparent")]
+    Io(#[from] io::Error),
     /// A segment in the log is corrupt, or the index itself is corrupt
+    #[error("Corrupt log")]
     CorruptLog,
     /// Offset supplied was not invalid.
+    #[error("Offset does not exist")]
     NoSuchSegment,
+    /// Failed to deserialize message.
+    #[error(transparent)]
+    Deserialize(#[from] rmp_serde::decode::Error),
 }
 
 /// Batch size limitation on read.
@@ -231,51 +223,18 @@ impl Default for ReadLimit {
     }
 }
 
-impl error::Error for ReadError {
-    fn description(&self) -> &str {
-        match *self {
-            ReadError::Io(_) => "File IO error occurred while reading to the log",
-            ReadError::CorruptLog => "Corrupt log segment has been detected",
-            ReadError::NoSuchSegment => "The offset requested does not exist in the log",
-        }
-    }
-
-    fn cause(&self) -> Option<&dyn error::Error> {
-        match *self {
-            ReadError::Io(ref e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl fmt::Display for ReadError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            ReadError::Io(_) => write!(f, "IO Error"),
-            ReadError::CorruptLog => write!(f, "Corrupt Log Error"),
-            ReadError::NoSuchSegment => write!(f, "Offset does not exist"),
-        }
-    }
-}
-
-impl From<io::Error> for ReadError {
-    fn from(e: io::Error) -> ReadError {
-        ReadError::Io(e)
-    }
-}
-
 impl From<MessageError> for ReadError {
-    fn from(e: MessageError) -> ReadError {
-        match e {
-            MessageError::IoError(e) => ReadError::Io(e),
+    fn from(err: MessageError) -> ReadError {
+        match err {
+            MessageError::IoError(err) => ReadError::Io(err),
             MessageError::InvalidHash | MessageError::InvalidPayloadLength => ReadError::CorruptLog,
         }
     }
 }
 
 impl From<RangeFindError> for ReadError {
-    fn from(e: RangeFindError) -> ReadError {
-        match e {
+    fn from(err: RangeFindError) -> ReadError {
+        match err {
             RangeFindError::OffsetNotAppended => ReadError::NoSuchSegment,
             RangeFindError::MessageExceededMaxBytes => ReadError::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -285,12 +244,12 @@ impl From<RangeFindError> for ReadError {
     }
 }
 
-/// Commit log options allow customization of the commit
-/// log behavior.
+/// Event log options allow customization of the event log behavior.
 #[derive(Clone, Debug)]
 pub struct LogOptions {
     log_dir: PathBuf,
     log_max_bytes: usize,
+    log_max_entries: u64,
     index_max_bytes: usize,
     message_max_bytes: usize,
 }
@@ -299,8 +258,8 @@ impl LogOptions {
     /// Creates minimal log options value with a directory containing the log.
     ///
     /// The default values are:
-    /// - *segment_max_bytes*: 1GB
-    /// - *index_max_entries*: 100,000
+    /// - *segment_max_bytes*: 256MB
+    /// - *index_max_entries*: 800,000
     /// - *message_max_bytes*: 1mb
     pub fn new<P>(log_dir: P) -> LogOptions
     where
@@ -308,7 +267,8 @@ impl LogOptions {
     {
         LogOptions {
             log_dir: log_dir.as_ref().to_owned(),
-            log_max_bytes: 1_000_000_000,
+            log_max_bytes: 256 * 1024 * 1024,
+            log_max_entries: 256_000,
             index_max_bytes: 800_000,
             message_max_bytes: 1_000_000,
         }
@@ -318,6 +278,13 @@ impl LogOptions {
     #[inline]
     pub fn segment_max_bytes(&mut self, bytes: usize) -> &mut LogOptions {
         self.log_max_bytes = bytes;
+        self
+    }
+
+    /// Bounds the size of a log segment to a number of bytes.
+    #[inline]
+    pub fn segment_max_entries(&mut self, entries: u64) -> &mut LogOptions {
+        self.log_max_entries = entries;
         self
     }
 
@@ -337,47 +304,137 @@ impl LogOptions {
     }
 }
 
-/// The commit log is an append-only sequence of messages.
-pub struct CommitLog {
+/// The event log is an append-only sequence of messages.
+pub struct EventLog {
     file_set: FileSet,
+    unflushed: Vec<Event<'static>>,
+    broadcaster: broadcast::Sender<Vec<Event<'static>>>,
+    conn: rusqlite::Connection,
 }
 
-impl CommitLog {
-    /// Creates or opens an existing commit log.
-    pub fn new(opts: LogOptions) -> io::Result<CommitLog> {
-        fs::create_dir_all(&opts.log_dir).unwrap_or(());
+impl EventLog {
+    /// Creates or opens an existing event log.
+    pub fn new(opts: LogOptions) -> io::Result<EventLog> {
+        let _ = fs::create_dir_all(&opts.log_dir);
+        let conn = subscription_store::setup_db(&opts.log_dir)
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
 
-        info!("Opening log in directory {:?}", &opts.log_dir.to_str());
+        debug!(
+            "opening log in directory {:?}",
+            &opts.log_dir.to_str().unwrap_or_default()
+        );
 
         let fs = FileSet::load_log(opts)?;
-        Ok(CommitLog { file_set: fs })
+        Ok(EventLog {
+            file_set: fs,
+            unflushed: Vec::with_capacity(256),
+            broadcaster: broadcast::channel(32).0,
+            conn,
+        })
+    }
+
+    pub fn append_to_stream(
+        &mut self,
+        stream_id: impl Into<String>,
+        expected_version: ExpectedVersion,
+        events: Vec<NewEvent<'static>>,
+        timestamp: DateTime<Utc>,
+    ) -> Result<OffsetRange, AppendError> {
+        let mut offsets = OffsetRange(0, 0);
+
+        if events.is_empty() {
+            return Ok(offsets);
+        }
+
+        let stream_id = stream_id.into();
+        let current_version = match self.read_last_stream_msg(&stream_id)? {
+            Some(event) => CurrentVersion::Current(event.stream_version),
+            None => CurrentVersion::NoStream,
+        };
+        expected_version.validate(current_version)?;
+
+        for (i, event) in events.into_iter().enumerate() {
+            let i = i as u64;
+            let stream_version = match current_version {
+                CurrentVersion::Current(n) => n + 1 + i,
+                CurrentVersion::NoStream => i,
+            };
+            let offset =
+                self.append_to_stream_single(stream_id.clone(), stream_version, event, timestamp)?;
+            if offsets.is_empty() {
+                offsets = OffsetRange(offset, 1);
+            } else {
+                offsets.1 += 1;
+            }
+        }
+
+        Ok(offsets)
+    }
+
+    /// Appends events to the log, returning the offsets appended.
+    fn append_to_stream_single(
+        &mut self,
+        stream_id: String,
+        stream_version: u64,
+        event: NewEvent<'static>,
+        timestamp: DateTime<Utc>,
+    ) -> Result<Offset, AppendError> {
+        let id = self.file_set.active_index_mut().next_offset();
+        let event = Event {
+            id,
+            stream_id: Cow::Owned(stream_id),
+            stream_version,
+            event_name: Cow::Owned(event.event_name.into_owned()),
+            event_data: Cow::Owned(event.event_data.into_owned()),
+            metadata: Cow::Owned(event.metadata.into_owned()),
+            timestamp,
+        };
+        let bytes = rmp_serde::to_vec(&event)?;
+        let mut buf = MessageBuf::default();
+        buf.push(bytes)
+            .expect("Serialized event exceeds usize::MAX");
+        message::set_offsets(&mut buf, id);
+        let res = self.append_with_offsets(&event.stream_id, &buf)?;
+        assert_eq!(res.len(), 1);
+
+        self.unflushed.push(event);
+
+        Ok(res.first())
     }
 
     /// Appends a single message to the log, returning the offset appended.
     #[inline]
-    pub fn append_msg<B: AsRef<[u8]>>(&mut self, payload: B) -> Result<Offset, AppendError> {
+    pub fn append_msg<B: AsRef<[u8]>>(
+        &mut self,
+        stream_name: &str,
+        payload: B,
+    ) -> Result<Offset, AppendError> {
         let mut buf = MessageBuf::default();
         buf.push(payload).expect("Payload size exceeds usize::MAX");
-        let res = self.append(&mut buf)?;
+        let res = self.append(stream_name, &mut buf)?;
         assert_eq!(res.len(), 1);
         Ok(res.first())
     }
 
-    /// Appends log entrites to the commit log, returning the offsets appended.
+    /// Appends log entrites to the event log, returning the offsets appended.
     #[inline]
-    pub fn append<T>(&mut self, buf: &mut T) -> Result<OffsetRange, AppendError>
+    pub fn append<T>(&mut self, stream_name: &str, buf: &mut T) -> Result<OffsetRange, AppendError>
     where
         T: MessageSetMut,
     {
         let start_off = self.file_set.active_index_mut().next_offset();
         message::set_offsets(buf, start_off);
-        self.append_with_offsets(buf)
+        self.append_with_offsets(stream_name, buf)
     }
 
-    /// Appends log entrites to the commit log, returning the offsets appended.
+    /// Appends log entrites to the event log, returning the offsets appended.
     ///
     /// The offsets are expected to already be set within the buffer.
-    pub fn append_with_offsets<T>(&mut self, buf: &T) -> Result<OffsetRange, AppendError>
+    pub fn append_with_offsets<T>(
+        &mut self,
+        stream_name: &str,
+        buf: &T,
+    ) -> Result<OffsetRange, AppendError>
     where
         T: MessageSet,
     {
@@ -386,7 +443,7 @@ impl CommitLog {
             return Ok(OffsetRange(0, 0));
         }
 
-        //Check if given message exceeded the max size
+        // Check if given message exceeded the max size
         if buf.bytes().len() > self.file_set.log_options().message_max_bytes {
             return Err(AppendError::MessageSizeExceeded);
         }
@@ -397,6 +454,13 @@ impl CommitLog {
         // check to make sure the first message matches the starting offset
         if buf.iter().next().unwrap().offset() != start_off {
             return Err(AppendError::InvalidOffset);
+        }
+
+        // Check to make sure we aren't exceeding the log max entries
+        let starting_offset = self.file_set.active_index().starting_offset();
+        let ending_offset = start_off + buf.len() as u64;
+        if ending_offset - starting_offset > self.file_set.log_options().log_max_entries {
+            self.file_set.roll_segment()?;
         }
 
         let meta = match self.file_set.active_segment_mut().append(buf) {
@@ -412,8 +476,9 @@ impl CommitLog {
                     .append(buf)
                     .map_err(|_| AppendError::FreshSegmentNotWritable)?
             }
-            Err(SegmentAppendError::IoError(e)) => return Err(AppendError::Io(e)),
+            Err(SegmentAppendError::IoError(err)) => return Err(AppendError::Io(err)),
         };
+        self.file_set.active_segment_mut().flush_writer()?;
 
         // write to the index
         {
@@ -427,6 +492,14 @@ impl CommitLog {
             }
             // TODO: what happens when this errors out? Do we truncate the log...?
             index.append(index_pos_buf)?;
+        }
+
+        // write to the stream index
+        {
+            let stream_index = self.file_set.active_stream_index_mut();
+            for m in buf.iter() {
+                stream_index.insert(stream_name, m.offset())?;
+            }
         }
 
         Ok(OffsetRange(start_off, buf_len))
@@ -448,14 +521,77 @@ impl CommitLog {
         self.file_set.active_index().next_offset()
     }
 
+    pub fn read_last_stream_msg<'a>(
+        &'a mut self,
+        stream_name: &'a str,
+    ) -> Result<Option<Event>, ReadError> {
+        let Some(last_offset) = self
+            .file_set
+            .active_stream_index()
+            .last(stream_name)?
+            .map(Ok)
+            .or_else(|| {
+                self.file_set.closed().values().rev().find_map(
+                    |SegmentSet { stream_index, .. }| match stream_index.last(stream_name) {
+                        Ok(offset) => Ok(offset).transpose(),
+                        Err(err) => Some(Err(err)),
+                    },
+                )
+            })
+            .transpose()?
+        else {
+            return Ok(None);
+        };
+
+        // if last_offset >= self.file_set.active_index().next_offset() {}
+
+        let events = self.read(last_offset, ReadLimit::default())?;
+        let event = match events.into_iter().next() {
+            Some(event) => event,
+            None => {
+                // In this case the active stream index was flushed before the segment file
+                // (memory mapped files can automatically flush). And so we need to truncate this stream at the next offset - 1.
+                // TODO: ...
+                // Then call read_last_stream_msg again after truncating
+                // todo!();
+                // return self.read_last_stream_msg(stream_name);
+                return Err(ReadError::CorruptLog);
+            }
+        };
+
+        Ok(Some(event))
+    }
+
+    pub fn read_stream<'a>(
+        &'a self,
+        stream_name: &'a str,
+        stream_version_start: u64,
+    ) -> ReadStreamIter<'a, impl Iterator<Item = u64> + 'a> {
+        let stream_index_iter = self
+            .file_set
+            .closed()
+            .values()
+            .flat_map(|SegmentSet { stream_index, .. }| stream_index.iter(stream_name))
+            .chain(self.file_set.active_stream_index().iter(stream_name))
+            .skip(stream_version_start as usize);
+
+        ReadStreamIter {
+            log: self,
+            stream_index_iter,
+        }
+    }
+
     /// Reads a portion of the log, starting with the `start` offset, inclusive,
     /// up to the limit.
     #[inline]
-    pub fn read(&self, start: Offset, limit: ReadLimit) -> Result<MessageBuf, ReadError> {
+    pub fn read(&self, start: Offset, limit: ReadLimit) -> Result<Vec<Event<'static>>, ReadError> {
         let mut rd = MessageBufReader;
         match self.reader(&mut rd, start, limit)? {
-            Some(v) => Ok(v),
-            None => Ok(MessageBuf::default()),
+            Some(buf) => buf
+                .iter()
+                .map(|msg| rmp_serde::from_slice(msg.payload()).map_err(ReadError::Deserialize))
+                .collect(),
+            None => Ok(vec![]),
         }
     }
 
@@ -485,15 +621,15 @@ impl CommitLog {
         let max_bytes = limit.0 as u32;
 
         // find the correct segment
-        let &(ref ind, ref seg) = self.file_set.find(start);
-        let seg_bytes = seg.size() as u32;
+        let SegmentSet { segment, index, .. } = self.file_set.find(start);
+        let seg_bytes = segment.size() as u32;
 
         // grab the range from the contained index
-        let range = ind.find_segment_range(start, max_bytes, seg_bytes)?;
+        let range = index.find_segment_range(start, max_bytes, seg_bytes)?;
         if range.bytes() == 0 {
             Ok(None)
         } else {
-            Ok(Some(seg.read_slice(
+            Ok(Some(segment.read_slice(
                 reader,
                 range.file_position(),
                 range.bytes(),
@@ -534,20 +670,169 @@ impl CommitLog {
 
     /// Forces a flush of the log.
     pub fn flush(&mut self) -> io::Result<()> {
-        self.file_set.active_segment_mut().flush_sync()?;
-        self.file_set.active_index_mut().flush_sync()
+        if self.unflushed.is_empty() {
+            return Ok(());
+        }
+        info!("flushing {} events", self.unflushed.len());
+        self.file_set.active_index_mut().flush()?;
+        self.file_set.active_stream_index_mut().flush()?;
+        self.file_set.active_segment_mut().flush()?; // After this line, the events are considered as persisted.
+        let _ = self.broadcaster.send(mem::take(&mut self.unflushed));
+        assert!(self.unflushed.is_empty());
+        Ok(())
     }
 
-    fn delete_segments(segments: Vec<(Index, segment::Segment)>) -> io::Result<()> {
+    pub fn subscribe(&self) -> broadcast::Receiver<Vec<Event<'static>>> {
+        self.broadcaster.subscribe()
+    }
+
+    fn delete_segments(segments: Vec<SegmentSet>) -> io::Result<()> {
         for p in segments {
             trace!(
                 "Removing segment and index starting at {}",
-                p.0.starting_offset()
+                p.segment.starting_offset()
             );
-            p.0.remove()?;
-            p.1.remove()?;
+            p.segment.remove()?;
+            p.index.remove()?;
+            p.stream_index.remove()?;
         }
         Ok(())
+    }
+
+    pub fn load_subscription(&mut self, id: &str) -> rusqlite::Result<Option<u64>> {
+        tokio::task::block_in_place(move || subscription_store::load_subscription(&self.conn, id))
+    }
+
+    pub fn update_subscription(&mut self, id: &str, last_event_id: u64) -> rusqlite::Result<()> {
+        tokio::task::block_in_place(move || {
+            subscription_store::update_subscription(&self.conn, id, last_event_id)
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Event<'a> {
+    pub id: u64,
+    pub stream_id: Cow<'a, str>,
+    pub stream_version: u64,
+    pub event_name: Cow<'a, str>,
+    pub event_data: Cow<'a, [u8]>,
+    pub metadata: Cow<'a, [u8]>,
+    pub timestamp: DateTime<Utc>,
+}
+
+impl<'a> Event<'a> {
+    pub fn borrowed(&'a self) -> Event<'a> {
+        Event {
+            id: self.id,
+            stream_id: Cow::Borrowed(&self.stream_id),
+            stream_version: self.stream_version,
+            event_name: Cow::Borrowed(&self.event_name),
+            event_data: Cow::Borrowed(&self.event_data),
+            metadata: Cow::Borrowed(&self.metadata),
+            timestamp: self.timestamp,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct NewEvent<'a> {
+    pub event_name: Cow<'a, str>,
+    pub event_data: Cow<'a, [u8]>,
+    pub metadata: Cow<'a, [u8]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExpectedVersion {
+    /// This write should not conflict with anything and should always succeed.
+    Any,
+    /// The stream should exist. If it or a metadata stream does not exist,
+    /// treats that as a concurrency problem.
+    StreamExists,
+    /// The stream being written to should not yet exist. If it does exist,
+    /// treats that as a concurrency problem.
+    NoStream,
+    /// States that the last event written to the stream should have an event
+    /// number matching your expected value.
+    Exact(u64),
+}
+
+impl ExpectedVersion {
+    pub fn validate(&self, current: CurrentVersion) -> Result<(), AppendError> {
+        use CurrentVersion::NoStream as CurrentNoStream;
+        use CurrentVersion::*;
+        use ExpectedVersion::NoStream as ExpectedNoStream;
+        use ExpectedVersion::*;
+
+        match (self, current) {
+            (Any, _) | (StreamExists, Current(_)) | (ExpectedNoStream, CurrentNoStream) => Ok(()),
+            (Exact(e), Current(c)) if *e == c => Ok(()),
+            (Exact(_), Current(_))
+            | (StreamExists, CurrentNoStream)
+            | (ExpectedNoStream, Current(_))
+            | (Exact(_), CurrentNoStream) => Err(AppendError::WrongExpectedVersion {
+                current,
+                expected: *self,
+            }),
+        }
+    }
+}
+
+impl fmt::Display for ExpectedVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ExpectedVersion::Any => write!(f, "any"),
+            ExpectedVersion::StreamExists => write!(f, "stream exists"),
+            ExpectedVersion::NoStream => write!(f, "no stream"),
+            ExpectedVersion::Exact(version) => version.fmt(f),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Actual position of a stream.
+pub enum CurrentVersion {
+    /// The last event's number.
+    Current(u64),
+    /// The stream doesn't exist.
+    NoStream,
+}
+
+impl CurrentVersion {
+    pub fn as_expected_version(&self) -> ExpectedVersion {
+        match self {
+            CurrentVersion::Current(version) => ExpectedVersion::Exact(*version),
+            CurrentVersion::NoStream => ExpectedVersion::NoStream,
+        }
+    }
+}
+
+impl fmt::Display for CurrentVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CurrentVersion::Current(version) => version.fmt(f),
+            CurrentVersion::NoStream => write!(f, "<no stream>"),
+        }
+    }
+}
+
+pub struct ReadStreamIter<'a, I> {
+    log: &'a EventLog,
+    stream_index_iter: I,
+}
+
+impl<'a, I> Iterator for ReadStreamIter<'a, I>
+where
+    I: Iterator<Item = u64>,
+{
+    type Item = Result<Event<'static>, ReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let offset = self.stream_index_iter.next()?;
+        self.log
+            .read(offset, ReadLimit::default())
+            .map(|read| read.into_iter().next())
+            .transpose()
     }
 }
 
@@ -572,18 +857,18 @@ mod tests {
     #[test]
     pub fn append() {
         let dir = TestDir::new();
-        let mut log = CommitLog::new(LogOptions::new(&dir)).unwrap();
-        assert_eq!(log.append_msg("123456").unwrap(), 0);
-        assert_eq!(log.append_msg("abcdefg").unwrap(), 1);
-        assert_eq!(log.append_msg("foobarbaz").unwrap(), 2);
-        assert_eq!(log.append_msg("bing").unwrap(), 3);
+        let mut log = EventLog::new(LogOptions::new(&dir)).unwrap();
+        assert_eq!(log.append_msg("my_stream", "123456").unwrap(), 0);
+        assert_eq!(log.append_msg("my_stream", "abcdefg").unwrap(), 1);
+        assert_eq!(log.append_msg("my_stream", "foobarbaz").unwrap(), 2);
+        assert_eq!(log.append_msg("my_stream", "bing").unwrap(), 3);
         log.flush().unwrap();
     }
 
     #[test]
     pub fn append_multiple() {
         let dir = TestDir::new();
-        let mut log = CommitLog::new(LogOptions::new(&dir)).unwrap();
+        let mut log = EventLog::new(LogOptions::new(&dir)).unwrap();
         let mut buf = {
             let mut buf = MessageBuf::default();
             buf.push(b"123456").unwrap();
@@ -591,7 +876,7 @@ mod tests {
             buf.push(b"345678").unwrap();
             buf
         };
-        let range = log.append(&mut buf).unwrap();
+        let range = log.append("my_stream", &mut buf).unwrap();
         assert_eq!(0, range.first());
         assert_eq!(3, range.len());
         assert_eq!(vec![0, 1, 2], range.iter().collect::<Vec<u64>>());
@@ -604,13 +889,13 @@ mod tests {
         opts.segment_max_bytes(62);
 
         {
-            let mut log = CommitLog::new(opts).unwrap();
+            let mut log = EventLog::new(opts).unwrap();
             // first 2 entries fit (both 30 bytes with encoding)
-            log.append_msg("0123456789").unwrap();
-            log.append_msg("0123456789").unwrap();
+            log.append_msg("my_stream", "0123456789").unwrap();
+            log.append_msg("my_stream", "0123456789").unwrap();
 
             // this one should roll the log
-            log.append_msg("0123456789").unwrap();
+            log.append_msg("my_stream", "0123456789").unwrap();
             log.flush().unwrap();
         }
 
@@ -619,8 +904,10 @@ mod tests {
             vec![
                 "00000000000000000000.index",
                 "00000000000000000000.log",
+                "00000000000000000000.streams",
                 "00000000000000000002.log",
                 "00000000000000000002.index",
+                "00000000000000000002.streams",
             ],
         );
     }
@@ -633,11 +920,11 @@ mod tests {
         let mut opts = LogOptions::new(&dir);
         opts.index_max_items(20);
         opts.segment_max_bytes(1000);
-        let mut log = CommitLog::new(opts).unwrap();
+        let mut log = EventLog::new(opts).unwrap();
 
         for i in 0..100 {
             let s = format!("-data {}", i);
-            log.append_msg(s.as_str()).unwrap();
+            log.append_msg("my_stream", s.as_str()).unwrap();
         }
         log.flush().unwrap();
 
@@ -646,10 +933,7 @@ mod tests {
             assert_eq!(6, active_index_read.len());
             assert_eq!(
                 vec![82, 83, 84, 85, 86, 87],
-                active_index_read
-                    .iter()
-                    .map(|v| v.offset())
-                    .collect::<Vec<_>>()
+                active_index_read.iter().map(|v| v.id).collect::<Vec<_>>()
             );
         }
 
@@ -658,10 +942,7 @@ mod tests {
             assert_eq!(4, old_index_read.len());
             assert_eq!(
                 vec![5, 6, 7, 8],
-                old_index_read
-                    .iter()
-                    .map(|v| v.offset())
-                    .collect::<Vec<_>>()
+                old_index_read.iter().map(|v| v.id).collect::<Vec<_>>()
             );
         }
 
@@ -672,7 +953,7 @@ mod tests {
             assert_eq!(3, boundary_read.len());
             assert_eq!(
                 vec![33, 34, 35],
-                boundary_read.iter().map(|v| v.offset()).collect::<Vec<_>>()
+                boundary_read.iter().map(|v| v.id).collect::<Vec<_>>()
             );
         }
     }
@@ -687,31 +968,28 @@ mod tests {
         opts.segment_max_bytes(1000);
 
         {
-            let mut log = CommitLog::new(opts.clone()).unwrap();
+            let mut log = EventLog::new(opts.clone()).unwrap();
 
             for i in 0..99 {
                 let s = format!("some data {}", i);
-                let off = log.append_msg(s.as_str()).unwrap();
+                let off = log.append_msg("my_stream", s.as_str()).unwrap();
                 assert_eq!(i, off);
             }
             log.flush().unwrap();
         }
 
         {
-            let mut log = CommitLog::new(opts).unwrap();
+            let mut log = EventLog::new(opts).unwrap();
 
             let active_index_read = log.read(82, ReadLimit::max_bytes(130)).unwrap();
 
             assert_eq!(4, active_index_read.len());
             assert_eq!(
                 vec![82, 83, 84, 85],
-                active_index_read
-                    .iter()
-                    .map(|v| v.offset())
-                    .collect::<Vec<_>>()
+                active_index_read.iter().map(|v| v.id).collect::<Vec<_>>()
             );
 
-            let off = log.append_msg("moar data").unwrap();
+            let off = log.append_msg("my_stream", "moar data").unwrap();
             assert_eq!(99, off);
         }
     }
@@ -726,16 +1004,16 @@ mod tests {
         opts.segment_max_bytes(1000);
 
         {
-            let mut log = CommitLog::new(opts.clone()).unwrap();
+            let mut log = EventLog::new(opts.clone()).unwrap();
             log.flush().unwrap();
         }
 
         {
-            CommitLog::new(opts.clone()).expect("Should be able to reopen log without writes");
+            EventLog::new(opts.clone()).expect("Should be able to reopen log without writes");
         }
 
         {
-            CommitLog::new(opts).expect("Should be able to reopen log without writes");
+            EventLog::new(opts).expect("Should be able to reopen log without writes");
         }
     }
 
@@ -745,12 +1023,12 @@ mod tests {
         let dir = TestDir::new();
         let opts = LogOptions::new(&dir);
         {
-            let mut log = CommitLog::new(opts.clone()).unwrap();
-            log.append_msg("Test").unwrap();
+            let mut log = EventLog::new(opts.clone()).unwrap();
+            log.append_msg("my_stream", "Test").unwrap();
             log.flush().unwrap();
         }
         {
-            let log = CommitLog::new(opts).unwrap();
+            let log = EventLog::new(opts).unwrap();
             assert_eq!(1, log.next_offset());
         }
     }
@@ -758,7 +1036,7 @@ mod tests {
     #[test]
     pub fn append_message_greater_than_max() {
         let dir = TestDir::new();
-        let mut log = CommitLog::new(LogOptions::new(&dir)).unwrap();
+        let mut log = EventLog::new(LogOptions::new(&dir)).unwrap();
         //create vector with 1.2mb of size, u8 = 1 byte thus,
         //1mb = 1000000 bytes, 1200000 items needed
         let mut value = String::new();
@@ -767,7 +1045,7 @@ mod tests {
             value.push('a');
             target += 1;
         }
-        let res = log.append_msg(value);
+        let res = log.append_msg("my_stream", value);
         //will fail if no error is found which means a message greater than the limit
         // passed through
         assert!(res.is_err());
@@ -777,7 +1055,7 @@ mod tests {
     #[test]
     pub fn truncate_from_active() {
         let dir = TestDir::new();
-        let mut log = CommitLog::new(LogOptions::new(&dir)).unwrap();
+        let mut log = EventLog::new(LogOptions::new(&dir)).unwrap();
 
         // append 5 messages
         {
@@ -787,7 +1065,7 @@ mod tests {
             buf.push(b"345678").unwrap();
             buf.push(b"aaaaaa").unwrap();
             buf.push(b"bbbbbb").unwrap();
-            log.append(&mut buf).unwrap();
+            log.append("my_stream", &mut buf).unwrap();
         }
 
         // truncate to offset 2 (should remove 2 messages)
@@ -804,12 +1082,12 @@ mod tests {
         let mut opts = LogOptions::new(&dir);
         opts.index_max_items(20);
         opts.segment_max_bytes(52);
-        let mut log = CommitLog::new(opts).unwrap();
+        let mut log = EventLog::new(opts).unwrap();
 
         // append 6 messages (4 segments)
         {
             for _ in 0..7 {
-                log.append_msg(b"12345").unwrap();
+                log.append_msg("my_stream", b"12345").unwrap();
             }
         }
 
@@ -819,11 +1097,15 @@ mod tests {
             vec![
                 "00000000000000000000.index",
                 "00000000000000000000.log",
+                "00000000000000000000.streams",
                 "00000000000000000002.log",
+                "00000000000000000002.streams",
                 "00000000000000000002.index",
                 "00000000000000000004.log",
+                "00000000000000000004.streams",
                 "00000000000000000004.index",
                 "00000000000000000006.log",
+                "00000000000000000006.streams",
                 "00000000000000000006.index",
             ],
         );
@@ -839,8 +1121,10 @@ mod tests {
             vec![
                 "00000000000000000000.index",
                 "00000000000000000000.log",
+                "00000000000000000000.streams",
                 "00000000000000000002.log",
                 "00000000000000000002.index",
+                "00000000000000000002.streams",
             ],
         );
     }
@@ -853,12 +1137,12 @@ mod tests {
         let mut opts = LogOptions::new(&dir);
         opts.index_max_items(20);
         opts.segment_max_bytes(52);
-        let mut log = CommitLog::new(opts).unwrap();
+        let mut log = EventLog::new(opts).unwrap();
 
         // append 6 messages (4 segments)
         {
             for _ in 0..7 {
-                log.append_msg(b"12345").unwrap();
+                log.append_msg("my_stream", b"12345").unwrap();
             }
         }
 
@@ -868,12 +1152,16 @@ mod tests {
             vec![
                 "00000000000000000000.index",
                 "00000000000000000000.log",
+                "00000000000000000000.streams",
                 "00000000000000000002.log",
                 "00000000000000000002.index",
+                "00000000000000000002.streams",
                 "00000000000000000004.log",
                 "00000000000000000004.index",
+                "00000000000000000004.streams",
                 "00000000000000000006.log",
                 "00000000000000000006.index",
+                "00000000000000000006.streams",
             ],
         );
 
@@ -888,8 +1176,10 @@ mod tests {
             vec![
                 "00000000000000000000.index",
                 "00000000000000000000.log",
+                "00000000000000000000.streams",
                 "00000000000000000002.log",
                 "00000000000000000002.index",
+                "00000000000000000002.streams",
             ],
         );
     }
@@ -902,12 +1192,12 @@ mod tests {
         let mut opts = LogOptions::new(&dir);
         opts.index_max_items(20);
         opts.segment_max_bytes(52);
-        let mut log = CommitLog::new(opts).unwrap();
+        let mut log = EventLog::new(opts).unwrap();
 
         // append 6 messages (4 segments)
         {
             for _ in 0..7 {
-                log.append_msg(b"12345").unwrap();
+                log.append_msg("my_stream", b"12345").unwrap();
             }
         }
 
@@ -917,11 +1207,15 @@ mod tests {
             vec![
                 "00000000000000000000.index",
                 "00000000000000000000.log",
+                "00000000000000000000.streams",
                 "00000000000000000002.log",
+                "00000000000000000002.streams",
                 "00000000000000000002.index",
                 "00000000000000000004.log",
+                "00000000000000000004.streams",
                 "00000000000000000004.index",
                 "00000000000000000006.log",
+                "00000000000000000006.streams",
                 "00000000000000000006.index",
             ],
         );
@@ -937,12 +1231,16 @@ mod tests {
             vec![
                 "00000000000000000000.index",
                 "00000000000000000000.log",
+                "00000000000000000000.streams",
                 "00000000000000000002.log",
                 "00000000000000000002.index",
+                "00000000000000000002.streams",
                 "00000000000000000004.log",
                 "00000000000000000004.index",
+                "00000000000000000004.streams",
                 "00000000000000000006.log",
                 "00000000000000000006.index",
+                "00000000000000000006.streams",
             ],
         );
     }
@@ -955,12 +1253,12 @@ mod tests {
         let mut opts = LogOptions::new(&dir);
         opts.index_max_items(20);
         opts.segment_max_bytes(52);
-        let mut log = CommitLog::new(opts).unwrap();
+        let mut log = EventLog::new(opts).unwrap();
 
         // append 6 messages (4 segments)
         {
             for _ in 0..7 {
-                log.append_msg(b"12345").unwrap();
+                log.append_msg("my_stream", b"12345").unwrap();
             }
         }
 
@@ -970,12 +1268,16 @@ mod tests {
             vec![
                 "00000000000000000000.index",
                 "00000000000000000000.log",
+                "00000000000000000000.streams",
                 "00000000000000000002.log",
                 "00000000000000000002.index",
+                "00000000000000000002.streams",
                 "00000000000000000004.log",
                 "00000000000000000004.index",
+                "00000000000000000004.streams",
                 "00000000000000000006.log",
                 "00000000000000000006.index",
+                "00000000000000000006.streams",
             ],
         );
 
@@ -991,10 +1293,13 @@ mod tests {
             vec![
                 "00000000000000000002.index",
                 "00000000000000000002.log",
+                "00000000000000000002.streams",
                 "00000000000000000004.log",
                 "00000000000000000004.index",
+                "00000000000000000004.streams",
                 "00000000000000000006.log",
                 "00000000000000000006.index",
+                "00000000000000000006.streams",
             ],
         );
 
@@ -1002,7 +1307,7 @@ mod tests {
         let reader = log
             .read(0, ReadLimit::default())
             .expect("Unabled to grab reader");
-        assert_eq!(2, reader.iter().next().unwrap().offset());
+        assert_eq!(2, reader.iter().next().unwrap().id);
     }
 
     #[test]
@@ -1013,12 +1318,12 @@ mod tests {
         let mut opts = LogOptions::new(&dir);
         opts.index_max_items(20);
         opts.segment_max_bytes(52);
-        let mut log = CommitLog::new(opts).unwrap();
+        let mut log = EventLog::new(opts).unwrap();
 
         // append 6 messages (4 segments)
         {
             for _ in 0..7 {
-                log.append_msg(b"12345").unwrap();
+                log.append_msg("my_stream", b"12345").unwrap();
             }
         }
 
@@ -1028,12 +1333,16 @@ mod tests {
             vec![
                 "00000000000000000000.index",
                 "00000000000000000000.log",
+                "00000000000000000000.streams",
                 "00000000000000000002.log",
                 "00000000000000000002.index",
+                "00000000000000000002.streams",
                 "00000000000000000004.log",
                 "00000000000000000004.index",
+                "00000000000000000004.streams",
                 "00000000000000000006.log",
                 "00000000000000000006.index",
+                "00000000000000000006.streams",
             ],
         );
 
@@ -1049,8 +1358,10 @@ mod tests {
             vec![
                 "00000000000000000004.log",
                 "00000000000000000004.index",
+                "00000000000000000004.streams",
                 "00000000000000000006.log",
                 "00000000000000000006.index",
+                "00000000000000000006.streams",
             ],
         );
 
@@ -1058,7 +1369,7 @@ mod tests {
         let reader = log
             .read(0, ReadLimit::default())
             .expect("Unabled to grab reader");
-        assert_eq!(4, reader.iter().next().unwrap().offset());
+        assert_eq!(4, reader.iter().next().unwrap().id);
     }
 
     #[test]
@@ -1072,12 +1383,12 @@ mod tests {
             let mut opts = LogOptions::new(&dir);
             opts.index_max_items(20);
             opts.segment_max_bytes(52);
-            let mut log = CommitLog::new(opts).unwrap();
+            let mut log = EventLog::new(opts).unwrap();
 
             // append the messages
             {
                 for _ in 0..TOTAL_MESSAGES {
-                    log.append_msg(b"12345").unwrap();
+                    log.append_msg("my_stream", b"12345").unwrap();
                 }
             }
 
@@ -1089,7 +1400,7 @@ mod tests {
             let reader = log
                 .read(0, ReadLimit::default())
                 .expect("Unabled to grab reader");
-            let start_off = reader.iter().next().unwrap().offset();
+            let start_off = reader.iter().next().unwrap().id;
             assert!(start_off <= trim_off);
         }
     }
@@ -1102,12 +1413,12 @@ mod tests {
         let mut opts = LogOptions::new(&dir);
         opts.index_max_items(20);
         opts.segment_max_bytes(52);
-        let mut log = CommitLog::new(opts).unwrap();
+        let mut log = EventLog::new(opts).unwrap();
 
         // append the messages
         {
             for _ in 0..TOTAL_MESSAGES {
-                log.append_msg(b"12345").unwrap();
+                log.append_msg("my_stream", b"12345").unwrap();
             }
         }
 
@@ -1117,7 +1428,7 @@ mod tests {
             let reader = log
                 .read(0, ReadLimit::default())
                 .expect("Unabled to grab reader");
-            assert_eq!(2, reader.iter().next().unwrap().offset());
+            assert_eq!(2, reader.iter().next().unwrap().id);
         }
 
         log.trim_segments_before(10).unwrap();
@@ -1126,7 +1437,7 @@ mod tests {
             let reader = log
                 .read(0, ReadLimit::default())
                 .expect("Unabled to grab reader");
-            assert_eq!(10, reader.iter().next().unwrap().offset());
+            assert_eq!(10, reader.iter().next().unwrap().id);
         }
     }
 
@@ -1139,12 +1450,12 @@ mod tests {
         let mut opts = LogOptions::new(&dir);
         opts.index_max_items(20);
         opts.segment_max_bytes(52);
-        let mut log = CommitLog::new(opts).unwrap();
+        let mut log = EventLog::new(opts).unwrap();
 
         // append the messages
         {
             for _ in 0..TOTAL_MESSAGES {
-                log.append_msg(b"12345").unwrap();
+                log.append_msg("my_stream", b"12345").unwrap();
             }
         }
 
@@ -1156,7 +1467,7 @@ mod tests {
         let reader = log
             .read(0, ReadLimit::default())
             .expect("Unabled to grab reader");
-        let start_off = reader.iter().next().unwrap().offset();
+        let start_off = reader.iter().next().unwrap().id;
         assert_eq!(16, start_off);
     }
 
@@ -1168,20 +1479,20 @@ mod tests {
         let mut opts = LogOptions::new(&dir);
         opts.index_max_items(20);
         opts.segment_max_bytes(52);
-        let mut log = CommitLog::new(opts).unwrap();
+        let mut log = EventLog::new(opts).unwrap();
 
         log.trim_inactive_segments()
             .expect("Unable to truncate file");
         assert_eq!(None, log.last_offset());
 
         // append the messages
-        log.append_msg(b"12345").unwrap();
+        log.append_msg("my_stream", b"12345").unwrap();
 
         // make sure the messages are really gone
         let reader = log
             .read(0, ReadLimit::default())
             .expect("Unabled to grab reader");
-        let start_off = reader.iter().next().unwrap().offset();
+        let start_off = reader.iter().next().unwrap().id;
         assert_eq!(0, start_off);
     }
 
@@ -1191,8 +1502,8 @@ mod tests {
     {
         let dir_files = fs::read_dir(&dir)
             .unwrap()
-            .map(|e| {
-                e.unwrap()
+            .map(|res| {
+                res.unwrap()
                     .path()
                     .file_name()
                     .unwrap()

@@ -1,14 +1,15 @@
 //! Message encoding used for the on-disk format for the log.
-use super::Offset;
-use byteorder::{ByteOrder, LittleEndian};
-use bytes::BufMut;
-use crc32c::{crc32c, crc32c_append};
-use log::trace;
 use std::{
     io::{self, Read},
     iter::{FromIterator, IntoIterator},
     u16,
 };
+
+use bytes::BufMut;
+use crc32c::{crc32c, crc32c_append};
+use tracing::trace;
+
+use super::Offset;
 
 /// Error for the message encoding or decoding.
 #[derive(Debug)]
@@ -30,8 +31,8 @@ pub enum MessageSerializationError {
 }
 
 impl From<io::Error> for MessageError {
-    fn from(e: io::Error) -> MessageError {
-        MessageError::IoError(e)
+    fn from(err: io::Error) -> MessageError {
+        MessageError::IoError(err)
     }
 }
 
@@ -45,14 +46,14 @@ macro_rules! read_n {
                     $err_msg,
                 )));
             }
-            Err(e) => return Err(MessageError::IoError(e)),
+            Err(err) => return Err(MessageError::IoError(err)),
         }
     }};
     ($reader:expr, $buf:expr, $size:expr) => {{
         match $reader.read(&mut $buf) {
             Ok(s) if s == $size => (),
             Ok(_) => return Err(MessageError::InvalidPayloadLength),
-            Err(e) => return Err(MessageError::IoError(e)),
+            Err(err) => return Err(MessageError::IoError(err)),
         }
     }};
 }
@@ -61,31 +62,31 @@ pub const HEADER_SIZE: usize = 20;
 
 macro_rules! read_header {
     (offset, $buf:expr) => {
-        LittleEndian::read_u64(&$buf[0..8])
+        u64::from_le_bytes($buf[0..8].try_into().unwrap())
     };
     (size, $buf:expr) => {
-        LittleEndian::read_u32(&$buf[8..12])
+        u32::from_le_bytes($buf[8..12].try_into().unwrap())
     };
     (hash, $buf:expr) => {
-        LittleEndian::read_u32(&$buf[12..16])
+        u32::from_le_bytes($buf[12..16].try_into().unwrap())
     };
     (meta_size, $buf:expr) => {
-        LittleEndian::read_u16(&$buf[18..20])
+        u16::from_le_bytes($buf[18..20].try_into().unwrap())
     };
 }
 
 macro_rules! set_header {
     (offset, $buf:expr, $v:expr) => {
-        LittleEndian::write_u64(&mut $buf[0..8], $v)
+        $buf[0..8].copy_from_slice(&u64::to_le_bytes($v))
     };
     (size, $buf:expr, $v:expr) => {
-        LittleEndian::write_u32(&mut $buf[8..12], $v)
+        $buf[8..12].copy_from_slice(&u32::to_le_bytes($v))
     };
     (hash, $buf:expr, $v:expr) => {
-        LittleEndian::write_u32(&mut $buf[12..16], $v)
+        $buf[12..16].copy_from_slice(&u32::to_le_bytes($v))
     };
     (meta_size, $buf:expr, $v:expr) => {
-        LittleEndian::write_u16(&mut $buf[18..20], $v)
+        $buf[18..20].copy_from_slice(&u16::to_le_bytes($v))
     };
 }
 
@@ -354,7 +355,7 @@ pub trait MessageSetMut: MessageSet {
 /// Mutable message buffer.
 ///
 /// The buffer will handle the serialization of the message into the proper
-/// format expected by the `CommitLog`.
+/// format expected by the `EventLog`.
 #[derive(Default)]
 pub struct MessageBuf {
     bytes: Vec<u8>,

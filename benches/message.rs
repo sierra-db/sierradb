@@ -1,6 +1,6 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 
-use commitlog::message::{set_offsets, MessageBuf};
+use eventus::message::{set_offsets, MessageBuf};
 
 fn bench_message_construct(c: &mut Criterion) {
     c.bench_function("message construct", |b| {

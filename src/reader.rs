@@ -1,6 +1,7 @@
 //! Custom log reading.
+use std::{fs::File, os::unix::fs::FileExt};
+
 use super::message::{MessageBuf, MessageError};
-use std::fs::File;
 
 /// Trait that allows reading from a slice of the log.
 pub trait LogSliceReader {
@@ -35,8 +36,6 @@ impl LogSliceReader for MessageBufReader {
         file_position: u32,
         bytes: usize,
     ) -> Result<Self::Result, MessageError> {
-        use std::os::unix::fs::FileExt;
-
         let mut vec = vec![0; bytes];
         file.read_at(&mut vec, u64::from(file_position))?;
         MessageBuf::from_bytes(vec)

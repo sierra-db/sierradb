@@ -1,9 +1,14 @@
-use super::{reader::*, *};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, Write},
-    os::unix::fs::FileExt,
+    io::{self, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+};
+
+use tracing::{debug, info};
+
+use crate::{
+    message::{MessageError, MessageSet},
+    reader::LogSliceReader,
 };
 
 /// Number of bytes contained in the base name of the file.
@@ -27,8 +32,8 @@ pub enum SegmentAppendError {
 
 impl From<io::Error> for SegmentAppendError {
     #[inline]
-    fn from(e: io::Error) -> SegmentAppendError {
-        SegmentAppendError::IoError(e)
+    fn from(err: io::Error) -> SegmentAppendError {
+        SegmentAppendError::IoError(err)
     }
 }
 
@@ -36,21 +41,17 @@ pub struct AppendMetadata {
     pub starting_position: usize,
 }
 
-/// A segment is a portion of the commit log. Segments are append-only logs
+/// A segment is a portion of the event log. Segments are append-only logs
 /// written until the maximum size is reached.
 pub struct Segment {
     /// File descriptor
-    file: File,
-
+    writer: BufWriter<File>,
     /// Path to the file
     path: PathBuf,
-
     /// Base offset of the log
     base_offset: u64,
-
     /// current file position for the write
     write_pos: usize,
-
     /// Maximum number of bytes permitted to be appended to the log
     max_bytes: usize,
 }
@@ -69,17 +70,17 @@ impl Segment {
             path_buf
         };
 
-        let mut f = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .read(true)
             .create_new(true)
             .append(true)
             .open(&log_path)?;
 
         // add the magic
-        f.write_all(&VERSION_1_MAGIC)?;
+        file.write_all(&VERSION_1_MAGIC)?;
 
         Ok(Segment {
-            file: f,
+            writer: BufWriter::new(file),
             path: log_path,
             base_offset,
             write_pos: 2,
@@ -87,17 +88,17 @@ impl Segment {
         })
     }
 
-    pub fn open<P>(seg_path: P, max_bytes: usize) -> io::Result<Segment>
+    pub fn open<P>(path: P, max_bytes: usize) -> io::Result<Segment>
     where
         P: AsRef<Path>,
     {
-        let seg_file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .append(true)
-            .open(&seg_path)?;
+            .open(&path)?;
 
-        let filename = seg_path.as_ref().file_name().unwrap().to_str().unwrap();
+        let filename = path.as_ref().file_name().unwrap().to_str().unwrap();
         let base_offset = match (&filename[0..SEGMENT_FILE_NAME_LEN]).parse::<u64>() {
             Ok(v) => v,
             Err(_) => {
@@ -108,13 +109,14 @@ impl Segment {
             }
         };
 
-        let meta = seg_file.metadata()?;
+        let meta = file.metadata()?;
 
         // check the magic
         {
             let mut bytes = [0u8; 2];
-            let size = seg_file.read_at(&mut bytes, 0)?;
-            if size < 2 || bytes != VERSION_1_MAGIC {
+            file.seek(SeekFrom::Start(0))?;
+            file.read_exact(&mut bytes)?;
+            if bytes != VERSION_1_MAGIC {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
@@ -126,11 +128,11 @@ impl Segment {
             }
         }
 
-        info!("Opened segment {}", filename);
+        debug!(%filename, "opening segment");
 
         Ok(Segment {
-            file: seg_file,
-            path: seg_path.as_ref().to_path_buf(),
+            writer: BufWriter::new(file),
+            path: path.as_ref().to_path_buf(),
             write_pos: meta.len() as usize,
             base_offset,
             max_bytes,
@@ -160,13 +162,24 @@ impl Segment {
             starting_position: self.write_pos,
         };
 
-        self.file.write_all(payload.bytes())?;
+        self.writer.write_all(payload.bytes())?;
         self.write_pos += payload_len;
         Ok(meta)
     }
 
-    pub fn flush_sync(&mut self) -> io::Result<()> {
-        self.file.flush()
+    // pub fn flush_sync(&mut self) -> io::Result<()> {
+    //     self.file.flush()?;
+    //     self.file.sync_all()
+    // }
+
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()?;
+        self.writer.get_ref().sync_all()?;
+        Ok(())
+    }
+
+    pub fn flush_writer(&mut self) -> io::Result<()> {
+        self.writer.flush()
     }
 
     pub fn read_slice<T: LogSliceReader>(
@@ -175,7 +188,7 @@ impl Segment {
         file_pos: u32,
         bytes: u32,
     ) -> Result<T::Result, MessageError> {
-        reader.read_from(&self.file, file_pos, bytes as usize)
+        reader.read_from(self.writer.get_ref(), file_pos, bytes as usize)
     }
 
     /// Removes the segment file.
@@ -190,7 +203,7 @@ impl Segment {
     /// Truncates the segment file to desired length. Other methods should
     /// ensure that the truncation is at the message boundary.
     pub fn truncate(&mut self, length: u32) -> io::Result<()> {
-        self.file.set_len(u64::from(length))?;
+        self.writer.get_ref().set_len(length as u64)?;
         self.write_pos = length as usize;
         Ok(())
     }
@@ -198,6 +211,8 @@ impl Segment {
 
 #[cfg(test)]
 mod tests {
+    use crate::{message::MessageBuf, reader::MessageBufReader};
+
     use super::{
         super::{message::set_offsets, testutil::*},
         *,
@@ -231,7 +246,7 @@ mod tests {
             assert_eq!(p1.total_bytes(), 25);
         }
 
-        f.flush_sync().unwrap();
+        f.flush().unwrap();
     }
 
     #[test]
@@ -244,7 +259,7 @@ mod tests {
             buf.push("12345").unwrap();
             buf.push("66666").unwrap();
             f.append(&mut buf).unwrap();
-            f.flush_sync().unwrap();
+            f.flush().unwrap();
         }
 
         // open it
@@ -414,6 +429,7 @@ mod tests {
         };
         assert_eq!(second_msg_start, meta2.starting_position);
 
+        f.flush().unwrap();
         let size = fs::metadata(&f.path).unwrap().len();
         assert_eq!(f.size() as u64, size);
 
