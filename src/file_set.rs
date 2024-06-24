@@ -6,6 +6,8 @@ use std::{
 
 use tracing::{debug, error, info, trace, warn};
 
+use crate::message::{MessageSet, HEADER_SIZE};
+use crate::reader::MessageBufReader;
 use crate::stream_index::{StreamIndex, STREAM_INDEX_FILE_NAME_EXTENSION};
 
 use super::{index::*, segment::*, LogOptions, Offset};
@@ -73,8 +75,7 @@ impl FileSet {
 
                     let offset = index.starting_offset();
                     indexes.insert(offset, index);
-                    // TODO: fix missing index updates (crash before write to
-                    // index)
+                    // TODO: fix missing index updates (crash before write to index)
                 }
                 Some(ext) if STREAM_INDEX_FILE_NAME_EXTENSION.eq(ext) => {
                     let stream_index = match StreamIndex::open(&f.path()) {
@@ -93,25 +94,39 @@ impl FileSet {
         }
 
         // pair up the index and segments (there should be an index per segment)
+        let log_opts = opts.clone();
         let mut closed = segments
             .into_iter()
             .map(move |(i, segment)| {
-                match indexes.remove(&i).zip(stream_indexes.remove(&i)) {
-                    Some((index, stream_index)) => (
-                        i,
-                        SegmentSet {
-                            segment,
-                            index,
-                            stream_index,
-                        },
-                    ),
-                    None => {
-                        // TODO: create the index from the segment
-                        panic!("No index found for segment starting at {}", i);
-                    }
-                }
+                let index = match indexes.remove(&i) {
+                    Some(index) => index,
+                    None => Index::restore(
+                        &segment,
+                        &log_opts.log_dir,
+                        log_opts.log_max_bytes,
+                        log_opts.message_max_bytes,
+                    )?,
+                };
+                let stream_index = match stream_indexes.remove(&i) {
+                    Some(stream_index) => stream_index,
+                    None => StreamIndex::restore(
+                        &segment,
+                        &index,
+                        &log_opts.log_dir,
+                        log_opts.log_max_entries,
+                        log_opts.message_max_bytes,
+                    )?,
+                };
+                Ok((
+                    i,
+                    SegmentSet {
+                        segment,
+                        index,
+                        stream_index,
+                    },
+                ))
             })
-            .collect::<BTreeMap<u64, SegmentSet>>();
+            .collect::<io::Result<BTreeMap<u64, SegmentSet>>>()?;
 
         // try to reuse the last index if it is not full. otherwise, open a new index
         // at the correct offset
@@ -127,10 +142,31 @@ impl FileSet {
             }
         };
 
-        // Honestly very confused as to why this needs to be 2 instead of 1, but it seems correct when testing.
-        active
-            .stream_index
-            .truncate(active.index.next_offset().saturating_sub(2));
+        // Truncate to the last event id based on the last log file
+        let mut pos = 2;
+        let mut i = active.segment.starting_offset();
+        let mut reader = MessageBufReader;
+        loop {
+            let msgs = active
+                .segment
+                .read_slice_partial(
+                    &mut reader,
+                    pos,
+                    (log_opts.message_max_bytes + HEADER_SIZE) as u32,
+                )
+                .unwrap();
+            if msgs.is_empty() {
+                break;
+            }
+            for msg in msgs.iter() {
+                pos += msg.total_bytes() as u32;
+                i += 1;
+            }
+        }
+
+        // TODO: if we're truncating to 0 - 1, we should clear the entire files
+        active.index.truncate(i.saturating_sub(1));
+        active.stream_index.truncate(i.saturating_sub(1));
 
         // mark all closed indexes as readonly (indexes are not opened as readonly)
         for SegmentSet { index, .. } in closed.values_mut() {

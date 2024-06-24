@@ -1,5 +1,6 @@
 use std::{
     cmp::Ordering,
+    fmt,
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
@@ -8,6 +9,12 @@ use std::{
 
 use memmap2::MmapMut;
 use tracing::{debug, info, trace, warn};
+
+use crate::{
+    message::{MessageError, MessageSet, HEADER_SIZE},
+    reader::MessageBufReader,
+    segment::Segment,
+};
 
 use super::Offset;
 
@@ -26,7 +33,7 @@ where
     assert_eq!(index.len() % INDEX_ENTRY_BYTES, 0);
 
     let mut i = 0usize;
-    let mut j = (index.len() / INDEX_ENTRY_BYTES) - 1;
+    let mut j = (index.len() / INDEX_ENTRY_BYTES).saturating_sub(1);
 
     while i < j {
         // grab midpoint
@@ -65,6 +72,15 @@ pub enum RangeFindError {
     OffsetNotAppended,
     /// The offset requested exceeded the max bytes.
     MessageExceededMaxBytes,
+}
+
+impl fmt::Display for RangeFindError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RangeFindError::OffsetNotAppended => write!(f, "offset not appended"),
+            RangeFindError::MessageExceededMaxBytes => write!(f, "message exceeded max bytes"),
+        }
+    }
 }
 
 /// Range within a single segment file of messages.
@@ -247,6 +263,45 @@ impl Index {
             last_flush_end_pos: next_write_pos,
             base_offset,
         })
+    }
+
+    pub fn restore<P>(
+        segment: &Segment,
+        log_dir: P,
+        file_bytes: usize,
+        message_max_bytes: usize,
+    ) -> io::Result<Self>
+    where
+        P: AsRef<Path>,
+    {
+        let mut index = Index::new(&log_dir, segment.starting_offset(), file_bytes)?;
+
+        let mut pos = 2;
+        let mut reader = MessageBufReader;
+        loop {
+            let msgs = segment
+                .read_slice_partial(&mut reader, pos, (message_max_bytes + HEADER_SIZE) as u32)
+                .map_err(|err| match err {
+                    MessageError::IoError(err) => err,
+                    MessageError::InvalidHash => {
+                        io::Error::new(io::ErrorKind::InvalidData, "invalid hash")
+                    }
+                    MessageError::InvalidPayloadLength => {
+                        io::Error::new(io::ErrorKind::InvalidData, "invalid payload length")
+                    }
+                })?;
+            if msgs.is_empty() {
+                break;
+            }
+            let mut buf = IndexBuf::new(msgs.len(), segment.starting_offset());
+            for msg in msgs.iter() {
+                buf.push(msg.offset(), pos);
+                pos += msg.total_bytes() as u32;
+            }
+            index.append(buf)?;
+        }
+
+        Ok(index)
     }
 
     #[inline]
@@ -1036,6 +1091,31 @@ mod tests {
         // ensure we've zeroed the entries
         let mem = &index.mmap[..];
         for i in (3 * INDEX_ENTRY_BYTES)..(5 * INDEX_ENTRY_BYTES) {
+            assert_eq!(0, mem[i], "Expected 0 at index {}", i);
+        }
+    }
+
+    #[test]
+    fn index_truncate_to_0() {
+        env_logger::try_init().unwrap_or(());
+        let dir = TestDir::new();
+        let mut index = Index::new(&dir, 10u64, 128usize).unwrap();
+        let mut buf = IndexBuf::new(5, 10u64);
+        buf.push(0, 10);
+        buf.push(1, 20);
+        buf.push(2, 30);
+        buf.push(3, 40);
+        buf.push(4, 50);
+        index.append(buf).unwrap();
+
+        let file_len = index.truncate(0);
+        assert_eq!(Some(0), file_len);
+        assert_eq!(1, index.next_offset());
+        assert_eq!(1 * INDEX_ENTRY_BYTES, index.next_write_pos);
+
+        // ensure we've zeroed the entries
+        let mem = &index.mmap[..];
+        for i in (1 * INDEX_ENTRY_BYTES)..(1 * INDEX_ENTRY_BYTES) {
             assert_eq!(0, mem[i], "Expected 0 at index {}", i);
         }
     }

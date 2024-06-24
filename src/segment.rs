@@ -191,6 +191,15 @@ impl Segment {
         reader.read_from(self.writer.get_ref(), file_pos, bytes as usize)
     }
 
+    pub fn read_slice_partial<T: LogSliceReader>(
+        &self,
+        reader: &mut T,
+        file_pos: u32,
+        bytes: u32,
+    ) -> Result<T::Result, MessageError> {
+        reader.read_from_partial(self.writer.get_ref(), file_pos, bytes as usize)
+    }
+
     /// Removes the segment file.
     pub fn remove(self) -> io::Result<()> {
         let path = self.path.clone();

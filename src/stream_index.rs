@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -7,7 +8,11 @@ use memmap2::MmapMut;
 use tracing::{debug, info};
 use twox_hash::Xxh3Hash64;
 
-use crate::Offset;
+use crate::index::Index;
+use crate::message::{MessageSet, HEADER_SIZE};
+use crate::reader::MessageBufReader;
+use crate::segment::Segment;
+use crate::{Event, Offset, ReadError};
 
 pub static STREAM_INDEX_FILE_NAME_EXTENSION: &str = "streams";
 pub static SEGMENT_FILE_NAME_LEN: usize = 20;
@@ -174,6 +179,72 @@ impl StreamIndex {
             max_entries,
             base_offset,
         })
+    }
+
+    pub fn restore(
+        segment: &Segment,
+        index: &Index,
+        log_dir: &Path,
+        max_entries: u64,
+        message_max_bytes: usize,
+    ) -> io::Result<Self> {
+        info!("restoring stream index");
+        let mut stream_index = StreamIndex::new(log_dir, segment.starting_offset(), max_entries)?;
+
+        let mut pos = index.starting_offset();
+        let mut expected_event_id = 0;
+        let mut expected_stream_versions = HashMap::<String, Option<u64>>::new();
+        let mut reader = MessageBufReader;
+        loop {
+            let seg_bytes = segment.size() as u32;
+
+            if pos >= index.next_offset() {
+                break;
+            }
+
+            // grab the range from the contained index
+            let range = index
+                .find_segment_range(pos, (message_max_bytes + HEADER_SIZE) as u32, seg_bytes)
+                .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+            let events = if range.bytes() == 0 {
+                break;
+            } else {
+                segment
+                    .read_slice(&mut reader, range.file_position(), range.bytes())
+                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "read slice error"))?
+                    .iter()
+                    .map(|msg| rmp_serde::from_slice(msg.payload()).map_err(ReadError::Deserialize))
+                    .collect::<Result<Vec<Event<'static>>, _>>()
+                    .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?
+            };
+
+            for event in events {
+                let id = event.stream_id.to_string();
+                let existing_stream_version = expected_stream_versions.get(&id).copied().flatten();
+                match existing_stream_version {
+                    Some(existing) => {
+                        assert_eq!(
+                            existing + 1,
+                            event.stream_version,
+                            "wrong version for {} {id}",
+                            event.id
+                        );
+                    }
+                    None => assert_eq!(
+                        event.stream_version, 0,
+                        "wrong version for {} {id}",
+                        event.id
+                    ),
+                }
+                expected_stream_versions.insert(id, Some(event.stream_version));
+                assert_eq!(event.id, expected_event_id);
+                expected_event_id += 1;
+                pos += 1;
+                stream_index.insert(&event.stream_id, event.id)?;
+            }
+        }
+
+        Ok(stream_index)
     }
 
     #[inline]

@@ -11,9 +11,8 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ (import rust-overlay) ];
-        rust-bin-nightly = pkgs.rust-bin.stable.latest.default.override {
+        rust-bin = pkgs.rust-bin.stable.latest.default.override {
           extensions = [ "rust-src" "rustfmt" "rust-analyzer" ];
-          targets = [ "wasm32-wasi" "wasm32-unknown-unknown" ];
         };
         pkgs = import nixpkgs {
           inherit system overlays;
@@ -30,7 +29,7 @@
             protobuf
             libiconv
             gcc
-            rust-bin-nightly
+            rust-bin
             darwin.apple_sdk.frameworks.CoreServices
             darwin.apple_sdk.frameworks.CoreFoundation
             darwin.apple_sdk.frameworks.Security

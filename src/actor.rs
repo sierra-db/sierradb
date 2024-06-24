@@ -144,6 +144,7 @@ impl Message<UpdateSubscription> for EventLog {
 pub struct ReadBatch {
     pub start_offset: u64,
     pub read_limit: ReadLimit,
+    pub batch_size: usize,
 }
 
 impl Message<ReadBatch> for EventLog {
@@ -154,6 +155,6 @@ impl Message<ReadBatch> for EventLog {
         msg: ReadBatch,
         _ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
-        self.read(msg.start_offset, msg.read_limit)
+        self.read(msg.start_offset, msg.read_limit, msg.batch_size)
     }
 }
