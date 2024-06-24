@@ -20,6 +20,13 @@ pub trait LogSliceReader {
         file_position: u32,
         bytes: usize,
     ) -> Result<Self::Result, MessageError>;
+
+    fn read_from_partial(
+        &mut self,
+        file: &File,
+        file_position: u32,
+        bytes: usize,
+    ) -> Result<Self::Result, MessageError>;
 }
 
 #[cfg(unix)]
@@ -39,5 +46,16 @@ impl LogSliceReader for MessageBufReader {
         let mut vec = vec![0; bytes];
         file.read_at(&mut vec, u64::from(file_position))?;
         MessageBuf::from_bytes(vec)
+    }
+
+    fn read_from_partial(
+        &mut self,
+        file: &File,
+        file_position: u32,
+        bytes: usize,
+    ) -> Result<Self::Result, MessageError> {
+        let mut vec = vec![0; bytes];
+        file.read_at(&mut vec, u64::from(file_position))?;
+        MessageBuf::from_bytes_partial(vec)
     }
 }

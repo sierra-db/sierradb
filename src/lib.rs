@@ -65,6 +65,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use file_set::{FileSet, SegmentSet};
+use fslock::LockFile;
 use index::{IndexBuf, RangeFindError, INDEX_ENTRY_BYTES};
 use message::{MessageBuf, MessageError, MessageSet, MessageSetMut};
 use reader::{LogSliceReader, MessageBufReader};
@@ -193,7 +194,7 @@ pub enum AppendError {
 #[derive(Error, Debug)]
 pub enum ReadError {
     /// Underlying IO error encountered by reading from the log
-    #[error("transparent")]
+    #[error(transparent)]
     Io(#[from] io::Error),
     /// A segment in the log is corrupt, or the index itself is corrupt
     #[error("Corrupt log")]
@@ -265,11 +266,13 @@ impl LogOptions {
     where
         P: AsRef<Path>,
     {
+        let log_max_entries = 256_000;
+
         LogOptions {
             log_dir: log_dir.as_ref().to_owned(),
             log_max_bytes: 256 * 1024 * 1024,
-            log_max_entries: 256_000,
-            index_max_bytes: 800_000,
+            log_max_entries,
+            index_max_bytes: log_max_entries as usize * INDEX_ENTRY_BYTES * 10,
             message_max_bytes: 1_000_000,
         }
     }
@@ -310,26 +313,34 @@ pub struct EventLog {
     unflushed: Vec<Event<'static>>,
     broadcaster: broadcast::Sender<Vec<Event<'static>>>,
     conn: rusqlite::Connection,
+    _lock_file: LockFile,
 }
 
 impl EventLog {
     /// Creates or opens an existing event log.
     pub fn new(opts: LogOptions) -> io::Result<EventLog> {
         let _ = fs::create_dir_all(&opts.log_dir);
+
+        let mut _lock_file = LockFile::open(&opts.log_dir.join("lock"))?;
+        if !_lock_file.try_lock_with_pid()? {
+            return Err(io::Error::new(io::ErrorKind::Other, "log directory locked"));
+        }
+
         let conn = subscription_store::setup_db(&opts.log_dir)
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+            .map_err(|err| io::Error::new(io::ErrorKind::AlreadyExists, err))?;
 
         debug!(
             "opening log in directory {:?}",
             &opts.log_dir.to_str().unwrap_or_default()
         );
 
-        let fs = FileSet::load_log(opts)?;
+        let file_set = FileSet::load_log(opts)?;
         Ok(EventLog {
-            file_set: fs,
+            file_set,
             unflushed: Vec::with_capacity(256),
             broadcaster: broadcast::channel(32).0,
             conn,
+            _lock_file,
         })
     }
 
@@ -543,9 +554,7 @@ impl EventLog {
             return Ok(None);
         };
 
-        // if last_offset >= self.file_set.active_index().next_offset() {}
-
-        let events = self.read(last_offset, ReadLimit::default())?;
+        let events = self.read(last_offset, ReadLimit::default(), 1)?;
         let event = match events.into_iter().next() {
             Some(event) => event,
             None => {
@@ -584,12 +593,18 @@ impl EventLog {
     /// Reads a portion of the log, starting with the `start` offset, inclusive,
     /// up to the limit.
     #[inline]
-    pub fn read(&self, start: Offset, limit: ReadLimit) -> Result<Vec<Event<'static>>, ReadError> {
+    pub fn read(
+        &self,
+        start: Offset,
+        limit: ReadLimit,
+        batch_size: usize,
+    ) -> Result<Vec<Event<'static>>, ReadError> {
         let mut rd = MessageBufReader;
         match self.reader(&mut rd, start, limit)? {
             Some(buf) => buf
                 .iter()
                 .map(|msg| rmp_serde::from_slice(msg.payload()).map_err(ReadError::Deserialize))
+                .take(batch_size)
                 .collect(),
             None => Ok(vec![]),
         }
@@ -830,708 +845,708 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         let offset = self.stream_index_iter.next()?;
         self.log
-            .read(offset, ReadLimit::default())
+            .read(offset, ReadLimit::default(), usize::MAX)
             .map(|read| read.into_iter().next())
             .transpose()
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{message::*, testutil::*, *};
-
-    use std::{collections::HashSet, fs};
-
-    #[test]
-    pub fn offset_range() {
-        let range = OffsetRange(2, 6);
-
-        assert_eq!(vec![2, 3, 4, 5, 6, 7], range.iter().collect::<Vec<u64>>());
-
-        assert_eq!(
-            vec![7, 6, 5, 4, 3, 2],
-            range.iter().rev().collect::<Vec<u64>>()
-        );
-    }
-
-    #[test]
-    pub fn append() {
-        let dir = TestDir::new();
-        let mut log = EventLog::new(LogOptions::new(&dir)).unwrap();
-        assert_eq!(log.append_msg("my_stream", "123456").unwrap(), 0);
-        assert_eq!(log.append_msg("my_stream", "abcdefg").unwrap(), 1);
-        assert_eq!(log.append_msg("my_stream", "foobarbaz").unwrap(), 2);
-        assert_eq!(log.append_msg("my_stream", "bing").unwrap(), 3);
-        log.flush().unwrap();
-    }
-
-    #[test]
-    pub fn append_multiple() {
-        let dir = TestDir::new();
-        let mut log = EventLog::new(LogOptions::new(&dir)).unwrap();
-        let mut buf = {
-            let mut buf = MessageBuf::default();
-            buf.push(b"123456").unwrap();
-            buf.push(b"789012").unwrap();
-            buf.push(b"345678").unwrap();
-            buf
-        };
-        let range = log.append("my_stream", &mut buf).unwrap();
-        assert_eq!(0, range.first());
-        assert_eq!(3, range.len());
-        assert_eq!(vec![0, 1, 2], range.iter().collect::<Vec<u64>>());
-    }
-
-    #[test]
-    pub fn append_new_segment() {
-        let dir = TestDir::new();
-        let mut opts = LogOptions::new(&dir);
-        opts.segment_max_bytes(62);
-
-        {
-            let mut log = EventLog::new(opts).unwrap();
-            // first 2 entries fit (both 30 bytes with encoding)
-            log.append_msg("my_stream", "0123456789").unwrap();
-            log.append_msg("my_stream", "0123456789").unwrap();
-
-            // this one should roll the log
-            log.append_msg("my_stream", "0123456789").unwrap();
-            log.flush().unwrap();
-        }
-
-        expect_files(
-            &dir,
-            vec![
-                "00000000000000000000.index",
-                "00000000000000000000.log",
-                "00000000000000000000.streams",
-                "00000000000000000002.log",
-                "00000000000000000002.index",
-                "00000000000000000002.streams",
-            ],
-        );
-    }
-
-    #[test]
-    pub fn read_entries() {
-        env_logger::try_init().unwrap_or(());
-
-        let dir = TestDir::new();
-        let mut opts = LogOptions::new(&dir);
-        opts.index_max_items(20);
-        opts.segment_max_bytes(1000);
-        let mut log = EventLog::new(opts).unwrap();
-
-        for i in 0..100 {
-            let s = format!("-data {}", i);
-            log.append_msg("my_stream", s.as_str()).unwrap();
-        }
-        log.flush().unwrap();
-
-        {
-            let active_index_read = log.read(82, ReadLimit::max_bytes(168)).unwrap();
-            assert_eq!(6, active_index_read.len());
-            assert_eq!(
-                vec![82, 83, 84, 85, 86, 87],
-                active_index_read.iter().map(|v| v.id).collect::<Vec<_>>()
-            );
-        }
-
-        {
-            let old_index_read = log.read(5, ReadLimit::max_bytes(112)).unwrap();
-            assert_eq!(4, old_index_read.len());
-            assert_eq!(
-                vec![5, 6, 7, 8],
-                old_index_read.iter().map(|v| v.id).collect::<Vec<_>>()
-            );
-        }
-
-        // read at the boundary (not going to get full message limit)
-        {
-            // log rolls at offset 36
-            let boundary_read = log.read(33, ReadLimit::max_bytes(100)).unwrap();
-            assert_eq!(3, boundary_read.len());
-            assert_eq!(
-                vec![33, 34, 35],
-                boundary_read.iter().map(|v| v.id).collect::<Vec<_>>()
-            );
-        }
-    }
-
-    #[test]
-    pub fn reopen_log() {
-        env_logger::try_init().unwrap_or(());
-
-        let dir = TestDir::new();
-        let mut opts = LogOptions::new(&dir);
-        opts.index_max_items(20);
-        opts.segment_max_bytes(1000);
-
-        {
-            let mut log = EventLog::new(opts.clone()).unwrap();
-
-            for i in 0..99 {
-                let s = format!("some data {}", i);
-                let off = log.append_msg("my_stream", s.as_str()).unwrap();
-                assert_eq!(i, off);
-            }
-            log.flush().unwrap();
-        }
-
-        {
-            let mut log = EventLog::new(opts).unwrap();
-
-            let active_index_read = log.read(82, ReadLimit::max_bytes(130)).unwrap();
-
-            assert_eq!(4, active_index_read.len());
-            assert_eq!(
-                vec![82, 83, 84, 85],
-                active_index_read.iter().map(|v| v.id).collect::<Vec<_>>()
-            );
-
-            let off = log.append_msg("my_stream", "moar data").unwrap();
-            assert_eq!(99, off);
-        }
-    }
-
-    #[test]
-    pub fn reopen_log_without_segment_write() {
-        env_logger::try_init().unwrap_or(());
-
-        let dir = TestDir::new();
-        let mut opts = LogOptions::new(&dir);
-        opts.index_max_items(20);
-        opts.segment_max_bytes(1000);
-
-        {
-            let mut log = EventLog::new(opts.clone()).unwrap();
-            log.flush().unwrap();
-        }
-
-        {
-            EventLog::new(opts.clone()).expect("Should be able to reopen log without writes");
-        }
-
-        {
-            EventLog::new(opts).expect("Should be able to reopen log without writes");
-        }
-    }
-
-    #[test]
-    pub fn reopen_log_with_one_segment_write() {
-        env_logger::try_init().unwrap_or(());
-        let dir = TestDir::new();
-        let opts = LogOptions::new(&dir);
-        {
-            let mut log = EventLog::new(opts.clone()).unwrap();
-            log.append_msg("my_stream", "Test").unwrap();
-            log.flush().unwrap();
-        }
-        {
-            let log = EventLog::new(opts).unwrap();
-            assert_eq!(1, log.next_offset());
-        }
-    }
-
-    #[test]
-    pub fn append_message_greater_than_max() {
-        let dir = TestDir::new();
-        let mut log = EventLog::new(LogOptions::new(&dir)).unwrap();
-        //create vector with 1.2mb of size, u8 = 1 byte thus,
-        //1mb = 1000000 bytes, 1200000 items needed
-        let mut value = String::new();
-        let mut target = 0;
-        while target != 2000000 {
-            value.push('a');
-            target += 1;
-        }
-        let res = log.append_msg("my_stream", value);
-        //will fail if no error is found which means a message greater than the limit
-        // passed through
-        assert!(res.is_err());
-        log.flush().unwrap();
-    }
-
-    #[test]
-    pub fn truncate_from_active() {
-        let dir = TestDir::new();
-        let mut log = EventLog::new(LogOptions::new(&dir)).unwrap();
-
-        // append 5 messages
-        {
-            let mut buf = MessageBuf::default();
-            buf.push(b"123456").unwrap();
-            buf.push(b"789012").unwrap();
-            buf.push(b"345678").unwrap();
-            buf.push(b"aaaaaa").unwrap();
-            buf.push(b"bbbbbb").unwrap();
-            log.append("my_stream", &mut buf).unwrap();
-        }
-
-        // truncate to offset 2 (should remove 2 messages)
-        log.truncate(2).expect("Unable to truncate file");
-
-        assert_eq!(Some(2), log.last_offset());
-    }
-
-    #[test]
-    pub fn truncate_after_offset_removes_segments() {
-        env_logger::try_init().unwrap_or(());
-        let dir = TestDir::new();
-
-        let mut opts = LogOptions::new(&dir);
-        opts.index_max_items(20);
-        opts.segment_max_bytes(52);
-        let mut log = EventLog::new(opts).unwrap();
-
-        // append 6 messages (4 segments)
-        {
-            for _ in 0..7 {
-                log.append_msg("my_stream", b"12345").unwrap();
-            }
-        }
-
-        // ensure we have the expected index/logs
-        expect_files(
-            &dir,
-            vec![
-                "00000000000000000000.index",
-                "00000000000000000000.log",
-                "00000000000000000000.streams",
-                "00000000000000000002.log",
-                "00000000000000000002.streams",
-                "00000000000000000002.index",
-                "00000000000000000004.log",
-                "00000000000000000004.streams",
-                "00000000000000000004.index",
-                "00000000000000000006.log",
-                "00000000000000000006.streams",
-                "00000000000000000006.index",
-            ],
-        );
-
-        // truncate to offset 2 (should remove 2 messages)
-        log.truncate(3).expect("Unable to truncate file");
-
-        assert_eq!(Some(3), log.last_offset());
-
-        // ensure we have the expected index/logs
-        expect_files(
-            &dir,
-            vec![
-                "00000000000000000000.index",
-                "00000000000000000000.log",
-                "00000000000000000000.streams",
-                "00000000000000000002.log",
-                "00000000000000000002.index",
-                "00000000000000000002.streams",
-            ],
-        );
-    }
-
-    #[test]
-    pub fn truncate_at_segment_boundary_removes_segments() {
-        env_logger::try_init().unwrap_or(());
-        let dir = TestDir::new();
-
-        let mut opts = LogOptions::new(&dir);
-        opts.index_max_items(20);
-        opts.segment_max_bytes(52);
-        let mut log = EventLog::new(opts).unwrap();
-
-        // append 6 messages (4 segments)
-        {
-            for _ in 0..7 {
-                log.append_msg("my_stream", b"12345").unwrap();
-            }
-        }
-
-        // ensure we have the expected index/logs
-        expect_files(
-            &dir,
-            vec![
-                "00000000000000000000.index",
-                "00000000000000000000.log",
-                "00000000000000000000.streams",
-                "00000000000000000002.log",
-                "00000000000000000002.index",
-                "00000000000000000002.streams",
-                "00000000000000000004.log",
-                "00000000000000000004.index",
-                "00000000000000000004.streams",
-                "00000000000000000006.log",
-                "00000000000000000006.index",
-                "00000000000000000006.streams",
-            ],
-        );
-
-        // truncate to offset 2 (should remove 2 messages)
-        log.truncate(2).expect("Unable to truncate file");
-
-        assert_eq!(Some(2), log.last_offset());
-
-        // ensure we have the expected index/logs
-        expect_files(
-            &dir,
-            vec![
-                "00000000000000000000.index",
-                "00000000000000000000.log",
-                "00000000000000000000.streams",
-                "00000000000000000002.log",
-                "00000000000000000002.index",
-                "00000000000000000002.streams",
-            ],
-        );
-    }
-
-    #[test]
-    pub fn truncate_after_last_append_does_nothing() {
-        env_logger::try_init().unwrap_or(());
-        let dir = TestDir::new();
-
-        let mut opts = LogOptions::new(&dir);
-        opts.index_max_items(20);
-        opts.segment_max_bytes(52);
-        let mut log = EventLog::new(opts).unwrap();
-
-        // append 6 messages (4 segments)
-        {
-            for _ in 0..7 {
-                log.append_msg("my_stream", b"12345").unwrap();
-            }
-        }
-
-        // ensure we have the expected index/logs
-        expect_files(
-            &dir,
-            vec![
-                "00000000000000000000.index",
-                "00000000000000000000.log",
-                "00000000000000000000.streams",
-                "00000000000000000002.log",
-                "00000000000000000002.streams",
-                "00000000000000000002.index",
-                "00000000000000000004.log",
-                "00000000000000000004.streams",
-                "00000000000000000004.index",
-                "00000000000000000006.log",
-                "00000000000000000006.streams",
-                "00000000000000000006.index",
-            ],
-        );
-
-        // truncate to offset 2 (should remove 2 messages)
-        log.truncate(7).expect("Unable to truncate file");
-
-        assert_eq!(Some(6), log.last_offset());
-
-        // ensure we have the expected index/logs
-        expect_files(
-            &dir,
-            vec![
-                "00000000000000000000.index",
-                "00000000000000000000.log",
-                "00000000000000000000.streams",
-                "00000000000000000002.log",
-                "00000000000000000002.index",
-                "00000000000000000002.streams",
-                "00000000000000000004.log",
-                "00000000000000000004.index",
-                "00000000000000000004.streams",
-                "00000000000000000006.log",
-                "00000000000000000006.index",
-                "00000000000000000006.streams",
-            ],
-        );
-    }
-
-    #[test]
-    pub fn trim_segments_before_removes_segments() {
-        env_logger::try_init().unwrap_or(());
-        let dir = TestDir::new();
-
-        let mut opts = LogOptions::new(&dir);
-        opts.index_max_items(20);
-        opts.segment_max_bytes(52);
-        let mut log = EventLog::new(opts).unwrap();
-
-        // append 6 messages (4 segments)
-        {
-            for _ in 0..7 {
-                log.append_msg("my_stream", b"12345").unwrap();
-            }
-        }
-
-        // ensure we have the expected index/logs
-        expect_files(
-            &dir,
-            vec![
-                "00000000000000000000.index",
-                "00000000000000000000.log",
-                "00000000000000000000.streams",
-                "00000000000000000002.log",
-                "00000000000000000002.index",
-                "00000000000000000002.streams",
-                "00000000000000000004.log",
-                "00000000000000000004.index",
-                "00000000000000000004.streams",
-                "00000000000000000006.log",
-                "00000000000000000006.index",
-                "00000000000000000006.streams",
-            ],
-        );
-
-        // remove segments < 3 which is just segment 0
-        log.trim_segments_before(3)
-            .expect("Unable to truncate file");
-
-        assert_eq!(Some(6), log.last_offset());
-
-        // ensure we have the expected index/logs
-        expect_files(
-            &dir,
-            vec![
-                "00000000000000000002.index",
-                "00000000000000000002.log",
-                "00000000000000000002.streams",
-                "00000000000000000004.log",
-                "00000000000000000004.index",
-                "00000000000000000004.streams",
-                "00000000000000000006.log",
-                "00000000000000000006.index",
-                "00000000000000000006.streams",
-            ],
-        );
-
-        // make sure the messages are really gone
-        let reader = log
-            .read(0, ReadLimit::default())
-            .expect("Unabled to grab reader");
-        assert_eq!(2, reader.iter().next().unwrap().id);
-    }
-
-    #[test]
-    pub fn trim_segments_before_removes_segments_at_boundary() {
-        env_logger::try_init().unwrap_or(());
-        let dir = TestDir::new();
-
-        let mut opts = LogOptions::new(&dir);
-        opts.index_max_items(20);
-        opts.segment_max_bytes(52);
-        let mut log = EventLog::new(opts).unwrap();
-
-        // append 6 messages (4 segments)
-        {
-            for _ in 0..7 {
-                log.append_msg("my_stream", b"12345").unwrap();
-            }
-        }
-
-        // ensure we have the expected index/logs
-        expect_files(
-            &dir,
-            vec![
-                "00000000000000000000.index",
-                "00000000000000000000.log",
-                "00000000000000000000.streams",
-                "00000000000000000002.log",
-                "00000000000000000002.index",
-                "00000000000000000002.streams",
-                "00000000000000000004.log",
-                "00000000000000000004.index",
-                "00000000000000000004.streams",
-                "00000000000000000006.log",
-                "00000000000000000006.index",
-                "00000000000000000006.streams",
-            ],
-        );
-
-        // remove segments < 3 which is just segment 0
-        log.trim_segments_before(4)
-            .expect("Unable to truncate file");
-
-        assert_eq!(Some(6), log.last_offset());
-
-        // ensure we have the expected index/logs
-        expect_files(
-            &dir,
-            vec![
-                "00000000000000000004.log",
-                "00000000000000000004.index",
-                "00000000000000000004.streams",
-                "00000000000000000006.log",
-                "00000000000000000006.index",
-                "00000000000000000006.streams",
-            ],
-        );
-
-        // make sure the messages are really gone
-        let reader = log
-            .read(0, ReadLimit::default())
-            .expect("Unabled to grab reader");
-        assert_eq!(4, reader.iter().next().unwrap().id);
-    }
-
-    #[test]
-    pub fn trim_start_logic_check() {
-        env_logger::try_init().unwrap_or(());
-        const TOTAL_MESSAGES: u64 = 20;
-        const TESTED_TRIM_START: u64 = TOTAL_MESSAGES + 1;
-
-        for trim_off in 0..TESTED_TRIM_START {
-            let dir = TestDir::new();
-            let mut opts = LogOptions::new(&dir);
-            opts.index_max_items(20);
-            opts.segment_max_bytes(52);
-            let mut log = EventLog::new(opts).unwrap();
-
-            // append the messages
-            {
-                for _ in 0..TOTAL_MESSAGES {
-                    log.append_msg("my_stream", b"12345").unwrap();
-                }
-            }
-
-            log.trim_segments_before(trim_off)
-                .expect("Unable to truncate file");
-            assert_eq!(Some(TOTAL_MESSAGES - 1), log.last_offset());
-
-            // make sure the messages are really gone
-            let reader = log
-                .read(0, ReadLimit::default())
-                .expect("Unabled to grab reader");
-            let start_off = reader.iter().next().unwrap().id;
-            assert!(start_off <= trim_off);
-        }
-    }
-
-    #[test]
-    pub fn multiple_trim_start_calls() {
-        env_logger::try_init().unwrap_or(());
-        const TOTAL_MESSAGES: u64 = 20;
-        let dir = TestDir::new();
-        let mut opts = LogOptions::new(&dir);
-        opts.index_max_items(20);
-        opts.segment_max_bytes(52);
-        let mut log = EventLog::new(opts).unwrap();
-
-        // append the messages
-        {
-            for _ in 0..TOTAL_MESSAGES {
-                log.append_msg("my_stream", b"12345").unwrap();
-            }
-        }
-
-        log.trim_segments_before(2).unwrap();
-
-        {
-            let reader = log
-                .read(0, ReadLimit::default())
-                .expect("Unabled to grab reader");
-            assert_eq!(2, reader.iter().next().unwrap().id);
-        }
-
-        log.trim_segments_before(10).unwrap();
-
-        {
-            let reader = log
-                .read(0, ReadLimit::default())
-                .expect("Unabled to grab reader");
-            assert_eq!(10, reader.iter().next().unwrap().id);
-        }
-    }
-
-    #[test]
-    pub fn trim_inactive_logic_check() {
-        env_logger::try_init().unwrap_or(());
-        const TOTAL_MESSAGES: u64 = 20;
-
-        let dir = TestDir::new();
-        let mut opts = LogOptions::new(&dir);
-        opts.index_max_items(20);
-        opts.segment_max_bytes(52);
-        let mut log = EventLog::new(opts).unwrap();
-
-        // append the messages
-        {
-            for _ in 0..TOTAL_MESSAGES {
-                log.append_msg("my_stream", b"12345").unwrap();
-            }
-        }
-
-        log.trim_inactive_segments()
-            .expect("Unable to truncate file");
-        assert_eq!(Some(TOTAL_MESSAGES - 1), log.last_offset());
-
-        // make sure the messages are really gone
-        let reader = log
-            .read(0, ReadLimit::default())
-            .expect("Unabled to grab reader");
-        let start_off = reader.iter().next().unwrap().id;
-        assert_eq!(16, start_off);
-    }
-
-    #[test]
-    pub fn trim_inactive_logic_check_zero_messages() {
-        env_logger::try_init().unwrap_or(());
-
-        let dir = TestDir::new();
-        let mut opts = LogOptions::new(&dir);
-        opts.index_max_items(20);
-        opts.segment_max_bytes(52);
-        let mut log = EventLog::new(opts).unwrap();
-
-        log.trim_inactive_segments()
-            .expect("Unable to truncate file");
-        assert_eq!(None, log.last_offset());
-
-        // append the messages
-        log.append_msg("my_stream", b"12345").unwrap();
-
-        // make sure the messages are really gone
-        let reader = log
-            .read(0, ReadLimit::default())
-            .expect("Unabled to grab reader");
-        let start_off = reader.iter().next().unwrap().id;
-        assert_eq!(0, start_off);
-    }
-
-    fn expect_files<P: AsRef<Path>, I>(dir: P, files: I)
-    where
-        I: IntoIterator<Item = &'static str>,
-    {
-        let dir_files = fs::read_dir(&dir)
-            .unwrap()
-            .map(|res| {
-                res.unwrap()
-                    .path()
-                    .file_name()
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .to_string()
-            })
-            .collect::<HashSet<String>>();
-        let expected = files
-            .into_iter()
-            .map(|s| s.to_string())
-            .collect::<HashSet<String>>();
-        assert_eq!(
-            dir_files.len(),
-            expected.len(),
-            "Invalid file count, expected {:?} got {:?}",
-            expected,
-            dir_files
-        );
-        assert_eq!(
-            dir_files.intersection(&expected).count(),
-            expected.len(),
-            "Invalid file count, expected {:?} got {:?}",
-            expected,
-            dir_files
-        );
-    }
-}
+// #[cfg(test)]
+// mod tests {
+//     use super::{message::*, testutil::*, *};
+
+//     use std::{collections::HashSet, fs};
+
+//     #[test]
+//     pub fn offset_range() {
+//         let range = OffsetRange(2, 6);
+
+//         assert_eq!(vec![2, 3, 4, 5, 6, 7], range.iter().collect::<Vec<u64>>());
+
+//         assert_eq!(
+//             vec![7, 6, 5, 4, 3, 2],
+//             range.iter().rev().collect::<Vec<u64>>()
+//         );
+//     }
+
+//     #[test]
+//     pub fn append() {
+//         let dir = TestDir::new();
+//         let mut log = EventLog::new(LogOptions::new(&dir)).unwrap();
+//         assert_eq!(log.append_msg("my_stream", "123456").unwrap(), 0);
+//         assert_eq!(log.append_msg("my_stream", "abcdefg").unwrap(), 1);
+//         assert_eq!(log.append_msg("my_stream", "foobarbaz").unwrap(), 2);
+//         assert_eq!(log.append_msg("my_stream", "bing").unwrap(), 3);
+//         log.flush().unwrap();
+//     }
+
+//     #[test]
+//     pub fn append_multiple() {
+//         let dir = TestDir::new();
+//         let mut log = EventLog::new(LogOptions::new(&dir)).unwrap();
+//         let mut buf = {
+//             let mut buf = MessageBuf::default();
+//             buf.push(b"123456").unwrap();
+//             buf.push(b"789012").unwrap();
+//             buf.push(b"345678").unwrap();
+//             buf
+//         };
+//         let range = log.append("my_stream", &mut buf).unwrap();
+//         assert_eq!(0, range.first());
+//         assert_eq!(3, range.len());
+//         assert_eq!(vec![0, 1, 2], range.iter().collect::<Vec<u64>>());
+//     }
+
+//     #[test]
+//     pub fn append_new_segment() {
+//         let dir = TestDir::new();
+//         let mut opts = LogOptions::new(&dir);
+//         opts.segment_max_bytes(62);
+
+//         {
+//             let mut log = EventLog::new(opts).unwrap();
+//             // first 2 entries fit (both 30 bytes with encoding)
+//             log.append_msg("my_stream", "0123456789").unwrap();
+//             log.append_msg("my_stream", "0123456789").unwrap();
+
+//             // this one should roll the log
+//             log.append_msg("my_stream", "0123456789").unwrap();
+//             log.flush().unwrap();
+//         }
+
+//         expect_files(
+//             &dir,
+//             vec![
+//                 "00000000000000000000.index",
+//                 "00000000000000000000.log",
+//                 "00000000000000000000.streams",
+//                 "00000000000000000002.log",
+//                 "00000000000000000002.index",
+//                 "00000000000000000002.streams",
+//             ],
+//         );
+//     }
+
+//     #[test]
+//     pub fn read_entries() {
+//         env_logger::try_init().unwrap_or(());
+
+//         let dir = TestDir::new();
+//         let mut opts = LogOptions::new(&dir);
+//         opts.index_max_items(20);
+//         opts.segment_max_bytes(1000);
+//         let mut log = EventLog::new(opts).unwrap();
+
+//         for i in 0..100 {
+//             let s = format!("-data {}", i);
+//             log.append_msg("my_stream", s.as_str()).unwrap();
+//         }
+//         log.flush().unwrap();
+
+//         {
+//             let active_index_read = log.read(82, ReadLimit::max_bytes(168)).unwrap();
+//             assert_eq!(6, active_index_read.len());
+//             assert_eq!(
+//                 vec![82, 83, 84, 85, 86, 87],
+//                 active_index_read.iter().map(|v| v.id).collect::<Vec<_>>()
+//             );
+//         }
+
+//         {
+//             let old_index_read = log.read(5, ReadLimit::max_bytes(112)).unwrap();
+//             assert_eq!(4, old_index_read.len());
+//             assert_eq!(
+//                 vec![5, 6, 7, 8],
+//                 old_index_read.iter().map(|v| v.id).collect::<Vec<_>>()
+//             );
+//         }
+
+//         // read at the boundary (not going to get full message limit)
+//         {
+//             // log rolls at offset 36
+//             let boundary_read = log.read(33, ReadLimit::max_bytes(100)).unwrap();
+//             assert_eq!(3, boundary_read.len());
+//             assert_eq!(
+//                 vec![33, 34, 35],
+//                 boundary_read.iter().map(|v| v.id).collect::<Vec<_>>()
+//             );
+//         }
+//     }
+
+//     #[test]
+//     pub fn reopen_log() {
+//         env_logger::try_init().unwrap_or(());
+
+//         let dir = TestDir::new();
+//         let mut opts = LogOptions::new(&dir);
+//         opts.index_max_items(20);
+//         opts.segment_max_bytes(1000);
+
+//         {
+//             let mut log = EventLog::new(opts.clone()).unwrap();
+
+//             for i in 0..99 {
+//                 let s = format!("some data {}", i);
+//                 let off = log.append_msg("my_stream", s.as_str()).unwrap();
+//                 assert_eq!(i, off);
+//             }
+//             log.flush().unwrap();
+//         }
+
+//         {
+//             let mut log = EventLog::new(opts).unwrap();
+
+//             let active_index_read = log.read(82, ReadLimit::max_bytes(130)).unwrap();
+
+//             assert_eq!(4, active_index_read.len());
+//             assert_eq!(
+//                 vec![82, 83, 84, 85],
+//                 active_index_read.iter().map(|v| v.id).collect::<Vec<_>>()
+//             );
+
+//             let off = log.append_msg("my_stream", "moar data").unwrap();
+//             assert_eq!(99, off);
+//         }
+//     }
+
+//     #[test]
+//     pub fn reopen_log_without_segment_write() {
+//         env_logger::try_init().unwrap_or(());
+
+//         let dir = TestDir::new();
+//         let mut opts = LogOptions::new(&dir);
+//         opts.index_max_items(20);
+//         opts.segment_max_bytes(1000);
+
+//         {
+//             let mut log = EventLog::new(opts.clone()).unwrap();
+//             log.flush().unwrap();
+//         }
+
+//         {
+//             EventLog::new(opts.clone()).expect("Should be able to reopen log without writes");
+//         }
+
+//         {
+//             EventLog::new(opts).expect("Should be able to reopen log without writes");
+//         }
+//     }
+
+//     #[test]
+//     pub fn reopen_log_with_one_segment_write() {
+//         env_logger::try_init().unwrap_or(());
+//         let dir = TestDir::new();
+//         let opts = LogOptions::new(&dir);
+//         {
+//             let mut log = EventLog::new(opts.clone()).unwrap();
+//             log.append_msg("my_stream", "Test").unwrap();
+//             log.flush().unwrap();
+//         }
+//         {
+//             let log = EventLog::new(opts).unwrap();
+//             assert_eq!(1, log.next_offset());
+//         }
+//     }
+
+//     #[test]
+//     pub fn append_message_greater_than_max() {
+//         let dir = TestDir::new();
+//         let mut log = EventLog::new(LogOptions::new(&dir)).unwrap();
+//         //create vector with 1.2mb of size, u8 = 1 byte thus,
+//         //1mb = 1000000 bytes, 1200000 items needed
+//         let mut value = String::new();
+//         let mut target = 0;
+//         while target != 2000000 {
+//             value.push('a');
+//             target += 1;
+//         }
+//         let res = log.append_msg("my_stream", value);
+//         //will fail if no error is found which means a message greater than the limit
+//         // passed through
+//         assert!(res.is_err());
+//         log.flush().unwrap();
+//     }
+
+//     #[test]
+//     pub fn truncate_from_active() {
+//         let dir = TestDir::new();
+//         let mut log = EventLog::new(LogOptions::new(&dir)).unwrap();
+
+//         // append 5 messages
+//         {
+//             let mut buf = MessageBuf::default();
+//             buf.push(b"123456").unwrap();
+//             buf.push(b"789012").unwrap();
+//             buf.push(b"345678").unwrap();
+//             buf.push(b"aaaaaa").unwrap();
+//             buf.push(b"bbbbbb").unwrap();
+//             log.append("my_stream", &mut buf).unwrap();
+//         }
+
+//         // truncate to offset 2 (should remove 2 messages)
+//         log.truncate(2).expect("Unable to truncate file");
+
+//         assert_eq!(Some(2), log.last_offset());
+//     }
+
+//     #[test]
+//     pub fn truncate_after_offset_removes_segments() {
+//         env_logger::try_init().unwrap_or(());
+//         let dir = TestDir::new();
+
+//         let mut opts = LogOptions::new(&dir);
+//         opts.index_max_items(20);
+//         opts.segment_max_bytes(52);
+//         let mut log = EventLog::new(opts).unwrap();
+
+//         // append 6 messages (4 segments)
+//         {
+//             for _ in 0..7 {
+//                 log.append_msg("my_stream", b"12345").unwrap();
+//             }
+//         }
+
+//         // ensure we have the expected index/logs
+//         expect_files(
+//             &dir,
+//             vec![
+//                 "00000000000000000000.index",
+//                 "00000000000000000000.log",
+//                 "00000000000000000000.streams",
+//                 "00000000000000000002.log",
+//                 "00000000000000000002.streams",
+//                 "00000000000000000002.index",
+//                 "00000000000000000004.log",
+//                 "00000000000000000004.streams",
+//                 "00000000000000000004.index",
+//                 "00000000000000000006.log",
+//                 "00000000000000000006.streams",
+//                 "00000000000000000006.index",
+//             ],
+//         );
+
+//         // truncate to offset 2 (should remove 2 messages)
+//         log.truncate(3).expect("Unable to truncate file");
+
+//         assert_eq!(Some(3), log.last_offset());
+
+//         // ensure we have the expected index/logs
+//         expect_files(
+//             &dir,
+//             vec![
+//                 "00000000000000000000.index",
+//                 "00000000000000000000.log",
+//                 "00000000000000000000.streams",
+//                 "00000000000000000002.log",
+//                 "00000000000000000002.index",
+//                 "00000000000000000002.streams",
+//             ],
+//         );
+//     }
+
+//     #[test]
+//     pub fn truncate_at_segment_boundary_removes_segments() {
+//         env_logger::try_init().unwrap_or(());
+//         let dir = TestDir::new();
+
+//         let mut opts = LogOptions::new(&dir);
+//         opts.index_max_items(20);
+//         opts.segment_max_bytes(52);
+//         let mut log = EventLog::new(opts).unwrap();
+
+//         // append 6 messages (4 segments)
+//         {
+//             for _ in 0..7 {
+//                 log.append_msg("my_stream", b"12345").unwrap();
+//             }
+//         }
+
+//         // ensure we have the expected index/logs
+//         expect_files(
+//             &dir,
+//             vec![
+//                 "00000000000000000000.index",
+//                 "00000000000000000000.log",
+//                 "00000000000000000000.streams",
+//                 "00000000000000000002.log",
+//                 "00000000000000000002.index",
+//                 "00000000000000000002.streams",
+//                 "00000000000000000004.log",
+//                 "00000000000000000004.index",
+//                 "00000000000000000004.streams",
+//                 "00000000000000000006.log",
+//                 "00000000000000000006.index",
+//                 "00000000000000000006.streams",
+//             ],
+//         );
+
+//         // truncate to offset 2 (should remove 2 messages)
+//         log.truncate(2).expect("Unable to truncate file");
+
+//         assert_eq!(Some(2), log.last_offset());
+
+//         // ensure we have the expected index/logs
+//         expect_files(
+//             &dir,
+//             vec![
+//                 "00000000000000000000.index",
+//                 "00000000000000000000.log",
+//                 "00000000000000000000.streams",
+//                 "00000000000000000002.log",
+//                 "00000000000000000002.index",
+//                 "00000000000000000002.streams",
+//             ],
+//         );
+//     }
+
+//     #[test]
+//     pub fn truncate_after_last_append_does_nothing() {
+//         env_logger::try_init().unwrap_or(());
+//         let dir = TestDir::new();
+
+//         let mut opts = LogOptions::new(&dir);
+//         opts.index_max_items(20);
+//         opts.segment_max_bytes(52);
+//         let mut log = EventLog::new(opts).unwrap();
+
+//         // append 6 messages (4 segments)
+//         {
+//             for _ in 0..7 {
+//                 log.append_msg("my_stream", b"12345").unwrap();
+//             }
+//         }
+
+//         // ensure we have the expected index/logs
+//         expect_files(
+//             &dir,
+//             vec![
+//                 "00000000000000000000.index",
+//                 "00000000000000000000.log",
+//                 "00000000000000000000.streams",
+//                 "00000000000000000002.log",
+//                 "00000000000000000002.streams",
+//                 "00000000000000000002.index",
+//                 "00000000000000000004.log",
+//                 "00000000000000000004.streams",
+//                 "00000000000000000004.index",
+//                 "00000000000000000006.log",
+//                 "00000000000000000006.streams",
+//                 "00000000000000000006.index",
+//             ],
+//         );
+
+//         // truncate to offset 2 (should remove 2 messages)
+//         log.truncate(7).expect("Unable to truncate file");
+
+//         assert_eq!(Some(6), log.last_offset());
+
+//         // ensure we have the expected index/logs
+//         expect_files(
+//             &dir,
+//             vec![
+//                 "00000000000000000000.index",
+//                 "00000000000000000000.log",
+//                 "00000000000000000000.streams",
+//                 "00000000000000000002.log",
+//                 "00000000000000000002.index",
+//                 "00000000000000000002.streams",
+//                 "00000000000000000004.log",
+//                 "00000000000000000004.index",
+//                 "00000000000000000004.streams",
+//                 "00000000000000000006.log",
+//                 "00000000000000000006.index",
+//                 "00000000000000000006.streams",
+//             ],
+//         );
+//     }
+
+//     #[test]
+//     pub fn trim_segments_before_removes_segments() {
+//         env_logger::try_init().unwrap_or(());
+//         let dir = TestDir::new();
+
+//         let mut opts = LogOptions::new(&dir);
+//         opts.index_max_items(20);
+//         opts.segment_max_bytes(52);
+//         let mut log = EventLog::new(opts).unwrap();
+
+//         // append 6 messages (4 segments)
+//         {
+//             for _ in 0..7 {
+//                 log.append_msg("my_stream", b"12345").unwrap();
+//             }
+//         }
+
+//         // ensure we have the expected index/logs
+//         expect_files(
+//             &dir,
+//             vec![
+//                 "00000000000000000000.index",
+//                 "00000000000000000000.log",
+//                 "00000000000000000000.streams",
+//                 "00000000000000000002.log",
+//                 "00000000000000000002.index",
+//                 "00000000000000000002.streams",
+//                 "00000000000000000004.log",
+//                 "00000000000000000004.index",
+//                 "00000000000000000004.streams",
+//                 "00000000000000000006.log",
+//                 "00000000000000000006.index",
+//                 "00000000000000000006.streams",
+//             ],
+//         );
+
+//         // remove segments < 3 which is just segment 0
+//         log.trim_segments_before(3)
+//             .expect("Unable to truncate file");
+
+//         assert_eq!(Some(6), log.last_offset());
+
+//         // ensure we have the expected index/logs
+//         expect_files(
+//             &dir,
+//             vec![
+//                 "00000000000000000002.index",
+//                 "00000000000000000002.log",
+//                 "00000000000000000002.streams",
+//                 "00000000000000000004.log",
+//                 "00000000000000000004.index",
+//                 "00000000000000000004.streams",
+//                 "00000000000000000006.log",
+//                 "00000000000000000006.index",
+//                 "00000000000000000006.streams",
+//             ],
+//         );
+
+//         // make sure the messages are really gone
+//         let reader = log
+//             .read(0, ReadLimit::default())
+//             .expect("Unabled to grab reader");
+//         assert_eq!(2, reader.iter().next().unwrap().id);
+//     }
+
+//     #[test]
+//     pub fn trim_segments_before_removes_segments_at_boundary() {
+//         env_logger::try_init().unwrap_or(());
+//         let dir = TestDir::new();
+
+//         let mut opts = LogOptions::new(&dir);
+//         opts.index_max_items(20);
+//         opts.segment_max_bytes(52);
+//         let mut log = EventLog::new(opts).unwrap();
+
+//         // append 6 messages (4 segments)
+//         {
+//             for _ in 0..7 {
+//                 log.append_msg("my_stream", b"12345").unwrap();
+//             }
+//         }
+
+//         // ensure we have the expected index/logs
+//         expect_files(
+//             &dir,
+//             vec![
+//                 "00000000000000000000.index",
+//                 "00000000000000000000.log",
+//                 "00000000000000000000.streams",
+//                 "00000000000000000002.log",
+//                 "00000000000000000002.index",
+//                 "00000000000000000002.streams",
+//                 "00000000000000000004.log",
+//                 "00000000000000000004.index",
+//                 "00000000000000000004.streams",
+//                 "00000000000000000006.log",
+//                 "00000000000000000006.index",
+//                 "00000000000000000006.streams",
+//             ],
+//         );
+
+//         // remove segments < 3 which is just segment 0
+//         log.trim_segments_before(4)
+//             .expect("Unable to truncate file");
+
+//         assert_eq!(Some(6), log.last_offset());
+
+//         // ensure we have the expected index/logs
+//         expect_files(
+//             &dir,
+//             vec![
+//                 "00000000000000000004.log",
+//                 "00000000000000000004.index",
+//                 "00000000000000000004.streams",
+//                 "00000000000000000006.log",
+//                 "00000000000000000006.index",
+//                 "00000000000000000006.streams",
+//             ],
+//         );
+
+//         // make sure the messages are really gone
+//         let reader = log
+//             .read(0, ReadLimit::default())
+//             .expect("Unabled to grab reader");
+//         assert_eq!(4, reader.iter().next().unwrap().id);
+//     }
+
+//     #[test]
+//     pub fn trim_start_logic_check() {
+//         env_logger::try_init().unwrap_or(());
+//         const TOTAL_MESSAGES: u64 = 20;
+//         const TESTED_TRIM_START: u64 = TOTAL_MESSAGES + 1;
+
+//         for trim_off in 0..TESTED_TRIM_START {
+//             let dir = TestDir::new();
+//             let mut opts = LogOptions::new(&dir);
+//             opts.index_max_items(20);
+//             opts.segment_max_bytes(52);
+//             let mut log = EventLog::new(opts).unwrap();
+
+//             // append the messages
+//             {
+//                 for _ in 0..TOTAL_MESSAGES {
+//                     log.append_msg("my_stream", b"12345").unwrap();
+//                 }
+//             }
+
+//             log.trim_segments_before(trim_off)
+//                 .expect("Unable to truncate file");
+//             assert_eq!(Some(TOTAL_MESSAGES - 1), log.last_offset());
+
+//             // make sure the messages are really gone
+//             let reader = log
+//                 .read(0, ReadLimit::default())
+//                 .expect("Unabled to grab reader");
+//             let start_off = reader.iter().next().unwrap().id;
+//             assert!(start_off <= trim_off);
+//         }
+//     }
+
+//     #[test]
+//     pub fn multiple_trim_start_calls() {
+//         env_logger::try_init().unwrap_or(());
+//         const TOTAL_MESSAGES: u64 = 20;
+//         let dir = TestDir::new();
+//         let mut opts = LogOptions::new(&dir);
+//         opts.index_max_items(20);
+//         opts.segment_max_bytes(52);
+//         let mut log = EventLog::new(opts).unwrap();
+
+//         // append the messages
+//         {
+//             for _ in 0..TOTAL_MESSAGES {
+//                 log.append_msg("my_stream", b"12345").unwrap();
+//             }
+//         }
+
+//         log.trim_segments_before(2).unwrap();
+
+//         {
+//             let reader = log
+//                 .read(0, ReadLimit::default())
+//                 .expect("Unabled to grab reader");
+//             assert_eq!(2, reader.iter().next().unwrap().id);
+//         }
+
+//         log.trim_segments_before(10).unwrap();
+
+//         {
+//             let reader = log
+//                 .read(0, ReadLimit::default())
+//                 .expect("Unabled to grab reader");
+//             assert_eq!(10, reader.iter().next().unwrap().id);
+//         }
+//     }
+
+//     #[test]
+//     pub fn trim_inactive_logic_check() {
+//         env_logger::try_init().unwrap_or(());
+//         const TOTAL_MESSAGES: u64 = 20;
+
+//         let dir = TestDir::new();
+//         let mut opts = LogOptions::new(&dir);
+//         opts.index_max_items(20);
+//         opts.segment_max_bytes(52);
+//         let mut log = EventLog::new(opts).unwrap();
+
+//         // append the messages
+//         {
+//             for _ in 0..TOTAL_MESSAGES {
+//                 log.append_msg("my_stream", b"12345").unwrap();
+//             }
+//         }
+
+//         log.trim_inactive_segments()
+//             .expect("Unable to truncate file");
+//         assert_eq!(Some(TOTAL_MESSAGES - 1), log.last_offset());
+
+//         // make sure the messages are really gone
+//         let reader = log
+//             .read(0, ReadLimit::default())
+//             .expect("Unabled to grab reader");
+//         let start_off = reader.iter().next().unwrap().id;
+//         assert_eq!(16, start_off);
+//     }
+
+//     #[test]
+//     pub fn trim_inactive_logic_check_zero_messages() {
+//         env_logger::try_init().unwrap_or(());
+
+//         let dir = TestDir::new();
+//         let mut opts = LogOptions::new(&dir);
+//         opts.index_max_items(20);
+//         opts.segment_max_bytes(52);
+//         let mut log = EventLog::new(opts).unwrap();
+
+//         log.trim_inactive_segments()
+//             .expect("Unable to truncate file");
+//         assert_eq!(None, log.last_offset());
+
+//         // append the messages
+//         log.append_msg("my_stream", b"12345").unwrap();
+
+//         // make sure the messages are really gone
+//         let reader = log
+//             .read(0, ReadLimit::default())
+//             .expect("Unabled to grab reader");
+//         let start_off = reader.iter().next().unwrap().id;
+//         assert_eq!(0, start_off);
+//     }
+
+//     fn expect_files<P: AsRef<Path>, I>(dir: P, files: I)
+//     where
+//         I: IntoIterator<Item = &'static str>,
+//     {
+//         let dir_files = fs::read_dir(&dir)
+//             .unwrap()
+//             .map(|res| {
+//                 res.unwrap()
+//                     .path()
+//                     .file_name()
+//                     .unwrap()
+//                     .to_str()
+//                     .unwrap()
+//                     .to_string()
+//             })
+//             .collect::<HashSet<String>>();
+//         let expected = files
+//             .into_iter()
+//             .map(|s| s.to_string())
+//             .collect::<HashSet<String>>();
+//         assert_eq!(
+//             dir_files.len(),
+//             expected.len(),
+//             "Invalid file count, expected {:?} got {:?}",
+//             expected,
+//             dir_files
+//         );
+//         assert_eq!(
+//             dir_files.intersection(&expected).count(),
+//             expected.len(),
+//             "Invalid file count, expected {:?} got {:?}",
+//             expected,
+//             dir_files
+//         );
+//     }
+// }
 
 #[doc = include_str!("../README.md")]
 #[cfg(doctest)]

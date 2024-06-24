@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::OnceLock, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, sync::OnceLock, time::Duration};
 
 use clap::{
     builder::{TypedValueParser, ValueParser},
@@ -18,6 +18,10 @@ pub fn init_args() -> &'static Args {
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 pub struct Args {
+    /// Path to database directory
+    #[arg(short, long, default_value = ".log")]
+    pub path: PathBuf,
+
     /// GRPC address to listen on
     #[arg(short, long, env, default_value = "[::1]:9220")]
     pub addr: SocketAddr,

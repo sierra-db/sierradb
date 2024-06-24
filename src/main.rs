@@ -20,8 +20,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let opts = LogOptions::new(".log");
-    let log = EventLog::new(opts).unwrap();
+    let opts = LogOptions::new(&args.path);
+    let log = EventLog::new(opts)?;
 
     let log_actor = kameo::actor::spawn_unsync_in_thread(log);
 

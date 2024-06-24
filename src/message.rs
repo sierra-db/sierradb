@@ -399,7 +399,18 @@ impl MessageBuf {
     /// Integrity checking is performed on the vector to ensure that it was
     /// properly serialized.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<MessageBuf, MessageError> {
+        let len = bytes.len();
+        let buf = MessageBuf::from_bytes_partial(bytes)?;
+        if buf.bytes.len() < len {
+            return Err(MessageError::InvalidPayloadLength);
+        }
+
+        Ok(buf)
+    }
+
+    pub fn from_bytes_partial(mut bytes: Vec<u8>) -> Result<MessageBuf, MessageError> {
         let mut msgs = 0usize;
+        let mut total_bytes = 0;
 
         // iterate over the bytes to initialize size and ensure we have
         // a properly formed message set
@@ -408,15 +419,19 @@ impl MessageBuf {
             while !bytes.is_empty() {
                 // check that the offset, size and hash are present
                 if bytes.len() < HEADER_SIZE {
-                    return Err(MessageError::InvalidPayloadLength);
+                    break;
                 }
 
                 let size = read_header!(size, bytes) as usize;
                 let hash = read_header!(hash, bytes);
 
+                if size == 0 && hash == 0 {
+                    break;
+                }
+
                 let next_msg_offset = HEADER_SIZE + size;
                 if bytes.len() < next_msg_offset {
-                    return Err(MessageError::InvalidPayloadLength);
+                    break;
                 }
 
                 // check the hash
@@ -427,11 +442,15 @@ impl MessageBuf {
 
                 // update metadata
                 msgs += 1;
+                total_bytes += next_msg_offset;
 
                 // move the slice along
                 bytes = &bytes[next_msg_offset..];
             }
         }
+
+        bytes.truncate(total_bytes);
+
         Ok(MessageBuf { bytes, len: msgs })
     }
 

@@ -8,10 +8,12 @@ use tokio::sync::mpsc::Sender;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
+use tracing::error;
 
 use eventstore::event_store_server::EventStore;
 use eventstore::{
-    AcknowledgeRequest, AppendToStreamRequest, Event, GetStreamEventsRequest, SubscribeRequest,
+    AcknowledgeRequest, AppendToStreamRequest, Event, GetEventsRequest, GetStreamEventsRequest,
+    SubscribeRequest,
 };
 
 use crate::actor::{
@@ -152,6 +154,7 @@ impl DefaultEventStoreServer {
 
 #[tonic::async_trait]
 impl EventStore for DefaultEventStoreServer {
+    type GetEventsStream = BoxStream<'static, Result<EventBatch, Status>>;
     type GetStreamEventsStream = BoxStream<'static, Result<EventBatch, Status>>;
     type SubscribeStream = BoxStream<'static, Result<EventBatch, Status>>;
 
@@ -188,6 +191,55 @@ impl EventStore for DefaultEventStoreServer {
             }
             Err(err) => Err(Status::internal(err.to_string())),
         }
+    }
+
+    async fn get_events(
+        &self,
+        request: Request<GetEventsRequest>,
+    ) -> Result<Response<Self::GetEventsStream>, Status> {
+        let req = request.into_inner();
+
+        let log = self.log.clone();
+        let mut total_read = 0;
+        let mut start_offset = req.start_event_id;
+        let s = stream! {
+            loop {
+                let remaining = (req.limit as usize).saturating_sub(total_read).min(req.batch_size as usize);
+                if remaining == 0 {
+                    break;
+                }
+
+                let batch = match log
+                    .ask(ReadBatch {
+                        start_offset,
+                        read_limit: ReadLimit(BATCH_SIZE),
+                        batch_size: remaining,
+                    })
+                    .send()
+                    .await {
+                        Ok(batch) => batch,
+                        Err(err) => {
+                            error!("{err}");
+                            break;
+                        }
+                    };
+
+                if batch.is_empty() {
+                    break;
+                }
+
+                total_read += batch.len();
+                start_offset = batch.last().map(|ev| ev.id).unwrap_or(start_offset) + 1;
+
+                let batch = batch.into_iter().map(|event| {
+                    Event::try_from(event).map_err(|_| Status::internal("invalid timestamp"))
+                }).collect::<Result<_, _>>().map(|events| EventBatch { events });
+
+                yield batch;
+            }
+        };
+
+        Ok(Response::new(Box::pin(s)))
     }
 
     async fn get_stream_events(
@@ -293,6 +345,7 @@ impl EventStore for DefaultEventStoreServer {
                     .ask(ReadBatch {
                         start_offset,
                         read_limit: ReadLimit(BATCH_SIZE),
+                        batch_size: usize::MAX,
                     })
                     .send()
                     .await
