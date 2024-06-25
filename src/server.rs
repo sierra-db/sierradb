@@ -27,7 +27,7 @@ use self::eventstore::{AppendToStreamResponse, EventBatch};
 const BATCH_SIZE: usize = 65_536; // 65KB
 
 pub mod eventstore {
-    use std::{borrow::Cow, time::UNIX_EPOCH};
+    use std::borrow::Cow;
 
     use chrono::{DateTime, Utc};
     use prost_types::Timestamp;
@@ -72,16 +72,9 @@ pub mod eventstore {
         }
     }
 
-    impl TryFrom<crate::Event<'static>> for Event {
-        type Error = InvalidTimestamp;
-
-        fn try_from(event: crate::Event<'static>) -> Result<Self, Self::Error> {
-            let epoch = DateTime::<Utc>::from(UNIX_EPOCH);
-            let duration_since_epoch = event.timestamp.signed_duration_since(epoch);
-            let timestamp = duration_since_epoch
-                .to_std()
-                .map_err(|_| InvalidTimestamp)?;
-            Ok(Event {
+    impl From<crate::Event<'static>> for Event {
+        fn from(event: crate::Event<'static>) -> Self {
+            Event {
                 id: event.id,
                 stream_id: event.stream_id.into_owned(),
                 stream_version: event.stream_version,
@@ -89,16 +82,14 @@ pub mod eventstore {
                 event_data: event.event_data.into_owned(),
                 metadata: event.metadata.into_owned(),
                 timestamp: Some(Timestamp {
-                    seconds: timestamp
-                        .as_secs()
+                    seconds: event.timestamp.timestamp(),
+                    nanos: event
+                        .timestamp
+                        .timestamp_subsec_nanos()
                         .try_into()
-                        .map_err(|_| InvalidTimestamp)?,
-                    nanos: timestamp
-                        .subsec_nanos()
-                        .try_into()
-                        .map_err(|_| InvalidTimestamp)?,
+                        .unwrap_or(i32::MAX),
                 }),
-            })
+            }
         }
     }
 
@@ -116,13 +107,9 @@ pub mod eventstore {
                 timestamp: event
                     .timestamp
                     .and_then(|ts| {
-                        Some(
-                            DateTime::<Utc>::from(UNIX_EPOCH)
-                                + chrono::Duration::from_std(std::time::Duration::new(
-                                    ts.seconds.try_into().ok()?,
-                                    ts.nanos.try_into().ok()?,
-                                ))
-                                .ok()?,
+                        DateTime::<Utc>::from_timestamp(
+                            ts.seconds,
+                            ts.nanos.try_into().unwrap_or(0),
                         )
                     })
                     .ok_or(InvalidTimestamp)?,
