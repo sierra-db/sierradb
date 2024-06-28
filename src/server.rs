@@ -7,6 +7,9 @@ use kameo::error::SendError;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::metadata::errors::InvalidMetadataValue;
+use tonic::metadata::AsciiMetadataValue;
+use tonic::service::Interceptor;
 use tonic::{Request, Response, Status};
 use tracing::error;
 
@@ -397,5 +400,49 @@ where
 {
     fn map_err_internal(self) -> Result<T, Status> {
         self.map_err(|err| Status::internal(err.to_string()))
+    }
+}
+
+#[derive(Clone)]
+pub struct ServerAuthInterceptor {
+    auth_token: AsciiMetadataValue,
+}
+
+impl ServerAuthInterceptor {
+    pub fn new(auth_token: &str) -> Result<Self, InvalidMetadataValue> {
+        Ok(ServerAuthInterceptor {
+            auth_token: auth_token.parse()?,
+        })
+    }
+}
+
+impl Interceptor for ServerAuthInterceptor {
+    fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
+        match request.metadata().get("authorization") {
+            Some(t) if self.auth_token == t => Ok(request),
+            _ => Err(Status::unauthenticated("No valid auth token")),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ClientAuthInterceptor {
+    auth_token: AsciiMetadataValue,
+}
+
+impl ClientAuthInterceptor {
+    pub fn new(auth_token: &str) -> Result<Self, InvalidMetadataValue> {
+        Ok(ClientAuthInterceptor {
+            auth_token: auth_token.parse()?,
+        })
+    }
+}
+
+impl Interceptor for ClientAuthInterceptor {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+        request
+            .metadata_mut()
+            .insert("authorization", self.auth_token.clone());
+        Ok(request)
     }
 }

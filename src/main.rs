@@ -1,7 +1,10 @@
 use eventus::{
     actor::Flush,
     cli::init_args,
-    server::{eventstore::event_store_server::EventStoreServer, DefaultEventStoreServer},
+    server::{
+        eventstore::event_store_server::EventStoreServer, DefaultEventStoreServer,
+        ServerAuthInterceptor,
+    },
     EventLog, LogOptions,
 };
 use tokio::signal;
@@ -29,12 +32,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_store = DefaultEventStoreServer::new(log_actor.clone());
 
     // Start the gRPC server
+    let interceptor = ServerAuthInterceptor::new(&args.auth_token)?;
     // tokio::task::Builder::new()
     //     .name("grpc_server")
     tokio::spawn(async move {
         info!("listening on {}", args.addr);
         Server::builder()
-            .add_service(EventStoreServer::new(event_store))
+            .add_service(EventStoreServer::with_interceptor(event_store, interceptor))
             .serve(args.addr)
             .await
     });

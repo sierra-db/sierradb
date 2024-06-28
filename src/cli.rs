@@ -26,6 +26,10 @@ pub struct Args {
     #[arg(short, long, env, default_value = "[::1]:9220")]
     pub addr: SocketAddr,
 
+    /// Authentication token
+    #[arg(long, env)]
+    pub auth_token: String,
+
     /// How frequently events should be flushed to disk
     #[arg(long, env, default_value = "100ms", value_parser = ValueParser::new(HumanReadableValueParser))]
     pub flush_interval: Duration,
