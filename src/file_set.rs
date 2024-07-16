@@ -6,8 +6,6 @@ use std::{
 
 use tracing::{debug, error, info, trace, warn};
 
-use crate::message::{MessageSet, HEADER_SIZE};
-use crate::reader::MessageBufReader;
 use crate::stream_index::{StreamIndex, STREAM_INDEX_FILE_NAME_EXTENSION};
 
 use super::{index::*, segment::*, LogOptions, Offset};
@@ -100,22 +98,29 @@ impl FileSet {
             .map(move |(i, segment)| {
                 let index = match indexes.remove(&i) {
                     Some(index) => index,
-                    None => Index::restore(
-                        &segment,
-                        &log_opts.log_dir,
-                        log_opts.log_max_bytes,
-                        log_opts.message_max_bytes,
-                    )?,
+                    None => {
+                        let mut index = Index::new(
+                            &log_opts.log_dir,
+                            segment.starting_offset(),
+                            log_opts.log_max_bytes,
+                        )?;
+                        index.rehydrate(&segment, log_opts.message_max_bytes)?;
+                        index.flush()?;
+                        index
+                    }
                 };
                 let stream_index = match stream_indexes.remove(&i) {
                     Some(stream_index) => stream_index,
-                    None => StreamIndex::restore(
-                        &segment,
-                        &index,
-                        &log_opts.log_dir,
-                        log_opts.log_max_entries,
-                        log_opts.message_max_bytes,
-                    )?,
+                    None => {
+                        let mut stream_index = StreamIndex::new(
+                            &log_opts.log_dir,
+                            segment.starting_offset(),
+                            log_opts.log_max_entries,
+                        )?;
+                        stream_index.rehydrate(&segment, &index, log_opts.message_max_bytes)?;
+                        stream_index.flush()?;
+                        stream_index
+                    }
                 };
                 Ok((
                     i,
@@ -142,31 +147,17 @@ impl FileSet {
             }
         };
 
-        // Truncate to the last event id based on the last log file
-        let mut pos = 2;
-        let mut i = active.segment.starting_offset();
-        let mut reader = MessageBufReader;
-        loop {
-            let msgs = active
-                .segment
-                .read_slice_partial(
-                    &mut reader,
-                    pos,
-                    (log_opts.message_max_bytes + HEADER_SIZE) as u32,
-                )
-                .unwrap();
-            if msgs.is_empty() {
-                break;
-            }
-            for msg in msgs.iter() {
-                pos += msg.total_bytes() as u32;
-                i += 1;
-            }
-        }
-
-        // TODO: if we're truncating to 0 - 1, we should clear the entire files
-        active.index.truncate(i.saturating_sub(1));
-        active.stream_index.truncate(i.saturating_sub(1));
+        // Rehydrate indexes
+        active
+            .index
+            .rehydrate(&active.segment, log_opts.message_max_bytes)?;
+        active.index.flush()?;
+        active.stream_index.rehydrate(
+            &active.segment,
+            &active.index,
+            log_opts.message_max_bytes,
+        )?;
+        active.stream_index.flush()?;
 
         // mark all closed indexes as readonly (indexes are not opened as readonly)
         for SegmentSet { index, .. } in closed.values_mut() {
@@ -216,17 +207,18 @@ impl FileSet {
 
     pub fn roll_segment(&mut self) -> io::Result<()> {
         self.active.index.set_readonly()?; // Setting to read only flushes already
-        self.active.segment.flush()?;
         self.active.stream_index.flush()?;
+        self.active.segment.flush()?;
 
         let next_offset = self.active.index.next_offset();
 
         info!("Starting new segment and index at offset {}", next_offset);
 
         // set the segment and index to the new active index/seg
-        let mut p = SegmentSet::new(&self.opts, next_offset)?;
-        swap(&mut p, &mut self.active);
-        self.closed.insert(p.index.starting_offset(), p);
+        let mut segment_set = SegmentSet::new(&self.opts, next_offset)?;
+        swap(&mut segment_set, &mut self.active);
+        self.closed
+            .insert(segment_set.index.starting_offset(), segment_set);
         Ok(())
     }
 

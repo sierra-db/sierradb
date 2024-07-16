@@ -1,23 +1,22 @@
-use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::{io, mem};
 
 use memmap2::MmapMut;
-use tracing::{debug, info};
+use tracing::{debug, info, trace};
 use twox_hash::Xxh3Hash64;
 
 use crate::index::Index;
 use crate::message::{MessageSet, HEADER_SIZE};
 use crate::reader::MessageBufReader;
 use crate::segment::Segment;
-use crate::{Event, Offset, ReadError};
+use crate::{to_page_size, Event, Offset, ReadError};
 
 pub static STREAM_INDEX_FILE_NAME_EXTENSION: &str = "streams";
 pub static SEGMENT_FILE_NAME_LEN: usize = 20;
 
-const KEY_SIZE: usize = 64;
+pub const KEY_SIZE: usize = 64;
 const OFFSET_SIZE: usize = mem::size_of::<u64>();
 const INDEX_ENTRY_SIZE: usize = KEY_SIZE + OFFSET_SIZE + OFFSET_SIZE + OFFSET_SIZE; // 64 (key) + 8 (head offset) + 8 (tail offset) + 8 (next entry offset)
 const VALUE_BLOCK_SIZE: usize = OFFSET_SIZE + OFFSET_SIZE; // 8 (value) + 8 (next offset)
@@ -83,6 +82,7 @@ pub struct StreamIndex {
     path: PathBuf,
     next_index_offset: usize,
     next_value_offset: usize,
+    last_flush_end_pos: usize,
     max_entries: u64,
     base_offset: u64,
 }
@@ -124,7 +124,7 @@ impl StreamIndex {
             }
         };
 
-        let file = OpenOptions::new()
+        let file = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
@@ -136,11 +136,14 @@ impl StreamIndex {
         data.flush()
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
 
+        let next_value_offset = Self::values_start_offset(max_entries);
+
         Ok(Self {
             data,
             path,
             next_index_offset: initial_space,
-            next_value_offset: Self::values_start_offset(max_entries),
+            next_value_offset,
+            last_flush_end_pos: 0,
             max_entries,
             base_offset,
         })
@@ -159,7 +162,7 @@ impl StreamIndex {
             }
         };
 
-        let file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let file = fs::OpenOptions::new().read(true).write(true).open(&path)?;
 
         let data = unsafe { MmapMut::map_mut(&file)? };
         let max_entries = u64::from_ne_bytes(data[0..OFFSET_SIZE].try_into().unwrap());
@@ -176,24 +179,33 @@ impl StreamIndex {
             path,
             next_index_offset,
             next_value_offset,
+            last_flush_end_pos: next_value_offset,
             max_entries,
             base_offset,
         })
     }
 
-    pub fn restore(
+    pub fn rehydrate(
+        &mut self,
         segment: &Segment,
         index: &Index,
-        log_dir: &Path,
-        max_entries: u64,
         message_max_bytes: usize,
-    ) -> io::Result<Self> {
-        info!("restoring stream index");
-        let mut stream_index = StreamIndex::new(log_dir, segment.starting_offset(), max_entries)?;
+    ) -> io::Result<()> {
+        trace!("rehydrating stream index");
 
-        let mut pos = index.starting_offset();
-        let mut expected_event_id = 0;
-        let mut expected_stream_versions = HashMap::<String, Option<u64>>::new();
+        let last = u64::from_ne_bytes(
+            self.data[self.next_value_offset - 16..self.next_value_offset - 8]
+                .try_into()
+                .unwrap(),
+        );
+
+        let mut pos = if last == 0 {
+            index.starting_offset()
+        } else {
+            last
+        };
+        // let mut expected_event_id = pos;
+        // let mut expected_stream_versions = HashMap::<String, Option<u64>>::new();
         let mut reader = MessageBufReader;
         loop {
             let seg_bytes = segment.size() as u32;
@@ -219,32 +231,32 @@ impl StreamIndex {
             };
 
             for event in events {
-                let id = event.stream_id.to_string();
-                let existing_stream_version = expected_stream_versions.get(&id).copied().flatten();
-                match existing_stream_version {
-                    Some(existing) => {
-                        assert_eq!(
-                            existing + 1,
-                            event.stream_version,
-                            "wrong version for {} {id}",
-                            event.id
-                        );
-                    }
-                    None => assert_eq!(
-                        event.stream_version, 0,
-                        "wrong version for {} {id}",
-                        event.id
-                    ),
-                }
-                expected_stream_versions.insert(id, Some(event.stream_version));
-                assert_eq!(event.id, expected_event_id);
-                expected_event_id += 1;
+                // let id = event.stream_id.to_string();
+                // let existing_stream_version = expected_stream_versions.get(&id).copied().flatten();
+                // match existing_stream_version {
+                //     Some(existing) => {
+                //         assert_eq!(
+                //             existing + 1,
+                //             event.stream_version,
+                //             "wrong version for {} {id}",
+                //             event.id
+                //         );
+                //     }
+                //     None => assert_eq!(
+                //         event.stream_version, 0,
+                //         "wrong version for {} {id}",
+                //         event.id
+                //     ),
+                // }
+                // expected_stream_versions.insert(id, Some(event.stream_version));
+                // assert_eq!(event.id, expected_event_id);
+                // expected_event_id += 1;
                 pos += 1;
-                stream_index.insert(&event.stream_id, event.id)?;
+                self.insert(&event.stream_id, event.id)?;
             }
         }
 
-        Ok(stream_index)
+        Ok(())
     }
 
     #[inline]
@@ -389,8 +401,17 @@ impl StreamIndex {
         ))
     }
 
+    /// Flush the index at page boundaries. This may leave some indexed values
+    /// not flushed during crash, which will be rehydrated on restart.
     pub fn flush(&mut self) -> io::Result<()> {
-        self.data.flush()?;
+        let start = to_page_size(self.last_flush_end_pos);
+        let end = to_page_size(self.next_value_offset);
+
+        if end > start {
+            self.data.flush_range(start, end - start)?;
+            self.last_flush_end_pos = end;
+        }
+
         Ok(())
     }
 
@@ -671,7 +692,13 @@ impl<'a> Iterator for StreamIndexIter<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::testutil::TestDir;
+    use chrono::Utc;
+
+    use crate::{
+        index::IndexBuf,
+        message::{set_offsets, MessageBuf},
+        testutil::TestDir,
+    };
 
     use super::*;
     use std::iter;
@@ -1100,5 +1127,584 @@ mod tests {
             vec![10, 20],
             "Values after no-effect truncation are not as expected"
         );
+    }
+
+    #[test]
+    fn test_truncate_empty_stream() {
+        let mut map = setup();
+
+        // Truncate on an empty stream
+        map.truncate(10);
+
+        let values = map.get("key1");
+        assert_eq!(
+            values,
+            vec![],
+            "Values after truncation on empty stream should be empty"
+        );
+    }
+
+    #[test]
+    fn test_truncate_all_values() {
+        let mut map = setup();
+
+        // Insert values
+        map.insert("key1", 10).expect("Insert failed");
+        map.insert("key1", 20).expect("Insert failed");
+
+        // Truncate all values
+        map.truncate(5);
+
+        let values = map.get("key1");
+        assert_eq!(values, vec![], "All values should be truncated");
+    }
+
+    #[test]
+    fn test_truncate_non_existent_key() {
+        let mut map = setup();
+
+        // Truncate on a non-existent key
+        map.truncate(10);
+
+        let values = map.get("non_existent_key");
+        assert_eq!(
+            values,
+            vec![],
+            "Values for non-existent key should be empty"
+        );
+    }
+
+    #[test]
+    fn test_truncate_repeated_values() {
+        let mut map = setup();
+
+        // Insert repeated values
+        map.insert("key1", 10).expect("Insert failed");
+        map.insert("key1", 10).expect("Insert failed");
+        map.insert("key1", 20).expect("Insert failed");
+
+        // Truncate at 10
+        map.truncate(10);
+
+        let values = map.get("key1");
+        assert_eq!(
+            values,
+            vec![10, 10],
+            "Repeated values should be retained up to the truncate point"
+        );
+    }
+
+    #[test]
+    fn test_truncate_at_zero() {
+        let mut map = setup();
+
+        // Insert values
+        map.insert("key1", 10).expect("Insert failed");
+        map.insert("key1", 20).expect("Insert failed");
+
+        // Truncate at zero
+        map.truncate(0);
+
+        let values = map.get("key1");
+        assert_eq!(values, vec![], "Truncate at zero should remove all values");
+    }
+
+    #[test]
+    fn test_truncate_preserves_order_before_offset() {
+        let mut map = setup();
+
+        // Insert values in order
+        map.insert("key1", 10).expect("Insert failed");
+        map.insert("key1", 20).expect("Insert failed");
+        map.insert("key1", 30).expect("Insert failed");
+        map.insert("key1", 40).expect("Insert failed");
+
+        // Truncate at value 30
+        map.truncate(30);
+
+        let values = map.get("key1");
+        assert_eq!(
+            values,
+            vec![10, 20, 30],
+            "Values before truncation offset should maintain order"
+        );
+    }
+
+    #[test]
+    fn test_truncate_maintains_integrity_across_multiple_keys() {
+        let mut map = setup();
+
+        // Insert values for multiple keys
+        map.insert("key1", 10).expect("Insert failed");
+        map.insert("key1", 20).expect("Insert failed");
+        map.insert("key2", 15).expect("Insert failed");
+        map.insert("key2", 25).expect("Insert failed");
+
+        // Truncate at value 20
+        map.truncate(20);
+
+        let values1 = map.get("key1");
+        let values2 = map.get("key2");
+
+        assert_eq!(
+            values1,
+            vec![10, 20],
+            "Values for key1 before truncation offset should be intact"
+        );
+        assert_eq!(
+            values2,
+            vec![15],
+            "Values for key2 before truncation offset should be intact"
+        );
+    }
+
+    #[test]
+    fn test_truncate_preserves_head_tail_links() {
+        let mut map = setup();
+
+        // Insert values
+        map.insert("key1", 10).expect("Insert failed");
+        map.insert("key1", 20).expect("Insert failed");
+        map.insert("key1", 30).expect("Insert failed");
+
+        // Truncate at value 20
+        map.truncate(20);
+
+        let values = map.get("key1");
+        assert_eq!(
+            values,
+            vec![10, 20],
+            "Head and tail links should be preserved after truncation"
+        );
+
+        // Ensure further inserts work correctly
+        map.insert("key1", 25).expect("Insert failed");
+        let updated_values = map.get("key1");
+        assert_eq!(
+            updated_values,
+            vec![10, 20, 25],
+            "Inserting after truncation should maintain order and integrity"
+        );
+    }
+
+    #[test]
+    fn test_last_after_truncate_simple_case() {
+        let mut map = setup();
+
+        // Insert values
+        map.insert("key1", 10).expect("Insert failed");
+        map.insert("key1", 20).expect("Insert failed");
+        map.insert("key1", 30).expect("Insert failed");
+
+        // Truncate at value 20
+        map.truncate(20);
+
+        let last_value = map.last("key1").expect("Failed to get last value");
+        assert_eq!(
+            last_value,
+            Some(20),
+            "Last value after truncation should be 20"
+        );
+    }
+
+    #[test]
+    fn test_last_after_truncate_no_remaining_values() {
+        let mut map = setup();
+
+        // Insert values
+        map.insert("key1", 10).expect("Insert failed");
+        map.insert("key1", 20).expect("Insert failed");
+
+        // Truncate at value 5 (removes all values)
+        map.truncate(5);
+
+        let last_value = map.last("key1").expect("Failed to get last value");
+        assert_eq!(
+            last_value, None,
+            "Last value after complete truncation should be None"
+        );
+    }
+
+    #[test]
+    fn test_last_after_truncate_with_multiple_keys() {
+        let mut map = setup();
+
+        // Insert values for multiple keys
+        map.insert("key1", 10).expect("Insert failed");
+        map.insert("key1", 20).expect("Insert failed");
+        map.insert("key2", 15).expect("Insert failed");
+        map.insert("key2", 25).expect("Insert failed");
+
+        // Truncate at value 20
+        map.truncate(20);
+
+        let last_value1 = map.last("key1").expect("Failed to get last value for key1");
+        let last_value2 = map.last("key2").expect("Failed to get last value for key2");
+
+        assert_eq!(
+            last_value1,
+            Some(20),
+            "Last value for key1 after truncation should be 20"
+        );
+        assert_eq!(
+            last_value2,
+            Some(15),
+            "Last value for key2 after truncation should be 15"
+        );
+    }
+
+    #[test]
+    fn test_last_after_boundary_truncate() {
+        let mut map = setup();
+
+        // Insert values
+        map.insert("key1", 10).expect("Insert failed");
+        map.insert("key1", 20).expect("Insert failed");
+        map.insert("key1", 30).expect("Insert failed");
+
+        // Truncate at the boundary value 30
+        map.truncate(30);
+
+        let last_value = map.last("key1").expect("Failed to get last value");
+        assert_eq!(
+            last_value,
+            Some(30),
+            "Last value after boundary truncation should be 30"
+        );
+    }
+
+    #[test]
+    fn test_truncate_with_zero_values() {
+        let mut map = setup();
+
+        // Insert values including 0
+        map.insert("key1", 0).expect("Insert failed");
+        map.insert("key1", 10).expect("Insert failed");
+        map.insert("key1", 20).expect("Insert failed");
+
+        // Truncate at value 15
+        map.truncate(15);
+
+        let values = map.get("key1");
+        assert_eq!(
+            values,
+            vec![0, 10],
+            "Values after truncation should include 0 and 10"
+        );
+    }
+
+    #[test]
+    fn test_last_with_zero_values() {
+        let mut map = setup();
+
+        // Insert values including 0
+        map.insert("key1", 0).expect("Insert failed");
+        map.insert("key1", 10).expect("Insert failed");
+        map.insert("key1", 20).expect("Insert failed");
+
+        let last_value = map.last("key1").expect("Failed to get last value");
+        assert_eq!(last_value, Some(20), "Last value should be 20");
+    }
+
+    #[test]
+    fn test_last_after_truncate_with_zero() {
+        let mut map = setup();
+
+        // Insert values including 0
+        map.insert("key1", 0).expect("Insert failed");
+        map.insert("key1", 10).expect("Insert failed");
+        map.insert("key1", 20).expect("Insert failed");
+
+        // Truncate at value 10
+        map.truncate(10);
+
+        let last_value = map.last("key1").expect("Failed to get last value");
+        assert_eq!(
+            last_value,
+            Some(10),
+            "Last value after truncation should be 10"
+        );
+    }
+
+    #[test]
+    fn test_truncate_all_zero_values() {
+        let mut map = setup();
+
+        // Insert values all as 0
+        map.insert("key1", 0).expect("Insert failed");
+        map.insert("key1", 0).expect("Insert failed");
+
+        // Truncate at value 0
+        map.truncate(0);
+
+        let values = map.get("key1");
+        assert_eq!(
+            values,
+            vec![0, 0],
+            "Values after truncation should include all 0s"
+        );
+
+        let last_value = map.last("key1").expect("Failed to get last value");
+        assert_eq!(last_value, Some(0), "Last value should be 0");
+    }
+
+    #[test]
+    fn test_rehydrate_from_empty_stream_index() {
+        // Setup a test directory and a segment
+        let dir = TestDir::new();
+        let mut segment = Segment::new(&dir, 0, 1024).unwrap();
+
+        // Write some data to the segment
+        {
+            let mut buf = MessageBuf::default();
+            let bytes = rmp_serde::encode::to_vec_named(&Event {
+                id: 0,
+                stream_id: "abc".into(),
+                stream_version: 0,
+                event_name: "DidSomething".into(),
+                event_data: vec![].into(),
+                metadata: vec![].into(),
+                timestamp: Utc::now(),
+            })
+            .unwrap();
+            buf.push(bytes).unwrap();
+            set_offsets(&mut buf, 0);
+            let meta = segment.append(&buf).unwrap();
+            assert_eq!(2, meta.starting_position);
+        }
+
+        segment.flush().unwrap();
+
+        // Create the index
+        let mut index = Index::new(&dir, segment.starting_offset(), 128).unwrap();
+        index.rehydrate(&segment, 1024).unwrap();
+        index.flush().unwrap();
+
+        // Rehydrate the stream index
+        let mut map = setup();
+        map.rehydrate(&segment, &index, 1024).unwrap();
+
+        assert_eq!(map.get("abc"), vec![0]);
+    }
+
+    #[test]
+    fn test_rehydrate_from_partial_stream_index_starting_0() {
+        let dir = TestDir::new();
+        let mut segment = Segment::new(&dir, 0, 1024).unwrap();
+        let mut index = Index::new(&dir, segment.starting_offset(), 128).unwrap();
+        let mut stream_index = setup();
+
+        // Write some data to the segment
+        {
+            let mut buf = MessageBuf::default();
+            buf.push(
+                rmp_serde::encode::to_vec_named(&Event {
+                    id: 0,
+                    stream_id: "abc".into(),
+                    stream_version: 0,
+                    event_name: "DidSomething".into(),
+                    event_data: vec![].into(),
+                    metadata: vec![].into(),
+                    timestamp: Utc::now(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            set_offsets(&mut buf, 0);
+            let meta = segment.append(&buf).unwrap();
+
+            let mut buf = IndexBuf::new(1, 0);
+            buf.push(0, meta.starting_position as u32);
+            index.append(buf).unwrap();
+
+            stream_index.insert("abc", 0).unwrap();
+
+            let mut buf = MessageBuf::default();
+            buf.push(
+                rmp_serde::encode::to_vec_named(&Event {
+                    id: 1,
+                    stream_id: "xyz".into(),
+                    stream_version: 0,
+                    event_name: "DidSomething".into(),
+                    event_data: vec![].into(),
+                    metadata: vec![].into(),
+                    timestamp: Utc::now(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            set_offsets(&mut buf, 1);
+            let meta = segment.append(&buf).unwrap();
+
+            let mut buf = IndexBuf::new(1, 0);
+            buf.push(1, meta.starting_position as u32);
+            index.append(buf).unwrap();
+
+            stream_index.insert("xyz", 1).unwrap();
+
+            let mut buf = MessageBuf::default();
+            buf.push(
+                rmp_serde::encode::to_vec_named(&Event {
+                    id: 2,
+                    stream_id: "abc".into(),
+                    stream_version: 1,
+                    event_name: "DidSomething".into(),
+                    event_data: vec![].into(),
+                    metadata: vec![].into(),
+                    timestamp: Utc::now(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            set_offsets(&mut buf, 2);
+            segment.append(&buf).unwrap();
+
+            let mut buf = MessageBuf::default();
+            buf.push(
+                rmp_serde::encode::to_vec_named(&Event {
+                    id: 3,
+                    stream_id: "xyz".into(),
+                    stream_version: 1,
+                    event_name: "DidSomething".into(),
+                    event_data: vec![].into(),
+                    metadata: vec![].into(),
+                    timestamp: Utc::now(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            set_offsets(&mut buf, 3);
+            segment.append(&buf).unwrap();
+        }
+
+        segment.flush().unwrap();
+
+        // Create the index
+        index.rehydrate(&segment, 1024).unwrap();
+        index.flush().unwrap();
+
+        // Rehydrate the stream index
+        stream_index.rehydrate(&segment, &index, 1024).unwrap();
+
+        assert_eq!(stream_index.get("abc"), vec![0, 2]);
+        assert_eq!(stream_index.get("xyz"), vec![1, 3]);
+    }
+
+    #[test]
+    fn test_rehydrate_from_partial_stream_index_starting_100() {
+        let dir = TestDir::new();
+        let mut segment = Segment::new(&dir, 100, 1024).unwrap();
+        let mut index = Index::new(&dir, segment.starting_offset(), 128).unwrap();
+        let mut stream_index = setup();
+
+        // Write some data to the segment
+        {
+            let mut buf = MessageBuf::default();
+            buf.push(
+                rmp_serde::encode::to_vec_named(&Event {
+                    id: 100,
+                    stream_id: "abc".into(),
+                    stream_version: 0,
+                    event_name: "DidSomething".into(),
+                    event_data: vec![].into(),
+                    metadata: vec![].into(),
+                    timestamp: Utc::now(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            set_offsets(&mut buf, 100);
+            let meta = segment.append(&buf).unwrap();
+
+            let mut buf = IndexBuf::new(1, 100);
+            buf.push(100, meta.starting_position as u32);
+            index.append(buf).unwrap();
+
+            stream_index.insert("abc", 100).unwrap();
+
+            let mut buf = MessageBuf::default();
+            buf.push(
+                rmp_serde::encode::to_vec_named(&Event {
+                    id: 101,
+                    stream_id: "xyz".into(),
+                    stream_version: 0,
+                    event_name: "DidSomething".into(),
+                    event_data: vec![].into(),
+                    metadata: vec![].into(),
+                    timestamp: Utc::now(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            set_offsets(&mut buf, 101);
+            let meta = segment.append(&buf).unwrap();
+
+            let mut buf = IndexBuf::new(1, 100);
+            buf.push(101, meta.starting_position as u32);
+            index.append(buf).unwrap();
+
+            stream_index.insert("xyz", 101).unwrap();
+
+            let mut buf = MessageBuf::default();
+            buf.push(
+                rmp_serde::encode::to_vec_named(&Event {
+                    id: 102,
+                    stream_id: "abc".into(),
+                    stream_version: 1,
+                    event_name: "DidSomething".into(),
+                    event_data: vec![].into(),
+                    metadata: vec![].into(),
+                    timestamp: Utc::now(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            set_offsets(&mut buf, 102);
+            segment.append(&buf).unwrap();
+
+            let mut buf = MessageBuf::default();
+            buf.push(
+                rmp_serde::encode::to_vec_named(&Event {
+                    id: 103,
+                    stream_id: "xyz".into(),
+                    stream_version: 1,
+                    event_name: "DidSomething".into(),
+                    event_data: vec![].into(),
+                    metadata: vec![].into(),
+                    timestamp: Utc::now(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            set_offsets(&mut buf, 103);
+            segment.append(&buf).unwrap();
+        }
+
+        segment.flush().unwrap();
+
+        // Create the index
+        index.rehydrate(&segment, 1024).unwrap();
+        index.flush().unwrap();
+
+        // Rehydrate the stream index
+        stream_index.rehydrate(&segment, &index, 1024).unwrap();
+
+        assert_eq!(stream_index.get("abc"), vec![100, 102]);
+        assert_eq!(stream_index.get("xyz"), vec![101, 103]);
+    }
+
+    #[test]
+    fn test_rehydrate_empty_segment() {
+        // Setup a test directory and a segment
+        let dir = TestDir::new();
+        let segment = Segment::new(&dir, 0, 1024).unwrap();
+        let mut index = Index::new(&dir, segment.starting_offset(), 128).unwrap();
+        let mut stream_index = setup();
+
+        index.rehydrate(&segment, 100).unwrap();
+        stream_index.rehydrate(&segment, &index, 100).unwrap();
+
+        // Verify the stream index is empty
+        assert!(stream_index.data.iter().skip(OFFSET_SIZE).all(|b| *b == 0));
     }
 }

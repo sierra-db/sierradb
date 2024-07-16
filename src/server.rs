@@ -194,9 +194,12 @@ impl EventStore for DefaultEventStoreServer {
         let mut start_offset = req.start_event_id;
         let s = stream! {
             loop {
-                let remaining = (req.limit as usize).saturating_sub(total_read).min(req.batch_size as usize);
-                if remaining == 0 {
-                    break;
+                let mut remaining = req.batch_size as usize;
+                if let Some(limit) = req.limit {
+                    remaining = remaining.min((limit as usize).saturating_sub(total_read));
+                    if remaining == 0 {
+                        break;
+                    }
                 }
 
                 let batch = match log

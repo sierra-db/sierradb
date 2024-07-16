@@ -67,10 +67,11 @@ use chrono::{DateTime, Utc};
 use file_set::{FileSet, SegmentSet};
 use fslock::LockFile;
 use index::{IndexBuf, RangeFindError, INDEX_ENTRY_BYTES};
-use message::{MessageBuf, MessageError, MessageSet, MessageSetMut};
+use message::{MessageBuf, MessageError, MessageSet};
 use reader::{LogSliceReader, MessageBufReader};
 use segment::SegmentAppendError;
 use serde::{Deserialize, Serialize};
+use stream_index::KEY_SIZE;
 use thiserror::Error;
 use tokio::sync::broadcast;
 use tracing::{debug, info, trace};
@@ -170,6 +171,10 @@ pub enum AppendError {
     /// of machine resources or other I/O issue.
     #[error("fresh segment not writable")]
     FreshSegmentNotWritable,
+    /// If a message with a stream id that is larger than the max size is tried to be
+    /// appended it will not be allowed an will return an error.
+    #[error("maximum stream id length exceeded")]
+    StreamIdLenExceeded,
     /// If a message that is larger than the per message size is tried to be
     /// appended it will not be allowed an will return an error.
     #[error("maximum message size exceeded")]
@@ -272,7 +277,7 @@ impl LogOptions {
             log_dir: log_dir.as_ref().to_owned(),
             log_max_bytes: 256 * 1024 * 1024,
             log_max_entries,
-            index_max_bytes: log_max_entries as usize * INDEX_ENTRY_BYTES * 10,
+            index_max_bytes: log_max_entries as usize * INDEX_ENTRY_BYTES,
             message_max_bytes: 1_000_000,
         }
     }
@@ -413,37 +418,37 @@ impl EventLog {
         Ok(res.first())
     }
 
-    /// Appends a single message to the log, returning the offset appended.
-    #[inline]
-    pub fn append_msg<B: AsRef<[u8]>>(
-        &mut self,
-        stream_name: &str,
-        payload: B,
-    ) -> Result<Offset, AppendError> {
-        let mut buf = MessageBuf::default();
-        buf.push(payload).expect("Payload size exceeds usize::MAX");
-        let res = self.append(stream_name, &mut buf)?;
-        assert_eq!(res.len(), 1);
-        Ok(res.first())
-    }
+    // /// Appends a single message to the log, returning the offset appended.
+    // #[inline]
+    // pub fn append_msg<B: AsRef<[u8]>>(
+    //     &mut self,
+    //     stream_name: &str,
+    //     payload: B,
+    // ) -> Result<Offset, AppendError> {
+    //     let mut buf = MessageBuf::default();
+    //     buf.push(payload).expect("Payload size exceeds usize::MAX");
+    //     let res = self.append(stream_name, &mut buf)?;
+    //     assert_eq!(res.len(), 1);
+    //     Ok(res.first())
+    // }
 
-    /// Appends log entrites to the event log, returning the offsets appended.
-    #[inline]
-    pub fn append<T>(&mut self, stream_name: &str, buf: &mut T) -> Result<OffsetRange, AppendError>
-    where
-        T: MessageSetMut,
-    {
-        let start_off = self.file_set.active_index_mut().next_offset();
-        message::set_offsets(buf, start_off);
-        self.append_with_offsets(stream_name, buf)
-    }
+    // /// Appends log entrites to the event log, returning the offsets appended.
+    // #[inline]
+    // pub fn append<T>(&mut self, stream_name: &str, buf: &mut T) -> Result<OffsetRange, AppendError>
+    // where
+    //     T: MessageSetMut,
+    // {
+    //     let start_off = self.file_set.active_index_mut().next_offset();
+    //     message::set_offsets(buf, start_off);
+    //     self.append_with_offsets(stream_name, buf)
+    // }
 
     /// Appends log entrites to the event log, returning the offsets appended.
     ///
     /// The offsets are expected to already be set within the buffer.
     pub fn append_with_offsets<T>(
         &mut self,
-        stream_name: &str,
+        stream_id: &str,
         buf: &T,
     ) -> Result<OffsetRange, AppendError>
     where
@@ -452,6 +457,11 @@ impl EventLog {
         let buf_len = buf.len();
         if buf_len == 0 {
             return Ok(OffsetRange(0, 0));
+        }
+
+        // Check if the stream id exceeds the max size
+        if stream_id.len() > KEY_SIZE {
+            return Err(AppendError::StreamIdLenExceeded);
         }
 
         // Check if given message exceeded the max size
@@ -509,7 +519,7 @@ impl EventLog {
         {
             let stream_index = self.file_set.active_stream_index_mut();
             for m in buf.iter() {
-                stream_index.insert(stream_name, m.offset())?;
+                stream_index.insert(stream_id, m.offset())?;
             }
         }
 
@@ -689,9 +699,9 @@ impl EventLog {
             return Ok(());
         }
         info!("flushing {} events", self.unflushed.len());
+        self.file_set.active_segment_mut().flush()?; // After this line, the events are considered as persisted.
         self.file_set.active_index_mut().flush()?;
         self.file_set.active_stream_index_mut().flush()?;
-        self.file_set.active_segment_mut().flush()?; // After this line, the events are considered as persisted.
         let _ = self.broadcaster.send(mem::take(&mut self.unflushed));
         assert!(self.unflushed.is_empty());
         Ok(())
@@ -849,6 +859,14 @@ where
             .map(|read| read.into_iter().next())
             .transpose()
     }
+}
+
+#[inline]
+pub(crate) fn to_page_size(size: usize) -> usize {
+    let truncated = size - (size & (page_size::get() - 1));
+    assert_eq!(truncated % page_size::get(), 0);
+    assert!(truncated <= size);
+    truncated
 }
 
 // #[cfg(test)]

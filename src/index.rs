@@ -2,7 +2,7 @@ use std::{
     cmp::Ordering,
     fmt,
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io::{self},
     path::{Path, PathBuf},
     u64, usize,
 };
@@ -14,6 +14,7 @@ use crate::{
     message::{MessageError, MessageSet, HEADER_SIZE},
     reader::MessageBufReader,
     segment::Segment,
+    to_page_size,
 };
 
 use super::Offset;
@@ -145,14 +146,6 @@ impl IndexBuf {
     }
 }
 
-#[inline]
-fn to_page_size(size: usize) -> usize {
-    let truncated = size - (size & (page_size::get() - 1));
-    assert_eq!(truncated % page_size::get(), 0);
-    assert!(truncated <= size);
-    truncated
-}
-
 impl Index {
     pub fn new<P>(log_dir: P, base_offset: u64, file_bytes: usize) -> io::Result<Index>
     where
@@ -265,18 +258,17 @@ impl Index {
         })
     }
 
-    pub fn restore<P>(
-        segment: &Segment,
-        log_dir: P,
-        file_bytes: usize,
-        message_max_bytes: usize,
-    ) -> io::Result<Self>
-    where
-        P: AsRef<Path>,
-    {
-        let mut index = Index::new(&log_dir, segment.starting_offset(), file_bytes)?;
+    pub fn rehydrate(&mut self, segment: &Segment, message_max_bytes: usize) -> io::Result<()> {
+        assert_eq!(
+            self.mode,
+            AccessMode::ReadWrite,
+            "Attempt to rehydrate to readonly index"
+        );
 
-        let mut pos = 2;
+        trace!("rehydrating index");
+
+        let latest = self.next_offset();
+        let mut pos = self.last().unwrap_or(2);
         let mut reader = MessageBufReader;
         loop {
             let msgs = segment
@@ -295,13 +287,15 @@ impl Index {
             }
             let mut buf = IndexBuf::new(msgs.len(), segment.starting_offset());
             for msg in msgs.iter() {
-                buf.push(msg.offset(), pos);
+                if latest == segment.starting_offset() || msg.offset() >= latest {
+                    buf.push(msg.offset(), pos);
+                }
                 pos += msg.total_bytes() as u32;
             }
-            index.append(buf)?;
+            self.append(buf)?;
         }
 
-        Ok(index)
+        Ok(())
     }
 
     #[inline]
@@ -316,6 +310,12 @@ impl Index {
     #[inline]
     pub fn size(&self) -> usize {
         self.mmap.len()
+    }
+
+    #[inline]
+    pub fn last(&self) -> Option<u32> {
+        self.find(self.next_offset().checked_sub(1)?)
+            .map(|(_, file_pos)| file_pos)
     }
 
     // TODO: use memremap on linux
@@ -360,6 +360,7 @@ impl Index {
         self.mmap[start..end].copy_from_slice(&offsets.0);
 
         self.next_write_pos = end;
+
         Ok(())
     }
 
@@ -449,7 +450,6 @@ impl Index {
         if end > start {
             self.mmap.flush_range(start, end - start)?;
             self.last_flush_end_pos = end;
-            self.file.flush()?;
         }
 
         Ok(())
@@ -484,7 +484,7 @@ impl Index {
 
     /// Finds the index entry corresponding to the offset.
     ///
-    /// If the entry does not exist in the index buy an entry > the offset
+    /// If the entry does not exist in the index but an entry > the offset
     /// exists, that entry is used.
     ///
     /// If the entry does not exist and the last entry is < the desired,
@@ -610,6 +610,8 @@ impl Index {
 
 #[cfg(test)]
 mod tests {
+    use crate::message::{set_offsets, MessageBuf};
+
     use super::{super::testutil::*, *};
 
     use std::{fs, path::PathBuf};
@@ -1099,8 +1101,8 @@ mod tests {
     fn index_truncate_to_0() {
         env_logger::try_init().unwrap_or(());
         let dir = TestDir::new();
-        let mut index = Index::new(&dir, 10u64, 128usize).unwrap();
-        let mut buf = IndexBuf::new(5, 10u64);
+        let mut index = Index::new(&dir, 0, 128).unwrap();
+        let mut buf = IndexBuf::new(5, 0);
         buf.push(0, 10);
         buf.push(1, 20);
         buf.push(2, 30);
@@ -1108,10 +1110,8 @@ mod tests {
         buf.push(4, 50);
         index.append(buf).unwrap();
 
-        let file_len = index.truncate(0);
-        assert_eq!(Some(0), file_len);
-        assert_eq!(1, index.next_offset());
-        assert_eq!(1 * INDEX_ENTRY_BYTES, index.next_write_pos);
+        assert_eq!(5, index.next_offset());
+        assert_eq!(5 * INDEX_ENTRY_BYTES, index.next_write_pos);
 
         // ensure we've zeroed the entries
         let mem = &index.mmap[..];
@@ -1137,5 +1137,173 @@ mod tests {
         assert_eq!(None, file_len);
         assert_eq!(15, index.next_offset());
         assert_eq!(5 * INDEX_ENTRY_BYTES, index.next_write_pos);
+    }
+
+    #[test]
+    fn test_rehydrate_from_empty_index() {
+        // Setup a test directory and a segment
+        let dir = TestDir::new();
+        let mut segment = Segment::new(&dir, 0, 1024).unwrap();
+
+        // Write some data to the segment
+        {
+            let mut buf = MessageBuf::default();
+            buf.push("12345").unwrap();
+            set_offsets(&mut buf, 0);
+            let meta = segment.append(&buf).unwrap();
+            assert_eq!(2, meta.starting_position);
+        }
+
+        segment.flush().unwrap();
+
+        // Create the index
+        let mut index = Index::new(&dir, segment.starting_offset(), 128).unwrap();
+
+        // Call the rehydrate method
+        let result = index.rehydrate(&segment, 100);
+        assert!(result.is_ok());
+
+        assert_eq!(1 * INDEX_ENTRY_BYTES, index.next_write_pos);
+        assert_eq!(1, index.next_offset());
+        assert_eq!(index.read_entry(0), Some((0, 2)));
+    }
+
+    #[test]
+    fn test_rehydrate_from_partial_index_starting_0() {
+        let dir = TestDir::new();
+        let mut segment = Segment::new(&dir, 0, 1024).unwrap();
+        let mut index = Index::new(&dir, segment.starting_offset(), 128).unwrap();
+
+        // Write some data to the segment
+        {
+            let mut buf = MessageBuf::default();
+            buf.push("12345").unwrap();
+            set_offsets(&mut buf, 0);
+            let meta = segment.append(&buf).unwrap();
+            assert_eq!(2, meta.starting_position);
+
+            let mut buf = IndexBuf::new(1, 0);
+            buf.push(0, meta.starting_position as u32);
+            index.append(buf).unwrap();
+
+            let mut buf = MessageBuf::default();
+            buf.push("hello").unwrap();
+            set_offsets(&mut buf, 1);
+            let meta = segment.append(&buf).unwrap();
+            assert_eq!(27, meta.starting_position);
+
+            let mut buf = IndexBuf::new(1, 0);
+            buf.push(1, meta.starting_position as u32);
+            index.append(buf).unwrap();
+
+            let mut buf = MessageBuf::default();
+            buf.push("world").unwrap();
+            set_offsets(&mut buf, 2);
+            let meta = segment.append(&buf).unwrap();
+            assert_eq!(52, meta.starting_position);
+
+            let mut buf = MessageBuf::default();
+            buf.push(":D").unwrap();
+            set_offsets(&mut buf, 3);
+            let meta = segment.append(&buf).unwrap();
+            assert_eq!(77, meta.starting_position);
+        }
+
+        segment.flush().unwrap();
+
+        // Call the rehydrate method
+        let result = index.rehydrate(&segment, 100);
+        assert!(result.is_ok());
+
+        index.flush().unwrap();
+
+        assert_eq!(4 * INDEX_ENTRY_BYTES, index.next_write_pos);
+        assert_eq!(4, index.next_offset());
+
+        // Verify the index has been updated
+        assert_eq!(index.read_entry(0), Some((0, 2)));
+        assert_eq!(index.read_entry(1), Some((1, 27)));
+        assert_eq!(index.read_entry(2), Some((2, 52)));
+        assert_eq!(index.read_entry(3), Some((3, 77)));
+        assert_eq!(index.read_entry(4), None);
+    }
+
+    #[test]
+    fn test_rehydrate_from_partial_index_starting_100() {
+        let dir = TestDir::new();
+        let mut segment = Segment::new(&dir, 100, 1024).unwrap();
+        let mut index = Index::new(&dir, segment.starting_offset(), 128).unwrap();
+
+        // Write some data to the segment
+        {
+            let mut buf = MessageBuf::default();
+            buf.push("12345").unwrap();
+            set_offsets(&mut buf, 100);
+            let meta = segment.append(&buf).unwrap();
+            assert_eq!(2, meta.starting_position);
+
+            let mut buf = IndexBuf::new(1, 100);
+            buf.push(100, meta.starting_position as u32);
+            index.append(buf).unwrap();
+
+            let mut buf = MessageBuf::default();
+            buf.push("hello").unwrap();
+            set_offsets(&mut buf, 101);
+            let meta = segment.append(&buf).unwrap();
+            assert_eq!(27, meta.starting_position);
+
+            let mut buf = IndexBuf::new(1, 100);
+            buf.push(101, meta.starting_position as u32);
+            index.append(buf).unwrap();
+
+            let mut buf = MessageBuf::default();
+            buf.push("world").unwrap();
+            set_offsets(&mut buf, 102);
+            let meta = segment.append(&buf).unwrap();
+            assert_eq!(52, meta.starting_position);
+
+            let mut buf = MessageBuf::default();
+            buf.push(":D").unwrap();
+            set_offsets(&mut buf, 103);
+            let meta = segment.append(&buf).unwrap();
+            assert_eq!(77, meta.starting_position);
+        }
+
+        segment.flush().unwrap();
+
+        // Call the rehydrate method
+        let result = index.rehydrate(&segment, 100);
+        assert!(result.is_ok());
+
+        index.flush().unwrap();
+
+        assert_eq!(4 * INDEX_ENTRY_BYTES, index.next_write_pos);
+        assert_eq!(4 + 100, index.next_offset());
+
+        // Verify the index has been updated
+        assert_eq!(index.read_entry(0), Some((100, 2)));
+        assert_eq!(index.read_entry(1), Some((101, 27)));
+        assert_eq!(index.read_entry(2), Some((102, 52)));
+        assert_eq!(index.read_entry(3), Some((103, 77)));
+        assert_eq!(index.read_entry(4), None);
+    }
+
+    #[test]
+    fn test_rehydrate_empty_segment() {
+        // Setup a test directory and a segment
+        let dir = TestDir::new();
+        let segment = Segment::new(&dir, 0, 1024).unwrap();
+
+        // Create the index
+        let mut index = Index::new(&dir, segment.starting_offset(), 128).unwrap();
+
+        // Call the rehydrate method
+        let result = index.rehydrate(&segment, 100);
+        assert!(result.is_ok());
+
+        // Verify the index is empty
+        assert!(index.is_empty());
+        assert_eq!(0, index.next_write_pos);
+        assert_eq!(0, index.next_offset());
     }
 }
