@@ -19,20 +19,26 @@ pub fn init_args() -> &'static Args {
 #[command(version, about, long_about = None)]
 pub struct Args {
     /// Path to database directory
-    #[arg(short, long, default_value = ".log")]
-    pub path: PathBuf,
+    #[arg(short, long, env = "EVENTUS_LOG_PATH", default_value = ".log")]
+    pub log_path: PathBuf,
 
     /// GRPC address to listen on
-    #[arg(short, long, env, default_value = "[::1]:9220")]
-    pub addr: SocketAddr,
+    #[arg(short, long, env = "EVENTUS_LISTEN_ADDR", default_value = "[::1]:9220")]
+    pub listen_addr: SocketAddr,
 
     /// Authentication token
-    #[arg(long, env)]
+    #[arg(long, env = "EVENTUS_AUTH_TOKEN")]
     pub auth_token: String,
 
     /// How frequently events should be flushed to disk
-    #[arg(long, env, default_value = "100ms", value_parser = ValueParser::new(HumanReadableValueParser))]
+    #[arg(long, env = "EVENTUS_FLUSH_INTERVAL", default_value = "100ms", value_parser = ValueParser::new(HumanReadableValueParser))]
     pub flush_interval: Duration,
+
+    /// Verbosity of logging
+    ///
+    /// See https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html
+    #[arg(long, env = "EVENTUS_LOG", default_value = "INFO")]
+    pub log: String,
 }
 
 #[derive(Clone)]
