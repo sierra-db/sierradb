@@ -57,6 +57,7 @@ pub struct AppendToStream {
     pub stream_id: String,
     pub expected_version: ExpectedVersion,
     pub events: Vec<NewEvent<'static>>,
+    pub timestamp: Option<DateTime<Utc>>,
 }
 
 impl Message<AppendToStream> for EventLog {
@@ -67,7 +68,7 @@ impl Message<AppendToStream> for EventLog {
         msg: AppendToStream,
         _ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
-        let timestamp = Utc::now();
+        let timestamp = msg.timestamp.unwrap_or_else(|| Utc::now());
         let offsets =
             self.append_to_stream(msg.stream_id, msg.expected_version, msg.events, timestamp)?;
         Ok((offsets, timestamp))
