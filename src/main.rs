@@ -20,10 +20,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .without_time()
         .with_target(false)
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(EnvFilter::builder().parse_lossy(&args.log))
         .init();
 
-    let opts = LogOptions::new(&args.path);
+    let opts = LogOptions::new(&args.log_path);
     let log = EventLog::new(opts)?;
 
     let log_actor = kameo::actor::spawn_unsync_in_thread(log);
@@ -36,10 +36,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // tokio::task::Builder::new()
     //     .name("grpc_server")
     tokio::spawn(async move {
-        info!("listening on {}", args.addr);
+        info!("listening on {}", args.listen_addr);
         Server::builder()
             .add_service(EventStoreServer::with_interceptor(event_store, interceptor))
-            .serve(args.addr)
+            .serve(args.listen_addr)
             .await
     });
 
