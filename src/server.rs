@@ -1,5 +1,6 @@
 use async_stream::stream;
 use chrono::Timelike;
+use chrono::{DateTime, Utc};
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use kameo::actor::ActorRef;
@@ -153,6 +154,13 @@ impl EventStore for DefaultEventStoreServer {
         request: Request<AppendToStreamRequest>,
     ) -> Result<Response<AppendToStreamResponse>, Status> {
         let req = request.into_inner();
+        let timestamp = req
+            .timestamp
+            .map(|ts| {
+                DateTime::<Utc>::from_timestamp(ts.seconds, ts.nanos.try_into().unwrap_or(0))
+                    .ok_or_else(|| Status::invalid_argument("invalid timestamp"))
+            })
+            .transpose()?;
         let res = self
             .log
             .ask(AppendToStream {
@@ -162,6 +170,7 @@ impl EventStore for DefaultEventStoreServer {
                     .map(crate::ExpectedVersion::from)
                     .unwrap_or(crate::ExpectedVersion::Any),
                 events: req.events.into_iter().map(|event| event.into()).collect(),
+                timestamp,
             })
             .send()
             .await;

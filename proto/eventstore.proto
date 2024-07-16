@@ -10,13 +10,13 @@ message AppendToStreamRequest {
     string stream_id = 1;
     ExpectedVersion expected_version = 2;
     repeated NewEvent events = 3;
+    google.protobuf.Timestamp timestamp = 4;
 }
 
 message NewEvent {
     string event_name = 1;
     bytes event_data = 2;
     bytes metadata = 3;
-    google.protobuf.Timestamp timestamp = 4;
 }
 
 message Event {
