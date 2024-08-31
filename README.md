@@ -42,7 +42,6 @@ fn main() {
 }
 ```
 
-## Prior Art
+## Credits
 
-- [Apache Kafka](https://kafka.apache.org/)
-- [Jocko](https://github.com/travisjeffery/jocko) + [EXCELLENT Blog Post](https://medium.com/the-hoard/how-kafkas-storage-internals-work-3a29b02e026)
+This project is a heavily modified fork of [commitlog](https://github.com/zowens/commitlog), which helped provide a very useful backbone to the storing of events.
