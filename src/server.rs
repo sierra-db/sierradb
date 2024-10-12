@@ -5,8 +5,8 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use kameo::actor::ActorRef;
 use kameo::error::SendError;
-use tokio::sync::mpsc::Sender;
-use tokio::sync::{mpsc, oneshot};
+use kameo::request::MessageSend;
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::errors::InvalidMetadataValue;
 use tonic::metadata::AsciiMetadataValue;
@@ -21,12 +21,16 @@ use eventstore::{
 };
 
 use crate::actor::{
-    AppendToStream, GetStreamEvents, LoadSubscription, ReadBatch, Subscribe, UpdateSubscription,
+    AppendToMultipleStreams, AppendToStream, GetStreamEvents, LoadSubscription, NewStreamEvents,
+    ReadBatch, Subscribe, UpdateSubscription,
 };
 use crate::{AppendError, EventLog, ReadLimit};
 
 use self::eventstore::subscribe_request::StartFrom;
-use self::eventstore::{AppendToStreamResponse, EventBatch};
+use self::eventstore::{
+    AppendToMultipleStreamsRequest, AppendToMultipleStreamsResponse, AppendToStreamResponse,
+    EventBatch,
+};
 
 const BATCH_SIZE: usize = 65_536; // 65KB
 
@@ -154,6 +158,9 @@ impl EventStore for DefaultEventStoreServer {
         request: Request<AppendToStreamRequest>,
     ) -> Result<Response<AppendToStreamResponse>, Status> {
         let req = request.into_inner();
+        if req.events.is_empty() {
+            return Err(Status::invalid_argument("empty events"));
+        }
         let timestamp = req
             .timestamp
             .map(|ts| {
@@ -182,6 +189,70 @@ impl EventStore for DefaultEventStoreServer {
                     nanos: timestamp.nanosecond().try_into().unwrap(),
                 }),
             })),
+            Err(SendError::HandlerError(AppendError::MessageSizeExceeded)) => {
+                Err(Status::failed_precondition("message size exceeded"))
+            }
+            Err(SendError::HandlerError(err @ AppendError::WrongExpectedVersion { .. })) => {
+                Err(Status::failed_precondition(err.to_string()))
+            }
+            Err(err) => Err(Status::internal(err.to_string())),
+        }
+    }
+
+    async fn append_to_multiple_streams(
+        &self,
+        request: Request<AppendToMultipleStreamsRequest>,
+    ) -> Result<Response<AppendToMultipleStreamsResponse>, Status> {
+        let req = request.into_inner();
+        if req.streams.is_empty() {
+            return Err(Status::invalid_argument("empty streams"));
+        }
+        if req.streams.iter().any(|stream| stream.events.is_empty()) {
+            return Err(Status::invalid_argument("streams has empty events"));
+        }
+        let timestamp = req
+            .timestamp
+            .map(|ts| {
+                DateTime::<Utc>::from_timestamp(ts.seconds, ts.nanos.try_into().unwrap_or(0))
+                    .ok_or_else(|| Status::invalid_argument("invalid timestamp"))
+            })
+            .transpose()?;
+
+        let res = self
+            .log
+            .ask(AppendToMultipleStreams {
+                streams: req
+                    .streams
+                    .into_iter()
+                    .map(|stream| NewStreamEvents {
+                        stream_id: stream.stream_id,
+                        expected_version: stream
+                            .expected_version
+                            .map(crate::ExpectedVersion::from)
+                            .unwrap_or(crate::ExpectedVersion::Any),
+                        events: stream
+                            .events
+                            .into_iter()
+                            .map(|event| event.into())
+                            .collect(),
+                    })
+                    .collect(),
+                timestamp,
+            })
+            .send()
+            .await;
+
+        match res {
+            Ok((offsets, timestamp)) => {
+                let first_id = offsets.first();
+                Ok(Response::new(AppendToMultipleStreamsResponse {
+                    first_id,
+                    timestamp: Some(prost_types::Timestamp {
+                        seconds: timestamp.timestamp(),
+                        nanos: timestamp.timestamp_subsec_nanos() as i32,
+                    }),
+                }))
+            }
             Err(SendError::HandlerError(AppendError::MessageSizeExceeded)) => {
                 Err(Status::failed_precondition("message size exceeded"))
             }
@@ -287,7 +358,7 @@ impl EventStore for DefaultEventStoreServer {
         let req = request.into_inner();
         let (tx, rx) = mpsc::channel(64);
 
-        let mut start_offset = match req.start_from {
+        let mut current_offset = match req.start_from {
             Some(StartFrom::SubscriberId(subscriber_id)) => self
                 .log
                 .ask(LoadSubscription { subscriber_id })
@@ -302,74 +373,78 @@ impl EventStore for DefaultEventStoreServer {
 
         let log = self.log.clone();
         tokio::spawn(async move {
-            // Subscribe, and save to a buffer
-            let (oneshot_tx, mut oneshot_rx) =
-                oneshot::channel::<(Sender<Vec<crate::Event<'static>>>, u64)>();
+            let mut subscription = log.ask(Subscribe).send().await.map_err_internal()?;
+            let mut buffered_live_events = Vec::new();
 
-            tokio::spawn({
-                let log = log.clone();
-                async move {
-                    let mut buffer = Vec::new();
-                    let mut subscription = log.ask(Subscribe).send().await.map_err_internal()?;
-
-                    // Consume into buffer whilst serving historical events
-                    loop {
-                        tokio::select! {
-                            res = subscription.recv() => {
-                                buffer.push(res.map_err_internal()?);
-                            }
-                            res = &mut oneshot_rx => {
-                                let (tx, last_offset) = res.map_err_internal()?;
-
-                                // Serve buffer
-                                for mut batch in buffer {
-                                    batch.retain(|event| event.id > last_offset);
-                                    tx.send(batch).await.map_err_internal()?;
-                                }
-
-                                // Serve from subscription
-                                while let Ok(batch) = subscription.recv().await {
-                                    tx.send(batch).await.map_err_internal()?;
-                                }
-
-                                break;
-                            }
-                        }
-                    }
-
-                    Ok::<_, Status>(())
-                }
-            });
-
-            // Start streaming from history
             loop {
-                let Ok(batch) = log
+                // Read historical events
+                let historical_batch = log
                     .ask(ReadBatch {
-                        start_offset,
+                        start_offset: current_offset,
                         read_limit: ReadLimit(BATCH_SIZE),
                         batch_size: usize::MAX,
                     })
                     .send()
                     .await
-                else {
-                    break;
-                };
+                    .map_err_internal()?;
 
-                if batch.is_empty() {
+                if historical_batch.is_empty() {
+                    // No more historical events, switch to live events
                     break;
                 }
 
-                start_offset = batch.last().map(|ev| ev.id).unwrap_or(start_offset) + 1;
+                // Send historical batch
+                if tx.send(historical_batch.clone()).await.is_err() {
+                    return Ok(());
+                }
 
-                if tx.send(batch).await.is_err() {
+                current_offset = historical_batch
+                    .last()
+                    .map(|ev| ev.id + 1)
+                    .unwrap_or(current_offset);
+
+                // Buffer live events that arrive during historical reading
+                while let Ok(live_batch) = subscription.try_recv() {
+                    buffered_live_events
+                        .extend(live_batch.into_iter().filter(|ev| ev.id >= current_offset));
+                }
+            }
+
+            // Helper function to remove duplicates
+            fn remove_duplicates(events: &mut Vec<crate::Event<'_>>, current_offset: u64) {
+                if events
+                    .first()
+                    .map(|event| event.id < current_offset)
+                    .unwrap_or(false)
+                {
+                    let partition_point = events.partition_point(|event| event.id < current_offset);
+                    *events = events.split_off(partition_point);
+                }
+            }
+
+            // Remove duplicates from buffered live events
+            remove_duplicates(&mut buffered_live_events, current_offset);
+
+            // Send buffered live events
+            if !buffered_live_events.is_empty() {
+                current_offset = buffered_live_events
+                    .last()
+                    .map(|event| event.id + 1)
+                    .unwrap_or(current_offset);
+                if tx.send(buffered_live_events).await.is_err() {
+                    return Ok(());
+                }
+            }
+
+            // Switch to live events
+            while let Ok(mut live_batch) = subscription.recv().await {
+                remove_duplicates(&mut live_batch, current_offset);
+                if tx.send(live_batch).await.is_err() {
                     break;
                 }
             }
 
-            // Switch from buffer to live events
-            if let Err(_) = oneshot_tx.send((tx, start_offset)) {
-                return;
-            }
+            Ok::<_, Status>(())
         });
 
         let stream = ReceiverStream::new(rx).map(|events| {

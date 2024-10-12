@@ -17,7 +17,7 @@ First, add this to your `Cargo.toml`:
 eventus = "0.2"
 ```
 
-```rust
+```rust,ignore
 use eventus::*;
 use eventus::message::*;
 

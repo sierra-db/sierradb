@@ -2,9 +2,11 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use kameo::{
-    actor::{ActorRef, BoundedMailbox},
+    actor::ActorRef,
     error::BoxError,
+    mailbox::bounded::BoundedMailbox,
     message::{Context, Message},
+    request::MessageSend,
     Actor,
 };
 use tokio::{io, sync::broadcast};
@@ -68,9 +70,57 @@ impl Message<AppendToStream> for EventLog {
         msg: AppendToStream,
         _ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
+        let tx = self.next_tx();
         let timestamp = msg.timestamp.unwrap_or_else(|| Utc::now());
-        let offsets =
-            self.append_to_stream(msg.stream_id, msg.expected_version, msg.events, timestamp)?;
+        self.append_to_stream(
+            msg.stream_id,
+            msg.expected_version,
+            msg.events,
+            timestamp,
+            tx,
+        )?;
+        let offsets = self.commit(tx)?;
+
+        Ok((offsets, timestamp))
+    }
+}
+
+pub struct AppendToMultipleStreams {
+    pub streams: Vec<NewStreamEvents<'static>>,
+    pub timestamp: Option<DateTime<Utc>>,
+}
+
+pub struct NewStreamEvents<'a> {
+    pub stream_id: String,
+    pub expected_version: ExpectedVersion,
+    pub events: Vec<NewEvent<'a>>,
+}
+
+impl Message<AppendToMultipleStreams> for EventLog {
+    type Reply = Result<(OffsetRange, DateTime<Utc>), AppendError>;
+
+    async fn handle(
+        &mut self,
+        msg: AppendToMultipleStreams,
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        let tx = self.next_tx();
+        let timestamp = msg.timestamp.unwrap_or_else(|| Utc::now());
+
+        for stream in msg.streams.into_iter() {
+            if stream.events.is_empty() {
+                continue;
+            }
+            self.append_to_stream(
+                stream.stream_id.clone(),
+                stream.expected_version,
+                stream.events,
+                timestamp,
+                tx,
+            )?;
+        }
+        let offsets = self.commit(tx)?;
+
         Ok((offsets, timestamp))
     }
 }

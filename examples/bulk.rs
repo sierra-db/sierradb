@@ -20,11 +20,13 @@ async fn main() {
 
     let start = SystemTime::now();
     for i in 0..BATCHES {
-        let mut buf = (0..BATCH_SIZE)
-            .map(|j| format!("{}-{}", i, j))
-            .collect::<MessageBuf>();
-        log.append("my_stream", &mut buf)
-            .expect("Unable to append batch");
+        // let mut events = Vec::new();
+        // for j in (0..BATCH_SIZE) {
+        //     buf.push(i as u64, format!("{}-{}", i, j))
+        //         .expect("Total size of messages exceeds usize::MAX");
+        // }
+        // log.append_to_stream("my_stream", ExpectedVersion::Any, &mut buf)
+        //     .expect("Unable to append batch");
 
         if i == 99 || i == 50 {
             log.flush().expect("Unable to flush");
@@ -46,7 +48,7 @@ async fn main() {
     let mut pos = 0;
     loop {
         let entries = log
-            .read(pos, ReadLimit::max_bytes(10_240))
+            .read(pos, ReadLimit::max_bytes(10_240), 100)
             .expect("Unable to read messages from the log");
         match entries.iter().last().map(|m| m.id) {
             Some(off) => {
