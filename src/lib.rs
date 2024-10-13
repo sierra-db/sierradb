@@ -88,6 +88,10 @@ pub type Offset = u64;
 pub struct OffsetRange(u64, usize);
 
 impl OffsetRange {
+    pub fn new(first: u64, len: usize) -> Self {
+        OffsetRange(first, len)
+    }
+
     /// Starting offset of the range.
     pub fn first(&self) -> Offset {
         self.0

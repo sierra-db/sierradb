@@ -32,7 +32,7 @@ use self::eventstore::{
     EventBatch,
 };
 
-const BATCH_SIZE: usize = 65_536; // 65KB
+const BATCH_SIZE: usize = 1024 * 64; // 64KB
 
 pub mod eventstore {
     use std::borrow::Cow;
@@ -210,13 +210,6 @@ impl EventStore for DefaultEventStoreServer {
         if req.streams.iter().any(|stream| stream.events.is_empty()) {
             return Err(Status::invalid_argument("streams has empty events"));
         }
-        let timestamp = req
-            .timestamp
-            .map(|ts| {
-                DateTime::<Utc>::from_timestamp(ts.seconds, ts.nanos.try_into().unwrap_or(0))
-                    .ok_or_else(|| Status::invalid_argument("invalid timestamp"))
-            })
-            .transpose()?;
 
         let res = self
             .log
@@ -224,35 +217,49 @@ impl EventStore for DefaultEventStoreServer {
                 streams: req
                     .streams
                     .into_iter()
-                    .map(|stream| NewStreamEvents {
-                        stream_id: stream.stream_id,
-                        expected_version: stream
-                            .expected_version
-                            .map(crate::ExpectedVersion::from)
-                            .unwrap_or(crate::ExpectedVersion::Any),
-                        events: stream
-                            .events
-                            .into_iter()
-                            .map(|event| event.into())
-                            .collect(),
+                    .map(|stream| {
+                        let timestamp = stream
+                            .timestamp
+                            .map(|ts| {
+                                DateTime::<Utc>::from_timestamp(
+                                    ts.seconds,
+                                    ts.nanos.try_into().unwrap_or(0),
+                                )
+                                .ok_or_else(|| Status::invalid_argument("invalid timestamp"))
+                            })
+                            .transpose()?;
+                        Ok(NewStreamEvents {
+                            stream_id: stream.stream_id,
+                            expected_version: stream
+                                .expected_version
+                                .map(crate::ExpectedVersion::from)
+                                .unwrap_or(crate::ExpectedVersion::Any),
+                            events: stream
+                                .events
+                                .into_iter()
+                                .map(|event| event.into())
+                                .collect(),
+                            timestamp,
+                        })
                     })
-                    .collect(),
-                timestamp,
+                    .collect::<Result<_, Status>>()?,
             })
             .send()
             .await;
 
         match res {
-            Ok((offsets, timestamp)) => {
-                let first_id = offsets.first();
-                Ok(Response::new(AppendToMultipleStreamsResponse {
-                    first_id,
-                    timestamp: Some(prost_types::Timestamp {
-                        seconds: timestamp.timestamp(),
-                        nanos: timestamp.timestamp_subsec_nanos() as i32,
-                    }),
-                }))
-            }
+            Ok(results) => Ok(Response::new(AppendToMultipleStreamsResponse {
+                streams: results
+                    .into_iter()
+                    .map(|(offset, timestamp)| AppendToStreamResponse {
+                        first_id: offset.first(),
+                        timestamp: Some(prost_types::Timestamp {
+                            seconds: timestamp.timestamp(),
+                            nanos: timestamp.nanosecond().try_into().unwrap(),
+                        }),
+                    })
+                    .collect(),
+            })),
             Err(SendError::HandlerError(AppendError::MessageSizeExceeded)) => {
                 Err(Status::failed_precondition("message size exceeded"))
             }

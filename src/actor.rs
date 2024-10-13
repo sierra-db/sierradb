@@ -87,17 +87,17 @@ impl Message<AppendToStream> for EventLog {
 
 pub struct AppendToMultipleStreams {
     pub streams: Vec<NewStreamEvents<'static>>,
-    pub timestamp: Option<DateTime<Utc>>,
 }
 
 pub struct NewStreamEvents<'a> {
     pub stream_id: String,
     pub expected_version: ExpectedVersion,
     pub events: Vec<NewEvent<'a>>,
+    pub timestamp: Option<DateTime<Utc>>,
 }
 
 impl Message<AppendToMultipleStreams> for EventLog {
-    type Reply = Result<(OffsetRange, DateTime<Utc>), AppendError>;
+    type Reply = Result<Vec<(OffsetRange, DateTime<Utc>)>, AppendError>;
 
     async fn handle(
         &mut self,
@@ -105,12 +105,16 @@ impl Message<AppendToMultipleStreams> for EventLog {
         _ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
         let tx = self.next_tx();
-        let timestamp = msg.timestamp.unwrap_or_else(|| Utc::now());
 
-        for stream in msg.streams.into_iter() {
+        let mut results = Vec::with_capacity(msg.streams.len());
+        let now = Utc::now();
+        let mut stream_offset = 0;
+        for stream in msg.streams {
             if stream.events.is_empty() {
                 continue;
             }
+            let timestamp = stream.timestamp.unwrap_or(now);
+            let events_len = stream.events.len();
             self.append_to_stream(
                 stream.stream_id.clone(),
                 stream.expected_version,
@@ -118,10 +122,21 @@ impl Message<AppendToMultipleStreams> for EventLog {
                 timestamp,
                 tx,
             )?;
+
+            results.push((stream_offset, events_len, timestamp));
+            stream_offset += events_len;
         }
         let offsets = self.commit(tx)?;
 
-        Ok((offsets, timestamp))
+        Ok(results
+            .into_iter()
+            .map(|(stream_offset, events_len, timestamp)| {
+                (
+                    OffsetRange::new(offsets.first() + stream_offset as u64, events_len),
+                    timestamp,
+                )
+            })
+            .collect())
     }
 }
 

@@ -46,18 +46,17 @@ message AppendToStreamResponse {
 // Append to multiple streams
 message AppendToMultipleStreamsRequest {
     repeated StreamEvents streams = 1;
-    google.protobuf.Timestamp timestamp = 2;
 }
 
 message StreamEvents {
     string stream_id = 1;
     ExpectedVersion expected_version = 2;
     repeated NewEvent events = 3;
+    google.protobuf.Timestamp timestamp = 4;
 }
 
 message AppendToMultipleStreamsResponse {
-    uint64 first_id = 1;
-    google.protobuf.Timestamp timestamp = 2;
+    repeated AppendToStreamResponse streams = 1;
 }
 
 // Get Global Events
