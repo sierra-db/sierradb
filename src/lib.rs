@@ -60,7 +60,7 @@ use std::{
     borrow::Cow,
     fmt, fs, io,
     iter::{DoubleEndedIterator, ExactSizeIterator},
-    mem,
+    mem, ops,
     path::{Path, PathBuf},
 };
 
@@ -199,8 +199,11 @@ pub enum AppendError {
     #[error("active transaction mismatch")]
     WrongTransaction,
     /// Wrong expected version
-    #[error("current stream position is {current:?} but expected {expected:?}")]
+    #[error(
+        "current stream position is {current:?} but expected {expected:?} for stream {stream_id}"
+    )]
     WrongExpectedVersion {
+        stream_id: String,
         current: CurrentVersion,
         expected: ExpectedVersion,
     },
@@ -401,12 +404,17 @@ impl EventLog {
         self.uncommitted_stream_events.clear();
 
         // 1. Write the commit message
-        for event in self.uncomitted_events.drain(..).collect::<Vec<_>>() {
+        for (i, event) in self
+            .uncomitted_events
+            .drain(..)
+            .enumerate()
+            .collect::<Vec<_>>()
+        {
             let bytes = rmp_serde::to_vec(&event)?;
             let mut buf = MessageBuf::default();
             buf.push(tx, bytes)?;
             message::set_offsets(&mut buf, event.id);
-            let Some((meta, offset)) = self.append_with_offsets(&buf, true)? else {
+            let Some((meta, offset)) = self.append_with_offsets(&buf, Some(i as u64))? else {
                 continue;
             };
             let mut pos = meta.starting_position;
@@ -416,7 +424,8 @@ impl EventLog {
                 pos += m.total_bytes();
             }
             self.uncommitted_stream_events
-                .push((event.stream_id.to_string(), offset.first()));
+                .push((event.stream_id.to_string(), event.id));
+
             self.unflushed.push(event);
             if offsets.is_empty() {
                 offsets = OffsetRange(offset.first(), 1);
@@ -427,7 +436,7 @@ impl EventLog {
 
         let mut buf = MessageBuf::default();
         buf.push_commit(tx);
-        self.append_with_offsets(&buf, false)?;
+        self.append_with_offsets(&buf, None)?;
         self.file_set.active_segment_mut().flush_writer()?;
 
         // 2. Append buffered global index entries
@@ -449,7 +458,6 @@ impl EventLog {
         stream_index.flush()?; // Ensure the stream index is flushed
 
         // 4. Clear the buffered uncommitted events
-        self.unflushed = mem::take(&mut self.uncomitted_events);
         self.active_tx = None;
 
         Ok(offsets)
@@ -467,17 +475,22 @@ impl EventLog {
             return Ok(());
         }
 
-        let stream_id = stream_id.into();
+        let mut stream_id = stream_id.into();
         // Check if the stream id exceeds the max size
         if stream_id.len() > KEY_SIZE {
             return Err(AppendError::StreamIdLenExceeded);
         }
 
-        let current_version = match self.read_last_stream_msg(&stream_id)? {
+        let mut current_version = match self.read_last_stream_msg(&stream_id)? {
             Some(event) => CurrentVersion::Current(event.stream_version),
             None => CurrentVersion::NoStream,
         };
-        expected_version.validate(current_version)?;
+        current_version += self
+            .uncomitted_events
+            .iter()
+            .filter(|event| event.stream_id == stream_id)
+            .count() as u64;
+        stream_id = expected_version.validate(stream_id, current_version)?;
 
         let next_offset = self.file_set.active_index_mut().next_offset();
         for (i, event) in events.into_iter().enumerate() {
@@ -572,7 +585,7 @@ impl EventLog {
     pub fn append_with_offsets<T>(
         &mut self,
         buf: &T,
-        validate_offsets: bool,
+        validate_offsets: Option<u64>,
     ) -> Result<Option<(AppendMetadata, OffsetRange)>, AppendError>
     where
         T: MessageSet,
@@ -591,8 +604,10 @@ impl EventLog {
         let start_off = self.next_offset();
 
         // check to make sure the first message matches the starting offset
-        if validate_offsets && buf.iter().next().unwrap().offset() != start_off {
-            return Err(AppendError::InvalidOffset);
+        if let Some(event_num) = validate_offsets {
+            if buf.iter().next().unwrap().offset() != start_off + event_num {
+                return Err(AppendError::InvalidOffset);
+            }
         }
 
         // Check to make sure we aren't exceeding the log max entries
@@ -734,6 +749,62 @@ impl EventLog {
         }
     }
 
+    pub fn read_one(
+        &self,
+        mut offset: Offset,
+        limit: ReadLimit,
+    ) -> Result<Option<Event<'static>>, ReadError> {
+        let mut rd = MessageBufReader;
+        let reader = self.reader(&mut rd, offset, limit)?;
+        match reader {
+            Some(mut buf) => {
+                let tx_id;
+                let event;
+
+                let mut iter = buf.iter();
+                match iter.next() {
+                    Some(msg) => {
+                        tx_id = msg.tx();
+                        event =
+                            rmp_serde::from_slice(msg.payload()).map_err(ReadError::Deserialize)?;
+                    }
+                    None => return Ok(None),
+                }
+
+                let commit = loop {
+                    let original_last_offset = offset;
+                    let mut last_offset = offset;
+                    let Some(commit) = iter.find(|msg| {
+                        last_offset = msg.offset();
+                        matches!(msg.kind(), MessageKind::Commit)
+                    }) else {
+                        if last_offset == original_last_offset {
+                            // Didn't increase the last offset, we reached the end
+                            return Ok(None);
+                        }
+
+                        offset = last_offset;
+                        match self.reader(&mut rd, offset, limit)? {
+                            Some(new_buf) => buf = new_buf,
+                            None => return Ok(None),
+                        }
+                        iter = buf.iter();
+                        continue; // Commit message not found here, lets buffer another batch of messages
+                    };
+
+                    break commit;
+                };
+
+                if commit.tx() == tx_id {
+                    return Ok(Some(event));
+                } else {
+                    return Ok(None);
+                }
+            }
+            None => return Ok(None),
+        }
+    }
+
     /// Reads a portion of the log, starting with the `start` offset, inclusive,
     /// up to the limit.
     #[inline]
@@ -746,7 +817,7 @@ impl EventLog {
         let mut rd = MessageBufReader;
         match self.reader(&mut rd, start, limit)? {
             Some(buf) => {
-                let mut committed_events = Vec::with_capacity(batch_size);
+                let mut committed_events = Vec::with_capacity(batch_size.min(limit.0 * 256));
                 let mut current_tx_events = Vec::with_capacity(4); // Buffer for events belonging to the current tx
                 let mut current_tx = None; // Track the current transaction ID
                 let mut has_commit = false;
@@ -959,19 +1030,26 @@ pub enum ExpectedVersion {
 }
 
 impl ExpectedVersion {
-    pub fn validate(&self, current: CurrentVersion) -> Result<(), AppendError> {
+    pub fn validate(
+        &self,
+        stream_id: String,
+        current: CurrentVersion,
+    ) -> Result<String, AppendError> {
         use CurrentVersion::NoStream as CurrentNoStream;
         use CurrentVersion::*;
         use ExpectedVersion::NoStream as ExpectedNoStream;
         use ExpectedVersion::*;
 
         match (self, current) {
-            (Any, _) | (StreamExists, Current(_)) | (ExpectedNoStream, CurrentNoStream) => Ok(()),
-            (Exact(e), Current(c)) if *e == c => Ok(()),
+            (Any, _) | (StreamExists, Current(_)) | (ExpectedNoStream, CurrentNoStream) => {
+                Ok(stream_id)
+            }
+            (Exact(e), Current(c)) if *e == c => Ok(stream_id),
             (Exact(_), Current(_))
             | (StreamExists, CurrentNoStream)
             | (ExpectedNoStream, Current(_))
             | (Exact(_), CurrentNoStream) => Err(AppendError::WrongExpectedVersion {
+                stream_id,
                 current,
                 expected: *self,
             }),
@@ -1017,6 +1095,19 @@ impl fmt::Display for CurrentVersion {
     }
 }
 
+impl ops::AddAssign<u64> for CurrentVersion {
+    fn add_assign(&mut self, rhs: u64) {
+        match self {
+            CurrentVersion::Current(current) => *current += rhs,
+            CurrentVersion::NoStream => {
+                if rhs > 0 {
+                    *self = CurrentVersion::Current(rhs - 1)
+                }
+            }
+        }
+    }
+}
+
 pub struct ReadStreamIter<'a, I> {
     log: &'a EventLog,
     stream_index_iter: I,
@@ -1030,10 +1121,7 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         let offset = self.stream_index_iter.next()?;
-        self.log
-            .read(offset, ReadLimit::default(), usize::MAX)
-            .map(|read| read.into_iter().next())
-            .transpose()
+        self.log.read_one(offset, ReadLimit::default()).transpose()
     }
 }
 

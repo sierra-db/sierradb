@@ -9,7 +9,7 @@ use kameo::request::MessageSend;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::errors::InvalidMetadataValue;
-use tonic::metadata::AsciiMetadataValue;
+use tonic::metadata::{AsciiMetadataValue, MetadataMap, MetadataValue};
 use tonic::service::Interceptor;
 use tonic::{Request, Response, Status};
 use tracing::error;
@@ -24,7 +24,7 @@ use crate::actor::{
     AppendToMultipleStreams, AppendToStream, GetStreamEvents, LoadSubscription, NewStreamEvents,
     ReadBatch, Subscribe, UpdateSubscription,
 };
-use crate::{AppendError, EventLog, ReadLimit};
+use crate::{AppendError, CurrentVersion, EventLog, ExpectedVersion, ReadLimit};
 
 use self::eventstore::subscribe_request::StartFrom;
 use self::eventstore::{
@@ -192,8 +192,21 @@ impl EventStore for DefaultEventStoreServer {
             Err(SendError::HandlerError(AppendError::MessageSizeExceeded)) => {
                 Err(Status::failed_precondition("message size exceeded"))
             }
-            Err(SendError::HandlerError(err @ AppendError::WrongExpectedVersion { .. })) => {
-                Err(Status::failed_precondition(err.to_string()))
+            Err(SendError::HandlerError(
+                ref err @ AppendError::WrongExpectedVersion {
+                    ref stream_id,
+                    current,
+                    expected,
+                },
+            )) => {
+                let mut status = Status::failed_precondition(err.to_string());
+                insert_expected_version_metadata(
+                    status.metadata_mut(),
+                    stream_id,
+                    current,
+                    expected,
+                );
+                Err(status)
             }
             Err(err) => Err(Status::internal(err.to_string())),
         }
@@ -263,8 +276,21 @@ impl EventStore for DefaultEventStoreServer {
             Err(SendError::HandlerError(AppendError::MessageSizeExceeded)) => {
                 Err(Status::failed_precondition("message size exceeded"))
             }
-            Err(SendError::HandlerError(err @ AppendError::WrongExpectedVersion { .. })) => {
-                Err(Status::failed_precondition(err.to_string()))
+            Err(SendError::HandlerError(
+                ref err @ AppendError::WrongExpectedVersion {
+                    ref stream_id,
+                    current,
+                    expected,
+                },
+            )) => {
+                let mut status = Status::failed_precondition(err.to_string());
+                insert_expected_version_metadata(
+                    status.metadata_mut(),
+                    stream_id,
+                    current,
+                    expected,
+                );
+                Err(status)
             }
             Err(err) => Err(Status::internal(err.to_string())),
         }
@@ -538,5 +564,36 @@ impl Interceptor for ClientAuthInterceptor {
             .metadata_mut()
             .insert("authorization", self.auth_token.clone());
         Ok(request)
+    }
+}
+
+fn insert_expected_version_metadata(
+    metadata: &mut MetadataMap,
+    stream_id: &str,
+    current: CurrentVersion,
+    expected: ExpectedVersion,
+) {
+    metadata.insert("stream_id", stream_id.parse().unwrap());
+    match current {
+        CurrentVersion::Current(current) => {
+            metadata.insert("current", current.to_string().parse().unwrap());
+        }
+        CurrentVersion::NoStream => {
+            metadata.insert("current", MetadataValue::from_static("-1"));
+        }
+    }
+    match expected {
+        ExpectedVersion::Any => {
+            metadata.insert("expected", MetadataValue::from_static("any"));
+        }
+        ExpectedVersion::StreamExists => {
+            metadata.insert("expected", MetadataValue::from_static("stream_exists"));
+        }
+        ExpectedVersion::NoStream => {
+            metadata.insert("expected", MetadataValue::from_static("no_stream"));
+        }
+        ExpectedVersion::Exact(expected) => {
+            metadata.insert("expected", expected.to_string().parse().unwrap());
+        }
     }
 }

@@ -113,6 +113,8 @@ impl StreamIndex {
             path_buf
         };
 
+        info!("Creating stream index file {path:?}");
+
         let filename = path.file_name().unwrap().to_str().unwrap();
         let base_offset = match (&filename[0..SEGMENT_FILE_NAME_LEN]).parse::<u64>() {
             Ok(v) => v,
@@ -237,9 +239,10 @@ impl StreamIndex {
 
                 match msg.kind() {
                     MessageKind::Event => {
-                        if msg_offset < pos {
+                        pos = msg.offset() + 1; // Move the position along
+
+                        if msg_offset < pos - 1 {
                             // Skip event messages that have already been indexed
-                            pos += 1; // Move the position along
                             continue;
                         }
 
@@ -264,13 +267,19 @@ impl StreamIndex {
                             // Commit the transaction and insert buffered events
                             for event in buffered_events.drain(..) {
                                 self.insert(&event.stream_id, event.id)?;
+                                if event.id == 4600 {
+                                    println!(
+                                        "Added it! Lets look up all the events for this stream"
+                                    );
+                                    let event_ids = self.get(&event.stream_id);
+                                    // dbg!(event_ids.len(), event_ids);
+                                    // dbg!(self.last(&event.stream_id));
+                                }
                             }
                             current_tx = None; // Reset the current transaction
                         }
                     }
                 }
-
-                pos += 1;
             }
         }
 

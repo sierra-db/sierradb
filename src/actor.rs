@@ -2,14 +2,15 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use kameo::{
-    actor::ActorRef,
-    error::BoxError,
+    actor::{ActorRef, WeakActorRef},
+    error::{ActorStopReason, BoxError, PanicError},
     mailbox::bounded::BoundedMailbox,
     message::{Context, Message},
     request::MessageSend,
     Actor,
 };
 use tokio::{io, sync::broadcast};
+use tracing::error;
 
 // const FLUSH_FREQUENCY_MS: u64 = 100;
 
@@ -41,6 +42,26 @@ impl Actor for EventLog {
             }
         });
 
+        Ok(())
+    }
+
+    async fn on_panic(
+        &mut self,
+        _actor_ref: WeakActorRef<Self>,
+        err: PanicError,
+    ) -> Result<Option<ActorStopReason>, BoxError> {
+        error!("event log actor panicked: {err}");
+        return Ok(None); // Restart
+    }
+
+    async fn on_stop(
+        self,
+        _actor_ref: WeakActorRef<Self>,
+        reason: ActorStopReason,
+    ) -> Result<(), BoxError> {
+        if !matches!(reason, ActorStopReason::Normal) {
+            error!("event log actor stopping: {reason:?}");
+        }
         Ok(())
     }
 }

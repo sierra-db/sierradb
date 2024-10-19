@@ -19,11 +19,11 @@ pub fn init_args() -> &'static Args {
 #[command(version, about, long_about = None)]
 pub struct Args {
     /// Path to database directory
-    #[arg(short, long, env = "EVENTUS_LOG_PATH", default_value = ".log")]
+    #[arg(long, env = "EVENTUS_LOG_PATH", default_value = ".log")]
     pub log_path: PathBuf,
 
     /// GRPC address to listen on
-    #[arg(short, long, env = "EVENTUS_LISTEN_ADDR", default_value = "[::1]:9220")]
+    #[arg(long, env = "EVENTUS_LISTEN_ADDR", default_value = "[::1]:9220")]
     pub listen_addr: SocketAddr,
 
     /// Authentication token

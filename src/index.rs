@@ -164,7 +164,7 @@ impl Index {
             path_buf
         };
 
-        info!("Creating index file {:?}", &path);
+        info!("Creating index file {path:?}");
 
         let file = OpenOptions::new()
             .read(true)
