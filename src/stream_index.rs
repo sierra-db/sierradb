@@ -267,14 +267,6 @@ impl StreamIndex {
                             // Commit the transaction and insert buffered events
                             for event in buffered_events.drain(..) {
                                 self.insert(&event.stream_id, event.id)?;
-                                if event.id == 4600 {
-                                    println!(
-                                        "Added it! Lets look up all the events for this stream"
-                                    );
-                                    let event_ids = self.get(&event.stream_id);
-                                    // dbg!(event_ids.len(), event_ids);
-                                    // dbg!(self.last(&event.stream_id));
-                                }
                             }
                             current_tx = None; // Reset the current transaction
                         }

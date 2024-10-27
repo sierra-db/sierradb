@@ -73,6 +73,12 @@ message GetStreamEventsRequest {
     uint32 batch_size = 3;
 }
 
+// Get last event ID
+message GetLastEventIDRequest {}
+message GetLastEventIDResponse {
+    optional uint64 last_event_id = 1;
+}
+
 // Subscribe
 message SubscribeRequest {
     oneof start_from {
@@ -97,6 +103,7 @@ service EventStore {
     rpc AppendToMultipleStreams(AppendToMultipleStreamsRequest) returns (AppendToMultipleStreamsResponse);
     rpc GetEvents(GetEventsRequest) returns (stream EventBatch);
     rpc GetStreamEvents(GetStreamEventsRequest) returns (stream EventBatch);
+    rpc GetLastEventID(GetLastEventIDRequest) returns (GetLastEventIDResponse);
     rpc Subscribe(SubscribeRequest) returns (stream EventBatch);
     rpc Acknowledge(AcknowledgeRequest) returns (google.protobuf.Empty);
 }

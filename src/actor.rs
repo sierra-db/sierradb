@@ -181,6 +181,20 @@ impl Message<GetStreamEvents> for EventLog {
     }
 }
 
+pub struct GetLastEventID;
+
+impl Message<GetLastEventID> for EventLog {
+    type Reply = Option<u64>;
+
+    async fn handle(
+        &mut self,
+        _msg: GetLastEventID,
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.last_offset()
+    }
+}
+
 pub struct Subscribe;
 
 impl Message<Subscribe> for EventLog {

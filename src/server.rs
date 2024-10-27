@@ -16,13 +16,13 @@ use tracing::error;
 
 use eventstore::event_store_server::EventStore;
 use eventstore::{
-    AcknowledgeRequest, AppendToStreamRequest, Event, GetEventsRequest, GetStreamEventsRequest,
-    SubscribeRequest,
+    AcknowledgeRequest, AppendToStreamRequest, Event, GetEventsRequest, GetLastEventIdRequest,
+    GetLastEventIdResponse, GetStreamEventsRequest, SubscribeRequest,
 };
 
 use crate::actor::{
-    AppendToMultipleStreams, AppendToStream, GetStreamEvents, LoadSubscription, NewStreamEvents,
-    ReadBatch, Subscribe, UpdateSubscription,
+    AppendToMultipleStreams, AppendToStream, GetLastEventID, GetStreamEvents, LoadSubscription,
+    NewStreamEvents, ReadBatch, Subscribe, UpdateSubscription,
 };
 use crate::{AppendError, CurrentVersion, EventLog, ExpectedVersion, ReadLimit};
 
@@ -382,6 +382,19 @@ impl EventStore for DefaultEventStoreServer {
         };
 
         Ok(Response::new(Box::pin(s)))
+    }
+
+    async fn get_last_event_id(
+        &self,
+        _request: Request<GetLastEventIdRequest>,
+    ) -> Result<Response<GetLastEventIdResponse>, Status> {
+        let last_event_id = self
+            .log
+            .ask(GetLastEventID)
+            .send()
+            .await
+            .map_err_internal()?;
+        Ok(Response::new(GetLastEventIdResponse { last_event_id }))
     }
 
     async fn subscribe(
