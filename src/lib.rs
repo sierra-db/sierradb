@@ -475,7 +475,7 @@ impl EventLog {
             return Ok(());
         }
 
-        let mut stream_id = stream_id.into();
+        let stream_id = stream_id.into();
         // Check if the stream id exceeds the max size
         if stream_id.len() > KEY_SIZE {
             return Err(AppendError::StreamIdLenExceeded);
@@ -490,7 +490,13 @@ impl EventLog {
             .iter()
             .filter(|event| event.stream_id == stream_id)
             .count() as u64;
-        stream_id = expected_version.validate(stream_id, current_version)?;
+        if !expected_version.validate(current_version) {
+            return Err(AppendError::WrongExpectedVersion {
+                stream_id,
+                current: current_version,
+                expected: expected_version,
+            });
+        }
 
         let next_offset = self.file_set.active_index_mut().next_offset();
         for (i, event) in events.into_iter().enumerate() {
@@ -1030,29 +1036,19 @@ pub enum ExpectedVersion {
 }
 
 impl ExpectedVersion {
-    pub fn validate(
-        &self,
-        stream_id: String,
-        current: CurrentVersion,
-    ) -> Result<String, AppendError> {
+    pub fn validate(&self, current: CurrentVersion) -> bool {
         use CurrentVersion::NoStream as CurrentNoStream;
         use CurrentVersion::*;
         use ExpectedVersion::NoStream as ExpectedNoStream;
         use ExpectedVersion::*;
 
         match (self, current) {
-            (Any, _) | (StreamExists, Current(_)) | (ExpectedNoStream, CurrentNoStream) => {
-                Ok(stream_id)
-            }
-            (Exact(e), Current(c)) if *e == c => Ok(stream_id),
+            (Any, _) | (StreamExists, Current(_)) | (ExpectedNoStream, CurrentNoStream) => true,
+            (Exact(e), Current(c)) if *e == c => true,
             (Exact(_), Current(_))
             | (StreamExists, CurrentNoStream)
             | (ExpectedNoStream, Current(_))
-            | (Exact(_), CurrentNoStream) => Err(AppendError::WrongExpectedVersion {
-                stream_id,
-                current,
-                expected: *self,
-            }),
+            | (Exact(_), CurrentNoStream) => false,
         }
     }
 }
