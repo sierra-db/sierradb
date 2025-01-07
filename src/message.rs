@@ -129,14 +129,14 @@ pub fn serialize<B: BufMut, P: AsRef<[u8]>>(
 /// Messages contain finite-sized binary values with an offset from
 /// the beginning of the log.
 ///
-/// | Bytes       | Encoding          | Value                          |
-/// | ---------   | ----------------- | ------------------------------ |
-/// | 0-7         | Little Endian u64 | Offset                         |
-/// | 8-11        | Little Endian u32 | Payload Size                   |
-/// | 12-15       | Little Endian u32 | CRC32C of payload and metadata |
-/// | 16-17       | Little Endiqn u16 | Record type                    |
-/// | 18-25       | Little Endiqn u64 | Transaction ID                 |
-/// | (26+)       |                   | Payload                        |
+/// | Bytes       | Encoding          | Value             |
+/// | ---------   | ----------------- | ----------------- |
+/// | 0-7         | Little Endian u64 | Offset            |
+/// | 8-11        | Little Endian u32 | Payload Size      |
+/// | 12-15       | Little Endian u32 | CRC32C of payload |
+/// | 16-17       | Little Endiqn u16 | Record type       |
+/// | 18-25       | Little Endiqn u64 | Transaction ID    |
+/// | (26+)       |                   | Payload           |
 #[derive(Debug)]
 pub struct Message<'a> {
     bytes: &'a [u8],
