@@ -93,9 +93,12 @@ impl FileSet {
 
         // pair up the index and segments (there should be an index per segment)
         let log_opts = opts.clone();
+        let segments_len = segments.len();
         let mut closed = segments
             .into_iter()
-            .map(move |(i, segment)| {
+            .enumerate()
+            .map(move |(segment_idx, (i, segment))| {
+                let is_last_segment = segment_idx == segments_len - 1;
                 let index = match indexes.remove(&i) {
                     Some(index) => index,
                     None => {
@@ -104,8 +107,11 @@ impl FileSet {
                             segment.starting_offset(),
                             log_opts.log_max_bytes,
                         )?;
-                        index.rehydrate(&segment, log_opts.message_max_bytes)?;
-                        index.flush()?;
+                        // We always rehydrate the last segment, so no need to do it here
+                        if !is_last_segment {
+                            index.rehydrate(&segment, log_opts.message_max_bytes)?;
+                            index.flush()?;
+                        }
                         index
                     }
                 };
@@ -117,8 +123,11 @@ impl FileSet {
                             segment.starting_offset(),
                             log_opts.log_max_entries,
                         )?;
-                        stream_index.rehydrate(&segment, &index, log_opts.message_max_bytes)?;
-                        stream_index.flush()?;
+                        // We always rehydrate the last segment, so no need to do it here
+                        if !is_last_segment {
+                            stream_index.rehydrate(&segment, &index, log_opts.message_max_bytes)?;
+                            stream_index.flush()?;
+                        }
                         stream_index
                     }
                 };
@@ -171,6 +180,18 @@ impl FileSet {
         })
     }
 
+    pub fn active_segment(&self) -> &Segment {
+        &self.active.segment
+    }
+
+    pub fn active_index(&self) -> &Index {
+        &self.active.index
+    }
+
+    pub fn active_stream_index(&self) -> &StreamIndex {
+        &self.active.stream_index
+    }
+
     pub fn active_segment_mut(&mut self) -> &mut Segment {
         &mut self.active.segment
     }
@@ -181,14 +202,6 @@ impl FileSet {
 
     pub fn active_stream_index_mut(&mut self) -> &mut StreamIndex {
         &mut self.active.stream_index
-    }
-
-    pub fn active_index(&self) -> &Index {
-        &self.active.index
-    }
-
-    pub fn active_stream_index(&self) -> &StreamIndex {
-        &self.active.stream_index
     }
 
     pub fn find(&self, offset: u64) -> &SegmentSet {

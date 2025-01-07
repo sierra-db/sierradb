@@ -8,10 +8,10 @@ use tracing::{debug, info, trace};
 use twox_hash::Xxh3Hash64;
 
 use crate::index::Index;
-use crate::message::{MessageSet, HEADER_SIZE};
+use crate::message::{MessageKind, MessageSet, HEADER_SIZE};
 use crate::reader::MessageBufReader;
 use crate::segment::Segment;
-use crate::{to_page_size, Event, Offset, ReadError};
+use crate::{to_page_size, Event, Offset};
 
 pub static STREAM_INDEX_FILE_NAME_EXTENSION: &str = "streams";
 pub static SEGMENT_FILE_NAME_LEN: usize = 20;
@@ -113,6 +113,8 @@ impl StreamIndex {
             path_buf
         };
 
+        info!("Creating stream index file {path:?}");
+
         let filename = path.file_name().unwrap().to_str().unwrap();
         let base_offset = match (&filename[0..SEGMENT_FILE_NAME_LEN]).parse::<u64>() {
             Ok(v) => v,
@@ -204,55 +206,72 @@ impl StreamIndex {
         } else {
             last
         };
-        // let mut expected_event_id = pos;
-        // let mut expected_stream_versions = HashMap::<String, Option<u64>>::new();
-        let mut reader = MessageBufReader;
-        loop {
-            let seg_bytes = segment.size() as u32;
 
+        let mut reader = MessageBufReader;
+        let mut current_tx = None;
+        let mut buffered_events = Vec::new();
+
+        loop {
             if pos >= index.next_offset() {
                 break;
             }
 
-            // grab the range from the contained index
+            // Find the range in the index for messages starting from `pos`
             let range = index
-                .find_segment_range(pos, (message_max_bytes + HEADER_SIZE) as u32, seg_bytes)
+                .find_segment_range(
+                    pos,
+                    (message_max_bytes + HEADER_SIZE) as u32,
+                    segment.size() as u32,
+                )
                 .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
-            let events = if range.bytes() == 0 {
-                break;
-            } else {
-                segment
-                    .read_slice(&mut reader, range.file_position(), range.bytes())
-                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "read slice error"))?
-                    .iter()
-                    .map(|msg| rmp_serde::from_slice(msg.payload()).map_err(ReadError::Deserialize))
-                    .collect::<Result<Vec<Event<'static>>, _>>()
-                    .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?
-            };
 
-            for event in events {
-                // let id = event.stream_id.to_string();
-                // let existing_stream_version = expected_stream_versions.get(&id).copied().flatten();
-                // match existing_stream_version {
-                //     Some(existing) => {
-                //         assert_eq!(
-                //             existing + 1,
-                //             event.stream_version,
-                //             "wrong version for {} {id}",
-                //             event.id
-                //         );
-                //     }
-                //     None => assert_eq!(
-                //         event.stream_version, 0,
-                //         "wrong version for {} {id}",
-                //         event.id
-                //     ),
-                // }
-                // expected_stream_versions.insert(id, Some(event.stream_version));
-                // assert_eq!(event.id, expected_event_id);
-                // expected_event_id += 1;
-                pos += 1;
-                self.insert(&event.stream_id, event.id)?;
+            if range.bytes() == 0 {
+                break;
+            }
+
+            // Read messages from the segment
+            let msgs = segment
+                .read_slice(&mut reader, range.file_position(), range.bytes())
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "read slice error"))?;
+
+            for msg in msgs.iter() {
+                let msg_offset = msg.offset();
+
+                match msg.kind() {
+                    MessageKind::Event => {
+                        pos = msg.offset() + 1; // Move the position along
+
+                        if msg_offset < pos - 1 {
+                            // Skip event messages that have already been indexed
+                            continue;
+                        }
+
+                        let tx_id = msg.tx();
+                        if current_tx.is_none() {
+                            // Start tracking a new transaction
+                            current_tx = Some(tx_id);
+                        }
+
+                        if current_tx == Some(tx_id) {
+                            // Buffer the event to be indexed after commit
+                            let event: Event<'static> = rmp_serde::from_slice(msg.payload())
+                                .map_err(|err| {
+                                    io::Error::new(io::ErrorKind::Other, err.to_string())
+                                })?;
+                            buffered_events.push(event);
+                        }
+                    }
+                    MessageKind::Commit => {
+                        let tx_id = msg.tx();
+                        if current_tx == Some(tx_id) {
+                            // Commit the transaction and insert buffered events
+                            for event in buffered_events.drain(..) {
+                                self.insert(&event.stream_id, event.id)?;
+                            }
+                            current_tx = None; // Reset the current transaction
+                        }
+                    }
+                }
             }
         }
 
@@ -1456,6 +1475,8 @@ mod tests {
 
         // Write some data to the segment
         {
+            let tx_id = 1;
+
             let mut buf = MessageBuf::default();
             let bytes = rmp_serde::encode::to_vec_named(&Event {
                 id: 0,
@@ -1467,10 +1488,15 @@ mod tests {
                 timestamp: Utc::now(),
             })
             .unwrap();
-            buf.push(bytes).unwrap();
+            buf.push(tx_id, bytes).unwrap();
             set_offsets(&mut buf, 0);
             let meta = segment.append(&buf).unwrap();
             assert_eq!(2, meta.starting_position);
+
+            // Append commit message
+            let mut commit_buf = MessageBuf::default();
+            commit_buf.push_commit(tx_id);
+            segment.append(&commit_buf).unwrap();
         }
 
         segment.flush().unwrap();
@@ -1479,6 +1505,8 @@ mod tests {
         let mut index = Index::new(&dir, segment.starting_offset(), 128).unwrap();
         index.rehydrate(&segment, 1024).unwrap();
         index.flush().unwrap();
+        assert_eq!(index.next_offset(), 1);
+        assert!(index.read_entry(0).is_some());
 
         // Rehydrate the stream index
         let mut map = setup();
@@ -1490,14 +1518,17 @@ mod tests {
     #[test]
     fn test_rehydrate_from_partial_stream_index_starting_0() {
         let dir = TestDir::new();
-        let mut segment = Segment::new(&dir, 0, 1024).unwrap();
+        let mut segment = Segment::new(&dir, 0, 2048).unwrap();
         let mut index = Index::new(&dir, segment.starting_offset(), 128).unwrap();
         let mut stream_index = setup();
 
         // Write some data to the segment
         {
+            let mut tx_id = 1;
+
             let mut buf = MessageBuf::default();
             buf.push(
+                tx_id,
                 rmp_serde::encode::to_vec_named(&Event {
                     id: 0,
                     stream_id: "abc".into(),
@@ -1517,10 +1548,18 @@ mod tests {
             buf.push(0, meta.starting_position as u32);
             index.append(buf).unwrap();
 
+            // Append commit message
+            let mut commit_buf = MessageBuf::default();
+            commit_buf.push_commit(tx_id);
+            segment.append(&commit_buf).unwrap();
+
+            tx_id = 2;
+
             stream_index.insert("abc", 0).unwrap();
 
             let mut buf = MessageBuf::default();
             buf.push(
+                tx_id,
                 rmp_serde::encode::to_vec_named(&Event {
                     id: 1,
                     stream_id: "xyz".into(),
@@ -1540,10 +1579,18 @@ mod tests {
             buf.push(1, meta.starting_position as u32);
             index.append(buf).unwrap();
 
+            // Append commit message
+            let mut commit_buf = MessageBuf::default();
+            commit_buf.push_commit(tx_id);
+            segment.append(&commit_buf).unwrap();
+
+            tx_id = 3;
+
             stream_index.insert("xyz", 1).unwrap();
 
             let mut buf = MessageBuf::default();
             buf.push(
+                tx_id,
                 rmp_serde::encode::to_vec_named(&Event {
                     id: 2,
                     stream_id: "abc".into(),
@@ -1561,6 +1608,7 @@ mod tests {
 
             let mut buf = MessageBuf::default();
             buf.push(
+                tx_id,
                 rmp_serde::encode::to_vec_named(&Event {
                     id: 3,
                     stream_id: "xyz".into(),
@@ -1575,6 +1623,11 @@ mod tests {
             .unwrap();
             set_offsets(&mut buf, 3);
             segment.append(&buf).unwrap();
+
+            // Append commit message
+            let mut commit_buf = MessageBuf::default();
+            commit_buf.push_commit(tx_id);
+            segment.append(&commit_buf).unwrap();
         }
 
         segment.flush().unwrap();
@@ -1599,8 +1652,11 @@ mod tests {
 
         // Write some data to the segment
         {
+            let mut tx_id = 1;
+
             let mut buf = MessageBuf::default();
             buf.push(
+                tx_id,
                 rmp_serde::encode::to_vec_named(&Event {
                     id: 100,
                     stream_id: "abc".into(),
@@ -1620,10 +1676,18 @@ mod tests {
             buf.push(100, meta.starting_position as u32);
             index.append(buf).unwrap();
 
+            // Append commit message
+            let mut commit_buf = MessageBuf::default();
+            commit_buf.push_commit(tx_id);
+            segment.append(&commit_buf).unwrap();
+
+            tx_id = 2;
+
             stream_index.insert("abc", 100).unwrap();
 
             let mut buf = MessageBuf::default();
             buf.push(
+                tx_id,
                 rmp_serde::encode::to_vec_named(&Event {
                     id: 101,
                     stream_id: "xyz".into(),
@@ -1643,10 +1707,18 @@ mod tests {
             buf.push(101, meta.starting_position as u32);
             index.append(buf).unwrap();
 
+            // Append commit message
+            let mut commit_buf = MessageBuf::default();
+            commit_buf.push_commit(tx_id);
+            segment.append(&commit_buf).unwrap();
+
+            tx_id = 3;
+
             stream_index.insert("xyz", 101).unwrap();
 
             let mut buf = MessageBuf::default();
             buf.push(
+                tx_id,
                 rmp_serde::encode::to_vec_named(&Event {
                     id: 102,
                     stream_id: "abc".into(),
@@ -1664,6 +1736,7 @@ mod tests {
 
             let mut buf = MessageBuf::default();
             buf.push(
+                tx_id,
                 rmp_serde::encode::to_vec_named(&Event {
                     id: 103,
                     stream_id: "xyz".into(),
@@ -1678,6 +1751,11 @@ mod tests {
             .unwrap();
             set_offsets(&mut buf, 103);
             segment.append(&buf).unwrap();
+
+            // Append commit message
+            let mut commit_buf = MessageBuf::default();
+            commit_buf.push_commit(tx_id);
+            segment.append(&commit_buf).unwrap();
         }
 
         segment.flush().unwrap();

@@ -1,6 +1,8 @@
 //! Custom log reading.
 use std::{fs::File, os::unix::fs::FileExt};
 
+use crate::message::HEADER_SIZE;
+
 use super::message::{MessageBuf, MessageError};
 
 /// Trait that allows reading from a slice of the log.
@@ -27,6 +29,34 @@ pub trait LogSliceReader {
         file_position: u32,
         bytes: usize,
     ) -> Result<Self::Result, MessageError>;
+}
+
+pub struct MessageHeaderReader;
+
+impl LogSliceReader for MessageHeaderReader {
+    type Result = MessageBuf;
+
+    fn read_from(
+        &mut self,
+        file: &File,
+        file_pos: u32,
+        _bytes: usize, // We ignore this because we know we only need HEADER_SIZE bytes
+    ) -> Result<Self::Result, MessageError> {
+        let mut buf = vec![0u8; HEADER_SIZE];
+        file.read_at(&mut buf, file_pos as u64)?;
+        Ok(MessageBuf::from_bytes(buf)?)
+    }
+
+    fn read_from_partial(
+        &mut self,
+        file: &File,
+        file_pos: u32,
+        _bytes: usize,
+    ) -> Result<Self::Result, MessageError> {
+        let mut buf = vec![0u8; HEADER_SIZE];
+        file.read_at(&mut buf, file_pos as u64)?;
+        Ok(MessageBuf::from_bytes_partial(buf)?)
+    }
 }
 
 #[cfg(unix)]

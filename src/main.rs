@@ -7,6 +7,7 @@ use eventus::{
     },
     EventLog, LogOptions,
 };
+use kameo::request::MessageSend;
 use tokio::signal;
 use tonic::transport::Server;
 use tracing::info;
@@ -26,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opts = LogOptions::new(&args.log_path);
     let log = EventLog::new(opts)?;
 
-    let log_actor = kameo::actor::spawn_unsync_in_thread(log);
+    let log_actor = kameo::actor::spawn_in_thread(log);
 
     // Create an instance of your EventStore implementation
     let event_store = DefaultEventStoreServer::new(log_actor.clone());

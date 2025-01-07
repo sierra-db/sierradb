@@ -2,7 +2,7 @@ use std::{
     cmp::Ordering,
     fmt,
     fs::{self, File, OpenOptions},
-    io::{self},
+    io, mem,
     path::{Path, PathBuf},
     u64, usize,
 };
@@ -11,7 +11,7 @@ use memmap2::MmapMut;
 use tracing::{debug, info, trace, warn};
 
 use crate::{
-    message::{MessageError, MessageSet, HEADER_SIZE},
+    message::{MessageError, MessageKind, MessageSet, HEADER_SIZE},
     reader::MessageBufReader,
     segment::Segment,
     to_page_size,
@@ -144,6 +144,10 @@ impl IndexBuf {
         tmp_buf[4..].copy_from_slice(&position.to_le_bytes());
         self.0.extend_from_slice(&tmp_buf);
     }
+
+    pub fn drain(&mut self) -> IndexBuf {
+        IndexBuf(mem::take(&mut self.0), self.1)
+    }
 }
 
 impl Index {
@@ -160,7 +164,7 @@ impl Index {
             path_buf
         };
 
-        info!("Creating index file {:?}", &path);
+        info!("Creating index file {path:?}");
 
         let file = OpenOptions::new()
             .read(true)
@@ -265,35 +269,68 @@ impl Index {
             "Attempt to rehydrate to readonly index"
         );
 
-        trace!("rehydrating index");
-
         let latest = self.next_offset();
         let mut pos = self.last().unwrap_or(2);
         let mut reader = MessageBufReader;
+
+        let mut current_tx = None;
+        let mut buf = IndexBuf::new(0, segment.starting_offset());
+
         loop {
             let msgs = segment
                 .read_slice_partial(&mut reader, pos, (message_max_bytes + HEADER_SIZE) as u32)
                 .map_err(|err| match err {
                     MessageError::IoError(err) => err,
-                    MessageError::InvalidHash => {
-                        io::Error::new(io::ErrorKind::InvalidData, "invalid hash")
-                    }
+                    MessageError::InvalidHash => io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid hash at position {pos}"),
+                    ),
                     MessageError::InvalidPayloadLength => {
                         io::Error::new(io::ErrorKind::InvalidData, "invalid payload length")
                     }
+                    MessageError::InvalidMessageKind => {
+                        io::Error::new(io::ErrorKind::InvalidData, "invalid message kind")
+                    }
                 })?;
+
             if msgs.is_empty() {
                 break;
             }
-            let mut buf = IndexBuf::new(msgs.len(), segment.starting_offset());
+
             for msg in msgs.iter() {
-                if latest == segment.starting_offset() || msg.offset() >= latest {
-                    buf.push(msg.offset(), pos);
+                match msg.kind() {
+                    MessageKind::Event => {
+                        if msg.offset() < latest {
+                            // This event is already indexed, skip it
+                            pos += msg.total_bytes() as u32; // Move the position along
+                            continue;
+                        }
+
+                        let tx_id = msg.tx();
+                        if current_tx.is_none() {
+                            // Start tracking a new transaction
+                            current_tx = Some(tx_id);
+                        }
+                        if current_tx == Some(tx_id) {
+                            // Buffer the message to be indexed if the transaction is committed later
+                            buf.push(msg.offset(), pos);
+                        }
+                    }
+                    MessageKind::Commit => {
+                        let tx_id = msg.tx();
+                        if current_tx == Some(tx_id) {
+                            // Commit the transaction, meaning all buffered events are now valid
+                            self.append(buf.drain())?;
+                            current_tx = None; // Reset the current transaction
+                        }
+                    }
                 }
+
                 pos += msg.total_bytes() as u32;
             }
-            self.append(buf)?;
         }
+
+        self.flush().unwrap();
 
         Ok(())
     }
@@ -566,7 +603,7 @@ impl Index {
         }
     }
 
-    fn find_index_pos(&self, offset: Offset) -> Option<usize> {
+    pub fn find_index_pos(&self, offset: Offset) -> Option<usize> {
         if offset < self.base_offset {
             // pathological case... not worth exposing Result
             return None;
@@ -1148,10 +1185,17 @@ mod tests {
         // Write some data to the segment
         {
             let mut buf = MessageBuf::default();
-            buf.push("12345").unwrap();
+            let tx_id = 1;
+            buf.push(tx_id, "12345").unwrap();
             set_offsets(&mut buf, 0);
             let meta = segment.append(&buf).unwrap();
             assert_eq!(2, meta.starting_position);
+
+            // Append commit message
+            let mut commit_buf = MessageBuf::default();
+            commit_buf.push_commit(tx_id);
+            let meta = segment.append(&commit_buf).unwrap();
+            assert_eq!(33, meta.starting_position);
         }
 
         segment.flush().unwrap();
@@ -1160,9 +1204,9 @@ mod tests {
         let mut index = Index::new(&dir, segment.starting_offset(), 128).unwrap();
 
         // Call the rehydrate method
-        let result = index.rehydrate(&segment, 100);
-        assert!(result.is_ok());
+        index.rehydrate(&segment, 100).unwrap();
 
+        // Since we have one committed event, the index should have one entry
         assert_eq!(1 * INDEX_ENTRY_BYTES, index.next_write_pos);
         assert_eq!(1, index.next_offset());
         assert_eq!(index.read_entry(0), Some((0, 2)));
@@ -1176,8 +1220,10 @@ mod tests {
 
         // Write some data to the segment
         {
+            let tx_id = 1;
+
             let mut buf = MessageBuf::default();
-            buf.push("12345").unwrap();
+            buf.push(tx_id, "12345").unwrap();
             set_offsets(&mut buf, 0);
             let meta = segment.append(&buf).unwrap();
             assert_eq!(2, meta.starting_position);
@@ -1187,26 +1233,19 @@ mod tests {
             index.append(buf).unwrap();
 
             let mut buf = MessageBuf::default();
-            buf.push("hello").unwrap();
+            buf.push(tx_id, "hello").unwrap();
             set_offsets(&mut buf, 1);
             let meta = segment.append(&buf).unwrap();
-            assert_eq!(27, meta.starting_position);
+            assert_eq!(33, meta.starting_position);
 
             let mut buf = IndexBuf::new(1, 0);
             buf.push(1, meta.starting_position as u32);
             index.append(buf).unwrap();
 
-            let mut buf = MessageBuf::default();
-            buf.push("world").unwrap();
-            set_offsets(&mut buf, 2);
-            let meta = segment.append(&buf).unwrap();
-            assert_eq!(52, meta.starting_position);
-
-            let mut buf = MessageBuf::default();
-            buf.push(":D").unwrap();
-            set_offsets(&mut buf, 3);
-            let meta = segment.append(&buf).unwrap();
-            assert_eq!(77, meta.starting_position);
+            // Append commit message
+            let mut commit_buf = MessageBuf::default();
+            commit_buf.push_commit(tx_id);
+            segment.append(&commit_buf).unwrap();
         }
 
         segment.flush().unwrap();
@@ -1217,15 +1256,14 @@ mod tests {
 
         index.flush().unwrap();
 
-        assert_eq!(4 * INDEX_ENTRY_BYTES, index.next_write_pos);
-        assert_eq!(4, index.next_offset());
+        // We only have two committed events
+        assert_eq!(2 * INDEX_ENTRY_BYTES, index.next_write_pos);
+        assert_eq!(2, index.next_offset());
 
         // Verify the index has been updated
         assert_eq!(index.read_entry(0), Some((0, 2)));
-        assert_eq!(index.read_entry(1), Some((1, 27)));
-        assert_eq!(index.read_entry(2), Some((2, 52)));
-        assert_eq!(index.read_entry(3), Some((3, 77)));
-        assert_eq!(index.read_entry(4), None);
+        assert_eq!(index.read_entry(1), Some((1, 33)));
+        assert_eq!(index.read_entry(2), None);
     }
 
     #[test]
@@ -1236,8 +1274,10 @@ mod tests {
 
         // Write some data to the segment
         {
+            let tx_id = 1;
+
             let mut buf = MessageBuf::default();
-            buf.push("12345").unwrap();
+            buf.push(tx_id, "12345").unwrap();
             set_offsets(&mut buf, 100);
             let meta = segment.append(&buf).unwrap();
             assert_eq!(2, meta.starting_position);
@@ -1247,29 +1287,35 @@ mod tests {
             index.append(buf).unwrap();
 
             let mut buf = MessageBuf::default();
-            buf.push("hello").unwrap();
+            buf.push(tx_id, "hello").unwrap();
             set_offsets(&mut buf, 101);
             let meta = segment.append(&buf).unwrap();
-            assert_eq!(27, meta.starting_position);
+            assert_eq!(33, meta.starting_position);
 
             let mut buf = IndexBuf::new(1, 100);
             buf.push(101, meta.starting_position as u32);
             index.append(buf).unwrap();
 
             let mut buf = MessageBuf::default();
-            buf.push("world").unwrap();
+            buf.push(tx_id, "world").unwrap();
             set_offsets(&mut buf, 102);
             let meta = segment.append(&buf).unwrap();
-            assert_eq!(52, meta.starting_position);
+            assert_eq!(64, meta.starting_position);
 
             let mut buf = MessageBuf::default();
-            buf.push(":D").unwrap();
+            buf.push(tx_id, ":D").unwrap();
             set_offsets(&mut buf, 103);
             let meta = segment.append(&buf).unwrap();
-            assert_eq!(77, meta.starting_position);
+            assert_eq!(95, meta.starting_position);
+
+            // Append commit message
+            let mut commit_buf = MessageBuf::default();
+            commit_buf.push_commit(tx_id);
+            segment.append(&commit_buf).unwrap();
         }
 
         segment.flush().unwrap();
+        index.flush().unwrap();
 
         // Call the rehydrate method
         let result = index.rehydrate(&segment, 100);
@@ -1282,10 +1328,79 @@ mod tests {
 
         // Verify the index has been updated
         assert_eq!(index.read_entry(0), Some((100, 2)));
-        assert_eq!(index.read_entry(1), Some((101, 27)));
-        assert_eq!(index.read_entry(2), Some((102, 52)));
-        assert_eq!(index.read_entry(3), Some((103, 77)));
+        assert_eq!(index.read_entry(1), Some((101, 33)));
+        assert_eq!(index.read_entry(2), Some((102, 64)));
+        assert_eq!(index.read_entry(3), Some((103, 95)));
         assert_eq!(index.read_entry(4), None);
+    }
+
+    #[test]
+    fn test_rehydrate_uncomitted_events() {
+        let dir = TestDir::new();
+        let mut segment = Segment::new(&dir, 100, 1024).unwrap();
+        let mut index = Index::new(&dir, segment.starting_offset(), 128).unwrap();
+
+        // Write some data to the segment
+        {
+            let tx_id = 1;
+
+            let mut buf = MessageBuf::default();
+            buf.push(tx_id, "12345").unwrap();
+            set_offsets(&mut buf, 100);
+            let meta = segment.append(&buf).unwrap();
+            assert_eq!(2, meta.starting_position);
+
+            let mut buf = IndexBuf::new(1, 100);
+            buf.push(100, meta.starting_position as u32);
+            index.append(buf).unwrap();
+
+            let mut buf = MessageBuf::default();
+            buf.push(tx_id, "hello").unwrap();
+            set_offsets(&mut buf, 101);
+            let meta = segment.append(&buf).unwrap();
+            assert_eq!(33, meta.starting_position);
+
+            let mut buf = IndexBuf::new(1, 100);
+            buf.push(101, meta.starting_position as u32);
+            index.append(buf).unwrap();
+
+            // Append commit message
+            let mut commit_buf = MessageBuf::default();
+            commit_buf.push_commit(tx_id);
+            segment.append(&commit_buf).unwrap();
+
+            let tx_id = 2;
+
+            let mut buf = MessageBuf::default();
+            buf.push(tx_id, "world").unwrap();
+            set_offsets(&mut buf, 102);
+            let meta = segment.append(&buf).unwrap();
+            assert_eq!(90, meta.starting_position);
+
+            let mut buf = MessageBuf::default();
+            buf.push(tx_id, ":D").unwrap();
+            set_offsets(&mut buf, 103);
+            let meta = segment.append(&buf).unwrap();
+            assert_eq!(121, meta.starting_position);
+        }
+
+        segment.flush().unwrap();
+
+        // Call the rehydrate method
+        let result = index.rehydrate(&segment, 100);
+        assert!(result.is_ok());
+
+        index.flush().unwrap();
+
+        assert_eq!(2 * INDEX_ENTRY_BYTES, index.next_write_pos);
+        assert_eq!(2 + 100, index.next_offset());
+
+        // Verify the index has been updated
+        assert_eq!(index.read_entry(0), Some((100, 2)));
+        assert_eq!(index.read_entry(1), Some((101, 33)));
+        // assert_eq!(index.read_entry(2), Some((102, 90)));
+        // assert_eq!(index.read_entry(3), Some((103, 121)));
+        assert_eq!(index.read_entry(2), None);
     }
 
     #[test]

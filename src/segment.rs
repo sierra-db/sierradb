@@ -14,7 +14,7 @@ use crate::{
 /// Number of bytes contained in the base name of the file.
 pub static SEGMENT_FILE_NAME_LEN: usize = 20;
 /// File extension for the segment file.
-pub static SEGMENT_FILE_NAME_EXTENSION: &str = "log";
+pub static SEGMENT_FILE_NAME_EXTENSION: &str = "events";
 
 /// Magic that appears in the header of the segment for version 1.
 ///
@@ -37,6 +37,7 @@ impl From<io::Error> for SegmentAppendError {
     }
 }
 
+#[derive(Debug)]
 pub struct AppendMetadata {
     pub starting_position: usize,
 }
@@ -148,6 +149,16 @@ impl Segment {
         self.base_offset
     }
 
+    #[inline]
+    pub fn next_tx(&self) -> u64 {
+        // Shift base_offset to the left by 32 bits (move it to the higher-order part)
+        // OR it with write_pos, which is in the lower-order part
+        //
+        // This will be unique up to u32::MAX base offset, and will overflow after.
+        // However two duplicate transactions will not be possible one after another.
+        ((self.base_offset as u64) << 32) | (self.write_pos as u64)
+    }
+
     pub fn append<T: MessageSet>(
         &mut self,
         payload: &T,
@@ -235,24 +246,24 @@ mod tests {
 
         {
             let mut buf = MessageBuf::default();
-            buf.push("12345").unwrap();
+            buf.push(0, "12345").unwrap();
             let meta = f.append(&mut buf).unwrap();
             assert_eq!(2, meta.starting_position);
         }
 
         {
             let mut buf = MessageBuf::default();
-            buf.push("66666").unwrap();
-            buf.push("77777").unwrap();
+            buf.push(0, "66666").unwrap();
+            buf.push(0, "77777").unwrap();
             let meta = f.append(&mut buf).unwrap();
-            assert_eq!(27, meta.starting_position);
+            assert_eq!(33, meta.starting_position);
 
             let mut it = buf.iter();
             let p0 = it.next().unwrap();
-            assert_eq!(p0.total_bytes(), 25);
+            assert_eq!(p0.total_bytes(), 31);
 
             let p1 = it.next().unwrap();
-            assert_eq!(p1.total_bytes(), 25);
+            assert_eq!(p1.total_bytes(), 31);
         }
 
         f.flush().unwrap();
@@ -265,8 +276,8 @@ mod tests {
         {
             let mut f = Segment::new(&log_dir, 0, 1024).unwrap();
             let mut buf = MessageBuf::default();
-            buf.push("12345").unwrap();
-            buf.push("66666").unwrap();
+            buf.push(0, "12345").unwrap();
+            buf.push(0, "66666").unwrap();
             f.append(&mut buf).unwrap();
             f.flush().unwrap();
         }
@@ -293,15 +304,16 @@ mod tests {
 
         {
             let mut buf = MessageBuf::default();
-            buf.push("0123456789").unwrap();
-            buf.push("aaaaaaaaaa").unwrap();
-            buf.push("abc").unwrap();
+            buf.push(1, "0123456789").unwrap();
+            buf.push(1, "aaaaaaaaaa").unwrap();
+            buf.push(1, "abc").unwrap();
             set_offsets(&mut buf, 0);
             f.append(&mut buf).unwrap();
+            f.flush_writer().unwrap();
         }
 
         let mut reader = MessageBufReader;
-        let msgs = f.read_slice(&mut reader, 2, 83).unwrap();
+        let msgs = f.read_slice(&mut reader, 2, 101).unwrap();
         assert_eq!(3, msgs.len());
 
         for (i, m) in msgs.iter().enumerate() {
@@ -315,11 +327,12 @@ mod tests {
         let mut f = Segment::new(&log_dir, 0, 1024).unwrap();
 
         let mut buf = MessageBuf::default();
-        buf.push("0123456789").unwrap();
-        buf.push("aaaaaaaaaa").unwrap();
-        buf.push("abc").unwrap();
+        buf.push(0, "0123456789").unwrap();
+        buf.push(0, "aaaaaaaaaa").unwrap();
+        buf.push(0, "abc").unwrap();
         set_offsets(&mut buf, 0);
         let meta = f.append(&mut buf).unwrap();
+        f.flush_writer().unwrap();
 
         let second_msg_start = {
             let mut it = buf.iter();
@@ -344,25 +357,27 @@ mod tests {
 
         {
             let mut buf = MessageBuf::default();
-            buf.push("0123456789").unwrap();
-            buf.push("aaaaaaaaaa").unwrap();
-            buf.push("abc").unwrap();
+            buf.push(0, "0123456789").unwrap();
+            buf.push(0, "aaaaaaaaaa").unwrap();
+            buf.push(0, "abc").unwrap();
             set_offsets(&mut buf, 0);
             f.append(&mut buf).unwrap();
+            f.flush_writer().unwrap();
         }
 
         let mut reader = MessageBufReader;
-        let msgs = f.read_slice(&mut reader, 2, 83).unwrap();
+        let msgs = f.read_slice(&mut reader, 2, 101).unwrap();
         assert_eq!(3, msgs.len());
 
         {
             let mut buf = MessageBuf::default();
-            buf.push("foo").unwrap();
+            buf.push(0, "foo").unwrap();
             set_offsets(&mut buf, 3);
             f.append(&mut buf).unwrap();
+            f.flush_writer().unwrap();
         }
 
-        let msgs = f.read_slice(&mut reader, 2, 106).unwrap();
+        let msgs = f.read_slice(&mut reader, 2, 130).unwrap();
         assert_eq!(4, msgs.len());
 
         for (i, m) in msgs.iter().enumerate() {
@@ -379,7 +394,7 @@ mod tests {
             .unwrap()
             .find(|entry| {
                 let path = entry.as_ref().unwrap().path();
-                path.file_name().unwrap() == "00000000000000000000.log"
+                path.file_name().unwrap() == "00000000000000000000.events"
             })
             .is_some();
         assert!(seg_exists, "Segment file does not exist?");
@@ -390,7 +405,7 @@ mod tests {
             .unwrap()
             .find(|entry| {
                 let path = entry.as_ref().unwrap().path();
-                path.file_name().unwrap() == "00000000000000000000.log"
+                path.file_name().unwrap() == "00000000000000000000.events"
             })
             .is_some();
         assert!(!seg_exists, "Segment file should have been removed");
@@ -402,11 +417,12 @@ mod tests {
         let mut f = Segment::new(&log_dir, 0, 1024).unwrap();
 
         let mut buf = MessageBuf::default();
-        buf.push("0123456789").unwrap();
-        buf.push("aaaaaaaaaa").unwrap();
-        buf.push("abc").unwrap();
+        buf.push(0, "0123456789").unwrap();
+        buf.push(0, "aaaaaaaaaa").unwrap();
+        buf.push(0, "abc").unwrap();
         set_offsets(&mut buf, 0);
         let meta = f.append(&mut buf).unwrap();
+        f.flush_writer().unwrap();
 
         let mut reader = MessageBufReader;
         let msg_buf = f
@@ -432,7 +448,7 @@ mod tests {
 
         let meta2 = {
             let mut buf = MessageBuf::default();
-            buf.push("zzzzzzzzzz").unwrap();
+            buf.push(0, "zzzzzzzzzz").unwrap();
             set_offsets(&mut buf, 1);
             f.append(&mut buf).unwrap()
         };

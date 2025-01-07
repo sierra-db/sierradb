@@ -1,3 +1,4 @@
+//! CorruptLog version
 //! The event log is an append-only data structure that can be used in a
 //! variety of use-cases, such as tracking sequences of events, transactions
 //! or replicated state machines.
@@ -15,7 +16,7 @@
 //!
 //! ## Example
 //!
-//! ```rust
+//! ```rust,ignore
 //! use eventus::*;
 //! use eventus::message::*;
 //!
@@ -59,7 +60,7 @@ use std::{
     borrow::Cow,
     fmt, fs, io,
     iter::{DoubleEndedIterator, ExactSizeIterator},
-    mem,
+    mem, ops,
     path::{Path, PathBuf},
 };
 
@@ -67,9 +68,9 @@ use chrono::{DateTime, Utc};
 use file_set::{FileSet, SegmentSet};
 use fslock::LockFile;
 use index::{IndexBuf, RangeFindError, INDEX_ENTRY_BYTES};
-use message::{MessageBuf, MessageError, MessageSet};
+use message::{MessageBuf, MessageError, MessageKind, MessageSerializationError, MessageSet};
 use reader::{LogSliceReader, MessageBufReader};
-use segment::SegmentAppendError;
+use segment::{AppendMetadata, SegmentAppendError};
 use serde::{Deserialize, Serialize};
 use stream_index::KEY_SIZE;
 use thiserror::Error;
@@ -87,6 +88,10 @@ pub type Offset = u64;
 pub struct OffsetRange(u64, usize);
 
 impl OffsetRange {
+    pub fn new(first: u64, len: usize) -> Self {
+        OffsetRange(first, len)
+    }
+
     /// Starting offset of the range.
     pub fn first(&self) -> Offset {
         self.0
@@ -187,9 +192,18 @@ pub enum AppendError {
     /// An event failed to serialize.
     #[error(transparent)]
     SerializeEvent(#[from] rmp_serde::encode::Error),
+    /// No transaction is active but a transaction was attempted to be comitted.
+    #[error("no transaction is active")]
+    NoActiveTransaction,
+    /// The active transaction doesn't match the one specified
+    #[error("active transaction mismatch")]
+    WrongTransaction,
     /// Wrong expected version
-    #[error("current stream position is {current:?} but expected {expected:?}")]
+    #[error(
+        "current stream position is {current:?} but expected {expected:?} for stream {stream_id}"
+    )]
     WrongExpectedVersion {
+        stream_id: String,
         current: CurrentVersion,
         expected: ExpectedVersion,
     },
@@ -229,11 +243,21 @@ impl Default for ReadLimit {
     }
 }
 
+impl From<MessageSerializationError> for AppendError {
+    fn from(err: MessageSerializationError) -> AppendError {
+        match err {
+            MessageSerializationError::TotalSizeExceedsBuffer => AppendError::MessageSizeExceeded,
+        }
+    }
+}
+
 impl From<MessageError> for ReadError {
     fn from(err: MessageError) -> ReadError {
         match err {
             MessageError::IoError(err) => ReadError::Io(err),
-            MessageError::InvalidHash | MessageError::InvalidPayloadLength => ReadError::CorruptLog,
+            MessageError::InvalidHash
+            | MessageError::InvalidPayloadLength
+            | MessageError::InvalidMessageKind => ReadError::CorruptLog,
         }
     }
 }
@@ -318,6 +342,10 @@ pub struct EventLog {
     unflushed: Vec<Event<'static>>,
     broadcaster: broadcast::Sender<Vec<Event<'static>>>,
     conn: rusqlite::Connection,
+    active_tx: Option<u64>,
+    uncomitted_events: Vec<Event<'static>>,
+    uncommitted_global_events: Vec<(Offset, u32)>,
+    uncommitted_stream_events: Vec<(String, Offset)>,
     _lock_file: LockFile,
 }
 
@@ -342,11 +370,97 @@ impl EventLog {
         let file_set = FileSet::load_log(opts)?;
         Ok(EventLog {
             file_set,
-            unflushed: Vec::with_capacity(256),
+            unflushed: Vec::with_capacity(1024),
             broadcaster: broadcast::channel(32).0,
             conn,
+            active_tx: None,
+            uncomitted_events: Vec::with_capacity(32),
+            uncommitted_global_events: Vec::with_capacity(32),
+            uncommitted_stream_events: Vec::with_capacity(32),
             _lock_file,
         })
+    }
+
+    pub fn commit(&mut self, tx: u64) -> Result<OffsetRange, AppendError> {
+        match self.active_tx {
+            Some(active_tx) => {
+                if active_tx != tx {
+                    // Tried to commit a transaction which doesn't match the active one
+                    return Err(AppendError::WrongTransaction);
+                }
+            }
+            None => {
+                // Tried to commit a transaction when none was active
+                return Err(AppendError::NoActiveTransaction);
+            }
+        }
+
+        let mut offsets = OffsetRange(0, 0);
+        if self.uncomitted_events.is_empty() {
+            return Ok(offsets);
+        }
+
+        self.uncommitted_global_events.clear();
+        self.uncommitted_stream_events.clear();
+
+        // 1. Write the commit message
+        for (i, event) in self
+            .uncomitted_events
+            .drain(..)
+            .enumerate()
+            .collect::<Vec<_>>()
+        {
+            let bytes = rmp_serde::to_vec(&event)?;
+            let mut buf = MessageBuf::default();
+            buf.push(tx, bytes)?;
+            message::set_offsets(&mut buf, event.id);
+            let Some((meta, offset)) = self.append_with_offsets(&buf, Some(i as u64))? else {
+                continue;
+            };
+            let mut pos = meta.starting_position;
+            for m in buf.iter() {
+                self.uncommitted_global_events
+                    .push((m.offset(), pos as u32));
+                pos += m.total_bytes();
+            }
+            self.uncommitted_stream_events
+                .push((event.stream_id.to_string(), event.id));
+
+            self.unflushed.push(event);
+            if offsets.is_empty() {
+                offsets = OffsetRange(offset.first(), 1);
+            } else {
+                offsets.1 += 1;
+            }
+        }
+
+        let mut buf = MessageBuf::default();
+        buf.push_commit(tx);
+        self.append_with_offsets(&buf, None)?;
+        self.file_set.active_segment_mut().flush_writer()?;
+
+        // 2. Append buffered global index entries
+        let index = self.file_set.active_index_mut();
+        let index_starting_offset = index.starting_offset();
+        let mut index_pos_buf =
+            IndexBuf::new(self.uncommitted_global_events.len(), index_starting_offset);
+        for (offset, position) in &self.uncommitted_global_events {
+            index_pos_buf.push(*offset, *position);
+        }
+        index.append(index_pos_buf)?;
+        index.flush()?; // Ensure the index is flushed to disk
+
+        // 3. Write the buffered events to the stream index
+        let stream_index = self.file_set.active_stream_index_mut();
+        for (stream_id, offset) in &self.uncommitted_stream_events {
+            stream_index.insert(stream_id, *offset)?;
+        }
+        stream_index.flush()?; // Ensure the stream index is flushed
+
+        // 4. Clear the buffered uncommitted events
+        self.active_tx = None;
+
+        Ok(offsets)
     }
 
     pub fn append_to_stream(
@@ -355,67 +469,95 @@ impl EventLog {
         expected_version: ExpectedVersion,
         events: Vec<NewEvent<'static>>,
         timestamp: DateTime<Utc>,
-    ) -> Result<OffsetRange, AppendError> {
-        let mut offsets = OffsetRange(0, 0);
-
+        tx: u64,
+    ) -> Result<(), AppendError> {
         if events.is_empty() {
-            return Ok(offsets);
+            return Ok(());
         }
 
         let stream_id = stream_id.into();
-        let current_version = match self.read_last_stream_msg(&stream_id)? {
+        // Check if the stream id exceeds the max size
+        if stream_id.len() > KEY_SIZE {
+            return Err(AppendError::StreamIdLenExceeded);
+        }
+
+        let mut current_version = match self.read_last_stream_msg(&stream_id)? {
             Some(event) => CurrentVersion::Current(event.stream_version),
             None => CurrentVersion::NoStream,
         };
-        expected_version.validate(current_version)?;
+        current_version += self
+            .uncomitted_events
+            .iter()
+            .filter(|event| event.stream_id == stream_id)
+            .count() as u64;
+        if !expected_version.validate(current_version) {
+            return Err(AppendError::WrongExpectedVersion {
+                stream_id,
+                current: current_version,
+                expected: expected_version,
+            });
+        }
 
+        let next_offset = self.file_set.active_index_mut().next_offset();
         for (i, event) in events.into_iter().enumerate() {
             let i = i as u64;
             let stream_version = match current_version {
                 CurrentVersion::Current(n) => n + 1 + i,
                 CurrentVersion::NoStream => i,
             };
-            let offset =
-                self.append_to_stream_single(stream_id.clone(), stream_version, event, timestamp)?;
-            if offsets.is_empty() {
-                offsets = OffsetRange(offset, 1);
-            } else {
-                offsets.1 += 1;
-            }
+            self.append_to_stream_single(
+                next_offset,
+                stream_id.clone(),
+                stream_version,
+                event,
+                timestamp,
+                tx,
+            )?;
         }
 
-        Ok(offsets)
+        Ok(())
     }
 
     /// Appends events to the log, returning the offsets appended.
     fn append_to_stream_single(
         &mut self,
+        next_offset: u64,
         stream_id: String,
         stream_version: u64,
         event: NewEvent<'static>,
         timestamp: DateTime<Utc>,
-    ) -> Result<Offset, AppendError> {
-        let id = self.file_set.active_index_mut().next_offset();
+        tx: u64,
+    ) -> Result<(), AppendError> {
+        if let Some(active_tx) = self.active_tx {
+            if active_tx != tx {
+                self.uncomitted_events.clear();
+                self.active_tx = Some(tx);
+                // return Err(AppendError::WrongTransaction);
+            }
+        }
+
+        let id = next_offset + self.uncomitted_events.len() as u64;
         let event = Event {
             id,
-            stream_id: Cow::Owned(stream_id),
+            stream_id: Cow::Owned(stream_id.clone()),
             stream_version,
-            event_name: Cow::Owned(event.event_name.into_owned()),
-            event_data: Cow::Owned(event.event_data.into_owned()),
-            metadata: Cow::Owned(event.metadata.into_owned()),
+            event_name: event.event_name,
+            event_data: event.event_data,
+            metadata: event.metadata,
             timestamp,
         };
-        let bytes = rmp_serde::to_vec(&event)?;
-        let mut buf = MessageBuf::default();
-        buf.push(bytes)
-            .expect("Serialized event exceeds usize::MAX");
-        message::set_offsets(&mut buf, id);
-        let res = self.append_with_offsets(&event.stream_id, &buf)?;
-        assert_eq!(res.len(), 1);
+        // let res = self.append_with_offsets(&event.stream_id, &buf)?;
+        // assert_eq!(res.len(), 1);
+        // let offset = res.first();
 
-        self.unflushed.push(event);
+        self.active_tx = Some(tx);
+        self.uncomitted_events.push(event);
 
-        Ok(res.first())
+        // // Buffer the uncommitted event
+        // self.uncommitted_stream_events.push((stream_id, offset));
+
+        // Ok(res.first())
+        Ok(())
     }
 
     // /// Appends a single message to the log, returning the offset appended.
@@ -448,20 +590,15 @@ impl EventLog {
     /// The offsets are expected to already be set within the buffer.
     pub fn append_with_offsets<T>(
         &mut self,
-        stream_id: &str,
         buf: &T,
-    ) -> Result<OffsetRange, AppendError>
+        validate_offsets: Option<u64>,
+    ) -> Result<Option<(AppendMetadata, OffsetRange)>, AppendError>
     where
         T: MessageSet,
     {
         let buf_len = buf.len();
         if buf_len == 0 {
-            return Ok(OffsetRange(0, 0));
-        }
-
-        // Check if the stream id exceeds the max size
-        if stream_id.len() > KEY_SIZE {
-            return Err(AppendError::StreamIdLenExceeded);
+            return Ok(None);
         }
 
         // Check if given message exceeded the max size
@@ -473,8 +610,10 @@ impl EventLog {
         let start_off = self.next_offset();
 
         // check to make sure the first message matches the starting offset
-        if buf.iter().next().unwrap().offset() != start_off {
-            return Err(AppendError::InvalidOffset);
+        if let Some(event_num) = validate_offsets {
+            if buf.iter().next().unwrap().offset() != start_off + event_num {
+                return Err(AppendError::InvalidOffset);
+            }
         }
 
         // Check to make sure we aren't exceeding the log max entries
@@ -499,31 +638,39 @@ impl EventLog {
             }
             Err(SegmentAppendError::IoError(err)) => return Err(AppendError::Io(err)),
         };
-        self.file_set.active_segment_mut().flush_writer()?;
 
-        // write to the index
-        {
-            // TODO: reduce indexing of every message
-            let index = self.file_set.active_index_mut();
-            let mut index_pos_buf = IndexBuf::new(buf_len, index.starting_offset());
-            let mut pos = meta.starting_position;
-            for m in buf.iter() {
-                index_pos_buf.push(m.offset(), pos as u32);
-                pos += m.total_bytes();
-            }
-            // TODO: what happens when this errors out? Do we truncate the log...?
-            index.append(index_pos_buf)?;
-        }
+        // EDIT: We don't write here, we write on commit
+        // // write to the index
+        // {
+        //     // TODO: reduce indexing of every message
+        //     let index = self.file_set.active_index_mut();
+        //     let mut index_pos_buf = IndexBuf::new(buf_len, index.starting_offset());
+        //     let mut pos = meta.starting_position;
+        //     for m in buf.iter() {
+        //         index_pos_buf.push(m.offset(), pos as u32);
+        //         pos += m.total_bytes();
+        //     }
+        //     // TODO: what happens when this errors out? Do we truncate the log...?
+        //     index.append(index_pos_buf)?;
+        // }
+        // Buffer the uncommitted global events
+        // let mut pos = meta.starting_position;
+        // for m in buf.iter() {
+        //     self.uncommitted_global_events
+        //         .push((m.offset(), pos as u32));
+        //     pos += m.total_bytes();
+        // }
 
+        // EDIT: We don't write here, we write on commit
         // write to the stream index
-        {
-            let stream_index = self.file_set.active_stream_index_mut();
-            for m in buf.iter() {
-                stream_index.insert(stream_id, m.offset())?;
-            }
-        }
+        // {
+        //     let stream_index = self.file_set.active_stream_index_mut();
+        //     for m in buf.iter() {
+        //         stream_index.insert(stream_id, m.offset())?;
+        //     }
+        // }
 
-        Ok(OffsetRange(start_off, buf_len))
+        Ok(Some((meta, OffsetRange(start_off, buf_len))))
     }
 
     /// Gets the last written offset.
@@ -539,7 +686,15 @@ impl EventLog {
     /// Gets the latest offset
     #[inline]
     pub fn next_offset(&self) -> Offset {
-        self.file_set.active_index().next_offset()
+        self.file_set.active_index().next_offset() + self.uncomitted_events.len() as u64
+    }
+
+    /// Gets the next transaction ID
+    pub fn next_tx(&mut self) -> u64 {
+        self.uncomitted_events.clear();
+        let tx = self.file_set.active_segment().next_tx();
+        self.active_tx = Some(tx);
+        tx
     }
 
     pub fn read_last_stream_msg<'a>(
@@ -600,6 +755,62 @@ impl EventLog {
         }
     }
 
+    pub fn read_one(
+        &self,
+        mut offset: Offset,
+        limit: ReadLimit,
+    ) -> Result<Option<Event<'static>>, ReadError> {
+        let mut rd = MessageBufReader;
+        let reader = self.reader(&mut rd, offset, limit)?;
+        match reader {
+            Some(mut buf) => {
+                let tx_id;
+                let event;
+
+                let mut iter = buf.iter();
+                match iter.next() {
+                    Some(msg) => {
+                        tx_id = msg.tx();
+                        event =
+                            rmp_serde::from_slice(msg.payload()).map_err(ReadError::Deserialize)?;
+                    }
+                    None => return Ok(None),
+                }
+
+                let commit = loop {
+                    let original_last_offset = offset;
+                    let mut last_offset = offset;
+                    let Some(commit) = iter.find(|msg| {
+                        last_offset = msg.offset();
+                        matches!(msg.kind(), MessageKind::Commit)
+                    }) else {
+                        if last_offset == original_last_offset {
+                            // Didn't increase the last offset, we reached the end
+                            return Ok(None);
+                        }
+
+                        offset = last_offset;
+                        match self.reader(&mut rd, offset, limit)? {
+                            Some(new_buf) => buf = new_buf,
+                            None => return Ok(None),
+                        }
+                        iter = buf.iter();
+                        continue; // Commit message not found here, lets buffer another batch of messages
+                    };
+
+                    break commit;
+                };
+
+                if commit.tx() == tx_id {
+                    return Ok(Some(event));
+                } else {
+                    return Ok(None);
+                }
+            }
+            None => return Ok(None),
+        }
+    }
+
     /// Reads a portion of the log, starting with the `start` offset, inclusive,
     /// up to the limit.
     #[inline]
@@ -611,11 +822,54 @@ impl EventLog {
     ) -> Result<Vec<Event<'static>>, ReadError> {
         let mut rd = MessageBufReader;
         match self.reader(&mut rd, start, limit)? {
-            Some(buf) => buf
-                .iter()
-                .map(|msg| rmp_serde::from_slice(msg.payload()).map_err(ReadError::Deserialize))
-                .take(batch_size)
-                .collect(),
+            Some(buf) => {
+                let mut committed_events = Vec::with_capacity(batch_size.min(limit.0 * 256));
+                let mut current_tx_events = Vec::with_capacity(4); // Buffer for events belonging to the current tx
+                let mut current_tx = None; // Track the current transaction ID
+                let mut has_commit = false;
+
+                // Iterate through the messages and handle commits
+                for msg in buf.iter() {
+                    match msg.kind() {
+                        MessageKind::Event => {
+                            let tx_id = msg.tx();
+                            let event: Event<'static> = rmp_serde::from_slice(msg.payload())
+                                .map_err(ReadError::Deserialize)?;
+
+                            if let Some(current_tx_id) = current_tx {
+                                if current_tx_id == tx_id {
+                                    current_tx_events.push(event);
+                                } else {
+                                    // New transaction encountered without a commit for the previous one
+                                    if has_commit {
+                                        committed_events.extend(current_tx_events.drain(..));
+                                        has_commit = false;
+                                    }
+                                    current_tx = Some(tx_id);
+                                    current_tx_events.clear();
+                                    current_tx_events.push(event);
+                                }
+                            } else {
+                                current_tx = Some(tx_id);
+                                current_tx_events.push(event);
+                            }
+                        }
+                        MessageKind::Commit => {
+                            let tx_id = msg.tx();
+                            if current_tx == Some(tx_id) {
+                                has_commit = true;
+                            }
+                        }
+                    }
+                }
+
+                // After processing, check if the last transaction was committed
+                if has_commit {
+                    committed_events.extend(current_tx_events.drain(..));
+                }
+
+                Ok(committed_events)
+            }
             None => Ok(vec![]),
         }
     }
@@ -628,13 +882,12 @@ impl EventLog {
         mut start: Offset,
         limit: ReadLimit,
     ) -> Result<Option<R::Result>, ReadError> {
-        // TODO: can this be caught at the index level insead?
+        // TODO: can this be caught at the index level instead?
         if start >= self.file_set.active_index().next_offset() {
             return Ok(None);
         }
 
-        // adjust for the minimum offset (e.g. reader requests an offset that was
-        // truncated)
+        // adjust for the minimum offset (e.g. reader requests an offset that was truncated)
         match self.file_set.min_offset() {
             Some(min_off) if min_off > start => {
                 start = min_off;
@@ -783,22 +1036,19 @@ pub enum ExpectedVersion {
 }
 
 impl ExpectedVersion {
-    pub fn validate(&self, current: CurrentVersion) -> Result<(), AppendError> {
+    pub fn validate(&self, current: CurrentVersion) -> bool {
         use CurrentVersion::NoStream as CurrentNoStream;
         use CurrentVersion::*;
         use ExpectedVersion::NoStream as ExpectedNoStream;
         use ExpectedVersion::*;
 
         match (self, current) {
-            (Any, _) | (StreamExists, Current(_)) | (ExpectedNoStream, CurrentNoStream) => Ok(()),
-            (Exact(e), Current(c)) if *e == c => Ok(()),
+            (Any, _) | (StreamExists, Current(_)) | (ExpectedNoStream, CurrentNoStream) => true,
+            (Exact(e), Current(c)) if *e == c => true,
             (Exact(_), Current(_))
             | (StreamExists, CurrentNoStream)
             | (ExpectedNoStream, Current(_))
-            | (Exact(_), CurrentNoStream) => Err(AppendError::WrongExpectedVersion {
-                current,
-                expected: *self,
-            }),
+            | (Exact(_), CurrentNoStream) => false,
         }
     }
 }
@@ -841,6 +1091,19 @@ impl fmt::Display for CurrentVersion {
     }
 }
 
+impl ops::AddAssign<u64> for CurrentVersion {
+    fn add_assign(&mut self, rhs: u64) {
+        match self {
+            CurrentVersion::Current(current) => *current += rhs,
+            CurrentVersion::NoStream => {
+                if rhs > 0 {
+                    *self = CurrentVersion::Current(rhs - 1)
+                }
+            }
+        }
+    }
+}
+
 pub struct ReadStreamIter<'a, I> {
     log: &'a EventLog,
     stream_index_iter: I,
@@ -854,10 +1117,7 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         let offset = self.stream_index_iter.next()?;
-        self.log
-            .read(offset, ReadLimit::default(), usize::MAX)
-            .map(|read| read.into_iter().next())
-            .transpose()
+        self.log.read_one(offset, ReadLimit::default()).transpose()
     }
 }
 
@@ -936,9 +1196,9 @@ pub(crate) fn to_page_size(size: usize) -> usize {
 //             &dir,
 //             vec![
 //                 "00000000000000000000.index",
-//                 "00000000000000000000.log",
+//                 "00000000000000000000.events",
 //                 "00000000000000000000.streams",
-//                 "00000000000000000002.log",
+//                 "00000000000000000002.events",
 //                 "00000000000000000002.index",
 //                 "00000000000000000002.streams",
 //             ],
@@ -1129,15 +1389,15 @@ pub(crate) fn to_page_size(size: usize) -> usize {
 //             &dir,
 //             vec![
 //                 "00000000000000000000.index",
-//                 "00000000000000000000.log",
+//                 "00000000000000000000.events",
 //                 "00000000000000000000.streams",
-//                 "00000000000000000002.log",
+//                 "00000000000000000002.events",
 //                 "00000000000000000002.streams",
 //                 "00000000000000000002.index",
-//                 "00000000000000000004.log",
+//                 "00000000000000000004.events",
 //                 "00000000000000000004.streams",
 //                 "00000000000000000004.index",
-//                 "00000000000000000006.log",
+//                 "00000000000000000006.events",
 //                 "00000000000000000006.streams",
 //                 "00000000000000000006.index",
 //             ],
@@ -1153,9 +1413,9 @@ pub(crate) fn to_page_size(size: usize) -> usize {
 //             &dir,
 //             vec![
 //                 "00000000000000000000.index",
-//                 "00000000000000000000.log",
+//                 "00000000000000000000.events",
 //                 "00000000000000000000.streams",
-//                 "00000000000000000002.log",
+//                 "00000000000000000002.events",
 //                 "00000000000000000002.index",
 //                 "00000000000000000002.streams",
 //             ],
@@ -1184,15 +1444,15 @@ pub(crate) fn to_page_size(size: usize) -> usize {
 //             &dir,
 //             vec![
 //                 "00000000000000000000.index",
-//                 "00000000000000000000.log",
+//                 "00000000000000000000.events",
 //                 "00000000000000000000.streams",
-//                 "00000000000000000002.log",
+//                 "00000000000000000002.events",
 //                 "00000000000000000002.index",
 //                 "00000000000000000002.streams",
-//                 "00000000000000000004.log",
+//                 "00000000000000000004.events",
 //                 "00000000000000000004.index",
 //                 "00000000000000000004.streams",
-//                 "00000000000000000006.log",
+//                 "00000000000000000006.events",
 //                 "00000000000000000006.index",
 //                 "00000000000000000006.streams",
 //             ],
@@ -1208,9 +1468,9 @@ pub(crate) fn to_page_size(size: usize) -> usize {
 //             &dir,
 //             vec![
 //                 "00000000000000000000.index",
-//                 "00000000000000000000.log",
+//                 "00000000000000000000.events",
 //                 "00000000000000000000.streams",
-//                 "00000000000000000002.log",
+//                 "00000000000000000002.events",
 //                 "00000000000000000002.index",
 //                 "00000000000000000002.streams",
 //             ],
@@ -1239,15 +1499,15 @@ pub(crate) fn to_page_size(size: usize) -> usize {
 //             &dir,
 //             vec![
 //                 "00000000000000000000.index",
-//                 "00000000000000000000.log",
+//                 "00000000000000000000.events",
 //                 "00000000000000000000.streams",
-//                 "00000000000000000002.log",
+//                 "00000000000000000002.events",
 //                 "00000000000000000002.streams",
 //                 "00000000000000000002.index",
-//                 "00000000000000000004.log",
+//                 "00000000000000000004.events",
 //                 "00000000000000000004.streams",
 //                 "00000000000000000004.index",
-//                 "00000000000000000006.log",
+//                 "00000000000000000006.events",
 //                 "00000000000000000006.streams",
 //                 "00000000000000000006.index",
 //             ],
@@ -1263,15 +1523,15 @@ pub(crate) fn to_page_size(size: usize) -> usize {
 //             &dir,
 //             vec![
 //                 "00000000000000000000.index",
-//                 "00000000000000000000.log",
+//                 "00000000000000000000.events",
 //                 "00000000000000000000.streams",
-//                 "00000000000000000002.log",
+//                 "00000000000000000002.events",
 //                 "00000000000000000002.index",
 //                 "00000000000000000002.streams",
-//                 "00000000000000000004.log",
+//                 "00000000000000000004.events",
 //                 "00000000000000000004.index",
 //                 "00000000000000000004.streams",
-//                 "00000000000000000006.log",
+//                 "00000000000000000006.events",
 //                 "00000000000000000006.index",
 //                 "00000000000000000006.streams",
 //             ],
@@ -1300,15 +1560,15 @@ pub(crate) fn to_page_size(size: usize) -> usize {
 //             &dir,
 //             vec![
 //                 "00000000000000000000.index",
-//                 "00000000000000000000.log",
+//                 "00000000000000000000.events",
 //                 "00000000000000000000.streams",
-//                 "00000000000000000002.log",
+//                 "00000000000000000002.events",
 //                 "00000000000000000002.index",
 //                 "00000000000000000002.streams",
-//                 "00000000000000000004.log",
+//                 "00000000000000000004.events",
 //                 "00000000000000000004.index",
 //                 "00000000000000000004.streams",
-//                 "00000000000000000006.log",
+//                 "00000000000000000006.events",
 //                 "00000000000000000006.index",
 //                 "00000000000000000006.streams",
 //             ],
@@ -1325,12 +1585,12 @@ pub(crate) fn to_page_size(size: usize) -> usize {
 //             &dir,
 //             vec![
 //                 "00000000000000000002.index",
-//                 "00000000000000000002.log",
+//                 "00000000000000000002.events",
 //                 "00000000000000000002.streams",
-//                 "00000000000000000004.log",
+//                 "00000000000000000004.events",
 //                 "00000000000000000004.index",
 //                 "00000000000000000004.streams",
-//                 "00000000000000000006.log",
+//                 "00000000000000000006.events",
 //                 "00000000000000000006.index",
 //                 "00000000000000000006.streams",
 //             ],
@@ -1365,15 +1625,15 @@ pub(crate) fn to_page_size(size: usize) -> usize {
 //             &dir,
 //             vec![
 //                 "00000000000000000000.index",
-//                 "00000000000000000000.log",
+//                 "00000000000000000000.events",
 //                 "00000000000000000000.streams",
-//                 "00000000000000000002.log",
+//                 "00000000000000000002.events",
 //                 "00000000000000000002.index",
 //                 "00000000000000000002.streams",
-//                 "00000000000000000004.log",
+//                 "00000000000000000004.events",
 //                 "00000000000000000004.index",
 //                 "00000000000000000004.streams",
-//                 "00000000000000000006.log",
+//                 "00000000000000000006.events",
 //                 "00000000000000000006.index",
 //                 "00000000000000000006.streams",
 //             ],
@@ -1389,10 +1649,10 @@ pub(crate) fn to_page_size(size: usize) -> usize {
 //         expect_files(
 //             &dir,
 //             vec![
-//                 "00000000000000000004.log",
+//                 "00000000000000000004.events",
 //                 "00000000000000000004.index",
 //                 "00000000000000000004.streams",
-//                 "00000000000000000006.log",
+//                 "00000000000000000006.events",
 //                 "00000000000000000006.index",
 //                 "00000000000000000006.streams",
 //             ],

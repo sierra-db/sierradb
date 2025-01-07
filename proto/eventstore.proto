@@ -43,6 +43,22 @@ message AppendToStreamResponse {
     google.protobuf.Timestamp timestamp = 2;
 }
 
+// Append to multiple streams
+message AppendToMultipleStreamsRequest {
+    repeated StreamEvents streams = 1;
+}
+
+message StreamEvents {
+    string stream_id = 1;
+    ExpectedVersion expected_version = 2;
+    repeated NewEvent events = 3;
+    google.protobuf.Timestamp timestamp = 4;
+}
+
+message AppendToMultipleStreamsResponse {
+    repeated AppendToStreamResponse streams = 1;
+}
+
 // Get Global Events
 message GetEventsRequest {
     uint64 start_event_id = 1;
@@ -55,6 +71,12 @@ message GetStreamEventsRequest {
     string stream_id = 1;
     uint64 stream_version = 2;
     uint32 batch_size = 3;
+}
+
+// Get last event ID
+message GetLastEventIDRequest {}
+message GetLastEventIDResponse {
+    optional uint64 last_event_id = 1;
 }
 
 // Subscribe
@@ -78,8 +100,10 @@ message AcknowledgeRequest {
 // Service
 service EventStore {
     rpc AppendToStream(AppendToStreamRequest) returns (AppendToStreamResponse);
+    rpc AppendToMultipleStreams(AppendToMultipleStreamsRequest) returns (AppendToMultipleStreamsResponse);
     rpc GetEvents(GetEventsRequest) returns (stream EventBatch);
     rpc GetStreamEvents(GetStreamEventsRequest) returns (stream EventBatch);
+    rpc GetLastEventID(GetLastEventIDRequest) returns (GetLastEventIDResponse);
     rpc Subscribe(SubscribeRequest) returns (stream EventBatch);
     rpc Acknowledge(AcknowledgeRequest) returns (google.protobuf.Empty);
 }
