@@ -1,0 +1,21 @@
+[package]
+name = "eventus_v2"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+ahash = "0.8"
+crc32fast = "1.4.2"
+crossbeam-channel = "0.5.14"
+rand = "0.9"
+rayon = "1.10.0"
+tracing = "0.1.40"
+uuid = { version = "1", features = ["v4", "v8"] }
+
+[dev-dependencies]
+criterion = "0.5"
+tempfile = "3.16"
+
+[[bench]]
+name = "random_sequential"
+harness = false

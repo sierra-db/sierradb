@@ -73,7 +73,7 @@ harness = false
 required-features = ["internals"]
 
 [workspace]
-members = [".", "monitus"]
+members = [".", "eventus_v2", "monitus"]
 
 [workspace.dependencies]
 eventus = { path = "." }
