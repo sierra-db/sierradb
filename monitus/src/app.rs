@@ -1,7 +1,8 @@
 use std::{io, time::Duration};
 
+use base64::prelude::*;
 use chrono::SecondsFormat;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     layout::Size,
     prelude::*,
@@ -119,15 +120,15 @@ impl App {
     fn handle_key_event(&mut self, key_event: KeyEvent) {
         match key_event.code {
             KeyCode::Char('q') => self.exit(),
-            KeyCode::Up | KeyCode::Char('k') => {
-                if self.focused.is_none() {
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
+                if self.focused.is_none() || key_event.modifiers.contains(KeyModifiers::SHIFT) {
                     self.prev_row();
                 } else {
                     self.scroll_view_state.scroll_up();
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.focused.is_none() {
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
+                if self.focused.is_none() || key_event.modifiers.contains(KeyModifiers::SHIFT) {
                     self.next_row();
                 } else {
                     self.scroll_view_state.scroll_down();
@@ -278,8 +279,11 @@ impl App {
     fn update_focused_value(&mut self) {
         if let Some(idx) = self.state.table.selected() {
             if let Some(event) = self.events_rx.borrow().get(idx) {
-                let data: rmpv::Value = rmp_serde::from_slice(&event.event_data).unwrap();
-                let hdata = rmp_value_to_hjson_value(data);
+                let data: ciborium::Value =
+                    ciborium::from_reader(event.event_data.as_ref()).unwrap();
+                let hdata = ciborium_value_to_hjson_value(data);
+                // let data: rmpv::Value = rmp_serde::from_slice(&event.event_data).unwrap();
+                // let hdata = rmp_value_to_hjson_value(data);
                 self.focused = Some(hdata);
             }
         }
@@ -401,6 +405,38 @@ impl StatefulWidget for EventDataWidget {
     }
 }
 
+fn ciborium_value_to_hjson_value(value: ciborium::Value) -> serde_hjson::Value {
+    match value {
+        ciborium::Value::Integer(num) => {
+            serde_hjson::Value::I64(i128::from(num).try_into().unwrap())
+        }
+        ciborium::Value::Bytes(bytes) => serde_hjson::Value::String(BASE64_STANDARD.encode(bytes)),
+        ciborium::Value::Float(num) => serde_hjson::Value::F64(num),
+        ciborium::Value::Text(s) => serde_hjson::Value::String(s),
+        ciborium::Value::Bool(b) => serde_hjson::Value::Bool(b),
+        ciborium::Value::Null => serde_hjson::Value::Null,
+        ciborium::Value::Tag(_, _) => todo!(),
+        ciborium::Value::Array(array) => serde_hjson::Value::Array(
+            array
+                .into_iter()
+                .map(ciborium_value_to_hjson_value)
+                .collect(),
+        ),
+        ciborium::Value::Map(map) => serde_hjson::Value::Object(serde_hjson::Map::from_iter(
+            map.into_iter().map(|(k, v)| {
+                (
+                    match ciborium_value_to_hjson_value(k) {
+                        serde_hjson::Value::String(s) => s,
+                        value => value.to_string(),
+                    },
+                    ciborium_value_to_hjson_value(v),
+                )
+            }),
+        )),
+        _ => todo!(),
+    }
+}
+
 fn rmp_value_to_hjson_value(value: rmpv::Value) -> serde_hjson::Value {
     match value {
         rmpv::Value::Nil => serde_hjson::Value::Null,
@@ -414,7 +450,10 @@ fn rmp_value_to_hjson_value(value: rmpv::Value) -> serde_hjson::Value {
         rmpv::Value::String(s) => {
             serde_hjson::Value::String(s.into_str().unwrap_or_else(|| "<invalid utf8>".to_string()))
         }
-        rmpv::Value::Binary(_) => serde_hjson::Value::String("<binary>".to_string()),
+        rmpv::Value::Binary(bytes) => {
+            serde_hjson::Value::String(BASE64_STANDARD.encode(bytes))
+            // serde_hjson::Value::String("<binary>".to_string())
+        }
         rmpv::Value::Array(vals) => {
             serde_hjson::Value::Array(vals.into_iter().map(rmp_value_to_hjson_value).collect())
         }

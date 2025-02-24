@@ -231,13 +231,14 @@ impl Segment {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::PathBuf};
+
     use crate::{message::MessageBuf, reader::MessageBufReader};
 
     use super::{
         super::{message::set_offsets, testutil::*},
         *,
     };
-    use std::{fs, path::PathBuf};
 
     #[test]
     pub fn log_append() {
