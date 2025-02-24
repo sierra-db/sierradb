@@ -78,7 +78,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, info, trace};
 
 #[cfg(feature = "internals")]
-pub use crate::{index::Index, index::IndexBuf, segment::Segment, stream_index::StreamIndex};
+pub use crate::{index::Index, segment::Segment, stream_index::StreamIndex};
 
 /// Offset of an appended log segment.
 pub type Offset = u64;
