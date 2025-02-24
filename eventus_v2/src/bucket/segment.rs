@@ -1,27 +1,26 @@
 mod reader;
-mod reader_thread_pool;
 mod writer;
 
 use std::{
     io, mem,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
-    thread,
 };
 
-use crossbeam_channel::{bounded, SendError, Sender};
 use uuid::Uuid;
 
-pub use self::reader::{BucketSegmentIter, BucketSegmentReader, Record};
-pub use self::reader_thread_pool::ReaderThreadPool;
+pub use self::reader::{
+    BucketSegmentIter, BucketSegmentReader, CommitRecord, CommittedEvents, CommittedEventsIntoIter,
+    EventRecord, Record,
+};
 pub use self::writer::{AppendEvent, AppendEventBody, AppendEventHeader, BucketSegmentWriter};
 
-use super::flusher::FlushSender;
+use super::{BucketSegmentId, flusher::FlushSender, reader_thread_pool::ReaderThreadPool};
 
 // Segment header constants
-const MAGIC_BYTES: u32 = 0x45565453; // EVTS
+const MAGIC_BYTES: u32 = 0x53545645; // EVTS
 const MAGIC_BYTES_SIZE: usize = mem::size_of::<u32>();
 const VERSION_SIZE: usize = mem::size_of::<u16>();
 const BUCKET_ID_SIZE: usize = mem::size_of::<u16>();
@@ -46,204 +45,207 @@ const COMMIT_SIZE: usize = RECORD_HEADER_SIZE + mem::size_of::<u32>(); // Event 
 
 pub type WriteFn = Box<dyn FnOnce(&mut BucketSegmentWriter) + Send>;
 
-/// The latest segment, with write access.
-#[derive(Debug)]
-pub struct OpenBucketSegment {
-    bucket_id: u16,
-    segment: u32,
-    reader: BucketSegmentReader,
-    reader_pool: ReaderThreadPool,
-    writer_tx: Sender<WriteFn>,
-}
+// /// The latest segment, with write access.
+// #[derive(Debug)]
+// pub struct OpenBucketSegment {
+//     id: BucketSegmentId,
+//     reader: BucketSegmentReader,
+//     pub reader_pool: ReaderThreadPool,
+//     // writer_tx: Sender<WriteFn>,
+//     writer: BucketSegmentWriter,
+// }
 
-impl OpenBucketSegment {
-    pub fn new(
-        bucket_id: u16,
-        segment: u32,
-        reader: BucketSegmentReader,
-        reader_pool: ReaderThreadPool,
-        mut writer: BucketSegmentWriter,
-    ) -> io::Result<Self> {
-        // Register the bucket segment in the reader thread pool
-        reader_pool.add_bucket_segment(bucket_id, segment, &reader)?;
+// impl OpenBucketSegment {
+//     pub fn new(
+//         id: BucketSegmentId,
+//         reader: BucketSegmentReader,
+//         reader_pool: ReaderThreadPool,
+//         writer: BucketSegmentWriter,
+//     ) -> Self {
+//         // Register the bucket segment in the reader thread pool
+//         reader_pool.add_bucket_segment(id, &reader);
 
-        // Spawn background thread for writer
-        let (writer_tx, writer_rx) = bounded::<WriteFn>(1024);
-        thread::spawn(move || {
-            while let Ok(handler) = writer_rx.recv() {
-                handler(&mut writer);
-            }
-        });
+//         // // Spawn background thread for writer
+//         // let (writer_tx, writer_rx) = bounded::<WriteFn>(1024);
+//         // thread::spawn(move || {
+//         //     while let Ok(handler) = writer_rx.recv() {
+//         //         handler(&mut writer);
+//         //     }
+//         // });
 
-        Ok(OpenBucketSegment {
-            bucket_id,
-            segment,
-            reader,
-            reader_pool,
-            writer_tx,
-        })
-    }
+//         OpenBucketSegment {
+//             id,
+//             reader,
+//             reader_pool,
+//             // writer_tx,
+//             writer,
+//         }
+//     }
 
-    /// Reads a record from the specified bucket and segment at the given offset.
-    /// This method executes synchronously using the thread pool and returns an owned record.
-    ///
-    /// # Arguments
-    /// - `offset`: The offset within the segment.
-    ///
-    /// # Returns
-    /// - `Ok(Some(Record<'static>))` if the record is found.
-    /// - `Ok(None)` if the record does not exist.
-    /// - `Err(io::Error)` if an error occurs during reading.
-    pub fn read_record(&self, offset: u64) -> io::Result<Option<Record<'static>>> {
-        self.reader_pool
-            .read_record(self.bucket_id, self.segment, offset)
-    }
+//     /// Closes the open bucket segment, dropping the writer.
+//     pub fn close(self) -> ClosedBucketSegment {
+//         ClosedBucketSegment {
+//             id: self.id,
+//             reader: self.reader,
+//             reader_pool: self.reader_pool,
+//         }
+//     }
 
-    /// Reads a record and passes the result to the provided handler function.
-    /// This method executes synchronously using the thread pool.
-    ///
-    /// # Arguments
-    /// - `offset`: The offset within the segment.
-    /// - `handler`: A closure that processes the read result.
-    ///
-    /// # Returns
-    /// - The return value of the `handler` function, wrapped in `Some`.
-    /// - `None` if the segment is unknown or if the handler panics.
-    pub fn read_record_with<R>(
-        &self,
-        offset: u64,
-        handler: impl FnOnce(io::Result<Option<Record>>) -> R + Send + 'static,
-    ) -> Option<R>
-    where
-        R: Send,
-    {
-        self.reader_pool
-            .read_record_with(self.bucket_id, self.segment, offset, handler)
-    }
+//     /// Reads a record from the specified bucket and segment at the given offset.
+//     /// This method executes synchronously using the thread pool and returns an owned record.
+//     ///
+//     /// # Arguments
+//     /// - `offset`: The offset within the segment.
+//     ///
+//     /// # Returns
+//     /// - `Ok(Some(Record<'static>))` if the record is found.
+//     /// - `Ok(None)` if the record does not exist.
+//     /// - `Err(io::Error)` if an error occurs during reading.
+//     pub fn read_record(&self, offset: u64) -> io::Result<Option<Record<'static>>> {
+//         self.reader_pool.read_record(self.id, offset)
+//     }
 
-    /// Spawns an asynchronous task to read a record and process it using the given handler function.
-    /// This method does not block and executes the handler in a separate thread.
-    ///
-    /// # Arguments
-    /// - `offset`: The offset within the segment.
-    /// - `handler`: A closure that processes the read result.
-    ///
-    /// # Notes
-    /// - If the handler panics, the error is logged.
-    /// - If the segment is unknown, an error is logged.
-    pub fn spawn_read_record(
-        &self,
-        offset: u64,
-        handler: impl FnOnce(io::Result<Option<Record>>) + Send + 'static,
-    ) {
-        self.reader_pool
-            .spawn_read_record(self.bucket_id, self.segment, offset, handler)
-    }
+//     /// Reads a record and passes the result to the provided handler function.
+//     /// This method executes synchronously using the thread pool.
+//     ///
+//     /// # Arguments
+//     /// - `offset`: The offset within the segment.
+//     /// - `handler`: A closure that processes the read result.
+//     ///
+//     /// # Returns
+//     /// - The return value of the `handler` function, wrapped in `Some`.
+//     /// - `None` if the segment is unknown or if the handler panics.
+//     pub fn read_record_with<R>(
+//         &self,
+//         offset: u64,
+//         handler: impl for<'a> FnOnce(io::Result<Option<Record<'a>>>) -> R + Send + 'static,
+//     ) -> Option<R>
+//     where
+//         R: Send,
+//     {
+//         self.reader_pool.read_record_with(self.id, offset, handler)
+//     }
 
-    /// Returns a dedicated reader useful for sequential reads.
-    #[inline]
-    pub fn sequential_reader(&self) -> io::Result<BucketSegmentReader> {
-        self.reader.try_clone()
-    }
+//     /// Spawns an asynchronous task to read a record and process it using the given handler function.
+//     /// This method does not block and executes the handler in a separate thread.
+//     ///
+//     /// # Arguments
+//     /// - `offset`: The offset within the segment.
+//     /// - `handler`: A closure that processes the read result.
+//     ///
+//     /// # Notes
+//     /// - If the handler panics, the error is logged.
+//     /// - If the segment is unknown, an error is logged.
+//     pub fn spawn_read_record(
+//         &self,
+//         offset: u64,
+//         handler: impl for<'a> FnOnce(io::Result<Option<Record<'a>>>) + Send + 'static,
+//     ) {
+//         self.reader_pool.spawn_read_record(self.id, offset, handler)
+//     }
 
-    /// Submits work to the writer thread.
-    pub fn with_writer<F>(&self, f: F) -> Result<(), SendError<WriteFn>>
-    where
-        F: FnOnce(&mut BucketSegmentWriter) + Send + 'static,
-    {
-        self.writer_tx.send(Box::new(f))
-    }
-}
+//     /// Returns a dedicated reader useful for sequential reads.
+//     #[inline]
+//     pub fn sequential_reader(&self) -> io::Result<BucketSegmentReader> {
+//         self.reader.try_clone()
+//     }
 
-/// An immutable segment which is closed and cannot be written to.
-#[derive(Debug)]
-pub struct ClosedBucketSegment {
-    bucket_id: u16,
-    segment: u32,
-    reader: BucketSegmentReader,
-    reader_pool: ReaderThreadPool,
-}
+//     pub fn writer(&mut self) -> &mut BucketSegmentWriter {
+//         &mut self.writer
+//     }
 
-impl ClosedBucketSegment {
-    pub fn new(
-        bucket_id: u16,
-        segment: u32,
-        reader: BucketSegmentReader,
-        reader_pool: ReaderThreadPool,
-    ) -> io::Result<Self> {
-        // Register the bucket segment in the reader thread pool
-        reader_pool.add_bucket_segment(bucket_id, segment, &reader)?;
+//     // /// Submits work to the writer thread.
+//     // pub fn with_writer<F>(&self, f: F) -> Result<(), SendError<WriteFn>>
+//     // where
+//     //     F: FnOnce(&mut BucketSegmentWriter) + Send + 'static,
+//     // {
+//     //     self.writer_tx.send(Box::new(f))
+//     // }
+// }
 
-        Ok(ClosedBucketSegment {
-            bucket_id,
-            segment,
-            reader,
-            reader_pool,
-        })
-    }
+// /// An immutable segment which is closed and cannot be written to.
+// #[derive(Debug)]
+// pub struct ClosedBucketSegment {
+//     id: BucketSegmentId,
+//     reader: BucketSegmentReader,
+//     reader_pool: ReaderThreadPool,
+// }
 
-    /// Reads a record from the specified bucket and segment at the given offset.
-    /// This method executes synchronously using the thread pool and returns an owned record.
-    ///
-    /// # Arguments
-    /// - `offset`: The offset within the segment.
-    ///
-    /// # Returns
-    /// - `Ok(Some(Record<'static>))` if the record is found.
-    /// - `Ok(None)` if the record does not exist.
-    /// - `Err(io::Error)` if an error occurs during reading.
-    pub fn read_record(&self, offset: u64) -> io::Result<Option<Record<'static>>> {
-        self.reader_pool
-            .read_record(self.bucket_id, self.segment, offset)
-    }
+// impl ClosedBucketSegment {
+//     pub fn new(
+//         id: BucketSegmentId,
+//         reader: BucketSegmentReader,
+//         reader_pool: ReaderThreadPool,
+//     ) -> Self {
+//         // Register the bucket segment in the reader thread pool
+//         reader_pool.add_bucket_segment(id, &reader);
 
-    /// Reads a record and passes the result to the provided handler function.
-    /// This method executes synchronously using the thread pool.
-    ///
-    /// # Arguments
-    /// - `offset`: The offset within the segment.
-    /// - `handler`: A closure that processes the read result.
-    ///
-    /// # Returns
-    /// - The return value of the `handler` function, wrapped in `Some`.
-    /// - `None` if the segment is unknown or if the handler panics.
-    pub fn read_record_with<R>(
-        &self,
-        offset: u64,
-        handler: impl FnOnce(io::Result<Option<Record>>) -> R + Send + 'static,
-    ) -> Option<R>
-    where
-        R: Send,
-    {
-        self.reader_pool
-            .read_record_with(self.bucket_id, self.segment, offset, handler)
-    }
+//         ClosedBucketSegment {
+//             id,
+//             reader,
+//             reader_pool,
+//         }
+//     }
 
-    /// Spawns an asynchronous task to read a record and process it using the given handler function.
-    /// This method does not block and executes the handler in a separate thread.
-    ///
-    /// # Arguments
-    /// - `offset`: The offset within the segment.
-    /// - `handler`: A closure that processes the read result.
-    ///
-    /// # Notes
-    /// - If the handler panics, the error is logged.
-    /// - If the segment is unknown, an error is logged.
-    pub fn spawn_read_record(
-        &self,
-        offset: u64,
-        handler: impl FnOnce(io::Result<Option<Record>>) + Send + 'static,
-    ) {
-        self.reader_pool
-            .spawn_read_record(self.bucket_id, self.segment, offset, handler)
-    }
+//     /// Reads a record from the specified bucket and segment at the given offset.
+//     /// This method executes synchronously using the thread pool and returns an owned record.
+//     ///
+//     /// # Arguments
+//     /// - `offset`: The offset within the segment.
+//     ///
+//     /// # Returns
+//     /// - `Ok(Some(Record<'static>))` if the record is found.
+//     /// - `Ok(None)` if the record does not exist.
+//     /// - `Err(io::Error)` if an error occurs during reading.
+//     pub fn read_record(&self, offset: u64) -> io::Result<Option<Record<'static>>> {
+//         self.reader_pool.read_record(self.id, offset)
+//     }
 
-    /// Returns a dedicated reader useful for sequential reads.
-    #[inline]
-    pub fn sequential_reader(&self) -> io::Result<BucketSegmentReader> {
-        self.reader.try_clone()
-    }
-}
+//     /// Reads a record and passes the result to the provided handler function.
+//     /// This method executes synchronously using the thread pool.
+//     ///
+//     /// # Arguments
+//     /// - `offset`: The offset within the segment.
+//     /// - `handler`: A closure that processes the read result.
+//     ///
+//     /// # Returns
+//     /// - The return value of the `handler` function, wrapped in `Some`.
+//     /// - `None` if the segment is unknown or if the handler panics.
+//     pub fn read_record_with<R>(
+//         &self,
+//         offset: u64,
+//         handler: impl for<'a> FnOnce(io::Result<Option<Record<'a>>>) -> R + Send + 'static,
+//     ) -> Option<R>
+//     where
+//         R: Send,
+//     {
+//         self.reader_pool.read_record_with(self.id, offset, handler)
+//     }
+
+//     /// Spawns an asynchronous task to read a record and process it using the given handler function.
+//     /// This method does not block and executes the handler in a separate thread.
+//     ///
+//     /// # Arguments
+//     /// - `offset`: The offset within the segment.
+//     /// - `handler`: A closure that processes the read result.
+//     ///
+//     /// # Notes
+//     /// - If the handler panics, the error is logged.
+//     /// - If the segment is unknown, an error is logged.
+//     pub fn spawn_read_record(
+//         &self,
+//         offset: u64,
+//         handler: impl for<'a> FnOnce(io::Result<Option<Record<'a>>>) + Send + 'static,
+//     ) {
+//         self.reader_pool.spawn_read_record(self.id, offset, handler)
+//     }
+
+//     /// Returns a dedicated reader useful for sequential reads.
+//     #[inline]
+//     pub fn sequential_reader(&self) -> io::Result<BucketSegmentReader> {
+//         self.reader.try_clone()
+//     }
+// }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BucketSegmentHeader {
@@ -377,8 +379,8 @@ mod tests {
         let correlation_id = Uuid::new_v4();
         let timestamp = 1700000000;
         let stream_version = 1;
-        let stream_id = "test_stream".as_bytes();
-        let event_name = "TestEvent".as_bytes();
+        let stream_id = "test_stream";
+        let event_name = "TestEvent";
         let metadata = b"{}";
         let payload = b"payload_data";
 
@@ -393,27 +395,17 @@ mod tests {
                     let (offset, _) = writer.append_commit(&transaction_id, timestamp, 1).unwrap();
                     offsets.push((1u8, offset));
                 } else {
-                    let (offset, _) = writer
-                        .append_event(AppendEvent::new(
-                            AppendEventHeader {
-                                event_id: &event_id,
-                                correlation_id: &correlation_id,
-                                transaction_id: &transaction_id,
-                                stream_version,
-                                timestamp,
-                                stream_id_len: stream_id.len() as u16,
-                                event_name_len: event_name.len() as u16,
-                                metadata_len: metadata.len() as u32,
-                                payload_len: payload.len() as u32,
-                            },
-                            AppendEventBody {
-                                stream_id,
-                                event_name,
-                                metadata,
-                                payload,
-                            },
-                        ))
-                        .unwrap();
+                    let body = AppendEventBody::new(stream_id, event_name, metadata, payload);
+                    let header = AppendEventHeader::new(
+                        &event_id,
+                        &correlation_id,
+                        &transaction_id,
+                        stream_version,
+                        timestamp,
+                        body,
+                    )
+                    .unwrap();
+                    let (offset, _) = writer.append_event(AppendEvent::new(header, body)).unwrap();
                     offsets.push((0u8, offset));
                 }
             }
@@ -429,7 +421,8 @@ mod tests {
         for (i, (kind, offset)) in offsets.into_iter().enumerate() {
             let record = reader.read_record(offset, i % 2 == 0).unwrap().unwrap();
             match record {
-                Record::Event {
+                Record::Event(EventRecord {
+                    offset: _,
                     event_id: rid,
                     correlation_id: rcid,
                     transaction_id: rtid,
@@ -439,23 +432,24 @@ mod tests {
                     event_name: ren,
                     metadata: rm,
                     payload: rp,
-                } => {
+                }) => {
                     assert_eq!(kind, 0);
                     assert_eq!(rid, event_id);
                     assert_eq!(rcid, correlation_id);
                     assert_eq!(rtid, transaction_id);
                     assert_eq!(rsv, stream_version);
                     assert_eq!(rts, timestamp);
-                    assert_eq!(rsid.as_bytes(), stream_id);
-                    assert_eq!(ren.as_bytes(), event_name);
+                    assert_eq!(rsid, stream_id);
+                    assert_eq!(ren, event_name);
                     assert_eq!(rm.as_ref(), metadata);
                     assert_eq!(rp.as_ref(), payload);
                 }
-                Record::Commit {
+                Record::Commit(CommitRecord {
+                    offset: _,
                     transaction_id: rtid,
                     timestamp: rts,
                     event_count,
-                } => {
+                }) => {
                     assert_eq!(kind, 1);
                     assert_eq!(rtid, transaction_id);
                     assert_eq!(rts & !0b1, timestamp);

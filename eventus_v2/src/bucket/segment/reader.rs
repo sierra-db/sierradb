@@ -4,14 +4,16 @@ use std::{
     io::{self, Read, Seek, SeekFrom},
     os::unix::fs::{FileExt, OpenOptionsExt},
     path::Path,
+    vec,
 };
 
+use polonius_the_crab::{exit_polonius, polonius, polonius_return, polonius_try};
 use uuid::Uuid;
 
 use super::{
-    calculate_commit_crc32c, calculate_event_crc32c, BucketSegmentHeader, FlushedOffset,
-    BUCKET_ID_SIZE, COMMIT_SIZE, CREATED_AT_SIZE, EVENT_HEADER_SIZE, MAGIC_BYTES, MAGIC_BYTES_SIZE,
-    RECORD_HEADER_SIZE, SEGMENT_HEADER_SIZE, VERSION_SIZE,
+    BUCKET_ID_SIZE, BucketSegmentHeader, COMMIT_SIZE, CREATED_AT_SIZE, EVENT_HEADER_SIZE,
+    FlushedOffset, MAGIC_BYTES, MAGIC_BYTES_SIZE, RECORD_HEADER_SIZE, SEGMENT_HEADER_SIZE,
+    VERSION_SIZE, calculate_commit_crc32c, calculate_event_crc32c,
 };
 
 const PAGE_SIZE: usize = 4096; // Usually a page is 4KB on Linux
@@ -29,6 +31,62 @@ macro_rules! read_bytes {
         }
         buf
     }};
+}
+
+pub enum CommittedEvents<'a> {
+    None {
+        next_offset: u64,
+    },
+    Single(EventRecord<'a>),
+    Transaction {
+        events: Vec<EventRecord<'static>>,
+        commit: CommitRecord,
+    },
+}
+
+impl<'a> CommittedEvents<'a> {
+    pub fn into_owned(self) -> CommittedEvents<'static> {
+        match self {
+            CommittedEvents::None { next_offset } => CommittedEvents::None { next_offset },
+            CommittedEvents::Single(event) => CommittedEvents::Single(event.into_owned()),
+            CommittedEvents::Transaction { events, commit } => {
+                CommittedEvents::Transaction { events, commit }
+            }
+        }
+    }
+
+    pub fn into_iter(self) -> CommittedEventsIntoIter<'a> {
+        let inner = match self {
+            CommittedEvents::None { .. } => CommittedEventsIntoIterInner::Single(None),
+            CommittedEvents::Single(event) => CommittedEventsIntoIterInner::Single(Some(event)),
+            CommittedEvents::Transaction { events, .. } => {
+                CommittedEventsIntoIterInner::Transaction(events.into_iter())
+            }
+        };
+        CommittedEventsIntoIter { inner }
+    }
+}
+
+pub struct CommittedEventsIntoIter<'a> {
+    inner: CommittedEventsIntoIterInner<'a>,
+}
+
+enum CommittedEventsIntoIterInner<'a> {
+    Single(Option<EventRecord<'a>>),
+    Transaction(vec::IntoIter<EventRecord<'static>>),
+}
+
+impl<'a> Iterator for CommittedEventsIntoIter<'a> {
+    type Item = EventRecord<'static>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.inner {
+            CommittedEventsIntoIterInner::Single(event) => {
+                event.take().map(EventRecord::into_owned)
+            }
+            CommittedEventsIntoIterInner::Transaction(iter) => iter.next(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -113,14 +171,14 @@ impl BucketSegmentReader {
         })
     }
 
-    pub fn iter(&mut self) -> BucketSegmentIter {
+    pub fn iter(&mut self) -> BucketSegmentIter<'_> {
         BucketSegmentIter {
             reader: self,
             offset: SEGMENT_HEADER_SIZE as u64,
         }
     }
 
-    pub fn iter_from(&mut self, start_offset: u64) -> BucketSegmentIter {
+    pub fn iter_from(&mut self, start_offset: u64) -> BucketSegmentIter<'_> {
         BucketSegmentIter {
             reader: self,
             offset: start_offset,
@@ -170,6 +228,66 @@ impl BucketSegmentReader {
         Ok(u64::from_le_bytes(created_at_bytes))
     }
 
+    pub fn read_committed_events(
+        &mut self,
+        mut offset: u64,
+        sequential: bool,
+    ) -> io::Result<Option<CommittedEvents<'_>>> {
+        let mut this = self;
+        let mut events = Vec::new();
+        let mut pending_transaction_id = Uuid::nil();
+        loop {
+            (events, offset) =
+                polonius!(|this| -> io::Result<Option<CommittedEvents<'polonius>>> {
+                    let record = polonius_try!(this.read_record(offset, sequential));
+                    match record {
+                        Some(Record::Event(
+                            event @ EventRecord {
+                                offset,
+                                transaction_id,
+                                ..
+                            },
+                        )) => {
+                            let next_offset = offset + event.len();
+
+                            if transaction_id.is_nil() {
+                                // Events with nil transaction ids are always approved
+                                if events.is_empty() {
+                                    // If its the first event we encountered, then return it alone
+                                    polonius_return!(Ok(Some(CommittedEvents::Single(event))));
+                                }
+
+                                events.push(event.into_owned());
+                            } else if transaction_id != pending_transaction_id {
+                                // Unexpected transaction, we'll start a new pending transaction
+                                events = vec![event.into_owned()];
+                                pending_transaction_id = transaction_id;
+                            } else {
+                                // Event belongs to the transaction
+                                events.push(event.into_owned());
+                            }
+
+                            exit_polonius!((events, next_offset))
+                        }
+                        Some(Record::Commit(commit)) => {
+                            if commit.transaction_id == pending_transaction_id && !events.is_empty()
+                            {
+                                polonius_return!(Ok(Some(CommittedEvents::Transaction {
+                                    events,
+                                    commit,
+                                })));
+                            }
+
+                            polonius_return!(Ok(Some(CommittedEvents::None {
+                                next_offset: commit.offset + COMMIT_SIZE as u64
+                            })));
+                        }
+                        None => polonius_return!(Ok(None)),
+                    }
+                });
+        }
+    }
+
     /// Reads a record at the given offset, returning either an event or commit.
     ///
     /// If sequential is `true`, the read will be optimized for future sequential reads.
@@ -177,13 +295,18 @@ impl BucketSegmentReader {
     ///
     /// Borrowed data will be returned in the record where possible. If the event length exceeds 4KB, then the event
     /// will be read directly from the file, and the returned `Record` will contain owned data.
-    pub fn read_record(&mut self, mut offset: u64, sequential: bool) -> io::Result<Option<Record>> {
+    pub fn read_record(
+        &mut self,
+        start_offset: u64,
+        sequential: bool,
+    ) -> io::Result<Option<Record<'_>>> {
         // This is the only check needed. We don't need to check for the event body,
         // since if the offset supports this header read, then the event body would have also been written too for the flush.
-        if offset + COMMIT_SIZE as u64 > self.flushed_offset.load() {
+        if start_offset + COMMIT_SIZE as u64 > self.flushed_offset.load() {
             return Ok(None);
         }
 
+        let mut offset = start_offset;
         let header_buf = if sequential {
             self.read_from_read_ahead(offset, COMMIT_SIZE)?
         } else {
@@ -197,15 +320,16 @@ impl BucketSegmentReader {
 
         if record_header.record_type == 0 {
             offset -= 4;
-            self.read_event_body(record_header, offset, sequential)
-                .map(Some)
+            self.read_event_body(start_offset, record_header, offset, sequential)
+                .map(|event| Some(Record::Event(event)))
         } else if record_header.record_type == 1 {
             let event_count = u32::from_le_bytes(
                 header_buf[RECORD_HEADER_SIZE..RECORD_HEADER_SIZE + 4]
                     .try_into()
                     .unwrap(),
             );
-            self.read_commit_body(record_header, event_count).map(Some)
+            self.read_commit_body(start_offset, record_header, event_count)
+                .map(|commit| Some(Record::Commit(commit)))
         } else {
             Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -216,10 +340,11 @@ impl BucketSegmentReader {
 
     fn read_event_body(
         &mut self,
+        start_offset: u64,
         record_header: RecordHeader,
         mut offset: u64,
         sequential: bool,
-    ) -> io::Result<Record> {
+    ) -> io::Result<EventRecord<'_>> {
         let length = EVENT_HEADER_SIZE - RECORD_HEADER_SIZE;
         let header_buf = if sequential {
             self.read_from_read_ahead(offset, length)?
@@ -245,14 +370,15 @@ impl BucketSegmentReader {
             EventBody::from_bytes(&event_header, self.body_buf.as_slice())?
         };
 
-        validate_and_combine_event(record_header, event_header, body)
+        validate_and_combine_event(start_offset, record_header, event_header, body)
     }
 
     fn read_commit_body(
         &self,
+        offset: u64,
         record_header: RecordHeader,
         event_count: u32,
-    ) -> io::Result<Record> {
+    ) -> io::Result<CommitRecord> {
         let new_crc32c = calculate_commit_crc32c(
             &record_header.transaction_id,
             record_header.timestamp,
@@ -265,7 +391,8 @@ impl BucketSegmentReader {
             ));
         }
 
-        Ok(Record::Commit {
+        Ok(CommitRecord {
+            offset,
             transaction_id: record_header.transaction_id,
             timestamp: record_header.timestamp,
             event_count,
@@ -341,28 +468,38 @@ pub struct BucketSegmentIter<'a> {
 }
 
 impl BucketSegmentIter<'_> {
-    pub fn next_record(&mut self) -> io::Result<Option<(u64, Record)>> {
+    pub fn next_committed_events(&mut self) -> io::Result<Option<CommittedEvents<'_>>> {
+        let mut this = self;
+        loop {
+            polonius!(|this| -> io::Result<Option<CommittedEvents<'polonius>>> {
+                match this.reader.read_committed_events(this.offset, true) {
+                    Ok(Some(events)) => {
+                        match &events {
+                            CommittedEvents::None { next_offset } => {
+                                this.offset = *next_offset;
+                                exit_polonius!();
+                            }
+                            CommittedEvents::Single(event) => {
+                                this.offset = event.offset + event.len();
+                            }
+                            CommittedEvents::Transaction { commit, .. } => {
+                                this.offset = commit.offset + COMMIT_SIZE as u64;
+                            }
+                        }
+                        polonius_return!(Ok(Some(events)));
+                    }
+                    Ok(None) => polonius_return!(Ok(None)),
+                    Err(err) => polonius_return!(Err(err)),
+                }
+            });
+        }
+    }
+
+    pub fn next_record(&mut self) -> io::Result<Option<Record<'_>>> {
         match self.reader.read_record(self.offset, true) {
             Ok(Some(record)) => {
-                let record_offset = self.offset;
-                let record_len = match &record {
-                    Record::Event {
-                        stream_id,
-                        event_name,
-                        metadata,
-                        payload,
-                        ..
-                    } => {
-                        EVENT_HEADER_SIZE as u64
-                            + stream_id.len() as u64
-                            + event_name.len() as u64
-                            + metadata.len() as u64
-                            + payload.len() as u64
-                    }
-                    Record::Commit { .. } => COMMIT_SIZE as u64,
-                };
-                self.offset += record_len;
-                Ok(Some((record_offset, record)))
+                self.offset = record.offset() + record.len();
+                Ok(Some(record))
             }
             Ok(None) => Ok(None),
             Err(err) => Err(err),
@@ -372,59 +509,94 @@ impl BucketSegmentIter<'_> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Record<'a> {
-    Event {
-        event_id: Uuid,
-        correlation_id: Uuid,
-        transaction_id: Uuid,
-        stream_version: u64,
-        timestamp: u64,
-        stream_id: Cow<'a, str>,
-        event_name: Cow<'a, str>,
-        metadata: Cow<'a, [u8]>,
-        payload: Cow<'a, [u8]>,
-    },
-    Commit {
-        transaction_id: Uuid,
-        timestamp: u64,
-        event_count: u32,
-    },
+    Event(EventRecord<'a>),
+    Commit(CommitRecord),
 }
 
 impl<'a> Record<'a> {
-    pub fn into_owned(self) -> Record<'static> {
+    pub fn into_event(self) -> Option<EventRecord<'a>> {
         match self {
-            Record::Event {
-                event_id,
-                correlation_id,
-                transaction_id,
-                stream_version,
-                timestamp,
-                stream_id,
-                event_name,
-                metadata,
-                payload,
-            } => Record::Event {
-                event_id,
-                correlation_id,
-                transaction_id,
-                stream_version,
-                timestamp,
-                stream_id: Cow::Owned(stream_id.into_owned()),
-                event_name: Cow::Owned(event_name.into_owned()),
-                metadata: Cow::Owned(metadata.into_owned()),
-                payload: Cow::Owned(payload.into_owned()),
-            },
-            Record::Commit {
-                transaction_id,
-                timestamp,
-                event_count,
-            } => Record::Commit {
-                transaction_id,
-                timestamp,
-                event_count,
-            },
+            Record::Event(event) => Some(event),
+            Record::Commit(_) => None,
         }
     }
+
+    pub fn into_commit(self) -> Option<CommitRecord> {
+        match self {
+            Record::Event(_) => None,
+            Record::Commit(commit) => Some(commit),
+        }
+    }
+
+    pub fn offset(&self) -> u64 {
+        match self {
+            Record::Event(EventRecord { offset, .. }) => *offset,
+            Record::Commit(CommitRecord { offset, .. }) => *offset,
+        }
+    }
+
+    pub fn into_owned(self) -> Record<'static> {
+        match self {
+            Record::Event(event) => Record::Event(event.into_owned()),
+            Record::Commit(commit) => Record::Commit(commit),
+        }
+    }
+
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> u64 {
+        match self {
+            Record::Event(event) => event.len(),
+            Record::Commit(_) => COMMIT_SIZE as u64,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventRecord<'a> {
+    pub offset: u64,
+    pub event_id: Uuid,
+    pub correlation_id: Uuid,
+    pub transaction_id: Uuid,
+    pub stream_version: u64,
+    pub timestamp: u64,
+    pub stream_id: Cow<'a, str>,
+    pub event_name: Cow<'a, str>,
+    pub metadata: Cow<'a, [u8]>,
+    pub payload: Cow<'a, [u8]>,
+}
+
+impl<'a> EventRecord<'a> {
+    pub fn into_owned(self) -> EventRecord<'static> {
+        EventRecord {
+            offset: self.offset,
+            event_id: self.event_id,
+            correlation_id: self.correlation_id,
+            transaction_id: self.transaction_id,
+            stream_version: self.stream_version,
+            timestamp: self.timestamp,
+            stream_id: Cow::Owned(self.stream_id.into_owned()),
+            event_name: Cow::Owned(self.event_name.into_owned()),
+            metadata: Cow::Owned(self.metadata.into_owned()),
+            payload: Cow::Owned(self.payload.into_owned()),
+        }
+    }
+
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> u64 {
+        EVENT_HEADER_SIZE as u64
+            + self.stream_id.len() as u64
+            + self.event_name.len() as u64
+            + self.metadata.len() as u64
+            + self.payload.len() as u64
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitRecord {
+    pub offset: u64,
+    pub transaction_id: Uuid,
+    pub timestamp: u64,
+    pub event_count: u32,
 }
 
 struct RecordHeader {
@@ -543,10 +715,11 @@ impl<'a> EventBody<'a> {
 }
 
 fn validate_and_combine_event(
+    offset: u64,
     record_header: RecordHeader,
     event_header: EventHeader,
-    body: EventBody,
-) -> io::Result<Record> {
+    body: EventBody<'_>,
+) -> io::Result<EventRecord<'_>> {
     let new_crc32c = calculate_event_crc32c(
         &record_header.event_id,
         &record_header.transaction_id,
@@ -565,7 +738,8 @@ fn validate_and_combine_event(
         ));
     }
 
-    Ok(Record::Event {
+    Ok(EventRecord {
+        offset,
         event_id: record_header.event_id,
         correlation_id: event_header.correlation_id,
         transaction_id: record_header.transaction_id,

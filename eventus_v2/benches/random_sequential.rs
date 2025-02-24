@@ -1,14 +1,13 @@
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 use std::{fs, mem};
 
-use criterion::{criterion_group, criterion_main, Criterion};
-use crossbeam::sync::WaitGroup;
+use criterion::{Criterion, criterion_group, criterion_main};
 use eventus_v2::bucket::flusher::FlushSender;
 use eventus_v2::bucket::segment::{
     AppendEvent, AppendEventBody, AppendEventHeader, BucketSegmentReader, BucketSegmentWriter,
-    FlushedOffset, OpenBucketSegment, ReaderThreadPool,
+    FlushedOffset,
 };
 use rand::rng;
 use rand::seq::SliceRandom;
@@ -28,29 +27,16 @@ fn setup_test_file() -> (BucketSegmentWriter, Vec<u64>) {
         let event_id = Uuid::new_v4();
         let correlation_id = Uuid::new_v4();
         let transaction_id = Uuid::new_v4();
-        let stream_id = b"test-stream";
-        let event_name = b"TestEvent";
+        let stream_id = "test-stream";
+        let event_name = "TestEvent";
         let metadata = b"{}";
         let payload = b"Some event data";
 
-        let header = AppendEventHeader {
-            event_id: &event_id,
-            correlation_id: &correlation_id,
-            transaction_id: &transaction_id,
-            stream_version: 1,
-            timestamp: 0,
-            stream_id_len: stream_id.len() as u16,
-            event_name_len: event_name.len() as u16,
-            metadata_len: metadata.len() as u32,
-            payload_len: payload.len() as u32,
-        };
+        let body = AppendEventBody::new(stream_id, event_name, metadata, payload);
 
-        let body = AppendEventBody {
-            stream_id,
-            event_name,
-            metadata,
-            payload,
-        };
+        let header =
+            AppendEventHeader::new(&event_id, &correlation_id, &transaction_id, 1, 0, body)
+                .unwrap();
 
         let event = AppendEvent::new(header, body);
         let (offset, _) = writer.append_event(event).expect("Failed to write event");
@@ -62,15 +48,15 @@ fn setup_test_file() -> (BucketSegmentWriter, Vec<u64>) {
 }
 
 fn benchmark_reads(c: &mut Criterion) {
-    let (writer, offsets) = setup_test_file();
+    let (_writer, offsets) = setup_test_file();
     let mut reader = BucketSegmentReader::open(
         FILE_PATH,
         FlushedOffset::new(Arc::new(AtomicU64::new(u64::MAX))),
     )
     .expect("Failed to open reader");
-    let reader_pool = ReaderThreadPool::spawn(8);
-    let segment =
-        OpenBucketSegment::new(0, 0, reader.try_clone().unwrap(), reader_pool, writer).unwrap();
+    // let reader_pool = ReaderThreadPool::new(8);
+    // let segment =
+    //     OpenBucketSegment::new(0, 0, reader.try_clone().unwrap(), reader_pool, writer).unwrap();
 
     let mut shuffled_offsets = offsets.clone();
     shuffled_offsets.shuffle(&mut rng());
@@ -83,6 +69,19 @@ fn benchmark_reads(c: &mut Criterion) {
     }
 
     // Benchmark random access with `sequential = false`
+    group.bench_function(
+        "Sequential lookup (sequential=false, singlethreaded)",
+        |b| {
+            let mut iter = looping_iter(&offsets);
+            b.iter(|| {
+                let offset = iter.next().unwrap();
+                reader
+                    .read_record(*offset, false)
+                    .expect("Failed to read event");
+            });
+        },
+    );
+
     group.bench_function("Random lookup (sequential=false, singlethreaded)", |b| {
         let mut iter = looping_iter(&shuffled_offsets);
         b.iter(|| {
@@ -93,25 +92,30 @@ fn benchmark_reads(c: &mut Criterion) {
         });
     });
 
-    group.bench_function("Random lookup (sequential=false, multithreaded)", |b| {
-        b.iter_custom(|iters| {
-            let wg = WaitGroup::new();
-            let mut iter = looping_iter(&shuffled_offsets);
-            let start = Instant::now();
+    // group.bench_function("Random lookup (sequential=false, multithreaded)", |b| {
+    //     b.iter_custom(|iters| {
+    //         let wg = WaitGroup::new();
+    //         let mut iter = looping_iter(&shuffled_offsets);
+    //         let start = Instant::now();
 
-            for _ in 0..iters {
-                let wg = wg.clone();
-                let offset = iter.next().unwrap();
-                segment.spawn_read_record(*offset, move |res| {
-                    res.unwrap().unwrap();
-                    mem::drop(wg);
-                });
-            }
+    //         for _ in 0..iters {
+    //             let wg = wg.clone();
+    //             let offset = iter.next().unwrap();
+    //             reader_pool.spawn(move |with_reader| {
+    //                 with_reader(|readers| {
+    //                     readers.ge
+    //                 })
+    //             });
+    //             // segment.spawn_read_record(*offset, move |res| {
+    //             //     res.unwrap().unwrap();
+    //             //     mem::drop(wg);
+    //             // });
+    //         }
 
-            wg.wait();
-            start.elapsed()
-        });
-    });
+    //         wg.wait();
+    //         start.elapsed()
+    //     });
+    // });
 
     // Benchmark random access with `sequential = true`
     // group.bench_function("Random lookup (sequential=true)", |b| {
@@ -125,19 +129,19 @@ fn benchmark_reads(c: &mut Criterion) {
     // });
 
     // Benchmark sequential access with `sequential = false`
-    // group.bench_function("Sequential lookup (sequential=false)", |b| {
-    //     let mut iter = looping_iter(&offsets);
-    //     b.iter(|| {
-    //         let offset = iter.next().unwrap();
-    //         reader
-    //             .read_record(*offset, false)
-    //             .expect("Failed to read event");
-    //     });
-    // });
-
-    // Benchmark sequential access with `sequential = true`
     group.bench_function("Sequential lookup (sequential=true)", |b| {
         let mut iter = looping_iter(&offsets);
+        b.iter(|| {
+            let offset = iter.next().unwrap();
+            reader
+                .read_record(*offset, true)
+                .expect("Failed to read event");
+        });
+    });
+
+    // Benchmark sequential access with `sequential = true`
+    group.bench_function("Random lookup (sequential=true)", |b| {
+        let mut iter = looping_iter(&shuffled_offsets);
         b.iter(|| {
             let offset = iter.next().unwrap();
             reader
@@ -160,29 +164,16 @@ fn benchmark_writes(c: &mut Criterion) {
             let event_id = Uuid::new_v4();
             let correlation_id = Uuid::new_v4();
             let transaction_id = Uuid::new_v4();
-            let stream_id = b"test-stream";
-            let event_name = b"TestEvent";
+            let stream_id = "test-stream";
+            let event_name = "TestEvent";
             let metadata = b"{}";
             let payload = b"Some event data";
 
-            let header = AppendEventHeader {
-                event_id: &event_id,
-                correlation_id: &correlation_id,
-                transaction_id: &transaction_id,
-                stream_version: 1,
-                timestamp: 0,
-                stream_id_len: stream_id.len() as u16,
-                event_name_len: event_name.len() as u16,
-                metadata_len: metadata.len() as u32,
-                payload_len: payload.len() as u32,
-            };
+            let body = AppendEventBody::new(stream_id, event_name, metadata, payload);
 
-            let body = AppendEventBody {
-                stream_id,
-                event_name,
-                metadata,
-                payload,
-            };
+            let header =
+                AppendEventHeader::new(&event_id, &correlation_id, &transaction_id, 1, 0, body)
+                    .unwrap();
 
             let event = AppendEvent::new(header, body);
             writer.append_event(event).expect("Failed to write event");

@@ -1,27 +1,34 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     mem,
     os::unix::fs::FileExt,
+    panic::panic_any,
     path::Path,
+    sync::{Arc, Weak},
 };
 
+use rayon::ThreadPool;
 use uuid::Uuid;
 
-use crate::RANDOM_STATE;
+use crate::{RANDOM_STATE, error::ThreadPoolError};
 
-use super::segment::{BucketSegmentReader, Record};
+use super::{
+    BucketSegmentId,
+    segment::{BucketSegmentReader, EventRecord, Record},
+};
 
 const RECORD_SIZE: usize = mem::size_of::<Uuid>() + mem::size_of::<u64>();
 
 pub struct OpenEventIndex {
+    id: BucketSegmentId,
     file: File,
     index: BTreeMap<Uuid, u64>,
 }
 
 impl OpenEventIndex {
-    pub fn create(path: impl AsRef<Path>) -> io::Result<Self> {
+    pub fn create(id: BucketSegmentId, path: impl AsRef<Path>) -> io::Result<Self> {
         let file = OpenOptions::new()
             .read(false)
             .write(true)
@@ -29,14 +36,57 @@ impl OpenEventIndex {
             .open(path)?;
         let index = BTreeMap::new();
 
-        Ok(OpenEventIndex { file, index })
+        Ok(OpenEventIndex { id, file, index })
     }
 
-    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
-        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    pub fn open(id: BucketSegmentId, path: impl AsRef<Path>) -> io::Result<Self> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
         let index = load_index_from_file(&mut file)?;
 
-        Ok(OpenEventIndex { file, index })
+        Ok(OpenEventIndex { id, file, index })
+    }
+
+    /// Closes the event index, flushing the index in a background thread.
+    pub fn close(
+        self,
+        pool: &ThreadPool,
+        committed_event_offsets: Arc<HashSet<u64>>,
+    ) -> io::Result<ClosedEventIndex> {
+        let id = self.id;
+        let mut file_clone = self.file.try_clone()?;
+        let num_slots = self.num_slots();
+        let strong_index = Arc::new(self.index);
+        let weak_index = Arc::downgrade(&strong_index);
+
+        pool.spawn({
+            move || {
+                if let Err(err) =
+                    Self::flush_inner(&mut file_clone, &strong_index, num_slots, |_, offset| {
+                        committed_event_offsets.contains(offset)
+                    })
+                {
+                    panic_any(ThreadPoolError::FlushEventIndex {
+                        id,
+                        file: file_clone,
+                        index: strong_index,
+                        num_slots: num_slots as u64,
+                        err,
+                    });
+                }
+            }
+        });
+
+        Ok(ClosedEventIndex {
+            id,
+            file: self.file,
+            num_slots: num_slots as u64,
+            index: Arc::new(weak_index),
+        })
     }
 
     pub fn get(&self, event_id: &Uuid) -> Option<u64> {
@@ -47,14 +97,54 @@ impl OpenEventIndex {
         self.index.insert(event_id, offset)
     }
 
+    pub fn retain<F>(&mut self, f: F)
+    where
+        F: FnMut(&Uuid, &mut u64) -> bool,
+    {
+        self.index.retain(f);
+    }
+
     pub fn flush(&mut self) -> io::Result<()> {
-        let num_slots = self.index.len() * 2;
+        let num_slots = self.num_slots();
+        Self::flush_inner(&mut self.file, &self.index, num_slots, |_, _| true)
+    }
+
+    /// Hydrates the index from a reader.
+    pub fn hydrate(&mut self, reader: &mut BucketSegmentReader) -> io::Result<()> {
+        let mut reader_iter = reader.iter();
+        while let Some(record) = reader_iter.next_record()? {
+            match record {
+                Record::Event(EventRecord {
+                    offset, event_id, ..
+                }) => {
+                    self.insert(event_id, offset);
+                }
+                Record::Commit(_) => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    fn flush_inner<F>(
+        file: &mut File,
+        index: &BTreeMap<Uuid, u64>,
+        num_slots: usize,
+        mut filter: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&Uuid, &u64) -> bool,
+    {
         let mut file_data = vec![0u8; 8 + num_slots * RECORD_SIZE];
 
         // Write number of slots at the start
         file_data[..8].copy_from_slice(&(num_slots as u64).to_le_bytes());
 
-        for (&event_id, &offset) in &self.index {
+        for (&event_id, &offset) in index {
+            if !filter(&event_id, &offset) {
+                continue; // Skip this event if it doesn't meet the filter condition
+            }
+
             let mut slot = RANDOM_STATE.hash_one(event_id) % num_slots as u64;
 
             // Linear probing to find an empty slot
@@ -74,33 +164,26 @@ impl OpenEventIndex {
         }
 
         // Flush the whole file at once
-        self.file.write_all_at(&file_data, 0)?;
-        self.file.flush()
+        file.write_all_at(&file_data, 0)?;
+        file.flush()
     }
 
-    /// Hydrates the index from a reader
-    pub fn hydrate(&mut self, reader: &mut BucketSegmentReader) -> io::Result<()> {
-        let mut reader_iter = reader.iter();
-        while let Some((offset, record)) = reader_iter.next_record()? {
-            match record {
-                Record::Event { event_id, .. } => {
-                    self.insert(event_id, offset);
-                }
-                Record::Commit { .. } => {}
-            }
-        }
-
-        Ok(())
+    #[inline]
+    fn num_slots(&self) -> usize {
+        self.index.len() * 2
     }
 }
 
 pub struct ClosedEventIndex {
+    #[allow(unused)] // TODO: is this ID needed?
+    id: BucketSegmentId,
     file: File,
     num_slots: u64,
+    index: Arc<Weak<BTreeMap<Uuid, u64>>>,
 }
 
 impl ClosedEventIndex {
-    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+    pub fn open(id: BucketSegmentId, path: impl AsRef<Path>) -> io::Result<Self> {
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
 
         // Read the first 8 bytes to get the total number of slots
@@ -108,10 +191,30 @@ impl ClosedEventIndex {
         file.read_exact(&mut count_buf)?;
         let num_slots = u64::from_le_bytes(count_buf);
 
-        Ok(ClosedEventIndex { file, num_slots })
+        Ok(ClosedEventIndex {
+            id,
+            file,
+            num_slots,
+            index: Arc::new(Weak::new()),
+        })
+    }
+
+    pub fn try_clone(&self) -> io::Result<Self> {
+        Ok(ClosedEventIndex {
+            id: self.id,
+            file: self.file.try_clone()?,
+            num_slots: self.num_slots,
+            index: Arc::clone(&self.index),
+        })
     }
 
     pub fn get(&self, event_id: &Uuid) -> io::Result<Option<u64>> {
+        // Read from memory.
+        // This code should only run when the segment is being closed and is being flushed in the background.
+        if let Some(index) = self.index.upgrade() {
+            return Ok(index.get(event_id).copied());
+        }
+
         if self.num_slots == 0 {
             return Ok(None);
         }
@@ -175,6 +278,10 @@ fn load_index_from_file(file: &mut File) -> io::Result<BTreeMap<Uuid, u64>> {
     file.seek(SeekFrom::Start(0))?;
     file.read_to_end(&mut file_data)?;
 
+    if file_data.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
     if file_data.len() < 8 {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -229,7 +336,7 @@ mod tests {
     #[test]
     fn test_open_event_index_insert_and_get() {
         let path = temp_file_path();
-        let mut index = OpenEventIndex::create(path).unwrap();
+        let mut index = OpenEventIndex::create(BucketSegmentId::new(0, 0), path).unwrap();
 
         let event_id = Uuid::new_v4();
         let offset = 12345;
@@ -242,7 +349,7 @@ mod tests {
     #[test]
     fn test_open_event_index_flush_and_reopen() {
         let path = temp_file_path();
-        let mut index = OpenEventIndex::create(&path).unwrap();
+        let mut index = OpenEventIndex::create(BucketSegmentId::new(0, 0), &path).unwrap();
 
         let event_id1 = Uuid::new_v4();
         let event_id2 = Uuid::new_v4();
@@ -257,7 +364,7 @@ mod tests {
         index.file.seek(SeekFrom::Start(0)).unwrap();
 
         // Reopen and verify data is still present
-        let reopened_index = OpenEventIndex::open(&path).unwrap();
+        let reopened_index = OpenEventIndex::open(BucketSegmentId::new(0, 0), &path).unwrap();
         assert_eq!(reopened_index.get(&event_id1), Some(offset1));
         assert_eq!(reopened_index.get(&event_id2), Some(offset2));
         assert_eq!(reopened_index.get(&Uuid::new_v4()), None);
@@ -266,7 +373,7 @@ mod tests {
     #[test]
     fn test_closed_event_index_lookup() {
         let path = temp_file_path();
-        let mut index = OpenEventIndex::create(&path).unwrap();
+        let mut index = OpenEventIndex::create(BucketSegmentId::new(0, 0), &path).unwrap();
 
         let event_id1 = Uuid::new_v4();
         let event_id2 = Uuid::new_v4();
@@ -277,7 +384,7 @@ mod tests {
         index.insert(event_id2, offset2);
         index.flush().unwrap();
 
-        let closed_index = ClosedEventIndex::open(&path).unwrap();
+        let closed_index = ClosedEventIndex::open(BucketSegmentId::new(0, 0), &path).unwrap();
         assert_eq!(closed_index.get(&event_id1).unwrap(), Some(offset1));
         assert_eq!(closed_index.get(&event_id2).unwrap(), Some(offset2));
         assert_eq!(closed_index.get(&Uuid::new_v4()).unwrap(), None);
@@ -286,7 +393,7 @@ mod tests {
     #[test]
     fn test_collision_handling_in_direct_mapping() {
         let path = temp_file_path();
-        let mut index = OpenEventIndex::create(&path).unwrap();
+        let mut index = OpenEventIndex::create(BucketSegmentId::new(0, 0), &path).unwrap();
 
         let event_id1 = Uuid::from_bytes([1, 4, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         let event_id2 = Uuid::from_bytes([1, 4, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
@@ -298,7 +405,7 @@ mod tests {
         index.insert(event_id2, offset2);
         index.flush().unwrap();
 
-        let closed_index = ClosedEventIndex::open(&path).unwrap();
+        let closed_index = ClosedEventIndex::open(BucketSegmentId::new(0, 0), &path).unwrap();
         assert_eq!(closed_index.get(&event_id1).unwrap(), Some(offset1));
         assert_eq!(closed_index.get(&event_id2).unwrap(), Some(offset2));
     }
@@ -307,10 +414,10 @@ mod tests {
     fn test_non_existent_event_lookup() {
         let path = temp_file_path();
 
-        let mut index = OpenEventIndex::create(&path).unwrap();
+        let mut index = OpenEventIndex::create(BucketSegmentId::new(0, 0), &path).unwrap();
         index.flush().unwrap();
 
-        let index = ClosedEventIndex::open(path).unwrap();
+        let index = ClosedEventIndex::open(BucketSegmentId::new(0, 0), path).unwrap();
 
         let unknown_event_id = Uuid::new_v4();
         assert_eq!(index.get(&unknown_event_id).unwrap(), None);
