@@ -2,8 +2,9 @@ use std::{
     fs::File,
     io::{self, Write},
     sync::{
+        Arc,
         atomic::{AtomicU64, Ordering},
-        mpsc, Arc,
+        mpsc,
     },
     thread,
 };

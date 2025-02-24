@@ -1,77 +1,65 @@
 use std::{
-    fs::{File, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{self, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use tracing::info;
 use uuid::Uuid;
 
+use crate::{
+    bucket::{BucketSegmentId, SegmentKind, file_name},
+    copy_bytes,
+};
+
 use super::{
-    calculate_commit_crc32c, calculate_event_crc32c, BucketSegmentHeader, FlushSender,
-    FlushedOffset, COMMIT_SIZE, EVENT_HEADER_SIZE, MAGIC_BYTES, PADDING_SIZE, SEGMENT_HEADER_SIZE,
+    BucketSegmentHeader, COMMIT_SIZE, EVENT_HEADER_SIZE, FlushSender, FlushedOffset, MAGIC_BYTES,
+    PADDING_SIZE, SEGMENT_HEADER_SIZE, calculate_commit_crc32c, calculate_event_crc32c,
 };
 
 const WRITE_BUF_SIZE: usize = 16 * 1024; // 16 KB buffer
 
-macro_rules! write_bytes {
-    ($this:ident, [ $( $buf:expr $( => $len:expr )? $(,)? )* ]) => {
-       $(
-           write_bytes!($this, $buf $(, $len )?);
-       )*
-    };
-    ($this:ident, $buf:expr) => {{
-        let buf = $buf;
-        let len = buf.len();
-        write_bytes!($this, buf, len);
-    }};
-    ($this:ident, $buf:expr, $len:expr) => {{
-        $this.buf[$this.pos..$this.pos + $len].copy_from_slice($buf);
-        $this.pos += $len;
-    }};
-}
-
 #[derive(Debug)]
 pub struct BucketSegmentWriter {
-    path: PathBuf,
     file: File,
     buf: Box<[u8]>,
     pos: usize,
     file_size: u64,
     flushed_offset: Arc<AtomicU64>,
-    flusher_tx: FlushSender,
+    flush_tx: FlushSender,
+    dirty: bool,
 }
 
 impl BucketSegmentWriter {
     /// Creates a new segment for writing.
     pub fn create(
-        path: impl Into<PathBuf>,
+        path: impl AsRef<Path>,
         bucket_id: u16,
-        flusher_tx: FlushSender,
+        flush_tx: FlushSender,
     ) -> io::Result<Self> {
-        let path = path.into();
         let file = OpenOptions::new()
             .read(false)
             .write(true)
             .create_new(true)
-            .open(&path)?;
+            .open(path)?;
         let buf = vec![0u8; WRITE_BUF_SIZE].into_boxed_slice();
         let pos = 0;
         let file_size = 0;
         let flushed_offset = Arc::new(AtomicU64::new(file_size));
 
         let mut writer = BucketSegmentWriter {
-            path,
             file,
             buf,
             pos,
             file_size,
             flushed_offset,
-            flusher_tx,
+            flush_tx,
+            dirty: false,
         };
 
         let created_at = SystemTime::now()
@@ -89,29 +77,68 @@ impl BucketSegmentWriter {
     }
 
     /// Opens a segment for writing.
-    pub fn open(path: impl Into<PathBuf>, flusher_tx: FlushSender) -> io::Result<Self> {
-        let path = path.into();
-        let mut file = OpenOptions::new().read(false).write(true).open(&path)?;
+    pub fn open(path: impl AsRef<Path>, flush_tx: FlushSender) -> io::Result<Self> {
+        let mut file = OpenOptions::new().read(false).write(true).open(path)?;
         let buf = vec![0u8; WRITE_BUF_SIZE].into_boxed_slice();
         let pos = 0;
-        let file_size = file.seek(SeekFrom::End(SEGMENT_HEADER_SIZE as i64))?;
+        let file_size = file.seek(SeekFrom::End(0))?;
         let flushed_offset = Arc::new(AtomicU64::new(file_size));
 
         Ok(BucketSegmentWriter {
-            path,
             file,
             buf,
             pos,
             file_size,
             flushed_offset,
-            flusher_tx,
+            flush_tx,
+            dirty: false,
         })
     }
 
-    /// Returns the path of the segment file.
-    #[inline]
-    pub fn path(&self) -> &Path {
-        &self.path
+    pub fn latest(
+        bucket_id: u16,
+        dir: impl AsRef<Path>,
+        flush_tx: FlushSender,
+    ) -> io::Result<(BucketSegmentId, Self)> {
+        let dir = dir.as_ref();
+        let prefix = format!("{:05}-", bucket_id);
+        let suffix = format!(".{}.dat", SegmentKind::Events);
+        let mut latest_segment: Option<(u32, PathBuf)> = None;
+
+        // Iterate through the directory and look for matching segment files.
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            let file_name_str = file_name.to_string_lossy();
+
+            // Check if the file name starts with the bucket prefix and ends with the events file suffix.
+            if file_name_str.starts_with(&prefix) && file_name_str.ends_with(&suffix) {
+                // Extract the segment id from the file name.
+                // File format: {bucket_id:05}-{segment_id:010}.events.dat
+                let start = prefix.len();
+                let end = file_name_str.len() - suffix.len();
+                if let Ok(segment_id) = file_name_str[start..end].parse::<u32>() {
+                    latest_segment = match latest_segment {
+                        Some((current_max, _)) if segment_id > current_max => {
+                            Some((segment_id, entry.path()))
+                        }
+                        None => Some((segment_id, entry.path())),
+                        _ => latest_segment,
+                    };
+                }
+            }
+        }
+
+        // If we found an existing segment, open it for writing (append mode).
+        if let Some((segment_id, path)) = latest_segment {
+            Self::open(path, flush_tx)
+                .map(|writer| (BucketSegmentId::new(bucket_id, segment_id), writer))
+        } else {
+            let bucket_segment_id = BucketSegmentId::new(bucket_id, 0);
+            let new_file_name = file_name(bucket_segment_id, SegmentKind::Events);
+            let path = dir.join(new_file_name);
+            Self::create(path, bucket_id, flush_tx).map(|writer| (bucket_segment_id, writer))
+        }
     }
 
     /// Returns the last flushed read only atomic offset.
@@ -141,6 +168,7 @@ impl BucketSegmentWriter {
         self.file.seek(SeekFrom::Start(0))?;
         self.file.write_all(&buf)?;
         self.file_size = self.file.seek(SeekFrom::End(0))?;
+        self.dirty = true;
 
         Ok(())
     }
@@ -152,7 +180,7 @@ impl BucketSegmentWriter {
             header,
             body,
             crc32c,
-        }: AppendEvent,
+        }: AppendEvent<'_>,
     ) -> io::Result<(u64, usize)> {
         let offset = self.file_size + self.pos as u64;
         let encoded_timestamp = header.timestamp & !0b1;
@@ -162,8 +190,9 @@ impl BucketSegmentWriter {
             self.flush_buf()?;
         }
 
-        write_bytes!(
-            self,
+        copy_bytes!(
+            self.buf,
+            self.pos,
             [
                 header.event_id.as_bytes() => 16,
                 header.transaction_id.as_bytes() => 16,
@@ -185,7 +214,7 @@ impl BucketSegmentWriter {
                 self.file.write_all(field)?;
                 self.file_size += field.len() as u64;
             } else {
-                write_bytes!(self, field, field.len());
+                copy_bytes!(self.buf, self.pos, field);
             }
         }
 
@@ -193,6 +222,8 @@ impl BucketSegmentWriter {
             // Flush if the buffer is at least half filled
             self.flush_buf()?;
         }
+
+        self.dirty = true;
 
         Ok((offset, record_len))
     }
@@ -214,8 +245,9 @@ impl BucketSegmentWriter {
             self.flush_buf()?;
         }
 
-        write_bytes!(
-            self,
+        copy_bytes!(
+            self.buf,
+            self.pos,
             [
                 event_id.as_bytes() => 16,
                 transaction_id.as_bytes() => 16,
@@ -230,14 +262,30 @@ impl BucketSegmentWriter {
             self.flush_buf()?;
         }
 
+        self.dirty = true;
+
         Ok((offset, COMMIT_SIZE))
+    }
+
+    pub fn file_size(&self) -> u64 {
+        self.file_size
+    }
+
+    pub fn set_len(&mut self, offset: u64) -> io::Result<()> {
+        if offset < self.file_size {
+            self.file.set_len(offset)?;
+        }
+        Ok(())
     }
 
     /// Flushes the segment, ensuring all data is persisted to disk.
     pub fn flush(&mut self) -> io::Result<()> {
-        self.flush_buf()?;
-        self.file.flush()?;
-        self.flushed_offset.store(self.file_size, Ordering::Release);
+        if self.dirty {
+            info!("flushing writer");
+            self.flush_buf()?;
+            self.file.flush()?;
+            self.flushed_offset.store(self.file_size, Ordering::Release);
+        }
         Ok(())
     }
 
@@ -247,7 +295,7 @@ impl BucketSegmentWriter {
     /// when the function returns.
     pub fn flush_async(&mut self) -> io::Result<()> {
         self.flush_buf()?;
-        self.flusher_tx
+        self.flush_tx
             .flush_async(&mut self.file, self.file_size, &self.flushed_offset)
     }
 
@@ -257,44 +305,95 @@ impl BucketSegmentWriter {
             self.file.write_all(&self.buf[..pos])?;
             self.pos = 0;
             self.file_size += pos as u64;
+            self.dirty = true;
         }
 
         Ok(())
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct AppendEvent<'a> {
     header: AppendEventHeader<'a>,
     body: AppendEventBody<'a>,
     crc32c: u32,
 }
 
+#[derive(Clone, Copy)]
 pub struct AppendEventHeader<'a> {
-    pub event_id: &'a Uuid,
-    pub correlation_id: &'a Uuid,
-    pub transaction_id: &'a Uuid,
-    pub stream_version: u64,
-    pub timestamp: u64,
-    pub stream_id_len: u16,
-    pub event_name_len: u16,
-    pub metadata_len: u32,
-    pub payload_len: u32,
+    event_id: &'a Uuid,
+    correlation_id: &'a Uuid,
+    transaction_id: &'a Uuid,
+    stream_version: u64,
+    timestamp: u64,
+    stream_id_len: u16,
+    event_name_len: u16,
+    metadata_len: u32,
+    payload_len: u32,
 }
 
-impl AppendEventHeader<'_> {
-    pub fn validate_id(&self) -> bool {
-        crate::id::validate_event_id(self.event_id, self.correlation_id)
+impl<'a> AppendEventHeader<'a> {
+    pub fn new(
+        event_id: &'a Uuid,
+        correlation_id: &'a Uuid,
+        transaction_id: &'a Uuid,
+        stream_version: u64,
+        timestamp: u64,
+        body: AppendEventBody<'a>,
+    ) -> io::Result<Self> {
+        Ok(AppendEventHeader {
+            event_id,
+            correlation_id,
+            transaction_id,
+            stream_version,
+            timestamp,
+            stream_id_len: body
+                .stream_id
+                .len()
+                .try_into()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "stream id too long"))?,
+            event_name_len: body
+                .event_name
+                .len()
+                .try_into()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "event id too long"))?,
+            metadata_len: body
+                .metadata
+                .len()
+                .try_into()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "metadata too big"))?,
+            payload_len: body
+                .payload
+                .len()
+                .try_into()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "payload too big"))?,
+        })
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct AppendEventBody<'a> {
-    pub stream_id: &'a [u8],
-    pub event_name: &'a [u8],
-    pub metadata: &'a [u8],
-    pub payload: &'a [u8],
+    stream_id: &'a [u8],
+    event_name: &'a [u8],
+    metadata: &'a [u8],
+    payload: &'a [u8],
 }
 
 impl<'a> AppendEventBody<'a> {
+    pub fn new(
+        stream_id: &'a str,
+        event_name: &'a str,
+        metadata: &'a [u8],
+        payload: &'a [u8],
+    ) -> Self {
+        AppendEventBody {
+            stream_id: stream_id.as_bytes(),
+            event_name: event_name.as_bytes(),
+            metadata,
+            payload,
+        }
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.stream_id.len() + self.event_name.len() + self.metadata.len() + self.payload.len()
