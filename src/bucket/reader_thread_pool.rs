@@ -1,23 +1,18 @@
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap},
-    io,
-    panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
 };
 
 use rayon::{ThreadPool, ThreadPoolBuilder};
-use tracing::error;
 
 use super::{
-    BucketSegmentId,
-    event_index::ClosedEventIndex,
-    segment::{BucketSegmentReader, CommittedEvents, Record},
-    stream_index::ClosedStreamIndex,
+    BucketId, BucketSegmentId, SegmentId, event_index::ClosedEventIndex,
+    segment::BucketSegmentReader, stream_index::ClosedStreamIndex,
 };
 
 thread_local! {
-    static READERS: RefCell<HashMap<u16, BTreeMap<u32, ReaderSet>>> = RefCell::new(HashMap::new());
+    static READERS: RefCell<HashMap<BucketId, BTreeMap<SegmentId, ReaderSet>>> = RefCell::new(HashMap::new());
 }
 
 pub struct ReaderSet {
@@ -44,26 +39,10 @@ impl ReaderThreadPool {
         }
     }
 
-    // pub fn spawn<OP, IN>(&self, op: OP)
-    // where
-    //     OP: FnOnce(fn(BucketSegmentId, IN)) + Send + 'static,
-    //     IN: FnOnce(Option<&mut BucketSegmentReader>),
-    // {
-    //     self.pool.spawn(|| {
-    //         let with_reader = |bucket_segment_id: BucketSegmentId, op: IN| {
-    //             READERS.with_borrow_mut(|readers| match readers.get_mut(&bucket_segment_id) {
-    //                 Some(reader) => op(Some(reader)),
-    //                 None => op(None),
-    //             })
-    //         };
-    //         op(with_reader as fn(_, _) -> _)
-    //     })
-    // }
-
     pub fn spawn<OP, IN>(&self, op: OP)
     where
         OP: FnOnce(fn(IN)) + Send + 'static,
-        IN: FnOnce(&mut HashMap<u16, BTreeMap<u32, ReaderSet>>),
+        IN: FnOnce(&mut HashMap<BucketId, BTreeMap<SegmentId, ReaderSet>>),
     {
         self.pool.spawn(|| {
             let with_reader = |op: IN| READERS.with_borrow_mut(op);

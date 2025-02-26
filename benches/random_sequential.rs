@@ -1,7 +1,6 @@
+use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::time::Instant;
-use std::{fs, mem};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use eventus_v2::bucket::flusher::FlushSender;

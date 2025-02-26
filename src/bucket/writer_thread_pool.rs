@@ -1,12 +1,16 @@
 use std::{
     collections::HashMap,
-    io,
-    path::Path,
-    sync::Arc,
+    io, mem,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
     thread::{self},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use rayon::ThreadPool;
 use smallvec::{SmallVec, smallvec};
 use thread_priority::ThreadBuilderExt;
 use tokio::sync::{
@@ -17,10 +21,13 @@ use tokio::sync::{
 use tracing::{error, trace};
 use uuid::Uuid;
 
-use crate::id::{stream_id_hash, validate_event_id};
+use crate::{
+    bucket::segment::{COMMIT_SIZE, EVENT_HEADER_SIZE},
+    id::{stream_id_bucket, validate_event_id},
+};
 
 use super::{
-    SegmentKind,
+    BucketId, BucketSegmentId, SegmentKind,
     event_index::OpenEventIndex,
     file_name,
     flusher::FlushSender,
@@ -30,6 +37,8 @@ use super::{
     },
     stream_index::OpenStreamIndex,
 };
+
+pub type LiveIndexes = Arc<RwLock<(OpenEventIndex, OpenStreamIndex)>>;
 
 const TOTAL_BUFFERED_WRITES: usize = 1_000; // At most, there can be 1,000 writes buffered across all threads
 const CHANNEL_BUFFER_MIN: usize = 16;
@@ -42,17 +51,18 @@ pub struct WriterThreadPool {
     num_buckets: u16,
     num_threads: u16,
     senders: Arc<[Sender]>,
-    indexes: Arc<HashMap<u16, (u32, Arc<RwLock<(OpenEventIndex, OpenStreamIndex)>>)>>,
+    indexes: Arc<HashMap<BucketId, (Arc<AtomicU32>, LiveIndexes)>>,
 }
 
 impl WriterThreadPool {
     pub fn new(
-        dir: impl AsRef<Path>,
+        dir: impl Into<PathBuf>,
         segment_size: usize,
         num_buckets: u16,
         num_threads: u16,
         flush_interval: Duration,
         reader_pool: &ReaderThreadPool,
+        thread_pool: &Arc<ThreadPool>,
     ) -> io::Result<Self> {
         assert!(num_threads > 0);
         assert!(
@@ -63,20 +73,25 @@ impl WriterThreadPool {
         let mut senders = Vec::with_capacity(num_threads as usize);
         let mut indexes = HashMap::new();
 
+        let dir = dir.into();
         for thread_id in 0..num_threads {
             let worker = Worker::new(
-                &dir,
+                dir.clone(),
                 segment_size,
                 thread_id,
                 num_buckets,
                 num_threads,
                 flush_interval,
                 reader_pool,
+                thread_pool,
             )?;
             for (bucket_id, writer_set) in &worker.writers {
                 indexes.insert(
                     *bucket_id,
-                    (writer_set.segment_id, Arc::clone(&writer_set.indexes)),
+                    (
+                        Arc::clone(&writer_set.index_segment_id),
+                        Arc::clone(&writer_set.indexes),
+                    ),
                 );
             }
 
@@ -130,9 +145,7 @@ impl WriterThreadPool {
         })
     }
 
-    pub fn indexes(
-        &self,
-    ) -> &Arc<HashMap<u16, (u32, Arc<RwLock<(OpenEventIndex, OpenStreamIndex)>>)>> {
+    pub fn indexes(&self) -> &Arc<HashMap<u16, (Arc<AtomicU32>, LiveIndexes)>> {
         &self.indexes
     }
 
@@ -171,29 +184,29 @@ impl WriterThreadPool {
         }
     }
 
-    pub async fn with_event_index<F, R>(&self, bucket_id: u16, f: F) -> Option<R>
+    pub async fn with_event_index<F, R>(&self, bucket_id: BucketId, f: F) -> Option<R>
     where
-        F: FnOnce(u32, &OpenEventIndex) -> R,
+        F: FnOnce(&Arc<AtomicU32>, &OpenEventIndex) -> R,
     {
         let (segment_id, index) = self.indexes.get(&bucket_id)?;
         let lock = index.read().await;
 
-        Some(f(*segment_id, &lock.0))
+        Some(f(segment_id, &lock.0))
     }
 
-    pub async fn with_stream_index<F, R>(&self, bucket_id: u16, f: F) -> Option<R>
+    pub async fn with_stream_index<F, R>(&self, bucket_id: BucketId, f: F) -> Option<R>
     where
-        F: FnOnce(u32, &OpenStreamIndex) -> R,
+        F: FnOnce(&Arc<AtomicU32>, &OpenStreamIndex) -> R,
     {
         let (segment_id, index) = self.indexes.get(&bucket_id)?;
         let lock = index.read().await;
 
-        Some(f(*segment_id, &lock.1))
+        Some(f(segment_id, &lock.1))
     }
 }
 
 pub struct AppendEventsBatch {
-    bucket_id: u16,
+    bucket_id: BucketId,
     transaction_id: Uuid,
     events: SmallVec<[WriteRequestEvent; 4]>,
 }
@@ -207,7 +220,7 @@ impl AppendEventsBatch {
             ));
         }
 
-        let bucket_id = stream_id_hash(&event.stream_id) % num_buckets;
+        let bucket_id = stream_id_bucket(&event.stream_id, num_buckets);
 
         Ok(AppendEventsBatch {
             bucket_id,
@@ -235,7 +248,7 @@ impl AppendEventsBatch {
                     Ok(ret)
                 },
                 None => Ok(Some((
-                    stream_id_hash(&event.stream_id) % num_buckets,
+                    stream_id_bucket(&event.stream_id, num_buckets),
                     event.correlation_id,
                 ))),
             })
@@ -273,37 +286,156 @@ pub struct WriteRequestEvent {
 }
 
 struct WriterSet {
-    segment_id: u32,
+    dir: PathBuf,
+    reader: BucketSegmentReader,
+    reader_pool: ReaderThreadPool,
+    bucket_segment_id: BucketSegmentId,
+    segment_size: usize,
     writer: BucketSegmentWriter,
-    indexes: Arc<RwLock<(OpenEventIndex, OpenStreamIndex)>>,
+    index_segment_id: Arc<AtomicU32>,
+    indexes: LiveIndexes,
     pending_indexes: Vec<PendingIndex>,
     last_flushed: Instant,
+    flush_interval: Duration,
+    thread_pool: Arc<ThreadPool>,
+}
+
+impl WriterSet {
+    fn flush(&mut self) -> io::Result<()> {
+        self.last_flushed = Instant::now();
+        self.writer.flush()?;
+        let mut indexes = self.indexes.blocking_write();
+        for PendingIndex {
+            event_id,
+            correlation_id,
+            stream_id,
+            stream_version,
+            offset,
+        } in self.pending_indexes.drain(..)
+        {
+            indexes.0.insert(event_id, offset);
+            if let Err(err) = indexes
+                .1
+                .insert(stream_id, stream_version, correlation_id, offset)
+            {
+                error!("failed to insert index: {err}");
+            }
+        }
+
+        Ok(())
+    }
+
+    fn flush_if_necessary(&mut self) {
+        if self.last_flushed.elapsed() >= self.flush_interval {
+            if let Err(err) = self.flush() {
+                error!("failed to flush writer: {err}");
+            }
+        }
+    }
+
+    fn rollover(&mut self) -> io::Result<()> {
+        self.last_flushed = Instant::now();
+        self.writer.flush()?;
+
+        // Open new segment
+        let old_bucket_segment_id = self.bucket_segment_id;
+        self.bucket_segment_id = self.bucket_segment_id.increment_segment_id();
+
+        self.writer = BucketSegmentWriter::create(
+            self.dir
+                .join(file_name(self.bucket_segment_id, SegmentKind::Events)),
+            self.bucket_segment_id.bucket_id,
+            FlushSender::local(),
+        )?;
+        let old_reader = mem::replace(
+            &mut self.reader,
+            BucketSegmentReader::open(
+                self.dir
+                    .join(file_name(self.bucket_segment_id, SegmentKind::Events)),
+                self.writer.flushed_offset(),
+            )?,
+        );
+
+        let event_index = OpenEventIndex::create(
+            self.bucket_segment_id,
+            self.dir
+                .join(file_name(self.bucket_segment_id, SegmentKind::EventIndex)),
+        )?;
+        let stream_index = OpenStreamIndex::create(
+            self.bucket_segment_id,
+            self.dir
+                .join(file_name(self.bucket_segment_id, SegmentKind::StreamIndex)),
+            self.segment_size,
+        )?;
+
+        let (closed_event_index, closed_stream_index) = {
+            let mut indexes = self.indexes.blocking_write();
+            for PendingIndex {
+                event_id,
+                correlation_id,
+                stream_id,
+                stream_version,
+                offset,
+            } in self.pending_indexes.drain(..)
+            {
+                indexes.0.insert(event_id, offset);
+                if let Err(err) =
+                    indexes
+                        .1
+                        .insert(stream_id, stream_version, correlation_id, offset)
+                {
+                    error!("failed to insert index: {err}");
+                }
+            }
+
+            let old_event_index = mem::replace(&mut indexes.0, event_index);
+            let old_stream_index = mem::replace(&mut indexes.1, stream_index);
+
+            let closed_event_index = old_event_index.close(&self.thread_pool)?;
+            let closed_stream_index = old_stream_index.close(&self.thread_pool)?;
+
+            self.index_segment_id
+                .store(self.bucket_segment_id.segment_id, Ordering::Release);
+
+            (closed_event_index, closed_stream_index)
+        };
+
+        self.reader_pool.add_bucket_segment(
+            old_bucket_segment_id,
+            &old_reader,
+            Some(&closed_event_index),
+            Some(&closed_stream_index),
+        );
+        self.reader_pool
+            .add_bucket_segment(self.bucket_segment_id, &self.reader, None, None);
+
+        Ok(())
+    }
 }
 
 struct Worker {
+    segment_size: usize,
     thread_id: u16,
-    flush_interval: Duration,
-    writers: HashMap<u16, WriterSet>,
+    writers: HashMap<BucketId, WriterSet>,
 }
 
 impl Worker {
     fn new(
-        dir: impl AsRef<Path>,
+        dir: PathBuf,
         segment_size: usize,
         thread_id: u16,
         num_buckets: u16,
         num_threads: u16,
         flush_interval: Duration,
         reader_pool: &ReaderThreadPool,
+        thread_pool: &Arc<ThreadPool>,
     ) -> io::Result<Self> {
-        let dir = dir.as_ref();
-
         let mut writers = HashMap::new();
         let now = Instant::now();
         for bucket_id in 0..num_buckets {
             if bucket_to_thread(bucket_id, num_buckets, num_threads) == thread_id {
                 let (bucket_segment_id, writer) =
-                    BucketSegmentWriter::latest(bucket_id, dir, FlushSender::local())?;
+                    BucketSegmentWriter::latest(bucket_id, &dir, FlushSender::local())?;
                 let mut reader = BucketSegmentReader::open(
                     dir.join(file_name(bucket_segment_id, SegmentKind::Events)),
                     writer.flushed_offset(),
@@ -327,11 +459,18 @@ impl Worker {
                 let indexes = Arc::new(RwLock::new((event_index, stream_index)));
 
                 let writer_set = WriterSet {
-                    segment_id: bucket_segment_id.segment_id,
+                    dir: dir.clone(),
+                    reader,
+                    reader_pool: reader_pool.clone(),
+                    bucket_segment_id,
+                    segment_size,
                     writer,
+                    index_segment_id: Arc::new(AtomicU32::new(bucket_segment_id.segment_id)),
                     indexes,
                     pending_indexes: Vec::with_capacity(256),
                     last_flushed: now,
+                    flush_interval,
+                    thread_pool: Arc::clone(thread_pool),
                 };
 
                 writers.insert(bucket_id, writer_set);
@@ -339,44 +478,13 @@ impl Worker {
         }
 
         Ok(Worker {
+            segment_size,
             thread_id,
-            flush_interval,
             writers,
         })
     }
 
     fn run(mut self, mut rx: Receiver) {
-        let flush_if_necessary = |writer_set: &mut WriterSet| {
-            if writer_set.last_flushed.elapsed() >= self.flush_interval {
-                writer_set.last_flushed = Instant::now();
-                match writer_set.writer.flush() {
-                    Ok(()) => {
-                        let mut indexes = writer_set.indexes.blocking_write();
-                        for PendingIndex {
-                            event_id,
-                            correlation_id,
-                            stream_id,
-                            stream_version,
-                            offset,
-                        } in writer_set.pending_indexes.drain(..)
-                        {
-                            indexes.0.insert(event_id, offset);
-                            if let Err(err) =
-                                indexes
-                                    .1
-                                    .insert(stream_id, stream_version, correlation_id, offset)
-                            {
-                                error!("failed to insert index: {err}");
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        error!("failed to flush writer: {err}");
-                    }
-                }
-            }
-        };
-
         // Process incoming write requests.
         'outer: while let Some(req) = rx.blocking_recv() {
             match req {
@@ -399,9 +507,24 @@ impl Worker {
                         continue;
                     };
 
-                    flush_if_necessary(writer_set);
+                    writer_set.flush_if_necessary();
 
                     let file_size = writer_set.writer.file_size();
+                    let events_size = events
+                        .iter()
+                        .map(|event| {
+                            EVENT_HEADER_SIZE
+                                + event.stream_id.len()
+                                + event.event_name.len()
+                                + event.metadata.len()
+                                + event.payload.len()
+                        })
+                        .sum::<usize>()
+                        + if transaction_id.is_nil() {
+                            0
+                        } else {
+                            COMMIT_SIZE
+                        };
 
                     macro_rules! tri {
                         ($($tt:tt)*) => {
@@ -420,6 +543,12 @@ impl Worker {
                                 }
                             }
                         };
+                    }
+
+                    if file_size as usize + writer_set.writer.buf_len() + events_size
+                        > self.segment_size
+                    {
+                        tri!(writer_set.rollover());
                     }
 
                     let mut new_pending_indexes = Vec::with_capacity(events.len());
@@ -471,7 +600,7 @@ impl Worker {
                 }
                 WriteRequest::FlushPoll => {
                     for writer_set in self.writers.values_mut() {
-                        flush_if_necessary(writer_set);
+                        writer_set.flush_if_necessary();
                     }
                 }
             }
@@ -494,11 +623,15 @@ struct PendingIndex {
     offset: u64,
 }
 
-fn bucket_to_thread(bucket_id: u16, num_buckets: u16, num_threads: u16) -> u16 {
+fn bucket_to_thread(bucket_id: BucketId, num_buckets: u16, num_threads: u16) -> u16 {
     assert!(
         num_buckets >= num_threads,
         "number of buckets cannot be less than number of threads"
     );
+
+    if num_threads == 1 {
+        return 0;
+    }
 
     let buckets_per_thread = num_buckets / num_threads;
     let extra = num_buckets % num_threads;

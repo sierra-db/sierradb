@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rand::Rng;
 use uuid::Uuid;
 
-use crate::RANDOM_STATE;
+use crate::{RANDOM_STATE, bucket::BucketId};
 
 // pub fn generate_correlation_id(stream_id: &str) -> Uuid {
 //     // Compute a 64-bit hash (using, say, xxh3 or ahash) of the stream id.
@@ -63,6 +63,14 @@ pub fn stream_id_hash(stream_id: &str) -> u16 {
     (RANDOM_STATE.hash_one(stream_id) & 0xFFFF) as u16
 }
 
+pub fn stream_id_bucket(stream_id: &str, num_buckets: u16) -> BucketId {
+    if num_buckets == 1 {
+        return 0;
+    }
+
+    stream_id_hash(stream_id) % num_buckets
+}
+
 /// Returns a UUID “inspired” by v7, except that 16 bits from the stream-id hash
 /// are embedded in it (bits 46–61 of the final 128-bit value).
 ///
@@ -109,6 +117,14 @@ pub fn extract_stream_hash(uuid: Uuid) -> u16 {
     ((uuid_u128 >> 46) & 0xFFFF) as u16
 }
 
+pub fn extract_event_id_bucket(uuid: Uuid, num_buckets: u16) -> BucketId {
+    if num_buckets == 1 {
+        return 0;
+    }
+
+    extract_stream_hash(uuid) % num_buckets
+}
+
 // pub fn extract_bucket_from_correlation_id(correlation_id: &Uuid, num_buckets: u16) -> u16 {
 //     let bytes = correlation_id.as_bytes();
 //     let stream_hash = u16::from_be_bytes([bytes[8], bytes[9]]);
@@ -118,7 +134,6 @@ pub fn extract_stream_hash(uuid: Uuid) -> u16 {
 // pub fn extract_bucket_from_id(event_id: &Uuid, num_buckets: u16) -> u16 {
 //     let bytes = event_id.as_bytes();
 //     let correlation_hash = u16::from_be_bytes([bytes[8], bytes[9]]);
-//     dbg!(correlation_hash);
 //     correlation_hash % num_buckets
 // }
 

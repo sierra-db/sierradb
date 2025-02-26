@@ -8,17 +8,28 @@ pub mod segment;
 pub mod stream_index;
 pub mod writer_thread_pool;
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub type BucketId = u16;
+pub type SegmentId = u32;
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct BucketSegmentId {
-    pub bucket_id: u16,
-    pub segment_id: u32,
+    pub bucket_id: BucketId,
+    pub segment_id: SegmentId,
 }
 
 impl BucketSegmentId {
-    pub fn new(bucket_id: u16, segment_id: u32) -> Self {
+    pub fn new(bucket_id: BucketId, segment_id: SegmentId) -> Self {
         BucketSegmentId {
             bucket_id,
             segment_id,
+        }
+    }
+
+    #[must_use]
+    pub fn increment_segment_id(&self) -> Self {
+        BucketSegmentId {
+            bucket_id: self.bucket_id,
+            segment_id: self.segment_id + 1,
         }
     }
 }

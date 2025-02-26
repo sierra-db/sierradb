@@ -9,11 +9,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use tracing::info;
+use tracing::trace;
 use uuid::Uuid;
 
 use crate::{
-    bucket::{BucketSegmentId, SegmentKind, file_name},
+    bucket::{BucketSegmentId, SegmentId, SegmentKind, file_name},
     copy_bytes,
 };
 
@@ -39,7 +39,7 @@ impl BucketSegmentWriter {
     /// Creates a new segment for writing.
     pub fn create(
         path: impl AsRef<Path>,
-        bucket_id: u16,
+        bucket_id: BucketId,
         flush_tx: FlushSender,
     ) -> io::Result<Self> {
         let file = OpenOptions::new()
@@ -96,14 +96,14 @@ impl BucketSegmentWriter {
     }
 
     pub fn latest(
-        bucket_id: u16,
+        bucket_id: BucketId,
         dir: impl AsRef<Path>,
         flush_tx: FlushSender,
     ) -> io::Result<(BucketSegmentId, Self)> {
         let dir = dir.as_ref();
         let prefix = format!("{:05}-", bucket_id);
         let suffix = format!(".{}.dat", SegmentKind::Events);
-        let mut latest_segment: Option<(u32, PathBuf)> = None;
+        let mut latest_segment: Option<(SegmentId, PathBuf)> = None;
 
         // Iterate through the directory and look for matching segment files.
         for entry in fs::read_dir(dir)? {
@@ -271,6 +271,10 @@ impl BucketSegmentWriter {
         self.file_size
     }
 
+    pub fn buf_len(&self) -> usize {
+        self.pos
+    }
+
     pub fn set_len(&mut self, offset: u64) -> io::Result<()> {
         if offset < self.file_size {
             self.file.set_len(offset)?;
@@ -281,7 +285,7 @@ impl BucketSegmentWriter {
     /// Flushes the segment, ensuring all data is persisted to disk.
     pub fn flush(&mut self) -> io::Result<()> {
         if self.dirty {
-            info!("flushing writer");
+            trace!("flushing writer");
             self.flush_buf()?;
             self.file.flush()?;
             self.flushed_offset.store(self.file_size, Ordering::Release);

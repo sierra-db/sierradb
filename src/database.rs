@@ -1,17 +1,29 @@
-use std::{io, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fs, io,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use tokio::sync::oneshot;
-use tracing::error;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::{
     bucket::{
+        BucketId, BucketSegmentId, SegmentId, SegmentKind,
+        event_index::ClosedEventIndex,
         reader_thread_pool::ReaderThreadPool,
-        segment::{CommittedEvents, EventRecord},
-        stream_index::EventStreamIter,
+        segment::{BucketSegmentReader, CommittedEvents, EventRecord, FlushedOffset},
+        stream_index::{ClosedStreamIndex, EventStreamIter},
         writer_thread_pool::{AppendEventsBatch, WriterThreadPool},
     },
-    id::{extract_stream_hash, stream_id_hash},
+    id::{extract_event_id_bucket, stream_id_bucket},
+    pool::create_thread_pool,
 };
 
 pub struct Database {
@@ -34,13 +46,13 @@ impl Database {
     }
 
     pub async fn read_event(&self, event_id: Uuid) -> io::Result<Option<EventRecord<'static>>> {
-        let bucket_id = extract_stream_hash(event_id) % self.num_buckets;
+        let bucket_id = extract_event_id_bucket(event_id, self.num_buckets);
         let segment_id_offset = self
             .writer_pool
             .with_event_index(bucket_id, |segment_id, event_index| {
                 event_index
                     .get(&event_id)
-                    .map(|offset| (segment_id, offset))
+                    .map(|offset| (segment_id.load(Ordering::Acquire), offset))
             })
             .await
             .flatten();
@@ -53,6 +65,7 @@ impl Database {
                         .get_mut(&bucket_id)
                         .and_then(|segments| segments.get_mut(&segment_id))
                     else {
+                        warn!(%bucket_id, %segment_id, "bucket or segment doesn't exist in reader pool");
                         let _ = reply_tx.send(Ok(None));
                         return;
                     };
@@ -107,7 +120,7 @@ impl Database {
 
     pub async fn read_stream(&self, stream_id: impl Into<Arc<str>>) -> io::Result<EventStreamIter> {
         let stream_id = stream_id.into();
-        let bucket_id = stream_id_hash(&stream_id) % self.num_buckets;
+        let bucket_id = stream_id_bucket(&stream_id, self.num_buckets);
         EventStreamIter::new(
             stream_id,
             bucket_id,
@@ -144,6 +157,10 @@ impl DatabaseBuilder {
     }
 
     pub fn open(&self) -> io::Result<Database> {
+        let _ = fs::create_dir_all(&self.dir);
+        let thread_pool = Arc::new(
+            create_thread_pool().map_err(|err| io::Error::new(io::ErrorKind::Other, err))?,
+        );
         let reader_pool = ReaderThreadPool::new(self.reader_pool_size as usize);
         let writer_pool = WriterThreadPool::new(
             &self.dir,
@@ -152,13 +169,112 @@ impl DatabaseBuilder {
             self.writer_pool_size,
             self.flush_interval,
             &reader_pool,
+            &thread_pool,
         )?;
+
+        // Scan all previous segments and add to reader pool
+        let events_suffix = format!(".{}.dat", SegmentKind::Events);
+        let event_index_suffix = format!(".{}.dat", SegmentKind::EventIndex);
+        let stream_index_suffix = format!(".{}.dat", SegmentKind::StreamIndex);
+        let mut segments: BTreeMap<BucketSegmentId, UnopenedFileSet> = BTreeMap::new();
+        for entry in fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            let file_name_str = file_name.to_string_lossy();
+
+            if file_name_str.len() < "00000-0000000000.dat".len() {
+                continue;
+            }
+
+            let Ok(bucket_id) = file_name_str[0..5].parse::<u16>() else {
+                continue;
+            };
+            let Ok(segment_id) = file_name_str[6..16].parse::<u32>() else {
+                continue;
+            };
+            let bucket_segment_id = BucketSegmentId::new(bucket_id, segment_id);
+
+            if file_name_str.ends_with(&events_suffix) {
+                segments.entry(bucket_segment_id).or_default().events = Some(entry.path());
+                // println!("opening events: {bucket_segment_id}");
+            } else if file_name_str.ends_with(&event_index_suffix) {
+                segments.entry(bucket_segment_id).or_default().event_index = Some(entry.path());
+                // println!("opening event index: {bucket_segment_id}");
+                // let event_index = ClosedEventIndex::open(bucket_segment_id, entry.path())?;
+                // segments.entry(bucket_segment_id).or_default().1 = Some(event_index);
+            } else if file_name_str.ends_with(&stream_index_suffix) {
+                segments.entry(bucket_segment_id).or_default().stream_index = Some(entry.path());
+                // println!("opening stream index: {bucket_segment_id}");
+                // let stream_index =
+                //     ClosedStreamIndex::open(bucket_segment_id, entry.path(), self.segment_size)?;
+                // segments.entry(bucket_segment_id).or_default().2 = Some(stream_index);
+            }
+        }
+
+        let latest_segments: HashMap<BucketId, SegmentId> =
+            segments
+                .iter()
+                .fold(HashMap::new(), |mut latest, (bucket_segment_id, _)| {
+                    latest
+                        .entry(bucket_segment_id.bucket_id)
+                        .and_modify(|segment_id| {
+                            *segment_id = (*segment_id).max(bucket_segment_id.segment_id);
+                        })
+                        .or_insert(bucket_segment_id.segment_id);
+                    latest
+                });
+
+        // Remove latest segments
+        segments.retain(|bucket_segment_id, _| {
+            latest_segments
+                .get(&bucket_segment_id.bucket_id)
+                .map(|latest_segment_id| *latest_segment_id != bucket_segment_id.segment_id)
+                .unwrap_or(true)
+        });
+
+        for (
+            bucket_segment_id,
+            UnopenedFileSet {
+                events,
+                event_index,
+                stream_index,
+            },
+        ) in segments
+        {
+            let Some(events) = events else {
+                continue;
+            };
+
+            let reader = BucketSegmentReader::open(
+                events,
+                FlushedOffset::new(Arc::new(AtomicU64::new(u64::MAX))),
+            )?;
+
+            let event_index = event_index
+                .map(|path| ClosedEventIndex::open(bucket_segment_id, path))
+                .transpose()?;
+            let stream_index = stream_index
+                .map(|path| ClosedStreamIndex::open(bucket_segment_id, path, self.segment_size))
+                .transpose()?;
+
+            reader_pool.add_bucket_segment(
+                bucket_segment_id,
+                &reader,
+                event_index.as_ref(),
+                stream_index.as_ref(),
+            );
+        }
 
         Ok(Database {
             reader_pool,
             writer_pool,
             num_buckets: self.num_buckets,
         })
+    }
+
+    pub fn segment_size(&mut self, n: usize) -> &mut Self {
+        self.segment_size = n;
+        self
     }
 
     pub fn num_buckets(&mut self, n: u16) -> &mut Self {
@@ -180,4 +296,11 @@ impl DatabaseBuilder {
         self.flush_interval = interval;
         self
     }
+}
+
+#[derive(Debug, Default)]
+struct UnopenedFileSet {
+    events: Option<PathBuf>,
+    event_index: Option<PathBuf>,
+    stream_index: Option<PathBuf>,
 }

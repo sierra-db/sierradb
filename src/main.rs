@@ -1,57 +1,63 @@
-use eventus::{
-    actor::Flush,
-    cli::init_args,
-    server::{
-        eventstore::event_store_server::EventStoreServer, DefaultEventStoreServer,
-        ServerAuthInterceptor,
-    },
-    EventLog, LogOptions,
+use std::{
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use kameo::request::MessageSend;
-use tokio::signal;
-use tonic::transport::Server;
-use tracing::info;
-use tracing_subscriber::EnvFilter;
+
+use eventus_v2::{
+    bucket::writer_thread_pool::{AppendEventsBatch, WriteRequestEvent},
+    database::DatabaseBuilder,
+    id::uuid_v7_with_stream_hash,
+};
+use tracing::Level;
+use uuid::uuid;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = init_args();
-
-    // console_subscriber::init();
-    tracing_subscriber::fmt()
-        .without_time()
-        .with_target(false)
-        .with_env_filter(EnvFilter::builder().parse_lossy(&args.log))
+    tracing_subscriber::fmt::SubscriberBuilder::default()
+        .with_max_level(Level::INFO)
         .init();
 
-    let opts = LogOptions::new(&args.log_path);
-    let log = EventLog::new(opts)?;
+    let db = DatabaseBuilder::new("target/db")
+        .segment_size(64_000_000)
+        .num_buckets(1)
+        .writer_pool_size(1)
+        .reader_pool_size(0)
+        .flush_interval(Duration::from_millis(400))
+        .open()?;
 
-    let log_actor = kameo::actor::spawn_in_thread(log);
+    let start = Instant::now();
+    for i in 0..5_000_000 {
+        let stream_id = "user-moira";
+        let event_id = uuid_v7_with_stream_hash(stream_id);
+        let correlation_id = uuid!("0195342a-38aa-99a7-8297-665721686848"); // uuid_v7_with_stream_hash(stream_id);
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
+        db.append_events(AppendEventsBatch::single(1, WriteRequestEvent {
+            event_id,
+            correlation_id,
+            stream_version: i,
+            timestamp,
+            stream_id: stream_id.into(),
+            event_name: "ActuallySuperGay".to_string(),
+            metadata: vec![],
+            payload: vec![1, 2, 3],
+        })?)
+        .await?;
+    }
+    let end = start.elapsed();
+    println!("{end:?}");
+    thread::sleep(Duration::from_secs(1));
 
-    // Create an instance of your EventStore implementation
-    let event_store = DefaultEventStoreServer::new(log_actor.clone());
+    // let event = db.read_event(event_id).await?;
+    // dbg!(event);
 
-    // Start the gRPC server
-    let interceptor = ServerAuthInterceptor::new(&args.auth_token)?;
-    // tokio::task::Builder::new()
-    //     .name("grpc_server")
-    tokio::spawn(async move {
-        info!("listening on {}", args.listen_addr);
-        Server::builder()
-            .add_service(EventStoreServer::with_interceptor(event_store, interceptor))
-            .serve(args.listen_addr)
-            .await
-    });
+    println!("====");
 
-    signal::ctrl_c().await.expect("failed to listen for event");
-    info!("shutting down...");
+    // let mut stream_iter = db.read_stream("user-moira").await?;
+    // while let Some(event) = stream_iter.next().await? {
+    //     dbg!(event.stream_version);
+    // }
 
-    log_actor.tell(Flush).send().await?;
-    log_actor.stop_gracefully().await?;
-    log_actor.wait_for_stop().await;
-
-    info!("goodbye.");
+    // thread::sleep(Duration::from_secs(1));
 
     Ok(())
 }
