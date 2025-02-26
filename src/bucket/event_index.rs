@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::BTreeMap,
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     mem,
@@ -52,11 +52,7 @@ impl OpenEventIndex {
     }
 
     /// Closes the event index, flushing the index in a background thread.
-    pub fn close(
-        self,
-        pool: &ThreadPool,
-        committed_event_offsets: Arc<HashSet<u64>>,
-    ) -> io::Result<ClosedEventIndex> {
+    pub fn close(self, pool: &ThreadPool) -> io::Result<ClosedEventIndex> {
         let id = self.id;
         let mut file_clone = self.file.try_clone()?;
         let num_slots = self.num_slots();
@@ -66,9 +62,7 @@ impl OpenEventIndex {
         pool.spawn({
             move || {
                 if let Err(err) =
-                    Self::flush_inner(&mut file_clone, &strong_index, num_slots, |_, offset| {
-                        committed_event_offsets.contains(offset)
-                    })
+                    Self::flush_inner(&mut file_clone, &strong_index, num_slots, |_, _| true)
                 {
                     panic_any(ThreadPoolError::FlushEventIndex {
                         id,
@@ -88,6 +82,44 @@ impl OpenEventIndex {
             index: Arc::new(weak_index),
         })
     }
+
+    // /// Closes the event index, flushing the index in a background thread.
+    // pub fn close(
+    //     self,
+    //     pool: &ThreadPool,
+    //     committed_event_offsets: Arc<HashSet<u64>>,
+    // ) -> io::Result<ClosedEventIndex> {
+    //     let id = self.id;
+    //     let mut file_clone = self.file.try_clone()?;
+    //     let num_slots = self.num_slots();
+    //     let strong_index = Arc::new(self.index);
+    //     let weak_index = Arc::downgrade(&strong_index);
+
+    //     pool.spawn({
+    //         move || {
+    //             if let Err(err) =
+    //                 Self::flush_inner(&mut file_clone, &strong_index, num_slots, |_, offset| {
+    //                     committed_event_offsets.contains(offset)
+    //                 })
+    //             {
+    //                 panic_any(ThreadPoolError::FlushEventIndex {
+    //                     id,
+    //                     file: file_clone,
+    //                     index: strong_index,
+    //                     num_slots: num_slots as u64,
+    //                     err,
+    //                 });
+    //             }
+    //         }
+    //     });
+
+    //     Ok(ClosedEventIndex {
+    //         id,
+    //         file: self.file,
+    //         num_slots: num_slots as u64,
+    //         index: Arc::new(weak_index),
+    //     })
+    // }
 
     pub fn get(&self, event_id: &Uuid) -> Option<u64> {
         self.index.get(event_id).copied()

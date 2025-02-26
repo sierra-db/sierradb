@@ -1,27 +1,33 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque, btree_map::Entry},
+    collections::{BTreeMap, HashMap, VecDeque, btree_map::Entry},
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     mem,
     os::unix::fs::FileExt,
     panic::panic_any,
     path::Path,
-    sync::{Arc, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicU32, Ordering},
+    },
 };
 
 use bloomfilter::Bloom;
 use rayon::ThreadPool;
-use tokio::sync::{RwLock, oneshot};
+use tokio::sync::oneshot;
 use tracing::{error, warn};
 use uuid::Uuid;
 
-use crate::{BLOOM_SEED, RANDOM_STATE, copy_bytes, error::ThreadPoolError, from_bytes};
+use crate::{
+    BLOOM_SEED, RANDOM_STATE, bucket::segment::CommittedEvents, copy_bytes, error::ThreadPoolError,
+    from_bytes,
+};
 
 use super::{
-    BucketSegmentId,
-    event_index::OpenEventIndex,
+    BucketId, BucketSegmentId, SegmentId,
     reader_thread_pool::ReaderThreadPool,
     segment::{BucketSegmentReader, EventRecord, Record},
+    writer_thread_pool::LiveIndexes,
 };
 
 const STREAM_ID_SIZE: usize = 64;
@@ -71,7 +77,7 @@ impl OpenStreamIndex {
             .open(path)?;
         let index = BTreeMap::new();
         let bloom = Bloom::new_for_fp_rate_with_seed(
-            segment_size / AVG_EVENT_SIZE / AVG_EVENTS_PER_STREAM,
+            (segment_size / AVG_EVENT_SIZE / AVG_EVENTS_PER_STREAM).max(1),
             FALSE_POSITIVE_PROBABILITY,
             &BLOOM_SEED,
         )
@@ -107,11 +113,7 @@ impl OpenStreamIndex {
     }
 
     /// Closes the stream index, flushing the index in a background thread.
-    pub fn close(
-        self,
-        pool: &ThreadPool,
-        committed_event_offsets: Arc<HashSet<u64>>,
-    ) -> io::Result<ClosedStreamIndex> {
+    pub fn close(self, pool: &ThreadPool) -> io::Result<ClosedStreamIndex> {
         let id = self.id;
         let mut file_clone = self.file.try_clone()?;
         let num_slots = self.num_slots();
@@ -122,13 +124,11 @@ impl OpenStreamIndex {
         pool.spawn({
             let bloom = Arc::clone(&bloom);
             move || {
-                if let Err(err) = Self::flush_inner(
-                    &mut file_clone,
-                    &strong_index,
-                    &bloom,
-                    num_slots,
-                    |_, offset| committed_event_offsets.contains(offset),
-                ) {
+                if let Err(err) =
+                    Self::flush_inner(&mut file_clone, &strong_index, &bloom, num_slots, |_, _| {
+                        true
+                    })
+                {
                     panic_any(ThreadPoolError::FlushStreamIndex {
                         id,
                         file: file_clone,
@@ -148,6 +148,49 @@ impl OpenStreamIndex {
             bloom,
         })
     }
+
+    // /// Closes the stream index, flushing the index in a background thread.
+    // pub fn close(
+    //     self,
+    //     pool: &ThreadPool,
+    //     committed_event_offsets: Arc<HashSet<u64>>,
+    // ) -> io::Result<ClosedStreamIndex> {
+    //     let id = self.id;
+    //     let mut file_clone = self.file.try_clone()?;
+    //     let num_slots = self.num_slots();
+    //     let strong_index = Arc::new(self.index);
+    //     let weak_index = Arc::downgrade(&strong_index);
+    //     let bloom = Arc::new(self.bloom);
+
+    //     pool.spawn({
+    //         let bloom = Arc::clone(&bloom);
+    //         move || {
+    //             if let Err(err) = Self::flush_inner(
+    //                 &mut file_clone,
+    //                 &strong_index,
+    //                 &bloom,
+    //                 num_slots,
+    //                 |_, offset| committed_event_offsets.contains(offset),
+    //             ) {
+    //                 panic_any(ThreadPoolError::FlushStreamIndex {
+    //                     id,
+    //                     file: file_clone,
+    //                     index: strong_index,
+    //                     num_slots: num_slots as u64,
+    //                     err,
+    //                 });
+    //             }
+    //         }
+    //     });
+
+    //     Ok(ClosedStreamIndex {
+    //         id,
+    //         file: self.file,
+    //         num_slots: num_slots as u64,
+    //         index: Arc::new(weak_index),
+    //         bloom,
+    //     })
+    // }
 
     pub fn get(&self, stream_id: &str) -> Option<&StreamIndexRecord<Vec<u64>>> {
         self.index.get(stream_id)
@@ -492,38 +535,56 @@ impl ClosedStreamIndex {
     }
 }
 
+#[derive(Debug)]
 pub struct EventStreamIter {
     stream_id: Arc<str>,
-    bucket_id: u16,
+    bucket_id: BucketId,
     reader_pool: ReaderThreadPool,
-    segment_id: u32,
+    segment_id: SegmentId,
     segment_offsets: VecDeque<u64>,
-    live_segment_id: Option<u32>,
+    live_segment_id: SegmentId,
     live_segment_offsets: VecDeque<u64>,
+    next_offset: Option<NextOffset>,
+    next_live_offset: Option<NextOffset>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NextOffset {
+    offset: u64,
+    segment_id: SegmentId,
 }
 
 impl EventStreamIter {
     #[allow(clippy::type_complexity)]
     pub(crate) async fn new(
         stream_id: Arc<str>,
-        bucket_id: u16,
+        bucket_id: BucketId,
         reader_pool: ReaderThreadPool,
-        live_indexes: &HashMap<u16, (u32, Arc<RwLock<(OpenEventIndex, OpenStreamIndex)>>)>,
+        live_indexes: &HashMap<BucketId, (Arc<AtomicU32>, LiveIndexes)>,
     ) -> io::Result<Self> {
-        let live_segment_id;
-        let live_segment_offsets = match live_indexes.get(&bucket_id) {
+        let mut live_segment_id = 0;
+        let mut live_segment_offsets: VecDeque<_> = match live_indexes.get(&bucket_id) {
             Some((current_live_segment_id, live_indexes)) => {
-                live_segment_id = Some(*current_live_segment_id);
+                let current_live_segment_id = current_live_segment_id.load(Ordering::Acquire);
+                live_segment_id = current_live_segment_id;
                 match live_indexes.read().await.1.get(&stream_id).cloned() {
                     Some(index) if index.version_min == 0 => {
+                        let mut live_segment_offsets: VecDeque<_> = index.offsets.into();
+                        let next_live_offset =
+                            live_segment_offsets.pop_front().map(|offset| NextOffset {
+                                offset,
+                                segment_id: current_live_segment_id,
+                            });
                         return Ok(EventStreamIter {
                             stream_id,
                             bucket_id,
                             reader_pool,
-                            segment_id: *current_live_segment_id,
+                            segment_id: current_live_segment_id,
                             segment_offsets: VecDeque::new(),
-                            live_segment_id: Some(*current_live_segment_id),
-                            live_segment_offsets: index.offsets.into(),
+                            live_segment_id: current_live_segment_id,
+                            live_segment_offsets,
+                            next_offset: None,
+                            next_live_offset,
                         });
                     }
                     Some(index) => Some(index.offsets.into()),
@@ -532,7 +593,6 @@ impl EventStreamIter {
             }
             None => {
                 warn!("live index doesn't contain this bucket");
-                live_segment_id = None;
                 None
             }
         }
@@ -546,19 +606,24 @@ impl EventStreamIter {
                     let res = readers
                         .get_mut(&bucket_id)
                         .and_then(|segments| {
-                            segments.iter().rev().find_map(|(segment_id, reader_set)| {
-                                let Some(stream_index) = &reader_set.stream_index else {
-                                    return None;
-                                };
+                            segments.iter().enumerate().rev().find_map(
+                                |(i, (segment_id, reader_set))| {
+                                    let Some(stream_index) = &reader_set.stream_index else {
+                                        return None;
+                                    };
 
-                                match stream_index.get_key(&stream_id) {
-                                    Ok(Some(index)) if index.version_min == 0 => {
-                                        Some(Ok((*segment_id, index)))
+                                    match stream_index.get_key(&stream_id) {
+                                        Ok(Some(key)) if key.version_min == 0 || i == 0 => {
+                                            match stream_index.get_from_key(key) {
+                                                Ok(offsets) => Some(Ok((*segment_id, offsets))),
+                                                Err(err) => Some(Err(err)),
+                                            }
+                                        }
+                                        Ok(_) => None,
+                                        Err(err) => Some(Err(err)),
                                     }
-                                    Ok(_) => None,
-                                    Err(err) => Some(Err(err)),
-                                }
-                            })
+                                },
+                            )
                         })
                         .transpose();
                     let _ = reply_tx.send(res);
@@ -567,11 +632,16 @@ impl EventStreamIter {
         });
 
         match reply_rx.await {
-            Ok(Ok(Some((segment_id, index)))) => {
-                let (segment_id, segment_offsets) = match index.offsets {
-                    OffsetKind::Pointer(_, _) => (segment_id, VecDeque::new()),
-                    OffsetKind::Cached(offsets) => (segment_id.saturating_add(1), offsets.into()),
-                };
+            Ok(Ok(Some((segment_id, segment_offsets)))) => {
+                let mut segment_offsets: VecDeque<_> = segment_offsets.into();
+                let next_offset = segment_offsets
+                    .pop_front()
+                    .map(|offset| NextOffset { offset, segment_id });
+                let next_live_offset = live_segment_offsets.pop_front().map(|offset| NextOffset {
+                    offset,
+                    segment_id: live_segment_id,
+                });
+
                 Ok(EventStreamIter {
                     stream_id,
                     bucket_id,
@@ -580,44 +650,49 @@ impl EventStreamIter {
                     segment_offsets,
                     live_segment_id,
                     live_segment_offsets,
+                    next_offset,
+                    next_live_offset,
                 })
             }
-            Ok(Ok(None)) | Err(_) => Ok(EventStreamIter {
-                stream_id,
-                bucket_id,
-                reader_pool,
-                segment_id: u32::MAX,
-                segment_offsets: VecDeque::new(),
-                live_segment_id,
-                live_segment_offsets,
-            }),
+            Ok(Ok(None)) | Err(_) => {
+                let next_live_offset = live_segment_offsets.pop_front().map(|offset| NextOffset {
+                    offset,
+                    segment_id: live_segment_id,
+                });
+
+                Ok(EventStreamIter {
+                    stream_id,
+                    bucket_id,
+                    reader_pool,
+                    segment_id: 0,
+                    segment_offsets: VecDeque::new(),
+                    live_segment_id,
+                    live_segment_offsets,
+                    next_offset: None,
+                    next_live_offset,
+                })
+            }
             Ok(Err(err)) => Err(err),
         }
     }
 
     pub async fn next(&mut self) -> io::Result<Option<EventRecord<'static>>> {
-        if self.segment_id == u32::MAX {
-            return Ok(None);
+        struct ReadResult {
+            events: Option<CommittedEvents<'static>>,
+            new_offsets: Option<(SegmentId, VecDeque<u64>)>,
+            is_live: bool,
         }
 
         let stream_id = Arc::clone(&self.stream_id);
         let bucket_id = self.bucket_id;
         let segment_id = self.segment_id;
-        let next_offset = match self.segment_offsets.pop_front() {
-            Some(next_offset) => Some(next_offset),
-            None => {
-                if Some(segment_id) == self.live_segment_id {
-                    match self.live_segment_offsets.pop_front() {
-                        Some(next_offset) => Some(next_offset),
-                        None => {
-                            return Ok(None);
-                        }
-                    }
-                } else {
-                    return Ok(None);
-                }
-            }
-        };
+        let live_segment_id = self.live_segment_id;
+        let next_offset = self.next_offset;
+        let next_live_offset = self.next_live_offset;
+
+        // if next_offset.is_none() && next_live_offset.is_none() && segment_id == live_segment_id {
+        //     return Ok(None);
+        // }
 
         let (reply_tx, reply_rx) = oneshot::channel();
         self.reader_pool.spawn(move |with_readers| {
@@ -625,55 +700,127 @@ impl EventStreamIter {
                 let res = readers
                     .get_mut(&bucket_id)
                     .map(|segments| {
-                        for i in segment_id..segments.len() as u32 {
-                            let Some(reader_set) = segments.get_mut(&i) else {
-                                continue;
-                            };
+                        match next_offset {
+                            Some(NextOffset { offset, segment_id }) => {
+                                // We have an offset from the last batch
+                                match segments.get_mut(&segment_id) {
+                                    Some(reader_set) => Ok(ReadResult {
+                                        events: reader_set
+                                            .reader
+                                            .read_committed_events(offset, false)?
+                                            .map(CommittedEvents::into_owned),
+                                        new_offsets: None,
+                                        is_live: false,
+                                    }),
+                                    None => Err(io::Error::new(
+                                        io::ErrorKind::NotFound,
+                                        "segment not found",
+                                    )),
+                                }
+                            }
+                            None => {
+                                // There's no more offsets in this batch, progress forwards finding the next batch
+                                for i in segment_id.saturating_add(1)
+                                    ..(segments.len() as SegmentId).min(live_segment_id)
+                                {
+                                    let Some(reader_set) = segments.get_mut(&i) else {
+                                        continue;
+                                    };
 
-                            let (next_offset, new_segment_offsets) = match next_offset {
-                                Some(offset) => (Some(offset), None),
-                                None => {
                                     let Some(stream_index) = &reader_set.stream_index else {
                                         continue;
                                     };
 
-                                    let offsets = stream_index.get(&stream_id)?;
+                                    let mut new_offsets: VecDeque<_> =
+                                        stream_index.get(&stream_id)?.into();
+                                    let Some(next_offset) = new_offsets.pop_front() else {
+                                        continue;
+                                    };
 
-                                    let mut new_segment_offsets: VecDeque<_> = offsets.into();
-                                    let next_offset = new_segment_offsets.pop_front();
-
-                                    (next_offset, Some(new_segment_offsets))
+                                    return Ok(ReadResult {
+                                        events: reader_set
+                                            .reader
+                                            .read_committed_events(next_offset, false)?
+                                            .map(CommittedEvents::into_owned),
+                                        new_offsets: Some((i, new_offsets)),
+                                        is_live: false,
+                                    });
                                 }
-                            };
-                            let Some(next_offset) = next_offset else {
-                                continue;
-                            };
 
-                            return Ok::<_, io::Error>(
-                                reader_set
-                                    .reader
-                                    .read_committed_events(next_offset, false)?
-                                    .map(|events| (events.into_owned(), new_segment_offsets)),
-                            );
+                                // No more batches found, we'll process the live offsets
+                                match next_live_offset {
+                                    Some(NextOffset { offset, segment_id }) => {
+                                        let Some(reader_set) = segments.get_mut(&segment_id) else {
+                                            return Ok(ReadResult {
+                                                events: None,
+                                                new_offsets: None,
+                                                is_live: true,
+                                            });
+                                        };
+
+                                        Ok(ReadResult {
+                                            events: reader_set
+                                                .reader
+                                                .read_committed_events(offset, false)?
+                                                .map(CommittedEvents::into_owned),
+                                            new_offsets: None,
+                                            is_live: true,
+                                        })
+                                    }
+                                    None => Ok(ReadResult {
+                                        events: None,
+                                        new_offsets: None,
+                                        is_live: true,
+                                    }),
+                                }
+                            }
                         }
-
-                        Ok(None)
                     })
-                    .transpose()
-                    .map(Option::flatten);
+                    .transpose();
                 let _ = reply_tx.send(res);
-            })
+            });
         });
 
         match reply_rx.await {
-            Ok(Ok(Some((events, new_segment_offsets)))) => {
-                if let Some(new_segment_offsets) = new_segment_offsets {
-                    self.segment_offsets = new_segment_offsets;
-                    if self.segment_offsets.is_empty() {
-                        self.segment_id = self.segment_id.saturating_add(1);
-                    }
+            Ok(Ok(Some(ReadResult {
+                events,
+                new_offsets,
+                is_live,
+            }))) => {
+                if is_live {
+                    self.segment_id = self.live_segment_id;
+                    self.next_live_offset =
+                        self.live_segment_offsets
+                            .pop_front()
+                            .map(|offset| NextOffset {
+                                offset,
+                                segment_id: self.live_segment_id,
+                            });
+                    return Ok(events.and_then(|events| events.into_iter().next()));
                 }
-                Ok(events.into_iter().next())
+
+                if let Some((new_segment, new_offsets)) = new_offsets {
+                    self.segment_id = new_segment;
+                    self.segment_offsets = new_offsets;
+                    self.next_offset = self.segment_offsets.pop_front().map(|offset| NextOffset {
+                        offset,
+                        segment_id: self.segment_id,
+                    });
+                } else {
+                    self.next_offset = self.segment_offsets.pop_front().map(|offset| NextOffset {
+                        offset,
+                        segment_id: self.segment_id,
+                    });
+                    // if self.segment_offsets.is_empty() {
+                    //     self.segment_id = self.segment_id.saturating_add(1);
+                    //     println!(
+                    //         "segment offsets is empty, incrementing to {}",
+                    //         self.segment_id
+                    //     );
+                    // }
+                }
+
+                Ok(events.and_then(|events| events.into_iter().next()))
             }
             Ok(Ok(None)) => Ok(None),
             Ok(Err(err)) => Err(err),
@@ -683,6 +830,121 @@ impl EventStreamIter {
             }
         }
     }
+
+    // pub async fn next(&mut self) -> io::Result<Option<EventRecord<'static>>> {
+    //     let stream_id = Arc::clone(&self.stream_id);
+    //     let bucket_id = self.bucket_id;
+    //     let segment_id = self.segment_id;
+    //     let next_offset = self
+    //         .segment_offsets
+    //         .pop_front()
+    //         .map(|offset| (self.segment_id, offset))
+    //         .or_else(|| {
+    //             if self.live_segment_id == Some(self.segment_id) {
+    //                 self.live_segment_offsets
+    //                     .pop_front()
+    //                     .map(|offset| (self.live_segment_id.unwrap(), offset))
+    //             } else {
+    //                 None
+    //             }
+    //         });
+
+    //     struct ReadResult {
+    //         events: Option<CommittedEvents<'static>>,
+    //         new_offsets: Option<VecDeque<u64>>,
+    //         last_segment_id: u32,
+    //     }
+
+    //     let (reply_tx, reply_rx) = oneshot::channel();
+    //     self.reader_pool.spawn(move |with_readers| {
+    //         with_readers(move |readers| {
+    //             let res = readers
+    //                 .get_mut(&bucket_id)
+    //                 .map(|segments| {
+    //                     let last_segment_id =
+    //                         segments.last_entry().map(|last| *last.key()).unwrap_or(0);
+    //                     match next_offset {
+    //                         Some((live_segment_id, next_offset)) => {
+    //                             match segments.get_mut(&live_segment_id) {
+    //                                 Some(reader_set) => Ok(ReadResult {
+    //                                     events: reader_set
+    //                                         .reader
+    //                                         .read_committed_events(next_offset, false)?
+    //                                         .map(CommittedEvents::into_owned),
+    //                                     new_offsets: None,
+    //                                     last_segment_id,
+    //                                 }),
+    //                                 None => {}
+    //                             }
+    //                         }
+    //                         None => {
+    //                             for i in segment_id..segments.len() as u32 {
+    //                                 let Some(reader_set) = segments.get_mut(&i) else {
+    //                                     continue;
+    //                                 };
+
+    //                                 let Some(stream_index) = &reader_set.stream_index else {
+    //                                     continue;
+    //                                 };
+
+    //                                 let mut new_offsets: VecDeque<_> =
+    //                                     stream_index.get(&stream_id)?.into();
+    //                                 let Some(next_offset) = new_offsets.pop_front() else {
+    //                                     continue;
+    //                                 };
+
+    //                                 return Ok(ReadResult {
+    //                                     events: reader_set
+    //                                         .reader
+    //                                         .read_committed_events(next_offset, false)?
+    //                                         .map(CommittedEvents::into_owned),
+    //                                     new_offsets: Some(new_offsets),
+    //                                     last_segment_id,
+    //                                 });
+    //                             }
+
+    //                             Ok(ReadResult {
+    //                                 events: None,
+    //                                 new_offsets: None,
+    //                                 last_segment_id,
+    //                             })
+    //                         }
+    //                     }
+    //                 })
+    //                 .transpose();
+    //             let _ = reply_tx.send(res);
+    //         })
+    //     });
+
+    //     match reply_rx.await {
+    //         Ok(Ok(Some(ReadResult {
+    //             events,
+    //             new_offsets,
+    //             last_segment_id,
+    //         }))) => {
+    //             if let Some(new_offsets) = new_offsets {
+    //                 // Only move onto the next segment if:
+    //                 //  - self.segment_offsets is empty
+    //                 //  - we didn't just read the last segment
+    //                 if self.segment_offsets.is_empty() && self.segment_id < last_segment_id {
+    //                     self.segment_id = self.segment_id.saturating_add(1);
+    //                 }
+
+    //                 self.segment_offsets = new_offsets;
+    //             } else if self.segment_offsets.is_empty() {
+    //                 self.segment_id = self.segment_id.saturating_add(1);
+    //             }
+
+    //             Ok(events.and_then(|events| events.into_iter().next()))
+    //         }
+    //         Ok(Ok(None)) => Ok(None),
+    //         Ok(Err(err)) => Err(err),
+    //         Err(_) => {
+    //             error!("no reply from reader pool");
+    //             Ok(None)
+    //         }
+    //     }
+    // }
 }
 
 #[allow(clippy::type_complexity)]
@@ -696,7 +958,7 @@ fn load_index_from_file(
 
     if file_data.is_empty() {
         let bloom = Bloom::new_for_fp_rate_with_seed(
-            segment_size / AVG_EVENT_SIZE / AVG_EVENTS_PER_STREAM,
+            (segment_size / AVG_EVENT_SIZE / AVG_EVENTS_PER_STREAM).max(1),
             FALSE_POSITIVE_PROBABILITY,
             &BLOOM_SEED,
         )

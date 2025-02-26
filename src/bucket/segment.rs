@@ -2,7 +2,7 @@ mod reader;
 mod writer;
 
 use std::{
-    io, mem,
+    mem,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -17,7 +17,7 @@ pub use self::reader::{
 };
 pub use self::writer::{AppendEvent, AppendEventBody, AppendEventHeader, BucketSegmentWriter};
 
-use super::{BucketSegmentId, flusher::FlushSender, reader_thread_pool::ReaderThreadPool};
+use super::{BucketId, flusher::FlushSender};
 
 // Segment header constants
 const MAGIC_BYTES: u32 = 0x53545645; // EVTS
@@ -30,18 +30,18 @@ const SEGMENT_HEADER_SIZE: usize =
     MAGIC_BYTES_SIZE + VERSION_SIZE + BUCKET_ID_SIZE + CREATED_AT_SIZE + PADDING_SIZE;
 
 // Record sizes
-const RECORD_HEADER_SIZE: usize = mem::size_of::<Uuid>() // Event ID
+pub const RECORD_HEADER_SIZE: usize = mem::size_of::<Uuid>() // Event ID
         + mem::size_of::<Uuid>() // Transaction ID
         + mem::size_of::<u64>() // Timestamp nanoseconds
         + mem::size_of::<u32>(); // CRC32C hash
-const EVENT_HEADER_SIZE: usize = RECORD_HEADER_SIZE
+pub const EVENT_HEADER_SIZE: usize = RECORD_HEADER_SIZE
     + mem::size_of::<u64>() // Stream version
     + mem::size_of::<Uuid>() // Correlation ID
     + mem::size_of::<u16>() // Stream ID length
     + mem::size_of::<u16>() // Event name length
     + mem::size_of::<u32>() // Metadata length
     + mem::size_of::<u32>(); // Payload length
-const COMMIT_SIZE: usize = RECORD_HEADER_SIZE + mem::size_of::<u32>(); // Event count
+pub const COMMIT_SIZE: usize = RECORD_HEADER_SIZE + mem::size_of::<u32>(); // Event count
 
 pub type WriteFn = Box<dyn FnOnce(&mut BucketSegmentWriter) + Send>;
 
@@ -250,7 +250,7 @@ pub type WriteFn = Box<dyn FnOnce(&mut BucketSegmentWriter) + Send>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BucketSegmentHeader {
     version: u16,
-    bucket_id: u16,
+    bucket_id: BucketId,
     created_at: u64,
 }
 

@@ -10,6 +10,8 @@ use std::{
 use polonius_the_crab::{exit_polonius, polonius, polonius_return, polonius_try};
 use uuid::Uuid;
 
+use crate::bucket::BucketId;
+
 use super::{
     BUCKET_ID_SIZE, BucketSegmentHeader, COMMIT_SIZE, CREATED_AT_SIZE, EVENT_HEADER_SIZE,
     FlushedOffset, MAGIC_BYTES, MAGIC_BYTES_SIZE, RECORD_HEADER_SIZE, SEGMENT_HEADER_SIZE,
@@ -44,7 +46,7 @@ pub enum CommittedEvents<'a> {
     },
 }
 
-impl<'a> CommittedEvents<'a> {
+impl CommittedEvents<'_> {
     pub fn into_owned(self) -> CommittedEvents<'static> {
         match self {
             CommittedEvents::None { next_offset } => CommittedEvents::None { next_offset },
@@ -54,8 +56,13 @@ impl<'a> CommittedEvents<'a> {
             }
         }
     }
+}
 
-    pub fn into_iter(self) -> CommittedEventsIntoIter<'a> {
+impl<'a> IntoIterator for CommittedEvents<'a> {
+    type Item = EventRecord<'static>;
+    type IntoIter = CommittedEventsIntoIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
         let inner = match self {
             CommittedEvents::None { .. } => CommittedEventsIntoIterInner::Single(None),
             CommittedEvents::Single(event) => CommittedEventsIntoIterInner::Single(Some(event)),
@@ -76,7 +83,7 @@ enum CommittedEventsIntoIterInner<'a> {
     Transaction(vec::IntoIter<EventRecord<'static>>),
 }
 
-impl<'a> Iterator for CommittedEventsIntoIter<'a> {
+impl Iterator for CommittedEventsIntoIter<'_> {
     type Item = EventRecord<'static>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -89,7 +96,6 @@ impl<'a> Iterator for CommittedEventsIntoIter<'a> {
     }
 }
 
-#[derive(Debug)]
 pub struct BucketSegmentReader {
     file: File,
     header_buf: [u8; COMMIT_SIZE],
@@ -206,7 +212,7 @@ impl BucketSegmentReader {
     }
 
     /// Reads the segments bucket ID.
-    pub fn read_bucket_id(&mut self) -> io::Result<u16> {
+    pub fn read_bucket_id(&mut self) -> io::Result<BucketId> {
         let mut bucket_id_bytes = [0u8; BUCKET_ID_SIZE];
 
         self.file
@@ -565,7 +571,7 @@ pub struct EventRecord<'a> {
     pub payload: Cow<'a, [u8]>,
 }
 
-impl<'a> EventRecord<'a> {
+impl EventRecord<'_> {
     pub fn into_owned(self) -> EventRecord<'static> {
         EventRecord {
             offset: self.offset,
