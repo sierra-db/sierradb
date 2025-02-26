@@ -45,22 +45,38 @@ const FALSE_POSITIVE_PROBABILITY: f64 = 0.001;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamIndexRecord<T> {
+    pub partition_key: Uuid,
     pub version_min: u64,
     pub version_max: u64,
-    pub partition_key: Uuid,
     offsets: T,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum OffsetKind {
+pub enum StreamOffsets {
+    Offsets(Vec<u64>), // Its cached
+    ExternalBucket,    // This stream lives in a different bucket
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClosedOffsetKind {
     Pointer(u64, u32), // Its in the file at this location
     Cached(Vec<u64>),  // Its cached
+    ExternalBucket,    // This stream lives in a different bucket
+}
+
+impl From<StreamOffsets> for ClosedOffsetKind {
+    fn from(offsets: StreamOffsets) -> Self {
+        match offsets {
+            StreamOffsets::Offsets(offsets) => ClosedOffsetKind::Cached(offsets),
+            StreamOffsets::ExternalBucket => ClosedOffsetKind::ExternalBucket,
+        }
+    }
 }
 
 pub struct OpenStreamIndex {
     id: BucketSegmentId,
     file: File,
-    index: BTreeMap<Arc<str>, StreamIndexRecord<Vec<u64>>>,
+    index: BTreeMap<Arc<str>, StreamIndexRecord<StreamOffsets>>,
     bloom: Bloom<str>,
 }
 
@@ -192,15 +208,15 @@ impl OpenStreamIndex {
     //     })
     // }
 
-    pub fn get(&self, stream_id: &str) -> Option<&StreamIndexRecord<Vec<u64>>> {
+    pub fn get(&self, stream_id: &str) -> Option<&StreamIndexRecord<StreamOffsets>> {
         self.index.get(stream_id)
     }
 
     pub fn insert(
         &mut self,
         stream_id: impl Into<Arc<str>>,
-        stream_version: u64,
         partition_key: Uuid,
+        stream_version: u64,
         offset: u64,
     ) -> io::Result<()> {
         let stream_id = stream_id.into();
@@ -221,10 +237,10 @@ impl OpenStreamIndex {
             Entry::Vacant(entry) => {
                 self.bloom.set(entry.key());
                 entry.insert(StreamIndexRecord {
+                    partition_key,
                     version_min: stream_version,
                     version_max: stream_version,
-                    partition_key,
-                    offsets: vec![offset],
+                    offsets: StreamOffsets::Offsets(vec![offset]),
                 });
             }
             Entry::Occupied(mut entry) => {
@@ -237,7 +253,69 @@ impl OpenStreamIndex {
                 }
                 entry.version_min = entry.version_min.min(stream_version);
                 entry.version_max = entry.version_max.max(stream_version);
-                entry.offsets.push(offset);
+                match &mut entry.offsets {
+                    StreamOffsets::Offsets(offsets) => {
+                        offsets.push(offset);
+                    }
+                    StreamOffsets::ExternalBucket => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "stream id already mapped to another partition key",
+                        ));
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn insert_external_bucket(
+        &mut self,
+        stream_id: impl Into<Arc<str>>,
+        partition_key: Uuid,
+    ) -> io::Result<()> {
+        let stream_id = stream_id.into();
+        if stream_id.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "stream id is empty",
+            ));
+        }
+        if stream_id.len() > STREAM_ID_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "stream id exceeds max len",
+            ));
+        }
+
+        match self.index.entry(stream_id) {
+            Entry::Vacant(entry) => {
+                self.bloom.set(entry.key());
+                entry.insert(StreamIndexRecord {
+                    partition_key,
+                    version_min: 0,
+                    version_max: 0,
+                    offsets: StreamOffsets::ExternalBucket,
+                });
+            }
+            Entry::Occupied(mut entry) => {
+                let entry = entry.get_mut();
+                if entry.partition_key != partition_key {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "partition key mismatch in stream index",
+                    ));
+                }
+                match &mut entry.offsets {
+                    StreamOffsets::Offsets(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "stream id already has offsets",
+                        ));
+                    }
+                    StreamOffsets::ExternalBucket => {}
+                }
             }
         }
 
@@ -278,15 +356,15 @@ impl OpenStreamIndex {
             match record {
                 Record::Event(EventRecord {
                     offset,
+                    partition_key,
                     stream_id,
                     stream_version,
-                    partition_key,
                     ..
                 }) => {
                     self.insert(
                         stream_id.into_owned(),
-                        stream_version,
                         partition_key,
+                        stream_version,
                         offset,
                     )?;
                 }
@@ -299,7 +377,7 @@ impl OpenStreamIndex {
 
     fn flush_inner<F>(
         file: &mut File,
-        index: &BTreeMap<Arc<str>, StreamIndexRecord<Vec<u64>>>,
+        index: &BTreeMap<Arc<str>, StreamIndexRecord<StreamOffsets>>,
         bloom: &Bloom<str>,
         num_slots: usize,
         mut filter: F,
@@ -326,48 +404,81 @@ impl OpenStreamIndex {
         ]);
 
         for (stream_id, record) in index {
-            let offsets_bytes: Vec<_> = record
-                .offsets
-                .iter()
-                .filter(|offset| filter(stream_id, offset))
-                .flat_map(|v| v.to_le_bytes())
-                .collect();
-            if offsets_bytes.is_empty() {
-                continue;
-            }
+            match &record.offsets {
+                StreamOffsets::Offsets(offsets) => {
+                    let offsets_bytes: Vec<_> = offsets
+                        .iter()
+                        .filter(|offset| filter(stream_id, offset))
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect();
+                    if offsets_bytes.is_empty() {
+                        continue;
+                    }
 
-            let mut slot = RANDOM_STATE.hash_one(stream_id) % num_slots as u64;
-            let offsets_len = record.offsets.len() as u32;
+                    let mut slot = RANDOM_STATE.hash_one(stream_id) % num_slots as u64;
+                    let offsets_len = offsets.len() as u32;
 
-            loop {
-                let mut pos = mem::size_of::<u64>()
-                    + mem::size_of::<u64>()
-                    + bloom_bytes.len()
-                    + (slot * RECORD_SIZE as u64) as usize;
-                let existing_key = &file_data[pos..pos + STREAM_ID_SIZE];
+                    loop {
+                        let mut pos = mem::size_of::<u64>()
+                            + mem::size_of::<u64>()
+                            + bloom_bytes.len()
+                            + (slot * RECORD_SIZE as u64) as usize;
+                        let existing_key = &file_data[pos..pos + STREAM_ID_SIZE];
 
-                if existing_key.iter().all(|&b| b == 0) {
-                    copy_bytes!(
-                        file_data,
-                        pos,
-                        [
-                            stream_id.as_bytes() => stream_id.len(); + STREAM_ID_SIZE,
-                            &record.version_min.to_le_bytes() => VERSION_SIZE,
-                            &record.version_max.to_le_bytes() => VERSION_SIZE,
-                            record.partition_key.as_bytes() => PARTITION_KEY_SIZE,
-                            &offset.to_le_bytes() => OFFSET_SIZE,
-                            &offsets_len.to_le_bytes() => LEN_SIZE,
-                        ]
-                    );
+                        if existing_key.iter().all(|&b| b == 0) {
+                            copy_bytes!(
+                                file_data,
+                                pos,
+                                [
+                                    stream_id.as_bytes() => stream_id.len(); + STREAM_ID_SIZE,
+                                    record.partition_key.as_bytes() => PARTITION_KEY_SIZE,
+                                    &record.version_min.to_le_bytes() => VERSION_SIZE,
+                                    &record.version_max.to_le_bytes() => VERSION_SIZE,
+                                    &offset.to_le_bytes() => OFFSET_SIZE,
+                                    &offsets_len.to_le_bytes() => LEN_SIZE,
+                                ]
+                            );
 
-                    break;
+                            break;
+                        }
+
+                        slot = (slot + 1) % num_slots as u64;
+                    }
+
+                    value_data.extend(offsets_bytes);
+                    offset += (offsets.len() * 8) as u64;
                 }
+                StreamOffsets::ExternalBucket => {
+                    let mut slot = RANDOM_STATE.hash_one(stream_id) % num_slots as u64;
 
-                slot = (slot + 1) % num_slots as u64;
+                    loop {
+                        let mut pos = mem::size_of::<u64>()
+                            + mem::size_of::<u64>()
+                            + bloom_bytes.len()
+                            + (slot * RECORD_SIZE as u64) as usize;
+                        let existing_key = &file_data[pos..pos + STREAM_ID_SIZE];
+
+                        if existing_key.iter().all(|&b| b == 0) {
+                            copy_bytes!(
+                                file_data,
+                                pos,
+                                [
+                                    stream_id.as_bytes() => stream_id.len(); + STREAM_ID_SIZE,
+                                    record.partition_key.as_bytes() => PARTITION_KEY_SIZE,
+                                    &record.version_min.to_le_bytes() => VERSION_SIZE,
+                                    &record.version_max.to_le_bytes() => VERSION_SIZE,
+                                    &u64::MAX.to_le_bytes() => OFFSET_SIZE,
+                                    &u32::MAX.to_le_bytes() => LEN_SIZE,
+                                ]
+                            );
+
+                            break;
+                        }
+
+                        slot = (slot + 1) % num_slots as u64;
+                    }
+                }
             }
-
-            value_data.extend(offsets_bytes);
-            offset += (record.offsets.len() * 8) as u64;
         }
 
         file.write_all_at(&file_data, 0)?;
@@ -387,7 +498,7 @@ pub struct ClosedStreamIndex {
     file: File,
     num_slots: u64,
     #[allow(clippy::type_complexity)]
-    index: Arc<Weak<BTreeMap<Arc<str>, StreamIndexRecord<Vec<u64>>>>>,
+    index: Arc<Weak<BTreeMap<Arc<str>, StreamIndexRecord<StreamOffsets>>>>,
     bloom: Arc<Bloom<str>>,
 }
 
@@ -423,7 +534,10 @@ impl ClosedStreamIndex {
         })
     }
 
-    pub fn get_key(&self, stream_id: &str) -> io::Result<Option<StreamIndexRecord<OffsetKind>>> {
+    pub fn get_key(
+        &self,
+        stream_id: &str,
+    ) -> io::Result<Option<StreamIndexRecord<ClosedOffsetKind>>> {
         // Read from memory.
         // This code should only run when the segment is being closed and is being flushed in the background.
         if let Some(index) = self.index.upgrade() {
@@ -434,7 +548,7 @@ impl ClosedStreamIndex {
                     version_min: record.version_min,
                     version_max: record.version_max,
                     partition_key: record.partition_key,
-                    offsets: OffsetKind::Cached(record.offsets),
+                    offsets: record.offsets.into(),
                 }));
         }
 
@@ -487,14 +601,19 @@ impl ClosedStreamIndex {
             }
 
             if stored_stream_id == stream_id {
-                let (version_min, version_max, partition_key, offset, len) =
-                    from_bytes!(buf, pos, [u64, u64, Uuid, u64, u32]);
+                let (partition_key, version_min, version_max, offset, len) =
+                    from_bytes!(buf, pos, [Uuid, u64, u64, u64, u32]);
+                let offsets = if offset == u64::MAX && len == u32::MAX {
+                    ClosedOffsetKind::ExternalBucket
+                } else {
+                    ClosedOffsetKind::Pointer(offset, len)
+                };
 
                 return Ok(Some(StreamIndexRecord {
                     version_min,
                     version_max,
                     partition_key,
-                    offsets: OffsetKind::Pointer(offset, len),
+                    offsets,
                 }));
             }
 
@@ -512,26 +631,28 @@ impl ClosedStreamIndex {
         Ok(None)
     }
 
-    pub fn get_from_key(&self, key: StreamIndexRecord<OffsetKind>) -> io::Result<Vec<u64>> {
+    pub fn get_from_key(
+        &self,
+        key: StreamIndexRecord<ClosedOffsetKind>,
+    ) -> io::Result<StreamOffsets> {
         match key.offsets {
-            OffsetKind::Pointer(offset, len) => {
+            ClosedOffsetKind::Pointer(offset, len) => {
                 let mut values_buf = vec![0u8; len as usize * 8];
                 self.file.read_exact_at(&mut values_buf, offset)?;
                 let offsets = values_buf
                     .chunks_exact(8)
                     .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
                     .collect();
-                Ok(offsets)
+                Ok(StreamOffsets::Offsets(offsets))
             }
-            OffsetKind::Cached(offsets) => Ok(offsets),
+            ClosedOffsetKind::Cached(offsets) => Ok(StreamOffsets::Offsets(offsets)),
+            ClosedOffsetKind::ExternalBucket => Ok(StreamOffsets::ExternalBucket),
         }
     }
 
-    pub fn get(&self, stream_id: &str) -> io::Result<Vec<u64>> {
-        Ok(self
-            .get_key(stream_id)
-            .and_then(|key| key.map(|key| self.get_from_key(key)).transpose())?
-            .unwrap_or_default())
+    pub fn get(&self, stream_id: &str) -> io::Result<Option<StreamOffsets>> {
+        self.get_key(stream_id)
+            .and_then(|key| key.map(|key| self.get_from_key(key)).transpose())
     }
 }
 
@@ -568,8 +689,12 @@ impl EventStreamIter {
                 let current_live_segment_id = current_live_segment_id.load(Ordering::Acquire);
                 live_segment_id = current_live_segment_id;
                 match live_indexes.read().await.1.get(&stream_id).cloned() {
-                    Some(index) if index.version_min == 0 => {
-                        let mut live_segment_offsets: VecDeque<_> = index.offsets.into();
+                    Some(StreamIndexRecord {
+                        version_min: 0,
+                        offsets: StreamOffsets::Offsets(offsets),
+                        ..
+                    }) => {
+                        let mut live_segment_offsets: VecDeque<_> = offsets.into();
                         let next_live_offset =
                             live_segment_offsets.pop_front().map(|offset| NextOffset {
                                 offset,
@@ -587,7 +712,14 @@ impl EventStreamIter {
                             next_live_offset,
                         });
                     }
-                    Some(index) => Some(index.offsets.into()),
+                    Some(StreamIndexRecord {
+                        offsets: StreamOffsets::Offsets(offsets),
+                        ..
+                    }) => Some(offsets.into()),
+                    Some(StreamIndexRecord {
+                        offsets: StreamOffsets::ExternalBucket,
+                        ..
+                    }) => None,
                     None => None,
                 }
             }
@@ -632,7 +764,7 @@ impl EventStreamIter {
         });
 
         match reply_rx.await {
-            Ok(Ok(Some((segment_id, segment_offsets)))) => {
+            Ok(Ok(Some((segment_id, StreamOffsets::Offsets(segment_offsets))))) => {
                 let mut segment_offsets: VecDeque<_> = segment_offsets.into();
                 let next_offset = segment_offsets
                     .pop_front()
@@ -654,7 +786,7 @@ impl EventStreamIter {
                     next_live_offset,
                 })
             }
-            Ok(Ok(None)) | Err(_) => {
+            Ok(Ok(Some((_, StreamOffsets::ExternalBucket)))) | Ok(Ok(None)) | Err(_) => {
                 let next_live_offset = live_segment_offsets.pop_front().map(|offset| NextOffset {
                     offset,
                     segment_id: live_segment_id,
@@ -732,7 +864,19 @@ impl EventStreamIter {
                                     };
 
                                     let mut new_offsets: VecDeque<_> =
-                                        stream_index.get(&stream_id)?.into();
+                                        match stream_index.get(&stream_id)? {
+                                            Some(StreamOffsets::Offsets(offsets)) => offsets.into(),
+                                            Some(StreamOffsets::ExternalBucket) => {
+                                                return Ok(ReadResult {
+                                                    events: None,
+                                                    new_offsets: None,
+                                                    is_live: false,
+                                                });
+                                            }
+                                            None => {
+                                                continue;
+                                            }
+                                        };
                                     let Some(next_offset) = new_offsets.pop_front() else {
                                         continue;
                                     };
@@ -951,7 +1095,10 @@ impl EventStreamIter {
 fn load_index_from_file(
     file: &mut File,
     segment_size: usize,
-) -> io::Result<(BTreeMap<Arc<str>, StreamIndexRecord<Vec<u64>>>, Bloom<str>)> {
+) -> io::Result<(
+    BTreeMap<Arc<str>, StreamIndexRecord<StreamOffsets>>,
+    Bloom<str>,
+)> {
     let mut file_data = Vec::with_capacity(file.metadata()?.len() as usize);
     file.seek(SeekFrom::Start(0))?;
     file.read_to_end(&mut file_data)?;
@@ -1014,22 +1161,27 @@ fn load_index_from_file(
             continue; // Skip empty slots
         }
 
-        let (version_min, version_max, partition_key, offset, len) =
-            from_bytes!(record_bytes, record_pos, [u64, u64, Uuid, u64, u32]);
+        let (partition_key, version_min, version_max, offset, len) =
+            from_bytes!(record_bytes, record_pos, [Uuid, u64, u64, u64, u32]);
+        let offsets = if offset == u64::MAX && len == u32::MAX {
+            StreamOffsets::ExternalBucket
+        } else {
+            let value_start = offset as usize;
+            let value_end = value_start + (len as usize * 8);
+            if value_end > file_data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "invalid value offset or length",
+                ));
+            }
 
-        let value_start = offset as usize;
-        let value_end = value_start + (len as usize * 8);
-        if value_end > file_data.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "invalid value offset or length",
-            ));
-        }
-
-        let offsets = file_data[value_start..value_end]
-            .chunks_exact(8)
-            .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
-            .collect();
+            StreamOffsets::Offsets(
+                file_data[value_start..value_end]
+                    .chunks_exact(8)
+                    .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+                    .collect(),
+            )
+        };
 
         index.insert(Arc::from(stream_id), StreamIndexRecord {
             version_min,
@@ -1106,7 +1258,7 @@ mod tests {
         let offsets = vec![42, 105];
         for (i, offset) in offsets.iter().enumerate() {
             index
-                .insert(stream_id, i as u64, partition_key, *offset)
+                .insert(stream_id, partition_key, i as u64, *offset)
                 .unwrap();
         }
 
@@ -1116,7 +1268,7 @@ mod tests {
                 version_min: 0,
                 version_max: 1,
                 partition_key,
-                offsets
+                offsets: StreamOffsets::Offsets(offsets),
             })
         );
         assert_eq!(index.get("unknown"), None);
@@ -1137,12 +1289,12 @@ mod tests {
 
         for (i, offset) in offsets1.iter().enumerate() {
             index
-                .insert(stream_id1, i as u64, partition_key1, *offset)
+                .insert(stream_id1, partition_key1, i as u64, *offset)
                 .unwrap();
         }
         for (i, offset) in offsets2.iter().enumerate() {
             index
-                .insert(stream_id2, i as u64, partition_key2, *offset)
+                .insert(stream_id2, partition_key2, i as u64, *offset)
                 .unwrap();
         }
         index.flush().unwrap();
@@ -1156,7 +1308,7 @@ mod tests {
                 version_min: 0,
                 version_max: 1,
                 partition_key: partition_key1,
-                offsets: offsets1,
+                offsets: StreamOffsets::Offsets(offsets1),
             })
         );
         assert_eq!(
@@ -1165,7 +1317,7 @@ mod tests {
                 version_min: 0,
                 version_max: 0,
                 partition_key: partition_key2,
-                offsets: offsets2,
+                offsets: StreamOffsets::Offsets(offsets2),
             })
         );
         assert_eq!(reopened_index.get("unknown"), None);
@@ -1186,12 +1338,12 @@ mod tests {
 
         for (i, offset) in offsets1.iter().enumerate() {
             index
-                .insert(stream_id1, i as u64, partition_key1, *offset)
+                .insert(stream_id1, partition_key1, i as u64, *offset)
                 .unwrap();
         }
         for (i, offset) in offsets2.iter().enumerate() {
             index
-                .insert(stream_id2, i as u64, partition_key2, *offset)
+                .insert(stream_id2, partition_key2, i as u64, *offset)
                 .unwrap();
         }
         index.flush().unwrap();
@@ -1204,20 +1356,26 @@ mod tests {
                 version_min: 0,
                 version_max: 1,
                 partition_key: partition_key1,
-                offsets: OffsetKind::Pointer(131944, 2),
+                offsets: ClosedOffsetKind::Pointer(131944, 2),
             })
         );
-        assert_eq!(closed_index.get(stream_id1).unwrap(), offsets1);
+        assert_eq!(
+            closed_index.get(stream_id1).unwrap(),
+            Some(StreamOffsets::Offsets(offsets1)),
+        );
         assert_eq!(
             closed_index.get_key(stream_id2).unwrap(),
             Some(StreamIndexRecord {
                 version_min: 0,
                 version_max: 0,
                 partition_key: partition_key2,
-                offsets: OffsetKind::Pointer(131960, 1),
+                offsets: ClosedOffsetKind::Pointer(131960, 1),
             })
         );
-        assert_eq!(closed_index.get(stream_id2).unwrap(), offsets2);
+        assert_eq!(
+            closed_index.get(stream_id2).unwrap(),
+            Some(StreamOffsets::Offsets(offsets2)),
+        );
     }
 
     #[test]
@@ -1268,22 +1426,22 @@ mod tests {
 
         for (i, offset) in offsets1.iter().enumerate() {
             index
-                .insert(stream_id1, i as u64, partition_key1, *offset)
+                .insert(stream_id1, partition_key1, i as u64, *offset)
                 .unwrap();
         }
         for (i, offset) in offsets2.iter().enumerate() {
             index
-                .insert(stream_id2, i as u64, partition_key2, *offset)
+                .insert(stream_id2, partition_key2, i as u64, *offset)
                 .unwrap();
         }
         for (i, offset) in offsets3.iter().enumerate() {
             index
-                .insert(stream_id3, i as u64, partition_key3, *offset)
+                .insert(stream_id3, partition_key3, i as u64, *offset)
                 .unwrap();
         }
         for (i, offset) in offsets4.iter().enumerate() {
             index
-                .insert(stream_id4, i as u64, partition_key4, *offset)
+                .insert(stream_id4, partition_key4, i as u64, *offset)
                 .unwrap();
         }
         index.flush().unwrap();
@@ -1297,10 +1455,13 @@ mod tests {
                 version_min: 0,
                 version_max: 1,
                 partition_key: partition_key1,
-                offsets: OffsetKind::Pointer(132376, 2),
+                offsets: ClosedOffsetKind::Pointer(132376, 2),
             })
         );
-        assert_eq!(closed_index.get(stream_id1).unwrap(), offsets1);
+        assert_eq!(
+            closed_index.get(stream_id1).unwrap(),
+            Some(StreamOffsets::Offsets(offsets1))
+        );
 
         assert_eq!(
             closed_index.get_key(stream_id2).unwrap(),
@@ -1308,10 +1469,13 @@ mod tests {
                 version_min: 0,
                 version_max: 2,
                 partition_key: partition_key2,
-                offsets: OffsetKind::Pointer(132392, 3),
+                offsets: ClosedOffsetKind::Pointer(132392, 3),
             })
         );
-        assert_eq!(closed_index.get(stream_id2).unwrap(), offsets2);
+        assert_eq!(
+            closed_index.get(stream_id2).unwrap(),
+            Some(StreamOffsets::Offsets(offsets2))
+        );
 
         assert_eq!(
             closed_index.get_key(stream_id3).unwrap(),
@@ -1319,10 +1483,13 @@ mod tests {
                 version_min: 0,
                 version_max: 1,
                 partition_key: partition_key3,
-                offsets: OffsetKind::Pointer(132416, 2),
+                offsets: ClosedOffsetKind::Pointer(132416, 2),
             })
         );
-        assert_eq!(closed_index.get(stream_id3).unwrap(), offsets3);
+        assert_eq!(
+            closed_index.get(stream_id3).unwrap(),
+            Some(StreamOffsets::Offsets(offsets3))
+        );
 
         assert_eq!(
             closed_index.get_key(stream_id4).unwrap(),
@@ -1330,12 +1497,15 @@ mod tests {
                 version_min: 0,
                 version_max: 0,
                 partition_key: partition_key4,
-                offsets: OffsetKind::Pointer(132432, 1),
+                offsets: ClosedOffsetKind::Pointer(132432, 1),
             })
         );
-        assert_eq!(closed_index.get(stream_id4).unwrap(), offsets4);
+        assert_eq!(
+            closed_index.get(stream_id4).unwrap(),
+            Some(StreamOffsets::Offsets(offsets4))
+        );
 
-        assert_eq!(closed_index.get("unknown").unwrap(), Vec::<u64>::new());
+        assert_eq!(closed_index.get("unknown").unwrap(), None);
     }
 
     #[test]
@@ -1348,7 +1518,7 @@ mod tests {
 
         let index =
             ClosedStreamIndex::open(BucketSegmentId::new(0, 0), path, SEGMENT_SIZE).unwrap();
-        assert_eq!(index.get("unknown").unwrap(), Vec::<u64>::new());
+        assert_eq!(index.get("unknown").unwrap(), None);
     }
 
     #[test]
@@ -1357,12 +1527,12 @@ mod tests {
 
         let mut index =
             OpenStreamIndex::create(BucketSegmentId::new(0, 0), &path, SEGMENT_SIZE).unwrap();
-        assert!(index.insert("", 0, Uuid::new_v4(), 0).is_err());
+        assert!(index.insert("", Uuid::new_v4(), 0, 0).is_err());
         index.flush().unwrap();
 
         let index =
             ClosedStreamIndex::open(BucketSegmentId::new(0, 0), path, SEGMENT_SIZE).unwrap();
-        assert_eq!(index.get("").unwrap(), Vec::<u64>::new());
+        assert_eq!(index.get("").unwrap(), None);
     }
 
     #[test]
@@ -1373,11 +1543,42 @@ mod tests {
 
         let mut index =
             OpenStreamIndex::create(BucketSegmentId::new(0, 0), &path, SEGMENT_SIZE).unwrap();
-        assert!(index.insert(stream_id, 0, Uuid::new_v4(), 0).is_err());
+        assert!(index.insert(stream_id, Uuid::new_v4(), 0, 0).is_err());
         index.flush().unwrap();
 
         let index =
             ClosedStreamIndex::open(BucketSegmentId::new(0, 0), path, SEGMENT_SIZE).unwrap();
-        assert_eq!(index.get(stream_id).unwrap(), Vec::<u64>::new());
+        assert_eq!(index.get(stream_id).unwrap(), None);
+    }
+
+    #[test]
+    fn test_insert_external_bucket() {
+        let path = temp_file_path();
+
+        let stream_id = "my-stream";
+        let partition_key = Uuid::new_v4();
+
+        let mut index =
+            OpenStreamIndex::create(BucketSegmentId::new(0, 0), &path, SEGMENT_SIZE).unwrap();
+        index
+            .insert_external_bucket(stream_id, partition_key)
+            .unwrap();
+        assert_eq!(
+            index.get(stream_id),
+            Some(&StreamIndexRecord {
+                partition_key,
+                version_min: 0,
+                version_max: 0,
+                offsets: StreamOffsets::ExternalBucket
+            })
+        );
+        index.flush().unwrap();
+
+        let index =
+            ClosedStreamIndex::open(BucketSegmentId::new(0, 0), &path, SEGMENT_SIZE).unwrap();
+        assert_eq!(
+            index.get(stream_id).unwrap(),
+            Some(StreamOffsets::ExternalBucket)
+        );
     }
 }

@@ -22,7 +22,7 @@ use crate::{
         stream_index::{ClosedStreamIndex, EventStreamIter},
         writer_thread_pool::{AppendEventsBatch, WriterThreadPool},
     },
-    id::{extract_event_id_bucket, stream_id_bucket},
+    id::extract_event_id_bucket,
     pool::create_thread_pool,
 };
 
@@ -119,12 +119,14 @@ impl Database {
         }
     }
 
-    pub async fn read_stream(&self, stream_id: impl Into<Arc<str>>) -> io::Result<EventStreamIter> {
-        let stream_id = stream_id.into();
-        let bucket_id = stream_id_bucket(&stream_id, self.num_buckets);
+    pub async fn read_stream(
+        &self,
+        stream_id: impl Into<Arc<str>>,
+        partition_key: Uuid,
+    ) -> io::Result<EventStreamIter> {
         EventStreamIter::new(
-            stream_id,
-            bucket_id,
+            stream_id.into(),
+            extract_event_id_bucket(partition_key, self.num_buckets),
             self.reader_pool.clone(),
             self.writer_pool.indexes(),
         )
