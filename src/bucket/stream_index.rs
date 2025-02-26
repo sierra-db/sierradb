@@ -32,12 +32,12 @@ use super::{
 
 const STREAM_ID_SIZE: usize = 64;
 const VERSION_SIZE: usize = mem::size_of::<u64>();
-const CORRELATION_ID_SIZE: usize = mem::size_of::<Uuid>();
+const PARTITION_KEY_SIZE: usize = mem::size_of::<Uuid>();
 const OFFSET_SIZE: usize = mem::size_of::<u64>();
 const LEN_SIZE: usize = mem::size_of::<u32>();
-// Stream ID, version min, version max, correlation id, offset, len
+// Stream ID, version min, version max, partition key, offset, len
 const RECORD_SIZE: usize =
-    STREAM_ID_SIZE + VERSION_SIZE + VERSION_SIZE + CORRELATION_ID_SIZE + OFFSET_SIZE + LEN_SIZE;
+    STREAM_ID_SIZE + VERSION_SIZE + VERSION_SIZE + PARTITION_KEY_SIZE + OFFSET_SIZE + LEN_SIZE;
 
 const AVG_EVENT_SIZE: usize = 350;
 const AVG_EVENTS_PER_STREAM: usize = 10;
@@ -47,7 +47,7 @@ const FALSE_POSITIVE_PROBABILITY: f64 = 0.001;
 pub struct StreamIndexRecord<T> {
     pub version_min: u64,
     pub version_max: u64,
-    pub correlation_id: Uuid,
+    pub partition_key: Uuid,
     offsets: T,
 }
 
@@ -200,7 +200,7 @@ impl OpenStreamIndex {
         &mut self,
         stream_id: impl Into<Arc<str>>,
         stream_version: u64,
-        correlation_id: Uuid,
+        partition_key: Uuid,
         offset: u64,
     ) -> io::Result<()> {
         let stream_id = stream_id.into();
@@ -223,16 +223,16 @@ impl OpenStreamIndex {
                 entry.insert(StreamIndexRecord {
                     version_min: stream_version,
                     version_max: stream_version,
-                    correlation_id,
+                    partition_key,
                     offsets: vec![offset],
                 });
             }
             Entry::Occupied(mut entry) => {
                 let entry = entry.get_mut();
-                if entry.correlation_id != correlation_id {
+                if entry.partition_key != partition_key {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        "correlation id mismatch in stream index",
+                        "partition key mismatch in stream index",
                     ));
                 }
                 entry.version_min = entry.version_min.min(stream_version);
@@ -280,13 +280,13 @@ impl OpenStreamIndex {
                     offset,
                     stream_id,
                     stream_version,
-                    correlation_id,
+                    partition_key,
                     ..
                 }) => {
                     self.insert(
                         stream_id.into_owned(),
                         stream_version,
-                        correlation_id,
+                        partition_key,
                         offset,
                     )?;
                 }
@@ -354,7 +354,7 @@ impl OpenStreamIndex {
                             stream_id.as_bytes() => stream_id.len(); + STREAM_ID_SIZE,
                             &record.version_min.to_le_bytes() => VERSION_SIZE,
                             &record.version_max.to_le_bytes() => VERSION_SIZE,
-                            record.correlation_id.as_bytes() => CORRELATION_ID_SIZE,
+                            record.partition_key.as_bytes() => PARTITION_KEY_SIZE,
                             &offset.to_le_bytes() => OFFSET_SIZE,
                             &offsets_len.to_le_bytes() => LEN_SIZE,
                         ]
@@ -433,7 +433,7 @@ impl ClosedStreamIndex {
                 .map(|record| StreamIndexRecord {
                     version_min: record.version_min,
                     version_max: record.version_max,
-                    correlation_id: record.correlation_id,
+                    partition_key: record.partition_key,
                     offsets: OffsetKind::Cached(record.offsets),
                 }));
         }
@@ -487,13 +487,13 @@ impl ClosedStreamIndex {
             }
 
             if stored_stream_id == stream_id {
-                let (version_min, version_max, correlation_id, offset, len) =
+                let (version_min, version_max, partition_key, offset, len) =
                     from_bytes!(buf, pos, [u64, u64, Uuid, u64, u32]);
 
                 return Ok(Some(StreamIndexRecord {
                     version_min,
                     version_max,
-                    correlation_id,
+                    partition_key,
                     offsets: OffsetKind::Pointer(offset, len),
                 }));
             }
@@ -1014,7 +1014,7 @@ fn load_index_from_file(
             continue; // Skip empty slots
         }
 
-        let (version_min, version_max, correlation_id, offset, len) =
+        let (version_min, version_max, partition_key, offset, len) =
             from_bytes!(record_bytes, record_pos, [u64, u64, Uuid, u64, u32]);
 
         let value_start = offset as usize;
@@ -1034,7 +1034,7 @@ fn load_index_from_file(
         index.insert(Arc::from(stream_id), StreamIndexRecord {
             version_min,
             version_max,
-            correlation_id,
+            partition_key,
             offsets,
         });
     }
@@ -1102,11 +1102,11 @@ mod tests {
             OpenStreamIndex::create(BucketSegmentId::new(0, 0), path, SEGMENT_SIZE).unwrap();
 
         let stream_id = "stream-a";
-        let correlation_id = Uuid::new_v4();
+        let partition_key = Uuid::new_v4();
         let offsets = vec![42, 105];
         for (i, offset) in offsets.iter().enumerate() {
             index
-                .insert(stream_id, i as u64, correlation_id, *offset)
+                .insert(stream_id, i as u64, partition_key, *offset)
                 .unwrap();
         }
 
@@ -1115,7 +1115,7 @@ mod tests {
             Some(&StreamIndexRecord {
                 version_min: 0,
                 version_max: 1,
-                correlation_id,
+                partition_key,
                 offsets
             })
         );
@@ -1130,19 +1130,19 @@ mod tests {
 
         let stream_id1 = "stream-a";
         let stream_id2 = "stream-b";
-        let correlation_id1 = Uuid::new_v4();
-        let correlation_id2 = Uuid::new_v4();
+        let partition_key1 = Uuid::new_v4();
+        let partition_key2 = Uuid::new_v4();
         let offsets1 = vec![1111, 2222];
         let offsets2 = vec![3333];
 
         for (i, offset) in offsets1.iter().enumerate() {
             index
-                .insert(stream_id1, i as u64, correlation_id1, *offset)
+                .insert(stream_id1, i as u64, partition_key1, *offset)
                 .unwrap();
         }
         for (i, offset) in offsets2.iter().enumerate() {
             index
-                .insert(stream_id2, i as u64, correlation_id2, *offset)
+                .insert(stream_id2, i as u64, partition_key2, *offset)
                 .unwrap();
         }
         index.flush().unwrap();
@@ -1155,7 +1155,7 @@ mod tests {
             Some(&StreamIndexRecord {
                 version_min: 0,
                 version_max: 1,
-                correlation_id: correlation_id1,
+                partition_key: partition_key1,
                 offsets: offsets1,
             })
         );
@@ -1164,7 +1164,7 @@ mod tests {
             Some(&StreamIndexRecord {
                 version_min: 0,
                 version_max: 0,
-                correlation_id: correlation_id2,
+                partition_key: partition_key2,
                 offsets: offsets2,
             })
         );
@@ -1179,19 +1179,19 @@ mod tests {
 
         let stream_id1 = "stream-a";
         let stream_id2 = "stream-b";
-        let correlation_id1 = Uuid::new_v4();
-        let correlation_id2 = Uuid::new_v4();
+        let partition_key1 = Uuid::new_v4();
+        let partition_key2 = Uuid::new_v4();
         let offsets1 = vec![1111, 2222];
         let offsets2 = vec![3333];
 
         for (i, offset) in offsets1.iter().enumerate() {
             index
-                .insert(stream_id1, i as u64, correlation_id1, *offset)
+                .insert(stream_id1, i as u64, partition_key1, *offset)
                 .unwrap();
         }
         for (i, offset) in offsets2.iter().enumerate() {
             index
-                .insert(stream_id2, i as u64, correlation_id2, *offset)
+                .insert(stream_id2, i as u64, partition_key2, *offset)
                 .unwrap();
         }
         index.flush().unwrap();
@@ -1203,7 +1203,7 @@ mod tests {
             Some(StreamIndexRecord {
                 version_min: 0,
                 version_max: 1,
-                correlation_id: correlation_id1,
+                partition_key: partition_key1,
                 offsets: OffsetKind::Pointer(131944, 2),
             })
         );
@@ -1213,7 +1213,7 @@ mod tests {
             Some(StreamIndexRecord {
                 version_min: 0,
                 version_max: 0,
-                correlation_id: correlation_id2,
+                partition_key: partition_key2,
                 offsets: OffsetKind::Pointer(131960, 1),
             })
         );
@@ -1256,10 +1256,10 @@ mod tests {
             RANDOM_STATE.hash_one(stream_id4) % 8
         );
 
-        let correlation_id1 = Uuid::new_v4();
-        let correlation_id2 = Uuid::new_v4();
-        let correlation_id3 = Uuid::new_v4();
-        let correlation_id4 = Uuid::new_v4();
+        let partition_key1 = Uuid::new_v4();
+        let partition_key2 = Uuid::new_v4();
+        let partition_key3 = Uuid::new_v4();
+        let partition_key4 = Uuid::new_v4();
 
         let offsets1 = vec![883, 44];
         let offsets2 = vec![39, 1, 429];
@@ -1268,22 +1268,22 @@ mod tests {
 
         for (i, offset) in offsets1.iter().enumerate() {
             index
-                .insert(stream_id1, i as u64, correlation_id1, *offset)
+                .insert(stream_id1, i as u64, partition_key1, *offset)
                 .unwrap();
         }
         for (i, offset) in offsets2.iter().enumerate() {
             index
-                .insert(stream_id2, i as u64, correlation_id2, *offset)
+                .insert(stream_id2, i as u64, partition_key2, *offset)
                 .unwrap();
         }
         for (i, offset) in offsets3.iter().enumerate() {
             index
-                .insert(stream_id3, i as u64, correlation_id3, *offset)
+                .insert(stream_id3, i as u64, partition_key3, *offset)
                 .unwrap();
         }
         for (i, offset) in offsets4.iter().enumerate() {
             index
-                .insert(stream_id4, i as u64, correlation_id4, *offset)
+                .insert(stream_id4, i as u64, partition_key4, *offset)
                 .unwrap();
         }
         index.flush().unwrap();
@@ -1296,7 +1296,7 @@ mod tests {
             Some(StreamIndexRecord {
                 version_min: 0,
                 version_max: 1,
-                correlation_id: correlation_id1,
+                partition_key: partition_key1,
                 offsets: OffsetKind::Pointer(132376, 2),
             })
         );
@@ -1307,7 +1307,7 @@ mod tests {
             Some(StreamIndexRecord {
                 version_min: 0,
                 version_max: 2,
-                correlation_id: correlation_id2,
+                partition_key: partition_key2,
                 offsets: OffsetKind::Pointer(132392, 3),
             })
         );
@@ -1318,7 +1318,7 @@ mod tests {
             Some(StreamIndexRecord {
                 version_min: 0,
                 version_max: 1,
-                correlation_id: correlation_id3,
+                partition_key: partition_key3,
                 offsets: OffsetKind::Pointer(132416, 2),
             })
         );
@@ -1329,7 +1329,7 @@ mod tests {
             Some(StreamIndexRecord {
                 version_min: 0,
                 version_max: 0,
-                correlation_id: correlation_id4,
+                partition_key: partition_key4,
                 offsets: OffsetKind::Pointer(132432, 1),
             })
         );

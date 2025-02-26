@@ -561,7 +561,7 @@ impl<'a> Record<'a> {
 pub struct EventRecord<'a> {
     pub offset: u64,
     pub event_id: Uuid,
-    pub correlation_id: Uuid,
+    pub partition_key: Uuid,
     pub transaction_id: Uuid,
     pub stream_version: u64,
     pub timestamp: u64,
@@ -576,7 +576,7 @@ impl EventRecord<'_> {
         EventRecord {
             offset: self.offset,
             event_id: self.event_id,
-            correlation_id: self.correlation_id,
+            partition_key: self.partition_key,
             transaction_id: self.transaction_id,
             stream_version: self.stream_version,
             timestamp: self.timestamp,
@@ -633,7 +633,7 @@ impl RecordHeader {
 
 struct EventHeader {
     stream_version: u64,
-    correlation_id: Uuid,
+    partition_key: Uuid,
     stream_id_len: usize,
     event_name_len: usize,
     metadata_len: usize,
@@ -645,7 +645,7 @@ impl EventHeader {
         let mut pos = 0;
         EventHeader {
             stream_version: u64::from_le_bytes(read_bytes!(buf, pos, 8)),
-            correlation_id: Uuid::from_bytes(read_bytes!(buf, pos, 16)),
+            partition_key: Uuid::from_bytes(read_bytes!(buf, pos, 16)),
             stream_id_len: u16::from_le_bytes(read_bytes!(buf, pos, 2)) as usize,
             event_name_len: u16::from_le_bytes(read_bytes!(buf, pos, 2)) as usize,
             metadata_len: u32::from_le_bytes(read_bytes!(buf, pos, 4)) as usize,
@@ -731,7 +731,7 @@ fn validate_and_combine_event(
         &record_header.transaction_id,
         record_header.timestamp,
         event_header.stream_version,
-        &event_header.correlation_id,
+        &event_header.partition_key,
         body.stream_id.as_bytes(),
         body.event_name.as_bytes(),
         &body.metadata,
@@ -747,7 +747,7 @@ fn validate_and_combine_event(
     Ok(EventRecord {
         offset,
         event_id: record_header.event_id,
-        correlation_id: event_header.correlation_id,
+        partition_key: event_header.partition_key,
         transaction_id: record_header.transaction_id,
         stream_version: event_header.stream_version,
         timestamp: record_header.timestamp,

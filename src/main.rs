@@ -9,7 +9,6 @@ use eventus_v2::{
     id::uuid_v7_with_stream_hash,
 };
 use tracing::Level;
-use uuid::uuid;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -19,21 +18,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let db = DatabaseBuilder::new("target/db")
         .segment_size(64_000_000)
-        .num_buckets(1)
-        .writer_pool_size(1)
-        .reader_pool_size(0)
+        .num_buckets(16)
+        .writer_pool_size(16)
+        .reader_pool_size(8)
         .flush_interval(Duration::from_millis(400))
         .open()?;
 
+    let stream_id = "user-moira";
+    let partition_key = uuid_v7_with_stream_hash(stream_id);
+
     let start = Instant::now();
-    for i in 0..5_000_000 {
-        let stream_id = "user-moira";
+    for i in 0..100_000 {
         let event_id = uuid_v7_with_stream_hash(stream_id);
-        let correlation_id = uuid!("0195342a-38aa-99a7-8297-665721686848"); // uuid_v7_with_stream_hash(stream_id);
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
-        db.append_events(AppendEventsBatch::single(1, WriteRequestEvent {
+        db.append_events(AppendEventsBatch::single(WriteRequestEvent {
             event_id,
-            correlation_id,
+            partition_key,
             stream_version: i,
             timestamp,
             stream_id: stream_id.into(),

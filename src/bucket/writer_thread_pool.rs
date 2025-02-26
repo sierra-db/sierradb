@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::{
     bucket::segment::{COMMIT_SIZE, EVENT_HEADER_SIZE},
-    id::{stream_id_bucket, validate_event_id},
+    id::{extract_event_id_bucket, validate_event_id},
 };
 
 use super::{
@@ -153,7 +153,8 @@ impl WriterThreadPool {
         &self,
         batch: AppendEventsBatch,
     ) -> oneshot::Receiver<io::Result<()>> {
-        let target_thread = bucket_to_thread(batch.bucket_id, self.num_buckets, self.num_threads);
+        let bucket_id = extract_event_id_bucket(batch.partition_key, self.num_buckets);
+        let target_thread = bucket_to_thread(bucket_id, self.num_buckets, self.num_threads);
 
         let sender = self
             .senders
@@ -163,6 +164,7 @@ impl WriterThreadPool {
         let (reply_tx, reply_rx) = oneshot::channel();
         let send_res = sender
             .send(WriteRequest::AppendEvents(Box::new(AppendEventsRequest {
+                bucket_id,
                 batch,
                 reply_tx,
             })))
@@ -206,58 +208,53 @@ impl WriterThreadPool {
 }
 
 pub struct AppendEventsBatch {
-    bucket_id: BucketId,
+    partition_key: Uuid,
     transaction_id: Uuid,
     events: SmallVec<[WriteRequestEvent; 4]>,
 }
 
 impl AppendEventsBatch {
-    pub fn single(num_buckets: u16, event: WriteRequestEvent) -> io::Result<Self> {
+    pub fn single(event: WriteRequestEvent) -> io::Result<Self> {
         if !validate_event_id(event.event_id, &event.stream_id) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "invalid event id: expected 8th and 9th bit of event id to be a hash of the correlation id",
+                "invalid event id: expected 8th and 9th bit of event id to be a hash of the partition key",
             ));
         }
 
-        let bucket_id = stream_id_bucket(&event.stream_id, num_buckets);
-
         Ok(AppendEventsBatch {
-            bucket_id,
+            partition_key: event.partition_key,
             transaction_id: Uuid::nil(),
             events: smallvec![event],
         })
     }
 
     pub fn transaction(
-        num_buckets: u16,
         events: SmallVec<[WriteRequestEvent; 4]>,
         transaction_id: Uuid,
     ) -> io::Result<Self> {
-        let Some(bucket_id) = events
+        let Some(partition_key) = events
             .iter()
             .try_fold(None, |ret, event| match ret {
-                ret @ Some((_, correlation_id)) => {
-                    if event.correlation_id != correlation_id {
-                        return Err(io::Error::new(io::ErrorKind::InvalidInput, "all events in a transaction must share the same correlation id"));
+                ret @ Some(partition_key) => {
+                    if event.partition_key != partition_key {
+                        return Err(io::Error::new(io::ErrorKind::InvalidInput, "all events in a transaction must share the same partition key"));
                     }
                     if !validate_event_id(event.event_id, &event.stream_id) {
-                        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid event id: expected 8th and 9th bit of event id to be a hash of the correlation id"));
+                        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid event id: expected 8th and 9th bit of event id to be a hash of the partition key"));
                     }
 
                     Ok(ret)
                 },
-                None => Ok(Some((
-                    stream_id_bucket(&event.stream_id, num_buckets),
-                    event.correlation_id,
-                ))),
-            })
-            .map(|opt| opt.map(|(bucket_id, _)| bucket_id))? else {
+                None => Ok(Some(
+                    event.partition_key,
+                )),
+            })? else {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "transaction has no events"));
         };
 
         Ok(AppendEventsBatch {
-            bucket_id,
+            partition_key,
             transaction_id,
             events,
         })
@@ -270,13 +267,14 @@ enum WriteRequest {
 }
 
 struct AppendEventsRequest {
+    bucket_id: BucketId,
     batch: AppendEventsBatch,
     reply_tx: oneshot::Sender<io::Result<()>>,
 }
 
 pub struct WriteRequestEvent {
     pub event_id: Uuid,
-    pub correlation_id: Uuid,
+    pub partition_key: Uuid,
     pub stream_version: u64,
     pub timestamp: u64,
     pub stream_id: Arc<str>,
@@ -307,7 +305,7 @@ impl WriterSet {
         let mut indexes = self.indexes.blocking_write();
         for PendingIndex {
             event_id,
-            correlation_id,
+            partition_key,
             stream_id,
             stream_version,
             offset,
@@ -316,7 +314,7 @@ impl WriterSet {
             indexes.0.insert(event_id, offset);
             if let Err(err) = indexes
                 .1
-                .insert(stream_id, stream_version, correlation_id, offset)
+                .insert(stream_id, stream_version, partition_key, offset)
             {
                 error!("failed to insert index: {err}");
             }
@@ -372,17 +370,16 @@ impl WriterSet {
             let mut indexes = self.indexes.blocking_write();
             for PendingIndex {
                 event_id,
-                correlation_id,
+                partition_key,
                 stream_id,
                 stream_version,
                 offset,
             } in self.pending_indexes.drain(..)
             {
                 indexes.0.insert(event_id, offset);
-                if let Err(err) =
-                    indexes
-                        .1
-                        .insert(stream_id, stream_version, correlation_id, offset)
+                if let Err(err) = indexes
+                    .1
+                    .insert(stream_id, stream_version, partition_key, offset)
                 {
                     error!("failed to insert index: {err}");
                 }
@@ -490,11 +487,12 @@ impl Worker {
             match req {
                 WriteRequest::AppendEvents(req) => {
                     let AppendEventsRequest {
+                        bucket_id,
                         batch:
                             AppendEventsBatch {
-                                bucket_id,
                                 transaction_id,
                                 events,
+                                ..
                             },
                         reply_tx,
                     } = *req;
@@ -563,7 +561,7 @@ impl Worker {
                         );
                         let header = tri!(AppendEventHeader::new(
                             &event.event_id,
-                            &event.correlation_id,
+                            &event.partition_key,
                             &transaction_id,
                             event.stream_version,
                             event.timestamp,
@@ -573,7 +571,7 @@ impl Worker {
                         let (offset, _) = tri!(writer_set.writer.append_event(append));
                         new_pending_indexes.push(PendingIndex {
                             event_id: event.event_id,
-                            correlation_id: event.correlation_id,
+                            partition_key: event.partition_key,
                             stream_id: event.stream_id,
                             stream_version: event.stream_version,
                             offset,
@@ -617,7 +615,7 @@ impl Worker {
 
 struct PendingIndex {
     event_id: Uuid,
-    correlation_id: Uuid,
+    partition_key: Uuid,
     stream_id: Arc<str>,
     stream_version: u64,
     offset: u64,

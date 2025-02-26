@@ -124,7 +124,7 @@ impl OpenBucketSegmentSet {
     pub fn append_event(
         &mut self,
         event_id: Uuid,
-        correlation_id: &Uuid,
+        partition_key: &Uuid,
         transaction_id: &Uuid,
         stream_version: u64,
         timestamp: u64,
@@ -137,7 +137,7 @@ impl OpenBucketSegmentSet {
         let body = AppendEventBody::new(&stream_id, event_name, metadata, payload);
         let header = AppendEventHeader::new(
             &event_id,
-            correlation_id,
+            partition_key,
             transaction_id,
             stream_version,
             timestamp,
