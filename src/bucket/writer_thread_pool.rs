@@ -314,7 +314,7 @@ impl WriterSet {
             indexes.0.insert(event_id, offset);
             if let Err(err) = indexes
                 .1
-                .insert(stream_id, stream_version, partition_key, offset)
+                .insert(stream_id, partition_key, stream_version, offset)
             {
                 error!("failed to insert index: {err}");
             }
@@ -379,7 +379,7 @@ impl WriterSet {
                 indexes.0.insert(event_id, offset);
                 if let Err(err) = indexes
                     .1
-                    .insert(stream_id, stream_version, partition_key, offset)
+                    .insert(stream_id, partition_key, stream_version, offset)
                 {
                     error!("failed to insert index: {err}");
                 }
