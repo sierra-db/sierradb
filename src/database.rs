@@ -26,6 +26,7 @@ use crate::{
     pool::create_thread_pool,
 };
 
+#[derive(Clone)]
 pub struct Database {
     reader_pool: ReaderThreadPool,
     writer_pool: WriterThreadPool,

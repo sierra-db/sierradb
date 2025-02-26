@@ -36,7 +36,7 @@ pub const RECORD_HEADER_SIZE: usize = mem::size_of::<Uuid>() // Event ID
         + mem::size_of::<u32>(); // CRC32C hash
 pub const EVENT_HEADER_SIZE: usize = RECORD_HEADER_SIZE
     + mem::size_of::<u64>() // Stream version
-    + mem::size_of::<Uuid>() // Correlation ID
+    + mem::size_of::<Uuid>() // Partition key
     + mem::size_of::<u16>() // Stream ID length
     + mem::size_of::<u16>() // Event name length
     + mem::size_of::<u32>() // Metadata length
@@ -274,7 +274,7 @@ fn calculate_event_crc32c(
     transaction_id: &Uuid,
     timestamp: u64,
     stream_version: u64,
-    correlation_id: &Uuid,
+    partition_key: &Uuid,
     stream_id: &[u8],
     event_name: &[u8],
     metadata: &[u8],
@@ -285,7 +285,7 @@ fn calculate_event_crc32c(
     hasher.update(transaction_id.as_bytes());
     hasher.update(&(timestamp & !0b1).to_le_bytes());
     hasher.update(&stream_version.to_le_bytes());
-    hasher.update(correlation_id.as_bytes());
+    hasher.update(partition_key.as_bytes());
     hasher.update(stream_id);
     hasher.update(event_name);
     hasher.update(metadata);
@@ -376,7 +376,7 @@ mod tests {
 
         let event_id = Uuid::new_v4();
         let transaction_id = Uuid::new_v4();
-        let correlation_id = Uuid::new_v4();
+        let partition_key = Uuid::new_v4();
         let timestamp = 1700000000;
         let stream_version = 1;
         let stream_id = "test_stream";
@@ -398,7 +398,7 @@ mod tests {
                     let body = AppendEventBody::new(stream_id, event_name, metadata, payload);
                     let header = AppendEventHeader::new(
                         &event_id,
-                        &correlation_id,
+                        &partition_key,
                         &transaction_id,
                         stream_version,
                         timestamp,
@@ -424,7 +424,7 @@ mod tests {
                 Record::Event(EventRecord {
                     offset: _,
                     event_id: rid,
-                    correlation_id: rcid,
+                    partition_key: rpk,
                     transaction_id: rtid,
                     stream_version: rsv,
                     timestamp: rts,
@@ -435,7 +435,7 @@ mod tests {
                 }) => {
                     assert_eq!(kind, 0);
                     assert_eq!(rid, event_id);
-                    assert_eq!(rcid, correlation_id);
+                    assert_eq!(rpk, partition_key);
                     assert_eq!(rtid, transaction_id);
                     assert_eq!(rsv, stream_version);
                     assert_eq!(rts, timestamp);

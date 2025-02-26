@@ -5,59 +5,6 @@ use uuid::Uuid;
 
 use crate::{RANDOM_STATE, bucket::BucketId};
 
-// pub fn generate_correlation_id(stream_id: &str) -> Uuid {
-//     // Compute a 64-bit hash (using, say, xxh3 or ahash) of the stream id.
-//     let full_hash = RANDOM_STATE.hash_one(stream_id);
-//     // Take the lower 16 bits as the partition key.
-//     let stream_hash: u16 = (full_hash & 0xFFFF) as u16;
-
-//     // Create a 128-bit value (using, for example, a custom UUID format)
-//     // where bytes 8-9 are reserved for the stream_hash.
-//     let mut bytes = [0u8; 16];
-
-//     // Fill in other parts of the correlation ID (e.g., a timestamp and random data)
-//     let timestamp = SystemTime::now()
-//         .duration_since(UNIX_EPOCH)
-//         .expect("Time went backwards")
-//         .as_millis() as u64;
-//     bytes[0..6].copy_from_slice(&timestamp.to_be_bytes()[2..]);
-
-//     // Embed the stream_hash into bytes 8-10
-//     bytes[8..10].copy_from_slice(&stream_hash.to_be_bytes());
-//     // Fill in the remaining bytes with random entropy, etc.
-//     let random_part: u64 = rand::random::<u64>() & 0xFFFFFFFFFFFF; // 48 bits
-//     bytes[10..16].copy_from_slice(&random_part.to_be_bytes()[2..]);
-
-//     Uuid::from_bytes(bytes)
-// }
-
-// pub fn generate_event_id(correlation_id: &Uuid) -> Uuid {
-//     // Get current timestamp in milliseconds (48 bits)
-//     let timestamp = SystemTime::now()
-//         .duration_since(UNIX_EPOCH)
-//         .expect("Time went backwards")
-//         .as_millis() as u64;
-//     let timestamp = timestamp & 0xFFFFFFFFFFFF; // Take only 48 bits
-
-//     // Increment atomic counter (16 bits, avoids collisions within the same millisecond)
-//     let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-
-//     // Hash correlation_id and take 16 bits for bucket mapping
-//     let correlation_hash = (RANDOM_STATE.hash_one(correlation_id) & 0xFFFF) as u16; // Take lowest 16 bits
-
-//     // Generate 48 bits of random entropy
-//     let random_part: u64 = rand::rng().random::<u64>() & 0xFFFFFFFFFFFF;
-
-//     // Construct the UUID bytes
-//     let mut bytes = [0u8; 16];
-//     bytes[0..6].copy_from_slice(&timestamp.to_be_bytes()[2..]); // 48-bit timestamp
-//     bytes[6..8].copy_from_slice(&counter.to_be_bytes()); // 16-bit counter
-//     bytes[8..10].copy_from_slice(&correlation_hash.to_be_bytes()); // 16-bit correlation hash
-//     bytes[10..16].copy_from_slice(&random_part.to_be_bytes()[2..]); // 48-bit random entropy
-
-//     Uuid::from_bytes(bytes)
-// }
-
 /// Hashes the stream id, and performs a modulo on the lowest 16 bits of the hash.
 pub fn stream_id_hash(stream_id: &str) -> u16 {
     (RANDOM_STATE.hash_one(stream_id) & 0xFFFF) as u16
@@ -125,39 +72,6 @@ pub fn extract_event_id_bucket(uuid: Uuid, num_buckets: u16) -> BucketId {
     extract_stream_hash(uuid) % num_buckets
 }
 
-// pub fn extract_bucket_from_correlation_id(correlation_id: &Uuid, num_buckets: u16) -> u16 {
-//     let bytes = correlation_id.as_bytes();
-//     let stream_hash = u16::from_be_bytes([bytes[8], bytes[9]]);
-//     stream_hash % num_buckets
-// }
-
-// pub fn extract_bucket_from_id(event_id: &Uuid, num_buckets: u16) -> u16 {
-//     let bytes = event_id.as_bytes();
-//     let correlation_hash = u16::from_be_bytes([bytes[8], bytes[9]]);
-//     correlation_hash % num_buckets
-// }
-
-// pub fn extract_buckets_with_nodes(
-//     event_id: &Uuid,
-//     num_buckets: u16,
-//     num_nodes: u16,
-//     rf: u16
-// ) -> Vec<(u16, u16)> {
-//     let bytes = event_id.as_bytes();
-//     let correlation_hash = u16::from_be_bytes([bytes[8], bytes[9]]);
-
-//     let mut primary_bucket = correlation_hash % num_buckets;
-//     let mut buckets = Vec::with_capacity(rf as usize);
-
-//     for i in 0..rf {
-//         let node_id = primary_bucket % num_nodes; // Assign bucket to a node
-//         buckets.push((primary_bucket, node_id));
-//         primary_bucket = (primary_bucket + (num_buckets / num_nodes)) % num_buckets; // Jump to next node
-//     }
-
-//     buckets
-// }
-
 pub fn validate_event_id(event_id: Uuid, stream_id: &str) -> bool {
     extract_stream_hash(event_id) == stream_id_hash(stream_id)
 }
@@ -210,18 +124,9 @@ mod tests {
         let hash3 = extract_stream_hash(id3);
         let hash4 = extract_stream_hash(id4);
 
-        assert_eq!(
-            hash1, hash2,
-            "Same correlation ID should have the same hash"
-        );
-        assert_eq!(
-            hash2, hash3,
-            "Same correlation ID should have the same hash"
-        );
-        assert_eq!(
-            hash3, hash4,
-            "Same correlation ID should have the same hash"
-        );
+        assert_eq!(hash1, hash2, "Same partition key should have the same hash");
+        assert_eq!(hash2, hash3, "Same partition key should have the same hash");
+        assert_eq!(hash3, hash4, "Same partition key should have the same hash");
     }
 
     #[test]

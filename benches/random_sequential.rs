@@ -24,7 +24,7 @@ fn setup_test_file() -> (BucketSegmentWriter, Vec<u64>) {
 
     for _ in 0..NUM_EVENTS {
         let event_id = Uuid::new_v4();
-        let correlation_id = Uuid::new_v4();
+        let partition_key = Uuid::new_v4();
         let transaction_id = Uuid::new_v4();
         let stream_id = "test-stream";
         let event_name = "TestEvent";
@@ -34,8 +34,7 @@ fn setup_test_file() -> (BucketSegmentWriter, Vec<u64>) {
         let body = AppendEventBody::new(stream_id, event_name, metadata, payload);
 
         let header =
-            AppendEventHeader::new(&event_id, &correlation_id, &transaction_id, 1, 0, body)
-                .unwrap();
+            AppendEventHeader::new(&event_id, &partition_key, &transaction_id, 1, 0, body).unwrap();
 
         let event = AppendEvent::new(header, body);
         let (offset, _) = writer.append_event(event).expect("Failed to write event");
@@ -161,7 +160,7 @@ fn benchmark_writes(c: &mut Criterion) {
             .expect("Failed to open writer");
         b.iter(|| {
             let event_id = Uuid::new_v4();
-            let correlation_id = Uuid::new_v4();
+            let partition_key = Uuid::new_v4();
             let transaction_id = Uuid::new_v4();
             let stream_id = "test-stream";
             let event_name = "TestEvent";
@@ -171,7 +170,7 @@ fn benchmark_writes(c: &mut Criterion) {
             let body = AppendEventBody::new(stream_id, event_name, metadata, payload);
 
             let header =
-                AppendEventHeader::new(&event_id, &correlation_id, &transaction_id, 1, 0, body)
+                AppendEventHeader::new(&event_id, &partition_key, &transaction_id, 1, 0, body)
                     .unwrap();
 
             let event = AppendEvent::new(header, body);

@@ -13,7 +13,7 @@ use tracing::trace;
 use uuid::Uuid;
 
 use crate::{
-    bucket::{BucketSegmentId, SegmentId, SegmentKind, file_name},
+    bucket::{BucketId, BucketSegmentId, SegmentId, SegmentKind, file_name},
     copy_bytes,
 };
 
@@ -199,7 +199,7 @@ impl BucketSegmentWriter {
                 &encoded_timestamp.to_le_bytes() => 8,
                 &crc32c.to_le_bytes() => 4,
                 &header.stream_version.to_le_bytes() => 8,
-                header.correlation_id.as_bytes() => 16,
+                header.partition_key.as_bytes() => 16,
                 &header.stream_id_len.to_le_bytes() => 2,
                 &header.event_name_len.to_le_bytes() => 2,
                 &header.metadata_len.to_le_bytes() => 4,
@@ -326,7 +326,7 @@ pub struct AppendEvent<'a> {
 #[derive(Clone, Copy)]
 pub struct AppendEventHeader<'a> {
     event_id: &'a Uuid,
-    correlation_id: &'a Uuid,
+    partition_key: &'a Uuid,
     transaction_id: &'a Uuid,
     stream_version: u64,
     timestamp: u64,
@@ -339,7 +339,7 @@ pub struct AppendEventHeader<'a> {
 impl<'a> AppendEventHeader<'a> {
     pub fn new(
         event_id: &'a Uuid,
-        correlation_id: &'a Uuid,
+        partition_key: &'a Uuid,
         transaction_id: &'a Uuid,
         stream_version: u64,
         timestamp: u64,
@@ -347,7 +347,7 @@ impl<'a> AppendEventHeader<'a> {
     ) -> io::Result<Self> {
         Ok(AppendEventHeader {
             event_id,
-            correlation_id,
+            partition_key,
             transaction_id,
             stream_version,
             timestamp,
@@ -417,7 +417,7 @@ impl<'a> AppendEvent<'a> {
             header.transaction_id,
             header.timestamp,
             header.stream_version,
-            header.correlation_id,
+            header.partition_key,
             body.stream_id,
             body.event_name,
             body.metadata,
