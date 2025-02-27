@@ -1,14 +1,16 @@
 use std::{
+    sync::Arc,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use eventus_v2::{
     bucket::writer_thread_pool::{AppendEventsBatch, WriteRequestEvent},
-    database::DatabaseBuilder,
-    id::uuid_v7_with_stream_hash,
+    database::{DatabaseBuilder, ExpectedVersion},
+    id::{extract_stream_hash, uuid_v7_with_stream_hash},
 };
 use tracing::Level;
+use uuid::uuid;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -25,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .open()?;
 
     let stream_id = "user-moira";
-    let partition_key = uuid_v7_with_stream_hash(stream_id);
+    let partition_key = uuid!("01954393-2f13-ae47-8297-67a33f5422ab"); // uuid_v7_with_stream_hash(stream_id);
 
     let start = Instant::now();
     for i in 0..100_000 {
@@ -34,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         db.append_events(AppendEventsBatch::single(WriteRequestEvent {
             event_id,
             partition_key,
-            stream_version: i,
+            stream_version: ExpectedVersion::Exact(i + 200_000),
             timestamp,
             stream_id: stream_id.into(),
             event_name: "ActuallySuperGay".to_string(),
@@ -46,6 +48,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let end = start.elapsed();
     println!("{end:?}");
     thread::sleep(Duration::from_secs(1));
+
+    let latest = db
+        .read_stream_latest_version(&Arc::from(stream_id), extract_stream_hash(partition_key))
+        .await?;
+    dbg!(latest);
 
     // let event = db.read_event(event_id).await?;
     // dbg!(event);

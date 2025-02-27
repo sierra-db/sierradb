@@ -30,7 +30,7 @@ use super::{
     writer_thread_pool::LiveIndexes,
 };
 
-const STREAM_ID_SIZE: usize = 64;
+pub const STREAM_ID_SIZE: usize = 64;
 const VERSION_SIZE: usize = mem::size_of::<u64>();
 const PARTITION_KEY_SIZE: usize = mem::size_of::<Uuid>();
 const OFFSET_SIZE: usize = mem::size_of::<u64>();
@@ -48,7 +48,7 @@ pub struct StreamIndexRecord<T> {
     pub partition_key: Uuid,
     pub version_min: u64,
     pub version_max: u64,
-    offsets: T,
+    pub offsets: T,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
