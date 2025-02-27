@@ -1,6 +1,6 @@
 use std::{
     fs::File,
-    io::{self, Write},
+    io::Write,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -10,6 +10,8 @@ use std::{
 };
 
 use tracing::error;
+
+use crate::error::WriteError;
 
 #[derive(Clone, Debug)]
 pub struct FlushSender(FlushSenderInner);
@@ -32,11 +34,12 @@ impl FlushSender {
         file: &mut File,
         offset: u64,
         global_offset: &Arc<AtomicU64>,
-    ) -> io::Result<()> {
+    ) -> Result<(), WriteError> {
         match &self.0 {
             FlushSenderInner::Local => {
                 file.flush()?;
                 global_offset.store(offset, Ordering::Release);
+
                 Ok(())
             }
             FlushSenderInner::Sender(tx) => {
@@ -45,6 +48,7 @@ impl FlushSender {
                     offset,
                     global_offset: Arc::clone(global_offset),
                 });
+
                 Ok(())
             }
         }

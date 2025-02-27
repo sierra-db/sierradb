@@ -10,7 +10,7 @@ use std::{
 use polonius_the_crab::{exit_polonius, polonius, polonius_return, polonius_try};
 use uuid::Uuid;
 
-use crate::bucket::BucketId;
+use crate::{bucket::BucketId, error::ReadError};
 
 use super::{
     BUCKET_ID_SIZE, BucketSegmentHeader, COMMIT_SIZE, CREATED_AT_SIZE, EVENT_HEADER_SIZE,
@@ -111,7 +111,7 @@ pub struct BucketSegmentReader {
 
 impl BucketSegmentReader {
     /// Opens a segment as read only.
-    pub fn open(path: impl AsRef<Path>, flushed_offset: FlushedOffset) -> io::Result<Self> {
+    pub fn open(path: impl AsRef<Path>, flushed_offset: FlushedOffset) -> Result<Self, ReadError> {
         // On OSX, gives ~5% better performance for both random and sequential reads
         const O_DIRECT: i32 = 0o0040000;
         let file = OpenOptions::new()
@@ -134,7 +134,7 @@ impl BucketSegmentReader {
         })
     }
 
-    pub fn try_clone(&self) -> io::Result<Self> {
+    pub fn try_clone(&self) -> Result<Self, ReadError> {
         Ok(BucketSegmentReader {
             file: self.file.try_clone()?,
             header_buf: self.header_buf,
@@ -148,7 +148,7 @@ impl BucketSegmentReader {
     }
 
     /// Reads the segments header.
-    pub fn read_segment_header(&mut self) -> io::Result<BucketSegmentHeader> {
+    pub fn read_segment_header(&mut self) -> Result<BucketSegmentHeader, ReadError> {
         let mut header_bytes = [0u8; VERSION_SIZE + BUCKET_ID_SIZE + CREATED_AT_SIZE];
 
         self.file.seek(SeekFrom::Start(MAGIC_BYTES_SIZE as u64))?;
@@ -192,7 +192,7 @@ impl BucketSegmentReader {
     }
 
     /// Validates the segments magic bytes.
-    pub fn validate_magic_bytes(&mut self) -> io::Result<bool> {
+    pub fn validate_magic_bytes(&mut self) -> Result<bool, ReadError> {
         let mut magic_bytes = [0u8; MAGIC_BYTES_SIZE];
 
         self.file.seek(SeekFrom::Start(0))?;
@@ -202,7 +202,7 @@ impl BucketSegmentReader {
     }
 
     /// Reads the segments version.
-    pub fn read_version(&mut self) -> io::Result<u16> {
+    pub fn read_version(&mut self) -> Result<u16, ReadError> {
         let mut version_bytes = [0u8; VERSION_SIZE];
 
         self.file.seek(SeekFrom::Start(MAGIC_BYTES_SIZE as u64))?;
@@ -212,7 +212,7 @@ impl BucketSegmentReader {
     }
 
     /// Reads the segments bucket ID.
-    pub fn read_bucket_id(&mut self) -> io::Result<BucketId> {
+    pub fn read_bucket_id(&mut self) -> Result<BucketId, ReadError> {
         let mut bucket_id_bytes = [0u8; BUCKET_ID_SIZE];
 
         self.file
@@ -223,7 +223,7 @@ impl BucketSegmentReader {
     }
 
     /// Reads the segments created at date.
-    pub fn read_created_at(&mut self) -> io::Result<u64> {
+    pub fn read_created_at(&mut self) -> Result<u64, ReadError> {
         let mut created_at_bytes = [0u8; CREATED_AT_SIZE];
 
         self.file.seek(SeekFrom::Start(
@@ -238,59 +238,60 @@ impl BucketSegmentReader {
         &mut self,
         mut offset: u64,
         sequential: bool,
-    ) -> io::Result<Option<CommittedEvents<'_>>> {
+    ) -> Result<Option<CommittedEvents<'_>>, ReadError> {
         let mut this = self;
         let mut events = Vec::new();
         let mut pending_transaction_id = Uuid::nil();
         loop {
-            (events, offset) =
-                polonius!(|this| -> io::Result<Option<CommittedEvents<'polonius>>> {
-                    let record = polonius_try!(this.read_record(offset, sequential));
-                    match record {
-                        Some(Record::Event(
-                            event @ EventRecord {
-                                offset,
-                                transaction_id,
-                                ..
-                            },
-                        )) => {
-                            let next_offset = offset + event.len();
+            (events, offset) = polonius!(|this| -> Result<
+                Option<CommittedEvents<'polonius>>,
+                ReadError,
+            > {
+                let record = polonius_try!(this.read_record(offset, sequential));
+                match record {
+                    Some(Record::Event(
+                        event @ EventRecord {
+                            offset,
+                            transaction_id,
+                            ..
+                        },
+                    )) => {
+                        let next_offset = offset + event.len();
 
-                            if transaction_id.is_nil() {
-                                // Events with nil transaction ids are always approved
-                                if events.is_empty() {
-                                    // If its the first event we encountered, then return it alone
-                                    polonius_return!(Ok(Some(CommittedEvents::Single(event))));
-                                }
-
-                                events.push(event.into_owned());
-                            } else if transaction_id != pending_transaction_id {
-                                // Unexpected transaction, we'll start a new pending transaction
-                                events = vec![event.into_owned()];
-                                pending_transaction_id = transaction_id;
-                            } else {
-                                // Event belongs to the transaction
-                                events.push(event.into_owned());
+                        if transaction_id.is_nil() {
+                            // Events with nil transaction ids are always approved
+                            if events.is_empty() {
+                                // If its the first event we encountered, then return it alone
+                                polonius_return!(Ok(Some(CommittedEvents::Single(event))));
                             }
 
-                            exit_polonius!((events, next_offset))
+                            events.push(event.into_owned());
+                        } else if transaction_id != pending_transaction_id {
+                            // Unexpected transaction, we'll start a new pending transaction
+                            events = vec![event.into_owned()];
+                            pending_transaction_id = transaction_id;
+                        } else {
+                            // Event belongs to the transaction
+                            events.push(event.into_owned());
                         }
-                        Some(Record::Commit(commit)) => {
-                            if commit.transaction_id == pending_transaction_id && !events.is_empty()
-                            {
-                                polonius_return!(Ok(Some(CommittedEvents::Transaction {
-                                    events,
-                                    commit,
-                                })));
-                            }
 
-                            polonius_return!(Ok(Some(CommittedEvents::None {
-                                next_offset: commit.offset + COMMIT_SIZE as u64
+                        exit_polonius!((events, next_offset))
+                    }
+                    Some(Record::Commit(commit)) => {
+                        if commit.transaction_id == pending_transaction_id && !events.is_empty() {
+                            polonius_return!(Ok(Some(CommittedEvents::Transaction {
+                                events,
+                                commit,
                             })));
                         }
-                        None => polonius_return!(Ok(None)),
+
+                        polonius_return!(Ok(Some(CommittedEvents::None {
+                            next_offset: commit.offset + COMMIT_SIZE as u64
+                        })));
                     }
-                });
+                    None => polonius_return!(Ok(None)),
+                }
+            });
         }
     }
 
@@ -305,7 +306,7 @@ impl BucketSegmentReader {
         &mut self,
         start_offset: u64,
         sequential: bool,
-    ) -> io::Result<Option<Record<'_>>> {
+    ) -> Result<Option<Record<'_>>, ReadError> {
         // This is the only check needed. We don't need to check for the event body,
         // since if the offset supports this header read, then the event body would have also been written too for the flush.
         if start_offset + COMMIT_SIZE as u64 > self.flushed_offset.load() {
@@ -337,10 +338,7 @@ impl BucketSegmentReader {
             self.read_commit_body(start_offset, record_header, event_count)
                 .map(|commit| Some(Record::Commit(commit)))
         } else {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Unknown record type",
-            ))
+            Err(ReadError::UnknownRecordType(record_header.record_type))
         }
     }
 
@@ -350,7 +348,7 @@ impl BucketSegmentReader {
         record_header: RecordHeader,
         mut offset: u64,
         sequential: bool,
-    ) -> io::Result<EventRecord<'_>> {
+    ) -> Result<EventRecord<'_>, ReadError> {
         let length = EVENT_HEADER_SIZE - RECORD_HEADER_SIZE;
         let header_buf = if sequential {
             self.read_from_read_ahead(offset, length)?
@@ -384,17 +382,14 @@ impl BucketSegmentReader {
         offset: u64,
         record_header: RecordHeader,
         event_count: u32,
-    ) -> io::Result<CommitRecord> {
+    ) -> Result<CommitRecord, ReadError> {
         let new_crc32c = calculate_commit_crc32c(
             &record_header.transaction_id,
             record_header.timestamp,
             event_count,
         );
         if record_header.crc32c != new_crc32c {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "mismatching commit crc32c hash",
-            ));
+            return Err(ReadError::Crc32cMismatch { offset });
         }
 
         Ok(CommitRecord {
@@ -405,7 +400,7 @@ impl BucketSegmentReader {
         })
     }
 
-    fn fill_read_ahead(&mut self, offset: u64, mut length: usize) -> io::Result<()> {
+    fn fill_read_ahead(&mut self, offset: u64, mut length: usize) -> Result<(), ReadError> {
         let end_offset = offset + length as u64;
 
         // Set the new read-ahead offset aligned to 64KB
@@ -439,7 +434,7 @@ impl BucketSegmentReader {
         Ok(())
     }
 
-    fn read_from_read_ahead(&mut self, offset: u64, length: usize) -> io::Result<&[u8]> {
+    fn read_from_read_ahead(&mut self, offset: u64, length: usize) -> Result<&[u8], ReadError> {
         let end_offset = offset + length as u64;
 
         // If offset is within the valid read-ahead range
@@ -460,7 +455,8 @@ impl BucketSegmentReader {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "requested data exceeds available read-ahead buffer",
-            ));
+            )
+            .into());
         }
 
         let start = (offset - self.read_ahead_offset) as usize;
@@ -474,34 +470,36 @@ pub struct BucketSegmentIter<'a> {
 }
 
 impl BucketSegmentIter<'_> {
-    pub fn next_committed_events(&mut self) -> io::Result<Option<CommittedEvents<'_>>> {
+    pub fn next_committed_events(&mut self) -> Result<Option<CommittedEvents<'_>>, ReadError> {
         let mut this = self;
         loop {
-            polonius!(|this| -> io::Result<Option<CommittedEvents<'polonius>>> {
-                match this.reader.read_committed_events(this.offset, true) {
-                    Ok(Some(events)) => {
-                        match &events {
-                            CommittedEvents::None { next_offset } => {
-                                this.offset = *next_offset;
-                                exit_polonius!();
+            polonius!(
+                |this| -> Result<Option<CommittedEvents<'polonius>>, ReadError> {
+                    match this.reader.read_committed_events(this.offset, true) {
+                        Ok(Some(events)) => {
+                            match &events {
+                                CommittedEvents::None { next_offset } => {
+                                    this.offset = *next_offset;
+                                    exit_polonius!();
+                                }
+                                CommittedEvents::Single(event) => {
+                                    this.offset = event.offset + event.len();
+                                }
+                                CommittedEvents::Transaction { commit, .. } => {
+                                    this.offset = commit.offset + COMMIT_SIZE as u64;
+                                }
                             }
-                            CommittedEvents::Single(event) => {
-                                this.offset = event.offset + event.len();
-                            }
-                            CommittedEvents::Transaction { commit, .. } => {
-                                this.offset = commit.offset + COMMIT_SIZE as u64;
-                            }
+                            polonius_return!(Ok(Some(events)));
                         }
-                        polonius_return!(Ok(Some(events)));
+                        Ok(None) => polonius_return!(Ok(None)),
+                        Err(err) => polonius_return!(Err(err)),
                     }
-                    Ok(None) => polonius_return!(Ok(None)),
-                    Err(err) => polonius_return!(Err(err)),
                 }
-            });
+            );
         }
     }
 
-    pub fn next_record(&mut self) -> io::Result<Option<Record<'_>>> {
+    pub fn next_record(&mut self) -> Result<Option<Record<'_>>, ReadError> {
         match self.reader.read_record(self.offset, true) {
             Ok(Some(record)) => {
                 self.offset = record.offset() + record.len();
@@ -666,15 +664,15 @@ struct EventBody<'a> {
 }
 
 impl<'a> EventBody<'a> {
-    fn from_bytes(event_header: &EventHeader, buf: &'a [u8]) -> io::Result<EventBody<'a>> {
+    fn from_bytes(event_header: &EventHeader, buf: &'a [u8]) -> Result<EventBody<'a>, ReadError> {
         let mut pos = 0;
 
         let stream_id = std::str::from_utf8(&buf[pos..pos + event_header.stream_id_len])
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid utf8 stream id"))?;
+            .map_err(ReadError::InvalidStreamIdUtf8)?;
         pos += event_header.stream_id_len;
 
         let event_name = std::str::from_utf8(&buf[pos..pos + event_header.event_name_len])
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid utf8 event name"))?;
+            .map_err(ReadError::InvalidEventNameUtf8)?;
         pos += event_header.event_name_len;
 
         let metadata = &buf[pos..pos + event_header.metadata_len];
@@ -693,16 +691,16 @@ impl<'a> EventBody<'a> {
     fn from_bytes_owned(
         event_header: &EventHeader,
         mut buf: Vec<u8>,
-    ) -> io::Result<EventBody<'static>> {
+    ) -> Result<EventBody<'static>, ReadError> {
         let mut pos = 0;
 
         let stream_id = std::str::from_utf8(&buf[pos..pos + event_header.stream_id_len])
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid utf8 stream id"))?
+            .map_err(ReadError::InvalidStreamIdUtf8)?
             .to_owned();
         pos += event_header.stream_id_len;
 
         let event_name = std::str::from_utf8(&buf[pos..pos + event_header.event_name_len])
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid utf8 event name"))?
+            .map_err(ReadError::InvalidEventNameUtf8)?
             .to_owned();
         pos += event_header.event_name_len;
 
@@ -725,7 +723,7 @@ fn validate_and_combine_event(
     record_header: RecordHeader,
     event_header: EventHeader,
     body: EventBody<'_>,
-) -> io::Result<EventRecord<'_>> {
+) -> Result<EventRecord<'_>, ReadError> {
     let new_crc32c = calculate_event_crc32c(
         &record_header.event_id,
         &record_header.transaction_id,
@@ -738,10 +736,7 @@ fn validate_and_combine_event(
         &body.payload,
     );
     if record_header.crc32c != new_crc32c {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "mismatching event crc32c hash",
-        ));
+        return Err(ReadError::Crc32cMismatch { offset });
     }
 
     Ok(EventRecord {

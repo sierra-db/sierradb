@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, Seek, SeekFrom, Write},
+    io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::{
     bucket::{BucketId, BucketSegmentId, SegmentId, SegmentKind, file_name},
     copy_bytes,
+    error::{EventValidationError, WriteError},
 };
 
 use super::{
@@ -41,7 +42,7 @@ impl BucketSegmentWriter {
         path: impl AsRef<Path>,
         bucket_id: BucketId,
         flush_tx: FlushSender,
-    ) -> io::Result<Self> {
+    ) -> Result<Self, WriteError> {
         let file = OpenOptions::new()
             .read(false)
             .write(true)
@@ -62,10 +63,7 @@ impl BucketSegmentWriter {
             dirty: false,
         };
 
-        let created_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "time went backwards"))?
-            .as_nanos() as u64;
+        let created_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
         writer.write_segment_header(&BucketSegmentHeader {
             version: 0,
             bucket_id,
@@ -77,7 +75,7 @@ impl BucketSegmentWriter {
     }
 
     /// Opens a segment for writing.
-    pub fn open(path: impl AsRef<Path>, flush_tx: FlushSender) -> io::Result<Self> {
+    pub fn open(path: impl AsRef<Path>, flush_tx: FlushSender) -> Result<Self, WriteError> {
         let mut file = OpenOptions::new().read(false).write(true).open(path)?;
         let buf = vec![0u8; WRITE_BUF_SIZE].into_boxed_slice();
         let pos = 0;
@@ -99,7 +97,7 @@ impl BucketSegmentWriter {
         bucket_id: BucketId,
         dir: impl AsRef<Path>,
         flush_tx: FlushSender,
-    ) -> io::Result<(BucketSegmentId, Self)> {
+    ) -> Result<(BucketSegmentId, Self), WriteError> {
         let dir = dir.as_ref();
         let prefix = format!("{:05}-", bucket_id);
         let suffix = format!(".{}.dat", SegmentKind::Events);
@@ -150,7 +148,7 @@ impl BucketSegmentWriter {
     }
 
     /// Writes the segment's header.
-    pub fn write_segment_header(&mut self, header: &BucketSegmentHeader) -> io::Result<()> {
+    pub fn write_segment_header(&mut self, header: &BucketSegmentHeader) -> Result<(), WriteError> {
         let mut buf = [0u8; SEGMENT_HEADER_SIZE];
         let mut pos = 0;
 
@@ -181,7 +179,7 @@ impl BucketSegmentWriter {
             body,
             crc32c,
         }: AppendEvent<'_>,
-    ) -> io::Result<(u64, usize)> {
+    ) -> Result<(u64, usize), WriteError> {
         let offset = self.file_size + self.pos as u64;
         let encoded_timestamp = header.timestamp & !0b1;
 
@@ -234,7 +232,7 @@ impl BucketSegmentWriter {
         transaction_id: &Uuid,
         timestamp: u64,
         event_count: u32,
-    ) -> io::Result<(u64, usize)> {
+    ) -> Result<(u64, usize), WriteError> {
         let offset = self.file_size + self.pos as u64;
         let event_id = Uuid::nil(); // Always a zero UUID for commits
         let encoded_timestamp = timestamp | 0b1;
@@ -275,21 +273,23 @@ impl BucketSegmentWriter {
         self.pos
     }
 
-    pub fn set_len(&mut self, offset: u64) -> io::Result<()> {
+    pub fn set_len(&mut self, offset: u64) -> Result<(), WriteError> {
         if offset < self.file_size {
             self.file.set_len(offset)?;
         }
+
         Ok(())
     }
 
     /// Flushes the segment, ensuring all data is persisted to disk.
-    pub fn flush(&mut self) -> io::Result<()> {
+    pub fn flush(&mut self) -> Result<(), WriteError> {
         if self.dirty {
             trace!("flushing writer");
             self.flush_buf()?;
             self.file.flush()?;
             self.flushed_offset.store(self.file_size, Ordering::Release);
         }
+
         Ok(())
     }
 
@@ -297,13 +297,13 @@ impl BucketSegmentWriter {
     ///
     /// If the `FlushSender` is not local, then the flush will occur in a background thread, and will not be persisted
     /// when the function returns.
-    pub fn flush_async(&mut self) -> io::Result<()> {
+    pub fn flush_async(&mut self) -> Result<(), WriteError> {
         self.flush_buf()?;
         self.flush_tx
             .flush_async(&mut self.file, self.file_size, &self.flushed_offset)
     }
 
-    fn flush_buf(&mut self) -> io::Result<()> {
+    fn flush_buf(&mut self) -> Result<(), WriteError> {
         if self.pos > 0 {
             let pos = self.pos;
             self.file.write_all(&self.buf[..pos])?;
@@ -344,7 +344,7 @@ impl<'a> AppendEventHeader<'a> {
         stream_version: u64,
         timestamp: u64,
         body: AppendEventBody<'a>,
-    ) -> io::Result<Self> {
+    ) -> Result<Self, EventValidationError> {
         Ok(AppendEventHeader {
             event_id,
             partition_key,
@@ -355,22 +355,22 @@ impl<'a> AppendEventHeader<'a> {
                 .stream_id
                 .len()
                 .try_into()
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "stream id too long"))?,
+                .map_err(|_| EventValidationError::InvalidStreamIdLen)?,
             event_name_len: body
                 .event_name
                 .len()
                 .try_into()
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "event id too long"))?,
+                .map_err(|_| EventValidationError::EventNameTooLong)?,
             metadata_len: body
                 .metadata
                 .len()
                 .try_into()
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "metadata too big"))?,
+                .map_err(|_| EventValidationError::MetadataTooLong)?,
             payload_len: body
                 .payload
                 .len()
                 .try_into()
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "payload too big"))?,
+                .map_err(|_| EventValidationError::PayloadTooLong)?,
         })
     }
 }
