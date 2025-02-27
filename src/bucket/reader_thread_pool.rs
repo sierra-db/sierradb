@@ -50,22 +50,27 @@ impl ReaderThreadPool {
         })
     }
 
+    // pub fn install<OP, IN, OPR, INR>(&self, op: OP) -> OPR
+    // where
+    //     OP: FnOnce(fn(IN)) -> OPR + Send,
+    //     IN: FnOnce(&mut HashMap<BucketId, BTreeMap<SegmentId, ReaderSet>>) -> INR,
+    //     OPR: Send,
+    // {
+    //     self.pool.install(|| {
+    //         let with_reader = |op: IN| READERS.with_borrow_mut(op);
+    //         op(with_reader as fn(_))
+    //     })
+    // }
+
     pub fn install<OP, R, IN, RR>(&self, op: OP) -> R
     where
-        OP: FnOnce(fn(BucketSegmentId, IN) -> RR) -> R + Send,
-        IN: FnOnce(Option<&mut ReaderSet>) -> RR,
+        OP: FnOnce(fn(IN) -> RR) -> R + Send,
+        IN: FnOnce(&mut HashMap<BucketId, BTreeMap<SegmentId, ReaderSet>>) -> RR,
         R: Send,
     {
         self.pool.install(|| {
-            let with_reader = |bucket_segment_id: BucketSegmentId, op: IN| {
-                READERS.with_borrow_mut(|readers| {
-                    match readers.get_mut(&bucket_segment_id.bucket_id) {
-                        Some(segments) => op(segments.get_mut(&bucket_segment_id.segment_id)),
-                        None => op(None),
-                    }
-                })
-            };
-            op(with_reader as fn(_, _) -> _)
+            let with_reader = |op: IN| READERS.with_borrow_mut(op);
+            op(with_reader as fn(_) -> _)
         })
     }
 

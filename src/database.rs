@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, hash_map::Entry},
     fs, io,
     path::PathBuf,
     sync::{
@@ -19,10 +19,13 @@ use crate::{
         event_index::ClosedEventIndex,
         reader_thread_pool::ReaderThreadPool,
         segment::{BucketSegmentReader, CommittedEvents, EventRecord, FlushedOffset},
-        stream_index::{ClosedStreamIndex, EventStreamIter},
+        stream_index::{ClosedStreamIndex, EventStreamIter, StreamIndexRecord, StreamOffsets},
         writer_thread_pool::{AppendEventsBatch, WriterThreadPool},
     },
-    id::extract_event_id_bucket,
+    id::{
+        extract_event_id_bucket, extract_stream_hash, partition_id_to_bucket,
+        stream_id_partition_id,
+    },
     pool::create_thread_pool,
 };
 
@@ -131,6 +134,86 @@ impl Database {
             self.writer_pool.indexes(),
         )
         .await
+    }
+
+    pub async fn read_stream_latest_version(
+        &self,
+        stream_id: &Arc<str>,
+        partition_id: u16,
+    ) -> io::Result<Option<StreamLatestVersion>> {
+        let root_bucket_id = partition_id_to_bucket(partition_id, self.num_buckets);
+        let latest = self
+            .writer_pool
+            .with_stream_index(root_bucket_id, |_, stream_index| {
+                stream_index.get(stream_id).map(
+                    |StreamIndexRecord {
+                         partition_key,
+                         version_max,
+                         offsets,
+                         ..
+                     }| {
+                        match offsets {
+                            StreamOffsets::Offsets(_) => StreamLatestVersion::LatestVersion {
+                                partition_key: *partition_key,
+                                version: *version_max,
+                            },
+                            StreamOffsets::ExternalBucket => StreamLatestVersion::ExternalBucket {
+                                partition_key: *partition_key,
+                            },
+                        }
+                    },
+                )
+            })
+            .await
+            .flatten();
+        if let Some(latest) = latest {
+            return Ok(Some(latest));
+        }
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.reader_pool.spawn({
+            let stream_id = Arc::clone(stream_id);
+            move |with_readers| {
+                with_readers(move |readers| {
+                    let res = readers
+                        .get(&root_bucket_id)
+                        .and_then(|segments| {
+                            segments.iter().rev().find_map(|(_, reader_set)| {
+                                let stream_index = reader_set.stream_index.as_ref()?;
+                                let record = match stream_index.get_key(&stream_id).transpose()? {
+                                    Ok(record) => record,
+                                    Err(err) => return Some(Err(err)),
+                                };
+                                match stream_index.get(&stream_id).transpose()? {
+                                    Ok(offsets) => Some(Ok((record, offsets))),
+                                    Err(err) => Some(Err(err)),
+                                }
+                            })
+                        })
+                        .transpose();
+                    let _ = reply_tx.send(res);
+                });
+            }
+        });
+
+        Ok(reply_rx.await.unwrap()?.map(
+            |(
+                StreamIndexRecord {
+                    partition_key,
+                    version_max,
+                    ..
+                },
+                offsets,
+            )| match offsets {
+                StreamOffsets::Offsets(_) => StreamLatestVersion::LatestVersion {
+                    partition_key,
+                    version: version_max,
+                },
+                StreamOffsets::ExternalBucket => {
+                    StreamLatestVersion::ExternalBucket { partition_key }
+                }
+            },
+        ))
     }
 }
 
@@ -306,4 +389,34 @@ struct UnopenedFileSet {
     events: Option<PathBuf>,
     event_index: Option<PathBuf>,
     stream_index: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpectedVersion {
+    /// This write should not conflict with anything and should always succeed.
+    Any,
+    /// The stream should exist. If it or a metadata stream does not exist,
+    /// treats that as a concurrency problem.
+    StreamExists,
+    /// The stream being written to should not yet exist. If it does exist,
+    /// treats that as a concurrency problem.
+    NoStream,
+    /// States that the last event written to the stream should have an event
+    /// number matching your expected value.
+    Exact(u64),
+}
+
+impl ExpectedVersion {
+    pub fn unwrap(self) -> u64 {
+        match self {
+            ExpectedVersion::Exact(version) => version,
+            _ => panic!("expected exact version"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamLatestVersion {
+    LatestVersion { partition_key: Uuid, version: u64 },
+    ExternalBucket { partition_key: Uuid },
 }

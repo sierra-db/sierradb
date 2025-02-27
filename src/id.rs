@@ -6,17 +6,17 @@ use uuid::Uuid;
 use crate::{RANDOM_STATE, bucket::BucketId};
 
 /// Hashes the stream id, and performs a modulo on the lowest 16 bits of the hash.
-fn stream_id_hash(stream_id: &str) -> u16 {
+pub fn stream_id_partition_id(stream_id: &str) -> u16 {
     (RANDOM_STATE.hash_one(stream_id) & 0xFFFF) as u16
 }
 
-// pub fn stream_id_bucket(stream_id: &str, num_buckets: u16) -> BucketId {
-//     if num_buckets == 1 {
-//         return 0;
-//     }
+pub fn stream_id_bucket(stream_id: &str, num_buckets: u16) -> BucketId {
+    if num_buckets == 1 {
+        return 0;
+    }
 
-//     stream_id_hash(stream_id) % num_buckets
-// }
+    stream_id_partition_id(stream_id) % num_buckets
+}
 
 /// Returns a UUID “inspired” by v7, except that 16 bits from the stream-id hash
 /// are embedded in it (bits 46–61 of the final 128-bit value).
@@ -37,7 +37,7 @@ pub fn uuid_v7_with_stream_hash(stream_id: &str) -> Uuid {
     let timestamp48 = timestamp_ms & 0xFFFFFFFFFFFF; // mask to 48 bits
 
     // Compute stream-id hash
-    let stream_hash = stream_id_hash(stream_id);
+    let stream_hash = stream_id_partition_id(stream_id);
 
     let mut rng = rand::rng();
     // 12 bits of randomness
@@ -72,8 +72,16 @@ pub fn extract_event_id_bucket(uuid: Uuid, num_buckets: u16) -> BucketId {
     extract_stream_hash(uuid) % num_buckets
 }
 
+pub fn partition_id_to_bucket(partition_id: u16, num_buckets: u16) -> BucketId {
+    if num_buckets == 1 {
+        return 0;
+    }
+
+    partition_id % num_buckets
+}
+
 pub fn validate_event_id(event_id: Uuid, stream_id: &str) -> bool {
-    extract_stream_hash(event_id) == stream_id_hash(stream_id)
+    extract_stream_hash(event_id) == stream_id_partition_id(stream_id)
 }
 
 #[cfg(test)]
