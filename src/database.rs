@@ -1,6 +1,6 @@
 use std::{
-    collections::{BTreeMap, HashMap, hash_map::Entry},
-    fs, io,
+    collections::{BTreeMap, HashMap},
+    fmt, fs, ops,
     path::PathBuf,
     sync::{
         Arc,
@@ -22,10 +22,8 @@ use crate::{
         stream_index::{ClosedStreamIndex, EventStreamIter, StreamIndexRecord, StreamOffsets},
         writer_thread_pool::{AppendEventsBatch, WriterThreadPool},
     },
-    id::{
-        extract_event_id_bucket, extract_stream_hash, partition_id_to_bucket,
-        stream_id_partition_id,
-    },
+    error::{DatabaseError, ReadError, StreamIndexError, WriteError},
+    id::{extract_event_id_bucket, partition_id_to_bucket},
     pool::create_thread_pool,
 };
 
@@ -37,19 +35,18 @@ pub struct Database {
 }
 
 impl Database {
-    pub fn open(dir: impl Into<PathBuf>) -> io::Result<Self> {
+    pub fn open(dir: impl Into<PathBuf>) -> Result<Self, DatabaseError> {
         DatabaseBuilder::new(dir).open()
     }
 
-    pub async fn append_events(&self, events: AppendEventsBatch) -> io::Result<()> {
-        self.writer_pool
-            .append_events(events)
-            .await
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "writer thread panicked"))?
+    pub async fn append_events(&self, events: AppendEventsBatch) -> Result<(), WriteError> {
+        self.writer_pool.append_events(events).await.await.unwrap()
     }
 
-    pub async fn read_event(&self, event_id: Uuid) -> io::Result<Option<EventRecord<'static>>> {
+    pub async fn read_event(
+        &self,
+        event_id: Uuid,
+    ) -> Result<Option<EventRecord<'static>>, ReadError> {
         let bucket_id = extract_event_id_bucket(event_id, self.num_buckets);
         let segment_id_offset = self
             .writer_pool
@@ -99,7 +96,7 @@ impl Database {
                                 }
                                 Ok(None) => {}
                                 Err(err) => {
-                                    let _ = reply_tx.send(Err(err));
+                                    let _ = reply_tx.send(Err(Box::new(err).into()));
                                     return;
                                 }
                             }
@@ -126,7 +123,7 @@ impl Database {
         &self,
         stream_id: impl Into<Arc<str>>,
         partition_key: Uuid,
-    ) -> io::Result<EventStreamIter> {
+    ) -> Result<EventStreamIter, StreamIndexError> {
         EventStreamIter::new(
             stream_id.into(),
             extract_event_id_bucket(partition_key, self.num_buckets),
@@ -140,7 +137,7 @@ impl Database {
         &self,
         stream_id: &Arc<str>,
         partition_id: u16,
-    ) -> io::Result<Option<StreamLatestVersion>> {
+    ) -> Result<Option<StreamLatestVersion>, StreamIndexError> {
         let root_bucket_id = partition_id_to_bucket(partition_id, self.num_buckets);
         let latest = self
             .writer_pool
@@ -221,9 +218,10 @@ pub struct DatabaseBuilder {
     dir: PathBuf,
     segment_size: usize,
     num_buckets: u16,
-    reader_pool_size: u16,
-    writer_pool_size: u16,
-    flush_interval: Duration,
+    reader_pool_num_threads: u16,
+    writer_pool_num_threads: u16,
+    flush_interval_duration: Duration,
+    flush_interval_events: u32,
 }
 
 impl DatabaseBuilder {
@@ -236,24 +234,24 @@ impl DatabaseBuilder {
             dir: dir.into(),
             segment_size: 256_000_000,
             num_buckets: 64,
-            reader_pool_size,
-            writer_pool_size,
-            flush_interval: Duration::from_millis(100),
+            reader_pool_num_threads: reader_pool_size,
+            writer_pool_num_threads: writer_pool_size,
+            flush_interval_duration: Duration::from_millis(100),
+            flush_interval_events: 1_000,
         }
     }
 
-    pub fn open(&self) -> io::Result<Database> {
+    pub fn open(&self) -> Result<Database, DatabaseError> {
         let _ = fs::create_dir_all(&self.dir);
-        let thread_pool = Arc::new(
-            create_thread_pool().map_err(|err| io::Error::new(io::ErrorKind::Other, err))?,
-        );
-        let reader_pool = ReaderThreadPool::new(self.reader_pool_size as usize);
+        let thread_pool = Arc::new(create_thread_pool()?);
+        let reader_pool = ReaderThreadPool::new(self.reader_pool_num_threads as usize);
         let writer_pool = WriterThreadPool::new(
             &self.dir,
             self.segment_size,
             self.num_buckets,
-            self.writer_pool_size,
-            self.flush_interval,
+            self.writer_pool_num_threads,
+            self.flush_interval_duration,
+            self.flush_interval_events,
             &reader_pool,
             &thread_pool,
         )?;
@@ -282,18 +280,10 @@ impl DatabaseBuilder {
 
             if file_name_str.ends_with(&events_suffix) {
                 segments.entry(bucket_segment_id).or_default().events = Some(entry.path());
-                // println!("opening events: {bucket_segment_id}");
             } else if file_name_str.ends_with(&event_index_suffix) {
                 segments.entry(bucket_segment_id).or_default().event_index = Some(entry.path());
-                // println!("opening event index: {bucket_segment_id}");
-                // let event_index = ClosedEventIndex::open(bucket_segment_id, entry.path())?;
-                // segments.entry(bucket_segment_id).or_default().1 = Some(event_index);
             } else if file_name_str.ends_with(&stream_index_suffix) {
                 segments.entry(bucket_segment_id).or_default().stream_index = Some(entry.path());
-                // println!("opening stream index: {bucket_segment_id}");
-                // let stream_index =
-                //     ClosedStreamIndex::open(bucket_segment_id, entry.path(), self.segment_size)?;
-                // segments.entry(bucket_segment_id).or_default().2 = Some(stream_index);
             }
         }
 
@@ -368,18 +358,23 @@ impl DatabaseBuilder {
         self
     }
 
-    pub fn reader_pool_size(&mut self, n: u16) -> &mut Self {
-        self.reader_pool_size = n;
+    pub fn reader_pool_num_threads(&mut self, n: u16) -> &mut Self {
+        self.reader_pool_num_threads = n;
         self
     }
 
-    pub fn writer_pool_size(&mut self, n: u16) -> &mut Self {
-        self.writer_pool_size = n;
+    pub fn writer_pool_num_threads(&mut self, n: u16) -> &mut Self {
+        self.writer_pool_num_threads = n;
         self
     }
 
-    pub fn flush_interval(&mut self, interval: Duration) -> &mut Self {
-        self.flush_interval = interval;
+    pub fn flush_interval_duration(&mut self, interval: Duration) -> &mut Self {
+        self.flush_interval_duration = interval;
+        self
+    }
+
+    pub fn flush_interval_events(&mut self, events: u32) -> &mut Self {
+        self.flush_interval_events = events;
         self
     }
 }
@@ -391,6 +386,7 @@ struct UnopenedFileSet {
     stream_index: Option<PathBuf>,
 }
 
+/// The expected version **before** the event is inserted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExpectedVersion {
     /// This write should not conflict with anything and should always succeed.
@@ -407,10 +403,70 @@ pub enum ExpectedVersion {
 }
 
 impl ExpectedVersion {
-    pub fn unwrap(self) -> u64 {
+    pub fn from_next_version(version: u64) -> Self {
+        if version == 0 {
+            ExpectedVersion::NoStream
+        } else {
+            ExpectedVersion::Exact(version - 1)
+        }
+    }
+
+    pub fn into_next_version(self) -> Option<u64> {
         match self {
-            ExpectedVersion::Exact(version) => version,
-            _ => panic!("expected exact version"),
+            ExpectedVersion::NoStream => Some(0),
+            ExpectedVersion::Exact(version) => version.checked_add(1),
+            _ => panic!("expected no stream or exact version"),
+        }
+    }
+}
+
+impl fmt::Display for ExpectedVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ExpectedVersion::Any => write!(f, "any"),
+            ExpectedVersion::StreamExists => write!(f, "stream exists"),
+            ExpectedVersion::NoStream => write!(f, "no stream"),
+            ExpectedVersion::Exact(version) => version.fmt(f),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Actual position of a stream.
+pub enum CurrentVersion {
+    /// The last event's number.
+    Current(u64),
+    /// The stream doesn't exist.
+    NoStream,
+}
+
+impl CurrentVersion {
+    pub fn as_expected_version(&self) -> ExpectedVersion {
+        match self {
+            CurrentVersion::Current(version) => ExpectedVersion::Exact(*version),
+            CurrentVersion::NoStream => ExpectedVersion::NoStream,
+        }
+    }
+}
+
+impl fmt::Display for CurrentVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CurrentVersion::Current(version) => version.fmt(f),
+            CurrentVersion::NoStream => write!(f, "<no stream>"),
+        }
+    }
+}
+
+impl ops::AddAssign<u64> for CurrentVersion {
+    fn add_assign(&mut self, rhs: u64) {
+        match self {
+            CurrentVersion::Current(current) => *current += rhs,
+            CurrentVersion::NoStream => {
+                if rhs > 0 {
+                    *self = CurrentVersion::Current(rhs - 1)
+                }
+            }
         }
     }
 }

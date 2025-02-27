@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs::{File, OpenOptions},
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom, Write},
     mem,
     os::unix::fs::FileExt,
     panic::panic_any,
@@ -12,7 +12,10 @@ use std::{
 use rayon::ThreadPool;
 use uuid::Uuid;
 
-use crate::{RANDOM_STATE, error::ThreadPoolError};
+use crate::{
+    RANDOM_STATE,
+    error::{EventIndexError, ThreadPoolError},
+};
 
 use super::{
     BucketSegmentId,
@@ -28,7 +31,7 @@ pub struct OpenEventIndex {
 }
 
 impl OpenEventIndex {
-    pub fn create(id: BucketSegmentId, path: impl AsRef<Path>) -> io::Result<Self> {
+    pub fn create(id: BucketSegmentId, path: impl AsRef<Path>) -> Result<Self, EventIndexError> {
         let file = OpenOptions::new()
             .read(false)
             .write(true)
@@ -39,7 +42,7 @@ impl OpenEventIndex {
         Ok(OpenEventIndex { id, file, index })
     }
 
-    pub fn open(id: BucketSegmentId, path: impl AsRef<Path>) -> io::Result<Self> {
+    pub fn open(id: BucketSegmentId, path: impl AsRef<Path>) -> Result<Self, EventIndexError> {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -52,7 +55,7 @@ impl OpenEventIndex {
     }
 
     /// Closes the event index, flushing the index in a background thread.
-    pub fn close(self, pool: &ThreadPool) -> io::Result<ClosedEventIndex> {
+    pub fn close(self, pool: &ThreadPool) -> Result<ClosedEventIndex, EventIndexError> {
         let id = self.id;
         let mut file_clone = self.file.try_clone()?;
         let num_slots = self.num_slots();
@@ -83,44 +86,6 @@ impl OpenEventIndex {
         })
     }
 
-    // /// Closes the event index, flushing the index in a background thread.
-    // pub fn close(
-    //     self,
-    //     pool: &ThreadPool,
-    //     committed_event_offsets: Arc<HashSet<u64>>,
-    // ) -> io::Result<ClosedEventIndex> {
-    //     let id = self.id;
-    //     let mut file_clone = self.file.try_clone()?;
-    //     let num_slots = self.num_slots();
-    //     let strong_index = Arc::new(self.index);
-    //     let weak_index = Arc::downgrade(&strong_index);
-
-    //     pool.spawn({
-    //         move || {
-    //             if let Err(err) =
-    //                 Self::flush_inner(&mut file_clone, &strong_index, num_slots, |_, offset| {
-    //                     committed_event_offsets.contains(offset)
-    //                 })
-    //             {
-    //                 panic_any(ThreadPoolError::FlushEventIndex {
-    //                     id,
-    //                     file: file_clone,
-    //                     index: strong_index,
-    //                     num_slots: num_slots as u64,
-    //                     err,
-    //                 });
-    //             }
-    //         }
-    //     });
-
-    //     Ok(ClosedEventIndex {
-    //         id,
-    //         file: self.file,
-    //         num_slots: num_slots as u64,
-    //         index: Arc::new(weak_index),
-    //     })
-    // }
-
     pub fn get(&self, event_id: &Uuid) -> Option<u64> {
         self.index.get(event_id).copied()
     }
@@ -136,13 +101,13 @@ impl OpenEventIndex {
         self.index.retain(f);
     }
 
-    pub fn flush(&mut self) -> io::Result<()> {
+    pub fn flush(&mut self) -> Result<(), EventIndexError> {
         let num_slots = self.num_slots();
         Self::flush_inner(&mut self.file, &self.index, num_slots, |_, _| true)
     }
 
     /// Hydrates the index from a reader.
-    pub fn hydrate(&mut self, reader: &mut BucketSegmentReader) -> io::Result<()> {
+    pub fn hydrate(&mut self, reader: &mut BucketSegmentReader) -> Result<(), EventIndexError> {
         let mut reader_iter = reader.iter();
         while let Some(record) = reader_iter.next_record()? {
             match record {
@@ -163,7 +128,7 @@ impl OpenEventIndex {
         index: &BTreeMap<Uuid, u64>,
         num_slots: usize,
         mut filter: F,
-    ) -> io::Result<()>
+    ) -> Result<(), EventIndexError>
     where
         F: FnMut(&Uuid, &u64) -> bool,
     {
@@ -197,7 +162,9 @@ impl OpenEventIndex {
 
         // Flush the whole file at once
         file.write_all_at(&file_data, 0)?;
-        file.flush()
+        file.flush()?;
+
+        Ok(())
     }
 
     #[inline]
@@ -215,7 +182,7 @@ pub struct ClosedEventIndex {
 }
 
 impl ClosedEventIndex {
-    pub fn open(id: BucketSegmentId, path: impl AsRef<Path>) -> io::Result<Self> {
+    pub fn open(id: BucketSegmentId, path: impl AsRef<Path>) -> Result<Self, EventIndexError> {
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
 
         // Read the first 8 bytes to get the total number of slots
@@ -231,7 +198,7 @@ impl ClosedEventIndex {
         })
     }
 
-    pub fn try_clone(&self) -> io::Result<Self> {
+    pub fn try_clone(&self) -> Result<Self, EventIndexError> {
         Ok(ClosedEventIndex {
             id: self.id,
             file: self.file.try_clone()?,
@@ -240,7 +207,7 @@ impl ClosedEventIndex {
         })
     }
 
-    pub fn get(&self, event_id: &Uuid) -> io::Result<Option<u64>> {
+    pub fn get(&self, event_id: &Uuid) -> Result<Option<u64>, EventIndexError> {
         // Read from memory.
         // This code should only run when the segment is being closed and is being flushed in the background.
         if let Some(index) = self.index.upgrade() {
@@ -305,7 +272,7 @@ impl ClosedEventIndex {
 }
 
 /// Loads the index from a direct-mapped file format
-fn load_index_from_file(file: &mut File) -> io::Result<BTreeMap<Uuid, u64>> {
+fn load_index_from_file(file: &mut File) -> Result<BTreeMap<Uuid, u64>, EventIndexError> {
     let mut file_data = Vec::with_capacity(file.metadata()?.len() as usize);
     file.seek(SeekFrom::Start(0))?;
     file.read_to_end(&mut file_data)?;
@@ -315,10 +282,7 @@ fn load_index_from_file(file: &mut File) -> io::Result<BTreeMap<Uuid, u64>> {
     }
 
     if file_data.len() < 8 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "invalid event index file",
-        ));
+        return Err(EventIndexError::CorruptNumSlots);
     }
 
     let num_slots = u64::from_le_bytes(file_data[..8].try_into().unwrap()) as usize;
@@ -329,10 +293,7 @@ fn load_index_from_file(file: &mut File) -> io::Result<BTreeMap<Uuid, u64>> {
         let pos = 8 + RECORD_SIZE * i;
 
         if file_data.len() < pos + RECORD_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "invalid event index file",
-            ));
+            return Err(EventIndexError::CorruptRecord { offset: pos as u64 });
         }
 
         let uuid = Uuid::from_bytes(file_data[pos..pos + 16].try_into().unwrap());

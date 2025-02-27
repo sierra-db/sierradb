@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, VecDeque, btree_map::Entry},
     fs::{File, OpenOptions},
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom, Write},
     mem,
     os::unix::fs::FileExt,
     panic::panic_any,
@@ -13,13 +13,17 @@ use std::{
 };
 
 use bloomfilter::Bloom;
+use const_primes::{Primes, next_prime};
 use rayon::ThreadPool;
 use tokio::sync::oneshot;
 use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::{
-    BLOOM_SEED, RANDOM_STATE, bucket::segment::CommittedEvents, copy_bytes, error::ThreadPoolError,
+    BLOOM_SEED, RANDOM_STATE,
+    bucket::segment::CommittedEvents,
+    copy_bytes,
+    error::{EventValidationError, StreamIndexError, ThreadPoolError},
     from_bytes,
 };
 
@@ -42,6 +46,15 @@ const RECORD_SIZE: usize =
 const AVG_EVENT_SIZE: usize = 350;
 const AVG_EVENTS_PER_STREAM: usize = 10;
 const FALSE_POSITIVE_PROBABILITY: f64 = 0.001;
+
+// First 23,001 primes, maxing out at 262,147 (2^18).
+// This occupies 92 KB
+#[cfg(not(debug_assertions))]
+const PRIMES: Primes<23_001> = Primes::new();
+
+// Smaller primes cache for faster build times in debug mode.
+#[cfg(debug_assertions)]
+const PRIMES: Primes<100> = Primes::new();
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamIndexRecord<T> {
@@ -85,7 +98,7 @@ impl OpenStreamIndex {
         id: BucketSegmentId,
         path: impl AsRef<Path>,
         segment_size: usize,
-    ) -> io::Result<Self> {
+    ) -> Result<Self, StreamIndexError> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -97,7 +110,7 @@ impl OpenStreamIndex {
             FALSE_POSITIVE_PROBABILITY,
             &BLOOM_SEED,
         )
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+        .map_err(|err| StreamIndexError::Bloom { err })?;
 
         Ok(OpenStreamIndex {
             id,
@@ -111,7 +124,7 @@ impl OpenStreamIndex {
         id: BucketSegmentId,
         path: impl AsRef<Path>,
         segment_size: usize,
-    ) -> io::Result<Self> {
+    ) -> Result<Self, StreamIndexError> {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -129,7 +142,7 @@ impl OpenStreamIndex {
     }
 
     /// Closes the stream index, flushing the index in a background thread.
-    pub fn close(self, pool: &ThreadPool) -> io::Result<ClosedStreamIndex> {
+    pub fn close(self, pool: &ThreadPool) -> Result<ClosedStreamIndex, StreamIndexError> {
         let id = self.id;
         let mut file_clone = self.file.try_clone()?;
         let num_slots = self.num_slots();
@@ -165,49 +178,6 @@ impl OpenStreamIndex {
         })
     }
 
-    // /// Closes the stream index, flushing the index in a background thread.
-    // pub fn close(
-    //     self,
-    //     pool: &ThreadPool,
-    //     committed_event_offsets: Arc<HashSet<u64>>,
-    // ) -> io::Result<ClosedStreamIndex> {
-    //     let id = self.id;
-    //     let mut file_clone = self.file.try_clone()?;
-    //     let num_slots = self.num_slots();
-    //     let strong_index = Arc::new(self.index);
-    //     let weak_index = Arc::downgrade(&strong_index);
-    //     let bloom = Arc::new(self.bloom);
-
-    //     pool.spawn({
-    //         let bloom = Arc::clone(&bloom);
-    //         move || {
-    //             if let Err(err) = Self::flush_inner(
-    //                 &mut file_clone,
-    //                 &strong_index,
-    //                 &bloom,
-    //                 num_slots,
-    //                 |_, offset| committed_event_offsets.contains(offset),
-    //             ) {
-    //                 panic_any(ThreadPoolError::FlushStreamIndex {
-    //                     id,
-    //                     file: file_clone,
-    //                     index: strong_index,
-    //                     num_slots: num_slots as u64,
-    //                     err,
-    //                 });
-    //             }
-    //         }
-    //     });
-
-    //     Ok(ClosedStreamIndex {
-    //         id,
-    //         file: self.file,
-    //         num_slots: num_slots as u64,
-    //         index: Arc::new(weak_index),
-    //         bloom,
-    //     })
-    // }
-
     pub fn get(&self, stream_id: &str) -> Option<&StreamIndexRecord<StreamOffsets>> {
         self.index.get(stream_id)
     }
@@ -218,18 +188,11 @@ impl OpenStreamIndex {
         partition_key: Uuid,
         stream_version: u64,
         offset: u64,
-    ) -> io::Result<()> {
+    ) -> Result<(), StreamIndexError> {
         let stream_id = stream_id.into();
-        if stream_id.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "stream id is empty",
-            ));
-        }
-        if stream_id.len() > STREAM_ID_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "stream id exceeds max len",
+        if !(1..=STREAM_ID_SIZE).contains(&stream_id.len()) {
+            return Err(StreamIndexError::Validation(
+                EventValidationError::InvalidStreamIdLen,
             ));
         }
 
@@ -246,9 +209,8 @@ impl OpenStreamIndex {
             Entry::Occupied(mut entry) => {
                 let entry = entry.get_mut();
                 if entry.partition_key != partition_key {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "partition key mismatch in stream index",
+                    return Err(StreamIndexError::Validation(
+                        EventValidationError::PartitionKeyMismatch,
                     ));
                 }
                 entry.version_min = entry.version_min.min(stream_version);
@@ -258,10 +220,7 @@ impl OpenStreamIndex {
                         offsets.push(offset);
                     }
                     StreamOffsets::ExternalBucket => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "stream id already mapped to another partition key",
-                        ));
+                        return Err(StreamIndexError::StreamIdMappedToExternalBucket);
                     }
                 }
             }
@@ -274,18 +233,11 @@ impl OpenStreamIndex {
         &mut self,
         stream_id: impl Into<Arc<str>>,
         partition_key: Uuid,
-    ) -> io::Result<()> {
+    ) -> Result<(), StreamIndexError> {
         let stream_id = stream_id.into();
-        if stream_id.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "stream id is empty",
-            ));
-        }
-        if stream_id.len() > STREAM_ID_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "stream id exceeds max len",
+        if !(1..=STREAM_ID_SIZE).contains(&stream_id.len()) {
+            return Err(StreamIndexError::Validation(
+                EventValidationError::InvalidStreamIdLen,
             ));
         }
 
@@ -302,17 +254,13 @@ impl OpenStreamIndex {
             Entry::Occupied(mut entry) => {
                 let entry = entry.get_mut();
                 if entry.partition_key != partition_key {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "partition key mismatch in stream index",
+                    return Err(StreamIndexError::Validation(
+                        EventValidationError::PartitionKeyMismatch,
                     ));
                 }
                 match &mut entry.offsets {
                     StreamOffsets::Offsets(_) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "stream id already has offsets",
-                        ));
+                        return Err(StreamIndexError::StreamIdOffsetExists);
                     }
                     StreamOffsets::ExternalBucket => {}
                 }
@@ -338,7 +286,7 @@ impl OpenStreamIndex {
     //     }
     // }
 
-    pub fn flush(&mut self) -> io::Result<()> {
+    pub fn flush(&mut self) -> Result<(), StreamIndexError> {
         let num_slots = self.num_slots();
         Self::flush_inner(
             &mut self.file,
@@ -350,7 +298,7 @@ impl OpenStreamIndex {
     }
 
     /// Hydrates the index from a reader.
-    pub fn hydrate(&mut self, reader: &mut BucketSegmentReader) -> io::Result<()> {
+    pub fn hydrate(&mut self, reader: &mut BucketSegmentReader) -> Result<(), StreamIndexError> {
         let mut reader_iter = reader.iter();
         while let Some(record) = reader_iter.next_record()? {
             match record {
@@ -381,7 +329,7 @@ impl OpenStreamIndex {
         bloom: &Bloom<str>,
         num_slots: usize,
         mut filter: F,
-    ) -> io::Result<()>
+    ) -> Result<(), StreamIndexError>
     where
         F: FnMut(&Arc<str>, &u64) -> bool,
     {
@@ -483,12 +431,25 @@ impl OpenStreamIndex {
 
         file.write_all_at(&file_data, 0)?;
         file.write_all_at(&value_data, file_size as u64)?;
-        file.flush()
+        file.flush()?;
+
+        Ok(())
     }
 
-    #[inline]
     fn num_slots(&self) -> usize {
-        self.index.len() * 2
+        // – For very fast lookups with minimal clustering, choose around 0.5.
+        // – For a more space‐efficient table with acceptable performance, 0.7 is common.
+        //
+        // 0.5 = avg successful probes: ~1.5
+        // avg unsuccessful probes: ~2.5
+        const LOAD_FACTOR: f64 = 0.5;
+        let len = self.index.len() as f64;
+        let estimated_size = (len / LOAD_FACTOR).ceil() as usize;
+        PRIMES
+            .next_prime(estimated_size as u32)
+            .map(|prime| prime as usize)
+            .or_else(|| next_prime(estimated_size as u64).map(|prime| prime as usize))
+            .unwrap()
     }
 }
 
@@ -507,7 +468,7 @@ impl ClosedStreamIndex {
         id: BucketSegmentId,
         path: impl AsRef<Path>,
         segment_size: usize,
-    ) -> io::Result<Self> {
+    ) -> Result<Self, StreamIndexError> {
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
         let mut count_buf = [0u8; 8];
         file.read_exact(&mut count_buf)?;
@@ -524,7 +485,7 @@ impl ClosedStreamIndex {
         })
     }
 
-    pub fn try_clone(&self) -> io::Result<Self> {
+    pub fn try_clone(&self) -> Result<Self, StreamIndexError> {
         Ok(ClosedStreamIndex {
             id: self.id,
             file: self.file.try_clone()?,
@@ -537,7 +498,7 @@ impl ClosedStreamIndex {
     pub fn get_key(
         &self,
         stream_id: &str,
-    ) -> io::Result<Option<StreamIndexRecord<ClosedOffsetKind>>> {
+    ) -> Result<Option<StreamIndexRecord<ClosedOffsetKind>>, StreamIndexError> {
         // Read from memory.
         // This code should only run when the segment is being closed and is being flushed in the background.
         if let Some(index) = self.index.upgrade() {
@@ -592,7 +553,7 @@ impl ClosedStreamIndex {
             let mut pos = 0;
 
             let stored_stream_id = std::str::from_utf8(&buf[pos..pos + STREAM_ID_SIZE])
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid UTF8 stream id"))?
+                .map_err(StreamIndexError::InvalidStreamIdUtf8)?
                 .trim_end_matches('\0');
             pos += STREAM_ID_SIZE;
 
@@ -634,7 +595,7 @@ impl ClosedStreamIndex {
     pub fn get_from_key(
         &self,
         key: StreamIndexRecord<ClosedOffsetKind>,
-    ) -> io::Result<StreamOffsets> {
+    ) -> Result<StreamOffsets, StreamIndexError> {
         match key.offsets {
             ClosedOffsetKind::Pointer(offset, len) => {
                 let mut values_buf = vec![0u8; len as usize * 8];
@@ -650,7 +611,7 @@ impl ClosedStreamIndex {
         }
     }
 
-    pub fn get(&self, stream_id: &str) -> io::Result<Option<StreamOffsets>> {
+    pub fn get(&self, stream_id: &str) -> Result<Option<StreamOffsets>, StreamIndexError> {
         self.get_key(stream_id)
             .and_then(|key| key.map(|key| self.get_from_key(key)).transpose())
     }
@@ -682,7 +643,7 @@ impl EventStreamIter {
         bucket_id: BucketId,
         reader_pool: ReaderThreadPool,
         live_indexes: &HashMap<BucketId, (Arc<AtomicU32>, LiveIndexes)>,
-    ) -> io::Result<Self> {
+    ) -> Result<Self, StreamIndexError> {
         let mut live_segment_id = 0;
         let mut live_segment_offsets: VecDeque<_> = match live_indexes.get(&bucket_id) {
             Some((current_live_segment_id, live_indexes)) => {
@@ -808,7 +769,7 @@ impl EventStreamIter {
         }
     }
 
-    pub async fn next(&mut self) -> io::Result<Option<EventRecord<'static>>> {
+    pub async fn next(&mut self) -> Result<Option<EventRecord<'static>>, StreamIndexError> {
         struct ReadResult {
             events: Option<CommittedEvents<'static>>,
             new_offsets: Option<(SegmentId, VecDeque<u64>)>,
@@ -821,10 +782,6 @@ impl EventStreamIter {
         let live_segment_id = self.live_segment_id;
         let next_offset = self.next_offset;
         let next_live_offset = self.next_live_offset;
-
-        // if next_offset.is_none() && next_live_offset.is_none() && segment_id == live_segment_id {
-        //     return Ok(None);
-        // }
 
         let (reply_tx, reply_rx) = oneshot::channel();
         self.reader_pool.spawn(move |with_readers| {
@@ -844,10 +801,11 @@ impl EventStreamIter {
                                         new_offsets: None,
                                         is_live: false,
                                     }),
-                                    None => Err(io::Error::new(
-                                        io::ErrorKind::NotFound,
-                                        "segment not found",
-                                    )),
+                                    None => Err(StreamIndexError::SegmentNotFound {
+                                        bucket_segment_id: BucketSegmentId::new(
+                                            bucket_id, segment_id,
+                                        ),
+                                    }),
                                 }
                             }
                             None => {
@@ -974,131 +932,19 @@ impl EventStreamIter {
             }
         }
     }
-
-    // pub async fn next(&mut self) -> io::Result<Option<EventRecord<'static>>> {
-    //     let stream_id = Arc::clone(&self.stream_id);
-    //     let bucket_id = self.bucket_id;
-    //     let segment_id = self.segment_id;
-    //     let next_offset = self
-    //         .segment_offsets
-    //         .pop_front()
-    //         .map(|offset| (self.segment_id, offset))
-    //         .or_else(|| {
-    //             if self.live_segment_id == Some(self.segment_id) {
-    //                 self.live_segment_offsets
-    //                     .pop_front()
-    //                     .map(|offset| (self.live_segment_id.unwrap(), offset))
-    //             } else {
-    //                 None
-    //             }
-    //         });
-
-    //     struct ReadResult {
-    //         events: Option<CommittedEvents<'static>>,
-    //         new_offsets: Option<VecDeque<u64>>,
-    //         last_segment_id: u32,
-    //     }
-
-    //     let (reply_tx, reply_rx) = oneshot::channel();
-    //     self.reader_pool.spawn(move |with_readers| {
-    //         with_readers(move |readers| {
-    //             let res = readers
-    //                 .get_mut(&bucket_id)
-    //                 .map(|segments| {
-    //                     let last_segment_id =
-    //                         segments.last_entry().map(|last| *last.key()).unwrap_or(0);
-    //                     match next_offset {
-    //                         Some((live_segment_id, next_offset)) => {
-    //                             match segments.get_mut(&live_segment_id) {
-    //                                 Some(reader_set) => Ok(ReadResult {
-    //                                     events: reader_set
-    //                                         .reader
-    //                                         .read_committed_events(next_offset, false)?
-    //                                         .map(CommittedEvents::into_owned),
-    //                                     new_offsets: None,
-    //                                     last_segment_id,
-    //                                 }),
-    //                                 None => {}
-    //                             }
-    //                         }
-    //                         None => {
-    //                             for i in segment_id..segments.len() as u32 {
-    //                                 let Some(reader_set) = segments.get_mut(&i) else {
-    //                                     continue;
-    //                                 };
-
-    //                                 let Some(stream_index) = &reader_set.stream_index else {
-    //                                     continue;
-    //                                 };
-
-    //                                 let mut new_offsets: VecDeque<_> =
-    //                                     stream_index.get(&stream_id)?.into();
-    //                                 let Some(next_offset) = new_offsets.pop_front() else {
-    //                                     continue;
-    //                                 };
-
-    //                                 return Ok(ReadResult {
-    //                                     events: reader_set
-    //                                         .reader
-    //                                         .read_committed_events(next_offset, false)?
-    //                                         .map(CommittedEvents::into_owned),
-    //                                     new_offsets: Some(new_offsets),
-    //                                     last_segment_id,
-    //                                 });
-    //                             }
-
-    //                             Ok(ReadResult {
-    //                                 events: None,
-    //                                 new_offsets: None,
-    //                                 last_segment_id,
-    //                             })
-    //                         }
-    //                     }
-    //                 })
-    //                 .transpose();
-    //             let _ = reply_tx.send(res);
-    //         })
-    //     });
-
-    //     match reply_rx.await {
-    //         Ok(Ok(Some(ReadResult {
-    //             events,
-    //             new_offsets,
-    //             last_segment_id,
-    //         }))) => {
-    //             if let Some(new_offsets) = new_offsets {
-    //                 // Only move onto the next segment if:
-    //                 //  - self.segment_offsets is empty
-    //                 //  - we didn't just read the last segment
-    //                 if self.segment_offsets.is_empty() && self.segment_id < last_segment_id {
-    //                     self.segment_id = self.segment_id.saturating_add(1);
-    //                 }
-
-    //                 self.segment_offsets = new_offsets;
-    //             } else if self.segment_offsets.is_empty() {
-    //                 self.segment_id = self.segment_id.saturating_add(1);
-    //             }
-
-    //             Ok(events.and_then(|events| events.into_iter().next()))
-    //         }
-    //         Ok(Ok(None)) => Ok(None),
-    //         Ok(Err(err)) => Err(err),
-    //         Err(_) => {
-    //             error!("no reply from reader pool");
-    //             Ok(None)
-    //         }
-    //     }
-    // }
 }
 
 #[allow(clippy::type_complexity)]
 fn load_index_from_file(
     file: &mut File,
     segment_size: usize,
-) -> io::Result<(
-    BTreeMap<Arc<str>, StreamIndexRecord<StreamOffsets>>,
-    Bloom<str>,
-)> {
+) -> Result<
+    (
+        BTreeMap<Arc<str>, StreamIndexRecord<StreamOffsets>>,
+        Bloom<str>,
+    ),
+    StreamIndexError,
+> {
     let mut file_data = Vec::with_capacity(file.metadata()?.len() as usize);
     file.seek(SeekFrom::Start(0))?;
     file.read_to_end(&mut file_data)?;
@@ -1109,15 +955,12 @@ fn load_index_from_file(
             FALSE_POSITIVE_PROBABILITY,
             &BLOOM_SEED,
         )
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+        .map_err(|err| StreamIndexError::Bloom { err })?;
         return Ok((BTreeMap::new(), bloom));
     }
 
     if file_data.len() < 8 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "invalid stream index file",
-        ));
+        return Err(StreamIndexError::CorruptNumSlots);
     }
 
     let (num_slots, bloom_bytes) = {
@@ -1126,16 +969,12 @@ fn load_index_from_file(
         let bloom_bytes = from_bytes!(&file_data, pos, &[u8], bloom_len as usize);
         (num_slots as usize, bloom_bytes)
     };
-    let bloom =
-        Bloom::from_slice(bloom_bytes).map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+    let bloom = Bloom::from_slice(bloom_bytes).map_err(|err| StreamIndexError::Bloom { err })?;
 
     let slot_section_size = num_slots * RECORD_SIZE;
 
     if file_data.len() < 8 + slot_section_size {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "corrupted stream index file",
-        ));
+        return Err(StreamIndexError::CorruptLen);
     }
 
     let mut index = BTreeMap::new();
@@ -1144,17 +983,14 @@ fn load_index_from_file(
         let pos = 8 + 8 + bloom_bytes.len() + (i * RECORD_SIZE);
 
         if file_data.len() < pos + RECORD_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "invalid stream index file",
-            ));
+            return Err(StreamIndexError::CorruptRecord { offset: pos as u64 });
         }
 
         let record_bytes = &file_data[pos..pos + RECORD_SIZE];
         let mut record_pos = 0;
 
         let stream_id = from_bytes!(record_bytes, record_pos, str, STREAM_ID_SIZE)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid UTF8 stream id"))?
+            .map_err(StreamIndexError::InvalidStreamIdUtf8)?
             .trim_end_matches('\0');
 
         if stream_id.is_empty() {
@@ -1169,10 +1005,7 @@ fn load_index_from_file(
             let value_start = offset as usize;
             let value_end = value_start + (len as usize * 8);
             if value_end > file_data.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "invalid value offset or length",
-                ));
+                return Err(StreamIndexError::CorruptRecord { offset: pos as u64 });
             }
 
             StreamOffsets::Offsets(
@@ -1194,7 +1027,10 @@ fn load_index_from_file(
     Ok((index, bloom))
 }
 
-fn load_bloom_from_file(file: &mut File, segment_size: usize) -> io::Result<Bloom<str>> {
+fn load_bloom_from_file(
+    file: &mut File,
+    segment_size: usize,
+) -> Result<Bloom<str>, StreamIndexError> {
     let mut file_data = Vec::with_capacity(file.metadata()?.len() as usize);
     file.seek(SeekFrom::Start(0))?;
     file.read_to_end(&mut file_data)?;
@@ -1205,15 +1041,12 @@ fn load_bloom_from_file(file: &mut File, segment_size: usize) -> io::Result<Bloo
             FALSE_POSITIVE_PROBABILITY,
             &BLOOM_SEED,
         )
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+        .map_err(|err| StreamIndexError::Bloom { err })?;
         return Ok(bloom);
     }
 
     if file_data.len() < 8 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "invalid stream index file",
-        ));
+        return Err(StreamIndexError::CorruptNumSlots);
     }
 
     let bloom_bytes = {
@@ -1221,8 +1054,7 @@ fn load_bloom_from_file(file: &mut File, segment_size: usize) -> io::Result<Bloo
         let (_num_slots, bloom_len) = from_bytes!(&file_data, pos, [u64, u64]);
         from_bytes!(&file_data, pos, &[u8], bloom_len as usize)
     };
-    let bloom =
-        Bloom::from_slice(bloom_bytes).map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+    let bloom = Bloom::from_slice(bloom_bytes).map_err(|err| StreamIndexError::Bloom { err })?;
 
     Ok(bloom)
 }

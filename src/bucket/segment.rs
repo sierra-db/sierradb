@@ -26,7 +26,7 @@ const VERSION_SIZE: usize = mem::size_of::<u16>();
 const BUCKET_ID_SIZE: usize = mem::size_of::<u16>();
 const CREATED_AT_SIZE: usize = mem::size_of::<u64>();
 const PADDING_SIZE: usize = 32; // For adding headers in future versions
-const SEGMENT_HEADER_SIZE: usize =
+pub const SEGMENT_HEADER_SIZE: usize =
     MAGIC_BYTES_SIZE + VERSION_SIZE + BUCKET_ID_SIZE + CREATED_AT_SIZE + PADDING_SIZE;
 
 // Record sizes

@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, hash_map::Entry},
-    io, mem,
+    mem,
     path::PathBuf,
     sync::{
         Arc,
@@ -23,8 +23,9 @@ use uuid::Uuid;
 
 use crate::{
     bucket::segment::{COMMIT_SIZE, EVENT_HEADER_SIZE},
-    database::{ExpectedVersion, StreamLatestVersion},
-    id::{extract_event_id_bucket, extract_stream_hash, stream_id_partition_id, validate_event_id},
+    database::{CurrentVersion, ExpectedVersion, StreamLatestVersion},
+    error::{EventValidationError, StreamIndexError, WriteError},
+    id::{extract_event_id_bucket, validate_event_id},
 };
 
 use super::{
@@ -35,6 +36,7 @@ use super::{
     reader_thread_pool::ReaderThreadPool,
     segment::{
         AppendEvent, AppendEventBody, AppendEventHeader, BucketSegmentReader, BucketSegmentWriter,
+        SEGMENT_HEADER_SIZE,
     },
     stream_index::{OpenStreamIndex, STREAM_ID_SIZE, StreamIndexRecord, StreamOffsets},
 };
@@ -56,15 +58,17 @@ pub struct WriterThreadPool {
 }
 
 impl WriterThreadPool {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         dir: impl Into<PathBuf>,
         segment_size: usize,
         num_buckets: u16,
         num_threads: u16,
-        flush_interval: Duration,
+        flush_interval_duration: Duration,
+        flush_interval_events: u32,
         reader_pool: &ReaderThreadPool,
         thread_pool: &Arc<ThreadPool>,
-    ) -> io::Result<Self> {
+    ) -> Result<Self, WriteError> {
         assert!(num_threads > 0);
         assert!(
             num_buckets >= num_threads,
@@ -82,7 +86,8 @@ impl WriterThreadPool {
                 thread_id,
                 num_buckets,
                 num_threads,
-                flush_interval,
+                flush_interval_duration,
+                flush_interval_events,
                 reader_pool,
                 thread_pool,
             )?;
@@ -109,34 +114,41 @@ impl WriterThreadPool {
         }
 
         // Spawn flusher thread
-        thread::Builder::new()
-            .name("writer-pool-flusher".to_string())
-            .spawn({
-                let mut senders: Vec<_> = senders.iter().map(|sender| sender.downgrade()).collect();
-                move || {
-                    let mut last_ran = Instant::now();
-                    loop {
-                        thread::sleep(flush_interval.saturating_sub(last_ran.elapsed()));
-                        last_ran = Instant::now();
+        if flush_interval_duration < Duration::MAX {
+            thread::Builder::new()
+                .name("writer-pool-flusher".to_string())
+                .spawn({
+                    let mut senders: Vec<_> =
+                        senders.iter().map(|sender| sender.downgrade()).collect();
+                    move || {
+                        let mut last_ran = Instant::now();
+                        loop {
+                            thread::sleep(
+                                flush_interval_duration.saturating_sub(last_ran.elapsed()),
+                            );
+                            last_ran = Instant::now();
 
-                        senders.retain(|sender| {
-                            let Some(sender) = sender.upgrade() else {
-                                return false;
-                            };
-                            match sender.try_send(WriteRequest::FlushPoll) {
-                                Ok(()) => true,
-                                Err(TrySendError::Full(_)) => true,
-                                Err(TrySendError::Closed(_)) => false,
+                            senders.retain(|sender| {
+                                let Some(sender) = sender.upgrade() else {
+                                    return false;
+                                };
+                                match sender.try_send(WriteRequest::FlushPoll) {
+                                    Ok(()) => true,
+                                    Err(TrySendError::Full(_)) => true,
+                                    Err(TrySendError::Closed(_)) => false,
+                                }
+                            });
+
+                            if senders.is_empty() {
+                                trace!(
+                                    "writer pool flusher stopping due to all workers being stopped"
+                                );
+                                break;
                             }
-                        });
-
-                        if senders.is_empty() {
-                            trace!("writer pool flusher stopping due to all workers being stopped");
-                            break;
                         }
                     }
-                }
-            })?;
+                })?;
+        }
 
         Ok(WriterThreadPool {
             num_buckets,
@@ -153,7 +165,7 @@ impl WriterThreadPool {
     pub async fn append_events(
         &self,
         batch: AppendEventsBatch,
-    ) -> oneshot::Receiver<io::Result<()>> {
+    ) -> oneshot::Receiver<Result<(), WriteError>> {
         let bucket_id = extract_event_id_bucket(batch.partition_key, self.num_buckets);
         let target_thread = bucket_to_thread(bucket_id, self.num_buckets, self.num_threads);
 
@@ -175,10 +187,7 @@ impl WriterThreadPool {
             Err(err) => match err.0 {
                 WriteRequest::AppendEvents(req) => {
                     req.reply_tx
-                        .send(Err(io::Error::new(
-                            io::ErrorKind::NotFound,
-                            "writer thread is no longer running",
-                        )))
+                        .send(Err(WriteError::WriterThreadNotRunning))
                         .unwrap();
                     reply_rx
                 }
@@ -211,23 +220,17 @@ impl WriterThreadPool {
 pub struct AppendEventsBatch {
     partition_key: Uuid,
     transaction_id: Uuid,
-    events: SmallVec<[WriteRequestEvent; 4]>,
+    events: SmallVec<[WriteEventRequest; 4]>,
 }
 
 impl AppendEventsBatch {
-    pub fn single(event: WriteRequestEvent) -> io::Result<Self> {
+    pub fn single(event: WriteEventRequest) -> Result<Self, EventValidationError> {
         if !validate_event_id(event.event_id, &event.stream_id) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid event id: expected 8th and 9th bit of event id to be a hash of the partition key",
-            ));
+            return Err(EventValidationError::InvalidEventId);
         }
 
         if !(1..=STREAM_ID_SIZE).contains(&event.stream_id.len()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("stream id must be between 1 and {STREAM_ID_SIZE} characters in length"),
-            ));
+            return Err(EventValidationError::InvalidStreamIdLen);
         }
 
         Ok(AppendEventsBatch {
@@ -238,35 +241,32 @@ impl AppendEventsBatch {
     }
 
     pub fn transaction(
-        events: SmallVec<[WriteRequestEvent; 4]>,
+        events: SmallVec<[WriteEventRequest; 4]>,
         transaction_id: Uuid,
-    ) -> io::Result<Self> {
-        let Some(partition_key) = events
-            .iter()
-            .try_fold(None, |partition_key, event| match partition_key {
-                Some(partition_key) => {
-                    if event.partition_key != partition_key {
-                        return Err(io::Error::new(io::ErrorKind::InvalidInput, "all events in a transaction must share the same partition key"));
-                    }
+    ) -> Result<Self, EventValidationError> {
+        let Some(partition_key) =
+            events
+                .iter()
+                .try_fold(None, |partition_key, event| match partition_key {
+                    Some(partition_key) => {
+                        if event.partition_key != partition_key {
+                            return Err(EventValidationError::PartitionKeyMismatch);
+                        }
 
-                    if !validate_event_id(event.event_id, &event.stream_id) {
-                        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid event id: expected 8th and 9th bit of event id to be a hash of the partition key"));
-                    }
+                        if !validate_event_id(event.event_id, &event.stream_id) {
+                            return Err(EventValidationError::InvalidEventId);
+                        }
 
-                    if !(1..=STREAM_ID_SIZE).contains(&event.stream_id.len()) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("stream id must be between 1 and {STREAM_ID_SIZE} characters in length"),
-                        ));
-                    }
+                        if !(1..=STREAM_ID_SIZE).contains(&event.stream_id.len()) {
+                            return Err(EventValidationError::InvalidStreamIdLen);
+                        }
 
-                    Ok(Some(partition_key))
-                },
-                None => Ok(Some(
-                    event.partition_key,
-                )),
-            })? else {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "transaction has no events"));
+                        Ok(Some(partition_key))
+                    }
+                    None => Ok(Some(event.partition_key)),
+                })?
+        else {
+            return Err(EventValidationError::EmptyTransaction);
         };
 
         Ok(AppendEventsBatch {
@@ -276,7 +276,7 @@ impl AppendEventsBatch {
         })
     }
 
-    pub fn events(&self) -> &SmallVec<[WriteRequestEvent; 4]> {
+    pub fn events(&self) -> &SmallVec<[WriteEventRequest; 4]> {
         &self.events
     }
 }
@@ -289,10 +289,10 @@ enum WriteRequest {
 struct AppendEventsRequest {
     bucket_id: BucketId,
     batch: AppendEventsBatch,
-    reply_tx: oneshot::Sender<io::Result<()>>,
+    reply_tx: oneshot::Sender<Result<(), WriteError>>,
 }
 
-pub struct WriteRequestEvent {
+pub struct WriteEventRequest {
     pub event_id: Uuid,
     pub partition_key: Uuid,
     pub stream_id: Arc<str>,
@@ -309,16 +309,18 @@ struct Worker {
 }
 
 impl Worker {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         dir: PathBuf,
         segment_size: usize,
         thread_id: u16,
         num_buckets: u16,
         num_threads: u16,
-        flush_interval: Duration,
+        flush_interval_duration: Duration,
+        flush_interval_events: u32,
         reader_pool: &ReaderThreadPool,
         thread_pool: &Arc<ThreadPool>,
-    ) -> io::Result<Self> {
+    ) -> Result<Self, WriteError> {
         let mut writers = HashMap::new();
         let now = Instant::now();
         for bucket_id in 0..num_buckets {
@@ -358,7 +360,9 @@ impl Worker {
                     indexes,
                     pending_indexes: Vec::with_capacity(128),
                     last_flushed: now,
-                    flush_interval,
+                    unflushed_events: 0,
+                    flush_interval_duration,
+                    flush_interval_events,
                     thread_pool: Arc::clone(thread_pool),
                 };
 
@@ -386,17 +390,25 @@ impl Worker {
 
                     let Some(writer_set) = self.writers.get_mut(&bucket_id) else {
                         error!(
-                            "thread {} received a request for bucket {} that isn't assigned here.",
+                            "thread {} received a request for bucket {} that isn't assigned here",
                             self.thread_id, bucket_id
                         );
-                        let _ = reply_tx.send(Err(io::Error::new(
-                            io::ErrorKind::NotFound,
-                            "the writer for the bucket was not found - this is a bug",
-                        )));
+                        let _ = reply_tx.send(Err(WriteError::BucketWriterNotFound));
                         continue;
                     };
 
-                    let _ = reply_tx.send(writer_set.handle_write(transaction_id, events));
+                    writer_set.flush_if_necessary();
+
+                    let file_size = writer_set.writer.file_size();
+
+                    let res = writer_set.handle_write(transaction_id, events);
+                    if res.is_err() {
+                        if let Err(err) = writer_set.writer.set_len(file_size) {
+                            error!("failed to set segment file length after write error: {err}");
+                        }
+                    }
+
+                    let _ = reply_tx.send(res);
                 }
                 WriteRequest::FlushPoll => {
                     for writer_set in self.writers.values_mut() {
@@ -426,7 +438,9 @@ struct WriterSet {
     indexes: LiveIndexes,
     pending_indexes: Vec<PendingIndex>,
     last_flushed: Instant,
-    flush_interval: Duration,
+    unflushed_events: u32,
+    flush_interval_duration: Duration,
+    flush_interval_events: u32,
     thread_pool: Arc<ThreadPool>,
 }
 
@@ -434,10 +448,8 @@ impl WriterSet {
     fn handle_write(
         &mut self,
         transaction_id: Uuid,
-        mut events: SmallVec<[WriteRequestEvent; 4]>,
-    ) -> io::Result<()> {
-        self.flush_if_necessary();
-
+        mut events: SmallVec<[WriteEventRequest; 4]>,
+    ) -> Result<(), WriteError> {
         let file_size = self.writer.file_size();
 
         self.validate_event_versions(&mut events)?;
@@ -458,11 +470,15 @@ impl WriterSet {
                 COMMIT_SIZE
             };
 
+        if events_size + SEGMENT_HEADER_SIZE > self.segment_size {
+            return Err(WriteError::EventsExceedSegmentSize);
+        }
+
         if file_size as usize + self.writer.buf_len() + events_size > self.segment_size {
             self.rollover()?;
         }
 
-        let mut new_pending_indexes = Vec::with_capacity(events.len());
+        let mut new_pending_indexes: Vec<PendingIndex> = Vec::with_capacity(events.len());
 
         let event_count = events.len();
         for event in events {
@@ -476,7 +492,10 @@ impl WriterSet {
                 &event.event_id,
                 &event.partition_key,
                 &transaction_id,
-                event.stream_version.unwrap(),
+                event
+                    .stream_version
+                    .into_next_version()
+                    .ok_or(WriteError::StreamVersionTooHigh)?,
                 event.timestamp,
                 body,
             )?;
@@ -485,8 +504,11 @@ impl WriterSet {
             new_pending_indexes.push(PendingIndex {
                 event_id: event.event_id,
                 partition_key: event.partition_key,
-                stream_id: event.stream_id,
-                stream_version: event.stream_version.unwrap(),
+                stream_id: Arc::clone(&event.stream_id),
+                stream_version: event
+                    .stream_version
+                    .into_next_version()
+                    .ok_or(WriteError::StreamVersionTooHigh)?,
                 offset,
             });
         }
@@ -502,13 +524,21 @@ impl WriterSet {
 
         self.pending_indexes.extend(new_pending_indexes);
 
+        self.unflushed_events += event_count as u32;
+        if self.unflushed_events >= self.flush_interval_events {
+            if let Err(err) = self.flush() {
+                error!("failed to flush writer: {err}");
+            }
+        }
+
         Ok(())
     }
 
-    fn flush(&mut self) -> io::Result<()> {
+    fn flush(&mut self) -> Result<(), WriteError> {
         self.last_flushed = Instant::now();
         self.writer.flush()?;
         let mut indexes = self.indexes.blocking_write();
+        self.unflushed_events = 0;
         for PendingIndex {
             event_id,
             partition_key,
@@ -530,14 +560,14 @@ impl WriterSet {
     }
 
     fn flush_if_necessary(&mut self) {
-        if self.last_flushed.elapsed() >= self.flush_interval {
+        if self.last_flushed.elapsed() >= self.flush_interval_duration {
             if let Err(err) = self.flush() {
                 error!("failed to flush writer: {err}");
             }
         }
     }
 
-    fn rollover(&mut self) -> io::Result<()> {
+    fn rollover(&mut self) -> Result<(), WriteError> {
         self.last_flushed = Instant::now();
         self.writer.flush()?;
 
@@ -617,124 +647,194 @@ impl WriterSet {
 
     fn validate_event_versions(
         &self,
-        events: &mut SmallVec<[WriteRequestEvent; 4]>,
-    ) -> io::Result<()> {
-        let mut stream_versions: HashMap<&Arc<str>, u64> = HashMap::new();
+        events: &mut SmallVec<[WriteEventRequest; 4]>,
+    ) -> Result<(), WriteError> {
+        let mut stream_versions: HashMap<&Arc<str>, (u64, Uuid)> = HashMap::new();
         for event in events {
-            match event.stream_version {
-                ExpectedVersion::Any => todo!(),
-                ExpectedVersion::StreamExists => {}
-                ExpectedVersion::NoStream => {
-                    // TODO: if hash(partition_id) != hash(stream_id), check if stream index exists in hash(stream_id) bucket,
-                    // and if not, create one
-                    let stream_partition_id = stream_id_partition_id(&event.stream_id);
-                    let partition_key_id = extract_stream_hash(event.partition_key);
-                    if stream_partition_id != partition_key_id {
-                        todo!(
-                            "check if stream index exists in stream partition id, otherwise create one"
-                        );
-                    } else {
-                        match stream_versions.entry(&event.stream_id) {
-                            Entry::Occupied(entry) => {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::Other,
-                                    format!(
-                                        "current stream position is {} but expected no stream for stream {}",
-                                        entry.get(),
-                                        event.stream_id,
-                                    ),
-                                ));
-                            }
-                            Entry::Vacant(entry) => {
-                                let latest_stream_version = self
-                                    .pending_indexes
-                                    .iter()
-                                    .rev()
-                                    .find_map(|pending| {
-                                        if pending.stream_id == event.stream_id {
-                                            Some(StreamLatestVersion::LatestVersion {
-                                                partition_key: pending.partition_key,
-                                                version: pending.stream_version,
-                                            })
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .map(Ok)
-                                    .or_else(|| {
-                                        self.read_stream_latest_version(&event.stream_id)
-                                            .transpose()
-                                    })
-                                    .transpose()?;
+            match stream_versions.entry(&event.stream_id) {
+                Entry::Occupied(mut entry) => {
+                    if entry.get().1 != event.partition_key {
+                        return Err(WriteError::Validation(
+                            EventValidationError::PartitionKeyMismatch,
+                        ));
+                    }
 
-                                if latest_stream_version.is_some() {
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::InvalidInput,
-                                        "expected empty stream but it exists",
-                                    ));
-                                }
-                                entry.insert(0);
-                                event.stream_version = ExpectedVersion::Exact(0);
+                    match event.stream_version {
+                        ExpectedVersion::Any => {
+                            entry.get_mut().0 += 1;
+                            event.stream_version = ExpectedVersion::Exact(entry.get().0);
+                        }
+                        ExpectedVersion::StreamExists => {
+                            todo!()
+                        }
+                        ExpectedVersion::NoStream => {
+                            return Err(WriteError::WrongExpectedVersion {
+                                stream_id: Arc::clone(&event.stream_id),
+                                current: CurrentVersion::Current(entry.get().0),
+                                expected: event.stream_version,
+                            });
+                        }
+                        ExpectedVersion::Exact(expected_version) => {
+                            if entry.get().0 != expected_version {
+                                return Err(WriteError::WrongExpectedVersion {
+                                    stream_id: Arc::clone(&event.stream_id),
+                                    current: CurrentVersion::Current(entry.get().0),
+                                    expected: ExpectedVersion::Exact(expected_version),
+                                });
                             }
                         }
                     }
                 }
-                ExpectedVersion::Exact(expected_version) => {
-                    match stream_versions.entry(&event.stream_id) {
-                        Entry::Occupied(entry) => {
-                            if entry.get() + 1 != expected_version {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidInput,
-                                    format!(
-                                        "expected stream version {expected_version} but got {}",
-                                        entry.get() + 1
-                                    ),
-                                ));
-                            }
-                        }
-                        Entry::Vacant(entry) => {
-                            let latest_stream_version = self
-                                .pending_indexes
-                                .iter()
-                                .rev()
-                                .find_map(|pending| {
-                                    if pending.stream_id == event.stream_id {
-                                        Some(StreamLatestVersion::LatestVersion {
-                                            partition_key: pending.partition_key,
-                                            version: pending.stream_version,
-                                        })
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .map(Ok)
-                                .or_else(|| {
-                                    self.read_stream_latest_version(&event.stream_id)
-                                        .transpose()
-                                })
-                                .transpose()?;
+                Entry::Vacant(entry) => match event.stream_version {
+                    ExpectedVersion::Any => {
+                        let latest_stream_version = self
+                            .pending_indexes
+                            .iter()
+                            .rev()
+                            .find_map(|pending| {
+                                if pending.stream_id == event.stream_id {
+                                    Some(StreamLatestVersion::LatestVersion {
+                                        partition_key: pending.partition_key,
+                                        version: pending.stream_version,
+                                    })
+                                } else {
+                                    None
+                                }
+                            })
+                            .map(Ok)
+                            .or_else(|| {
+                                self.read_stream_latest_version(&event.stream_id)
+                                    .transpose()
+                            })
+                            .transpose()?;
 
-                            match latest_stream_version {
-                                Some(StreamLatestVersion::LatestVersion { version, .. })
-                                    if version + 1 == expected_version =>
-                                {
-                                    entry.insert(expected_version);
-                                }
-                                None if expected_version == 0 => {
-                                    entry.insert(0);
-                                }
-                                _ => {
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::InvalidInput,
-                                        format!(
-                                            "expected stream version {expected_version} but got something else",
-                                        ),
+                        match latest_stream_version {
+                            Some(StreamLatestVersion::LatestVersion {
+                                partition_key,
+                                version,
+                            }) => {
+                                if partition_key != event.partition_key {
+                                    return Err(WriteError::Validation(
+                                        EventValidationError::PartitionKeyMismatch,
                                     ));
                                 }
+
+                                entry.insert((version, partition_key));
+                                event.stream_version = ExpectedVersion::Exact(version);
+                            }
+                            Some(StreamLatestVersion::ExternalBucket { .. }) => {
+                                todo!()
+                            }
+                            None => {
+                                entry.insert((0, event.partition_key));
+                                event.stream_version = ExpectedVersion::NoStream;
                             }
                         }
                     }
-                }
+                    ExpectedVersion::StreamExists => todo!(),
+                    ExpectedVersion::NoStream => {
+                        let latest_stream_version = self
+                            .pending_indexes
+                            .iter()
+                            .rev()
+                            .find_map(|pending| {
+                                if pending.stream_id == event.stream_id {
+                                    Some(StreamLatestVersion::LatestVersion {
+                                        partition_key: pending.partition_key,
+                                        version: pending.stream_version,
+                                    })
+                                } else {
+                                    None
+                                }
+                            })
+                            .map(Ok)
+                            .or_else(|| {
+                                self.read_stream_latest_version(&event.stream_id)
+                                    .transpose()
+                            })
+                            .transpose()?;
+
+                        match latest_stream_version {
+                            Some(StreamLatestVersion::LatestVersion {
+                                partition_key,
+                                version,
+                            }) => {
+                                if partition_key != event.partition_key {
+                                    return Err(WriteError::Validation(
+                                        EventValidationError::PartitionKeyMismatch,
+                                    ));
+                                }
+
+                                return Err(WriteError::WrongExpectedVersion {
+                                    stream_id: Arc::clone(&event.stream_id),
+                                    current: CurrentVersion::Current(version),
+                                    expected: event.stream_version,
+                                });
+                            }
+                            Some(StreamLatestVersion::ExternalBucket { .. }) => {
+                                todo!()
+                            }
+                            None => {
+                                entry.insert((0, event.partition_key));
+                            }
+                        }
+                    }
+                    ExpectedVersion::Exact(expected_version) => {
+                        let latest_stream_version = self
+                            .pending_indexes
+                            .iter()
+                            .rev()
+                            .find_map(|pending| {
+                                if pending.stream_id == event.stream_id {
+                                    Some(StreamLatestVersion::LatestVersion {
+                                        partition_key: pending.partition_key,
+                                        version: pending.stream_version,
+                                    })
+                                } else {
+                                    None
+                                }
+                            })
+                            .map(Ok)
+                            .or_else(|| {
+                                self.read_stream_latest_version(&event.stream_id)
+                                    .transpose()
+                            })
+                            .transpose()?;
+
+                        match latest_stream_version {
+                            Some(StreamLatestVersion::LatestVersion {
+                                partition_key,
+                                version,
+                            }) => {
+                                if partition_key != event.partition_key {
+                                    return Err(WriteError::Validation(
+                                        EventValidationError::PartitionKeyMismatch,
+                                    ));
+                                }
+
+                                if version != expected_version {
+                                    return Err(WriteError::WrongExpectedVersion {
+                                        stream_id: Arc::clone(&event.stream_id),
+                                        current: CurrentVersion::Current(version),
+                                        expected: ExpectedVersion::Exact(expected_version),
+                                    });
+                                }
+
+                                entry.insert((expected_version, partition_key));
+                            }
+                            Some(StreamLatestVersion::ExternalBucket { .. }) => {
+                                todo!()
+                            }
+                            None => {
+                                return Err(WriteError::WrongExpectedVersion {
+                                    stream_id: Arc::clone(&event.stream_id),
+                                    current: CurrentVersion::NoStream,
+                                    expected: ExpectedVersion::Exact(expected_version),
+                                });
+                            }
+                        }
+                    }
+                },
             }
         }
 
@@ -744,7 +844,7 @@ impl WriterSet {
     fn read_stream_latest_version(
         &self,
         stream_id: &Arc<str>,
-    ) -> io::Result<Option<StreamLatestVersion>> {
+    ) -> Result<Option<StreamLatestVersion>, StreamIndexError> {
         let latest = self.indexes.blocking_read().1.get(stream_id).map(
             |StreamIndexRecord {
                  partition_key,
