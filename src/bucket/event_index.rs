@@ -1,28 +1,37 @@
+//! The file format for an MPHF-based index is defined as follows:
+//!   [0..4]   : magic marker: b"EIDX"
+//!   [4..12]  : number of keys (n) as a u64
+//!   [12..20] : length of serialized MPHF (L) as a u64
+//!   [20..20+L] : serialized MPHF bytes (using bincode)
+//!   [20+L..] : records array, exactly n records of RECORD_SIZE bytes each.
+
 use std::{
     collections::BTreeMap,
     fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Write},
     mem,
     os::unix::fs::FileExt,
     panic::panic_any,
     path::Path,
-    sync::{Arc, Weak},
+    sync::Arc,
 };
 
+use arc_swap::{ArcSwap, Cache};
+use boomphf::Mphf;
 use rayon::ThreadPool;
 use uuid::Uuid;
 
-use crate::{
-    RANDOM_STATE,
-    error::{EventIndexError, ThreadPoolError},
-};
+use crate::error::{EventIndexError, ThreadPoolError};
 
 use super::{
     BucketSegmentId,
     segment::{BucketSegmentReader, EventRecord, Record},
 };
 
+// Each record is 16 bytes for the Uuid and 8 bytes for the offset.
 const RECORD_SIZE: usize = mem::size_of::<Uuid>() + mem::size_of::<u64>();
+
+const MPHF_GAMMA: f64 = 1.4;
 
 pub struct OpenEventIndex {
     id: BucketSegmentId,
@@ -43,13 +52,13 @@ impl OpenEventIndex {
     }
 
     pub fn open(id: BucketSegmentId, path: impl AsRef<Path>) -> Result<Self, EventIndexError> {
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .truncate(false)
+            .truncate(true)
             .open(path)?;
-        let index = load_index_from_file(&mut file)?;
+        let index = BTreeMap::new();
 
         Ok(OpenEventIndex { id, file, index })
     }
@@ -58,31 +67,35 @@ impl OpenEventIndex {
     pub fn close(self, pool: &ThreadPool) -> Result<ClosedEventIndex, EventIndexError> {
         let id = self.id;
         let mut file_clone = self.file.try_clone()?;
-        let num_slots = self.num_slots();
-        let strong_index = Arc::new(self.index);
-        let weak_index = Arc::downgrade(&strong_index);
+        let index = Arc::new(ArcSwap::new(Arc::new(ClosedIndex::Cache(self.index))));
 
         pool.spawn({
-            move || {
-                if let Err(err) =
-                    Self::flush_inner(&mut file_clone, &strong_index, num_slots, |_, _| true)
-                {
-                    panic_any(ThreadPoolError::FlushEventIndex {
-                        id,
-                        file: file_clone,
-                        index: strong_index,
-                        num_slots: num_slots as u64,
-                        err,
-                    });
-                }
+            let index = Arc::clone(&index);
+            move || match &**index.load() {
+                ClosedIndex::Cache(map) => match Self::flush_inner(&mut file_clone, map) {
+                    Ok((mphf, records_offset)) => {
+                        index.store(Arc::new(ClosedIndex::Mphf {
+                            mphf,
+                            records_offset,
+                        }));
+                    }
+                    Err(err) => {
+                        panic_any(ThreadPoolError::FlushEventIndex {
+                            id,
+                            file: file_clone,
+                            index,
+                            err,
+                        });
+                    }
+                },
+                ClosedIndex::Mphf { .. } => unreachable!("no other threads write to this arc swap"),
             }
         });
 
         Ok(ClosedEventIndex {
             id,
             file: self.file,
-            num_slots: num_slots as u64,
-            index: Arc::new(weak_index),
+            index: Cache::new(index),
         })
     }
 
@@ -101,9 +114,8 @@ impl OpenEventIndex {
         self.index.retain(f);
     }
 
-    pub fn flush(&mut self) -> Result<(), EventIndexError> {
-        let num_slots = self.num_slots();
-        Self::flush_inner(&mut self.file, &self.index, num_slots, |_, _| true)
+    pub fn flush(&mut self) -> Result<(Mphf<Uuid>, u64), EventIndexError> {
+        Self::flush_inner(&mut self.file, &self.index)
     }
 
     /// Hydrates the index from a reader.
@@ -123,53 +135,46 @@ impl OpenEventIndex {
         Ok(())
     }
 
-    fn flush_inner<F>(
+    fn flush_inner(
         file: &mut File,
         index: &BTreeMap<Uuid, u64>,
-        num_slots: usize,
-        mut filter: F,
-    ) -> Result<(), EventIndexError>
-    where
-        F: FnMut(&Uuid, &u64) -> bool,
-    {
-        let mut file_data = vec![0u8; 8 + num_slots * RECORD_SIZE];
+    ) -> Result<(Mphf<Uuid>, u64), EventIndexError> {
+        // Collect all keys from the index.
+        let keys: Vec<Uuid> = index.keys().cloned().collect();
+        let n = keys.len() as u64;
 
-        // Write number of slots at the start
-        file_data[..8].copy_from_slice(&(num_slots as u64).to_le_bytes());
+        // Build the MPHF over the keys. The parameter (gamma) controls the space/performance trade-off.
+        let mphf = Mphf::new(MPHF_GAMMA, &keys);
 
+        // Serialize the MPHF structure.
+        let mphf_bytes = bincode::serialize(&mphf).map_err(EventIndexError::SerializeMphf)?;
+        let mphf_bytes_len = mphf_bytes.len() as u64;
+
+        // Allocate a records array for exactly n records.
+        let mut records = vec![0u8; index.len() * RECORD_SIZE];
+
+        // Place each record in its slot according to the MPHF.
+        // Since the MPHF is perfect, each key maps to a unique slot.
         for (&event_id, &offset) in index {
-            if !filter(&event_id, &offset) {
-                continue; // Skip this event if it doesn't meet the filter condition
-            }
-
-            let mut slot = RANDOM_STATE.hash_one(event_id) % num_slots as u64;
-
-            // Linear probing to find an empty slot
-            loop {
-                let pos = 8 + (slot * RECORD_SIZE as u64) as usize;
-                let existing_uuid = Uuid::from_bytes(file_data[pos..pos + 16].try_into().unwrap());
-
-                if existing_uuid.is_nil() {
-                    // Write UUID and offset
-                    file_data[pos..pos + 16].copy_from_slice(event_id.as_bytes());
-                    file_data[pos + 16..pos + 24].copy_from_slice(&offset.to_le_bytes());
-                    break;
-                }
-
-                slot = (slot + 1) % num_slots as u64;
-            }
+            let slot = mphf.hash(&event_id) as usize;
+            let pos = slot * RECORD_SIZE;
+            records[pos..pos + 16].copy_from_slice(event_id.as_bytes());
+            records[pos + 16..pos + 24].copy_from_slice(&offset.to_le_bytes());
         }
 
-        // Flush the whole file at once
+        // Build the file header.
+        // Magic marker ("MPHF"), number of keys, length of mph_bytes, then the mph_bytes.
+        let mut file_data = Vec::with_capacity(20 + mphf_bytes.len() + records.len());
+        file_data.extend_from_slice(b"EIDX"); // magic: 4 bytes
+        file_data.extend_from_slice(&n.to_le_bytes()); // number of keys: 8 bytes
+        file_data.extend_from_slice(&mphf_bytes_len.to_le_bytes()); // length of mph_bytes: 8 bytes
+        file_data.extend_from_slice(&mphf_bytes); // serialized MPHF
+        file_data.extend_from_slice(&records); // records array
+
         file.write_all_at(&file_data, 0)?;
         file.flush()?;
 
-        Ok(())
-    }
-
-    #[inline]
-    fn num_slots(&self) -> usize {
-        self.index.len() * 2
+        Ok((mphf, 4 + 8 + 8 + mphf_bytes_len))
     }
 }
 
@@ -177,24 +182,30 @@ pub struct ClosedEventIndex {
     #[allow(unused)] // TODO: is this ID needed?
     id: BucketSegmentId,
     file: File,
-    num_slots: u64,
-    index: Arc<Weak<BTreeMap<Uuid, u64>>>,
+    index: Cache<Arc<ArcSwap<ClosedIndex>>, Arc<ClosedIndex>>,
+}
+
+#[derive(Debug)]
+pub enum ClosedIndex {
+    Cache(BTreeMap<Uuid, u64>),
+    Mphf {
+        mphf: Mphf<Uuid>,
+        records_offset: u64,
+    },
 }
 
 impl ClosedEventIndex {
     pub fn open(id: BucketSegmentId, path: impl AsRef<Path>) -> Result<Self, EventIndexError> {
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-
-        // Read the first 8 bytes to get the total number of slots
-        let mut count_buf = [0u8; 8];
-        file.read_exact(&mut count_buf)?;
-        let num_slots = u64::from_le_bytes(count_buf);
+        let (mphf, _, records_offset) = load_index_from_file(&mut file)?;
 
         Ok(ClosedEventIndex {
             id,
             file,
-            num_slots,
-            index: Arc::new(Weak::new()),
+            index: Cache::new(Arc::new(ArcSwap::new(Arc::new(ClosedIndex::Mphf {
+                mphf,
+                records_offset,
+            })))),
         })
     }
 
@@ -202,111 +213,68 @@ impl ClosedEventIndex {
         Ok(ClosedEventIndex {
             id: self.id,
             file: self.file.try_clone()?,
-            num_slots: self.num_slots,
-            index: Arc::clone(&self.index),
+            index: self.index.clone(),
         })
     }
 
-    pub fn get(&self, event_id: &Uuid) -> Result<Option<u64>, EventIndexError> {
-        // Read from memory.
-        // This code should only run when the segment is being closed and is being flushed in the background.
-        if let Some(index) = self.index.upgrade() {
-            return Ok(index.get(event_id).copied());
-        }
+    pub fn get(&mut self, event_id: &Uuid) -> Result<Option<u64>, EventIndexError> {
+        match self.index.load().as_ref() {
+            ClosedIndex::Cache(index) => Ok(index.get(event_id).copied()),
+            ClosedIndex::Mphf {
+                mphf,
+                records_offset,
+            } => {
+                // Compute the slot using the MPHF.
+                let Some(slot) = mphf.try_hash(event_id) else {
+                    return Ok(None);
+                };
+                let pos = records_offset + slot * RECORD_SIZE as u64;
+                let mut buf = [0u8; RECORD_SIZE];
+                self.file.read_exact_at(&mut buf, pos)?;
+                let stored_uuid = Uuid::from_bytes(buf[..16].try_into().unwrap());
 
-        if self.num_slots == 0 {
-            return Ok(None);
-        }
-
-        // Compute slot index
-        let mut slot = RANDOM_STATE.hash_one(event_id) % self.num_slots;
-
-        let mut read_buf = [0u8; RECORD_SIZE * 2];
-        let mut buf: &[u8] = &[];
-
-        // Try to find the key using linear probing
-        for _ in 0..self.num_slots {
-            if buf.len() < RECORD_SIZE {
-                let mut pos = 8 + slot * RECORD_SIZE as u64;
-                let mut read = 0;
-
-                while read < RECORD_SIZE * 2 {
-                    let n = self.file.read_at(&mut read_buf[read..], pos)?;
-                    pos += n as u64;
-                    read += n;
-                    if n == 0 {
-                        break;
-                    }
-                }
-
-                if read == 0 {
+                // Because the MPHF is defined only on the keys present at build time,
+                // if the key is not in the set you might read a record that doesn’t match.
+                if stored_uuid.is_nil() || &stored_uuid != event_id {
                     return Ok(None);
                 }
+                let offset = u64::from_le_bytes(buf[16..24].try_into().unwrap());
 
-                buf = &read_buf[..read];
-            }
-
-            let stored_uuid = Uuid::from_bytes(buf[..16].try_into().unwrap());
-            let offset = u64::from_le_bytes(buf[16..16 + 8].try_into().unwrap());
-
-            if stored_uuid.is_nil() {
-                return Ok(None);
-            }
-            if &stored_uuid == event_id {
-                return Ok(Some(offset));
-            }
-
-            // Collision: check next slot
-            slot = (slot + 1) % self.num_slots;
-
-            // Slide the buf across if there's length
-            if buf.len() >= RECORD_SIZE * 2 {
-                buf = &buf[RECORD_SIZE..];
-            } else {
-                buf = &[];
+                Ok(Some(offset))
             }
         }
-
-        Ok(None)
     }
 }
 
 /// Loads the index from a direct-mapped file format
-fn load_index_from_file(file: &mut File) -> Result<BTreeMap<Uuid, u64>, EventIndexError> {
-    let mut file_data = Vec::with_capacity(file.metadata()?.len() as usize);
-    file.seek(SeekFrom::Start(0))?;
-    file.read_to_end(&mut file_data)?;
-
-    if file_data.is_empty() {
-        return Ok(BTreeMap::new());
+fn load_index_from_file(file: &mut File) -> Result<(Mphf<Uuid>, u64, u64), EventIndexError> {
+    // Read magic marker.
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic)?;
+    if &magic != b"EIDX" {
+        return Err(EventIndexError::CorruptHeader);
     }
 
-    if file_data.len() < 8 {
-        return Err(EventIndexError::CorruptNumSlots);
-    }
+    // Read number of keys.
+    let mut n_buf = [0u8; 8];
+    file.read_exact(&mut n_buf)?;
+    let n = u64::from_le_bytes(n_buf);
 
-    let num_slots = u64::from_le_bytes(file_data[..8].try_into().unwrap()) as usize;
+    // Read length of serialized MPHF.
+    let mut mph_len_buf = [0u8; 8];
+    file.read_exact(&mut mph_len_buf)?;
+    let mph_bytes_len = u64::from_le_bytes(mph_len_buf) as usize;
 
-    let mut index = BTreeMap::new();
+    // Read the MPHF bytes and deserialize.
+    let mut mph_bytes = vec![0u8; mph_bytes_len];
+    file.read_exact(&mut mph_bytes)?;
+    let mph: Mphf<Uuid> =
+        bincode::deserialize(&mph_bytes).map_err(EventIndexError::DeserializeMphf)?;
 
-    for i in 0..num_slots {
-        let pos = 8 + RECORD_SIZE * i;
+    // The records array immediately follows.
+    let records_offset = 4 + 8 + 8 + mph_bytes_len as u64;
 
-        if file_data.len() < pos + RECORD_SIZE {
-            return Err(EventIndexError::CorruptRecord { offset: pos as u64 });
-        }
-
-        let uuid = Uuid::from_bytes(file_data[pos..pos + 16].try_into().unwrap());
-        let offset = u64::from_le_bytes(file_data[pos + 16..pos + 16 + 8].try_into().unwrap());
-
-        if uuid.is_nil() {
-            continue;
-        }
-
-        index.insert(uuid, offset);
-    }
-
-    Ok(index)
+    Ok((mph, n, records_offset))
 }
 
 #[cfg(test)]
@@ -340,30 +308,6 @@ mod tests {
     }
 
     #[test]
-    fn test_open_event_index_flush_and_reopen() {
-        let path = temp_file_path();
-        let mut index = OpenEventIndex::create(BucketSegmentId::new(0, 0), &path).unwrap();
-
-        let event_id1 = Uuid::new_v4();
-        let event_id2 = Uuid::new_v4();
-        let offset1 = 11111;
-        let offset2 = 22222;
-
-        index.insert(event_id1, offset1);
-        index.insert(event_id2, offset2);
-        index.flush().unwrap();
-
-        // Ensure the file is written by seeking back to the beginning
-        index.file.seek(SeekFrom::Start(0)).unwrap();
-
-        // Reopen and verify data is still present
-        let reopened_index = OpenEventIndex::open(BucketSegmentId::new(0, 0), &path).unwrap();
-        assert_eq!(reopened_index.get(&event_id1), Some(offset1));
-        assert_eq!(reopened_index.get(&event_id2), Some(offset2));
-        assert_eq!(reopened_index.get(&Uuid::new_v4()), None);
-    }
-
-    #[test]
     fn test_closed_event_index_lookup() {
         let path = temp_file_path();
         let mut index = OpenEventIndex::create(BucketSegmentId::new(0, 0), &path).unwrap();
@@ -377,7 +321,7 @@ mod tests {
         index.insert(event_id2, offset2);
         index.flush().unwrap();
 
-        let closed_index = ClosedEventIndex::open(BucketSegmentId::new(0, 0), &path).unwrap();
+        let mut closed_index = ClosedEventIndex::open(BucketSegmentId::new(0, 0), &path).unwrap();
         assert_eq!(closed_index.get(&event_id1).unwrap(), Some(offset1));
         assert_eq!(closed_index.get(&event_id2).unwrap(), Some(offset2));
         assert_eq!(closed_index.get(&Uuid::new_v4()).unwrap(), None);
@@ -398,7 +342,7 @@ mod tests {
         index.insert(event_id2, offset2);
         index.flush().unwrap();
 
-        let closed_index = ClosedEventIndex::open(BucketSegmentId::new(0, 0), &path).unwrap();
+        let mut closed_index = ClosedEventIndex::open(BucketSegmentId::new(0, 0), &path).unwrap();
         assert_eq!(closed_index.get(&event_id1).unwrap(), Some(offset1));
         assert_eq!(closed_index.get(&event_id2).unwrap(), Some(offset2));
     }
@@ -410,7 +354,7 @@ mod tests {
         let mut index = OpenEventIndex::create(BucketSegmentId::new(0, 0), &path).unwrap();
         index.flush().unwrap();
 
-        let index = ClosedEventIndex::open(BucketSegmentId::new(0, 0), path).unwrap();
+        let mut index = ClosedEventIndex::open(BucketSegmentId::new(0, 0), path).unwrap();
 
         let unknown_event_id = Uuid::new_v4();
         assert_eq!(index.get(&unknown_event_id).unwrap(), None);
