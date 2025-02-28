@@ -459,7 +459,7 @@ pub struct ClosedStreamIndex {
     file: File,
     num_slots: u64,
     #[allow(clippy::type_complexity)]
-    index: Arc<Weak<BTreeMap<Arc<str>, StreamIndexRecord<StreamOffsets>>>>,
+    index: Arc<Weak<BTreeMap<Arc<str>, StreamIndexRecord<StreamOffsets>>>>, // TODO: Don't wrap in Arc, wtf lol
     bloom: Arc<Bloom<str>>,
 }
 
@@ -1188,7 +1188,7 @@ mod tests {
                 version_min: 0,
                 version_max: 1,
                 partition_key: partition_key1,
-                offsets: ClosedOffsetKind::Pointer(131944, 2),
+                offsets: ClosedOffsetKind::Pointer(132052, 2),
             })
         );
         assert_eq!(
@@ -1201,7 +1201,7 @@ mod tests {
                 version_min: 0,
                 version_max: 0,
                 partition_key: partition_key2,
-                offsets: ClosedOffsetKind::Pointer(131960, 1),
+                offsets: ClosedOffsetKind::Pointer(132068, 1),
             })
         );
         assert_eq!(
@@ -1287,7 +1287,7 @@ mod tests {
                 version_min: 0,
                 version_max: 1,
                 partition_key: partition_key1,
-                offsets: ClosedOffsetKind::Pointer(132376, 2),
+                offsets: ClosedOffsetKind::Pointer(132700, 2),
             })
         );
         assert_eq!(
@@ -1301,7 +1301,7 @@ mod tests {
                 version_min: 0,
                 version_max: 2,
                 partition_key: partition_key2,
-                offsets: ClosedOffsetKind::Pointer(132392, 3),
+                offsets: ClosedOffsetKind::Pointer(132716, 3),
             })
         );
         assert_eq!(
@@ -1315,7 +1315,7 @@ mod tests {
                 version_min: 0,
                 version_max: 1,
                 partition_key: partition_key3,
-                offsets: ClosedOffsetKind::Pointer(132416, 2),
+                offsets: ClosedOffsetKind::Pointer(132740, 2),
             })
         );
         assert_eq!(
@@ -1329,7 +1329,7 @@ mod tests {
                 version_min: 0,
                 version_max: 0,
                 partition_key: partition_key4,
-                offsets: ClosedOffsetKind::Pointer(132432, 1),
+                offsets: ClosedOffsetKind::Pointer(132756, 1),
             })
         );
         assert_eq!(

@@ -1,12 +1,13 @@
 use std::{collections::BTreeMap, fs::File, io, str::Utf8Error, sync::Arc, time::SystemTimeError};
 
+use arc_swap::ArcSwap;
 use rayon::ThreadPoolBuildError;
 use thiserror::Error;
-use uuid::Uuid;
 
 use crate::{
     bucket::{
         BucketSegmentId,
+        event_index::ClosedIndex,
         stream_index::{StreamIndexRecord, StreamOffsets},
     },
     database::{CurrentVersion, ExpectedVersion},
@@ -19,8 +20,7 @@ pub enum ThreadPoolError {
     FlushEventIndex {
         id: BucketSegmentId,
         file: File,
-        index: Arc<BTreeMap<Uuid, u64>>,
-        num_slots: u64,
+        index: Arc<ArcSwap<ClosedIndex>>,
         err: EventIndexError,
     },
     #[error("failed to flush stream index for {id}: {err}")]
@@ -104,6 +104,12 @@ impl From<SystemTimeError> for WriteError {
 
 #[derive(Debug, Error)]
 pub enum EventIndexError {
+    #[error("failed to deserialize MPHF: {0}")]
+    DeserializeMphf(bincode::Error),
+    #[error("failed to serialize MPHF: {0}")]
+    SerializeMphf(bincode::Error),
+    #[error("corrupt magic bytes header")]
+    CorruptHeader,
     #[error("corrupt number of slots section in event index")]
     CorruptNumSlots,
     #[error("corrupt record in event index")]
