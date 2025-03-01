@@ -173,10 +173,10 @@ impl Database {
             move |with_readers| {
                 with_readers(move |readers| {
                     let res = readers
-                        .get(&root_bucket_id)
+                        .get_mut(&root_bucket_id)
                         .and_then(|segments| {
-                            segments.iter().rev().find_map(|(_, reader_set)| {
-                                let stream_index = reader_set.stream_index.as_ref()?;
+                            segments.iter_mut().rev().find_map(|(_, reader_set)| {
+                                let stream_index = reader_set.stream_index.as_mut()?;
                                 let record = match stream_index.get_key(&stream_id).transpose()? {
                                     Ok(record) => record,
                                     Err(err) => return Some(Err(err)),
