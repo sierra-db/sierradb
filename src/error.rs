@@ -1,15 +1,11 @@
-use std::{collections::BTreeMap, fs::File, io, str::Utf8Error, sync::Arc, time::SystemTimeError};
+use std::{fs::File, io, str::Utf8Error, sync::Arc, time::SystemTimeError};
 
 use arc_swap::ArcSwap;
 use rayon::ThreadPoolBuildError;
 use thiserror::Error;
 
 use crate::{
-    bucket::{
-        BucketSegmentId,
-        event_index::ClosedIndex,
-        stream_index::{StreamIndexRecord, StreamOffsets},
-    },
+    bucket::{BucketSegmentId, event_index::ClosedIndex},
     database::{CurrentVersion, ExpectedVersion},
 };
 
@@ -27,8 +23,7 @@ pub enum ThreadPoolError {
     FlushStreamIndex {
         id: BucketSegmentId,
         file: File,
-        index: Arc<BTreeMap<Arc<str>, StreamIndexRecord<StreamOffsets>>>,
-        num_slots: u64,
+        index: Arc<ArcSwap<crate::bucket::stream_index::ClosedIndex>>,
         err: StreamIndexError,
     },
 }
@@ -124,6 +119,12 @@ pub enum EventIndexError {
 pub enum StreamIndexError {
     #[error("bloom filter error: {err}")]
     Bloom { err: &'static str },
+    #[error("failed to deserialize MPHF: {0}")]
+    DeserializeMphf(bincode::Error),
+    #[error("failed to serialize MPHF: {0}")]
+    SerializeMphf(bincode::Error),
+    #[error("corrupt magic bytes header in stream index")]
+    CorruptHeader,
     #[error("corrupt number of slots section in stream index")]
     CorruptNumSlots,
     #[error("corrupt stream index length")]

@@ -279,10 +279,7 @@ fn load_index_from_file(file: &mut File) -> Result<(Mphf<Uuid>, u64, u64), Event
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::{Seek, SeekFrom},
-        path::PathBuf,
-    };
+    use std::path::PathBuf;
 
     use super::*;
 

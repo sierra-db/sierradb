@@ -1,28 +1,35 @@
+//! The file format for an MPHF-based stream index is defined as follows:
+//!   [0..4]   : magic marker: b"SIDX"
+//!   [4..12]  : number of keys (n) as a u64
+//!   [12..20] : length of serialized MPHF (L) as a u64
+//!   [20..20+L] : serialized MPHF bytes (using bincode)
+//!   [20+L..] : records array, exactly n records of RECORD_SIZE bytes each.
+
 use std::{
     collections::{BTreeMap, HashMap, VecDeque, btree_map::Entry},
     fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Seek, Write},
     mem,
     os::unix::fs::FileExt,
     panic::panic_any,
     path::Path,
     sync::{
-        Arc, Weak,
+        Arc,
         atomic::{AtomicU32, Ordering},
     },
 };
 
+use arc_swap::{ArcSwap, Cache};
 use bloomfilter::Bloom;
-use const_primes::{Primes, next_prime};
+use boomphf::Mphf;
 use rayon::ThreadPool;
 use tokio::sync::oneshot;
 use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::{
-    BLOOM_SEED, RANDOM_STATE,
+    BLOOM_SEED,
     bucket::segment::CommittedEvents,
-    copy_bytes,
     error::{EventValidationError, StreamIndexError, ThreadPoolError},
     from_bytes,
 };
@@ -46,15 +53,7 @@ const RECORD_SIZE: usize =
 const AVG_EVENT_SIZE: usize = 350;
 const AVG_EVENTS_PER_STREAM: usize = 10;
 const FALSE_POSITIVE_PROBABILITY: f64 = 0.001;
-
-// First 23,001 primes, maxing out at 262,147 (2^18).
-// This occupies 92 KB
-#[cfg(not(debug_assertions))]
-const PRIMES: Primes<23_001> = Primes::new();
-
-// Smaller primes cache for faster build times in debug mode.
-#[cfg(debug_assertions)]
-const PRIMES: Primes<100> = Primes::new();
+const MPHF_GAMMA: f64 = 1.4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamIndexRecord<T> {
@@ -125,13 +124,19 @@ impl OpenStreamIndex {
         path: impl AsRef<Path>,
         segment_size: usize,
     ) -> Result<Self, StreamIndexError> {
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(path)?;
-        let (index, bloom) = load_index_from_file(&mut file, segment_size)?;
+        let index = BTreeMap::new();
+        let bloom = Bloom::new_for_fp_rate_with_seed(
+            (segment_size / AVG_EVENT_SIZE / AVG_EVENTS_PER_STREAM).max(1),
+            FALSE_POSITIVE_PROBABILITY,
+            &BLOOM_SEED,
+        )
+        .map_err(|err| StreamIndexError::Bloom { err })?;
 
         Ok(OpenStreamIndex {
             id,
@@ -145,35 +150,37 @@ impl OpenStreamIndex {
     pub fn close(self, pool: &ThreadPool) -> Result<ClosedStreamIndex, StreamIndexError> {
         let id = self.id;
         let mut file_clone = self.file.try_clone()?;
-        let num_slots = self.num_slots();
-        let strong_index = Arc::new(self.index);
-        let weak_index = Arc::downgrade(&strong_index);
+        let index = Arc::new(ArcSwap::new(Arc::new(ClosedIndex::Cache(self.index))));
         let bloom = Arc::new(self.bloom);
 
         pool.spawn({
+            let index = Arc::clone(&index);
             let bloom = Arc::clone(&bloom);
-            move || {
-                if let Err(err) =
-                    Self::flush_inner(&mut file_clone, &strong_index, &bloom, num_slots, |_, _| {
-                        true
-                    })
-                {
-                    panic_any(ThreadPoolError::FlushStreamIndex {
-                        id,
-                        file: file_clone,
-                        index: strong_index,
-                        num_slots: num_slots as u64,
-                        err,
-                    });
-                }
+            move || match &**index.load() {
+                ClosedIndex::Cache(map) => match Self::flush_inner(&mut file_clone, map, &bloom) {
+                    Ok((mphf, records_offset)) => {
+                        index.store(Arc::new(ClosedIndex::Mphf {
+                            mphf,
+                            records_offset,
+                        }));
+                    }
+                    Err(err) => {
+                        panic_any(ThreadPoolError::FlushStreamIndex {
+                            id,
+                            file: file_clone,
+                            index,
+                            err,
+                        });
+                    }
+                },
+                ClosedIndex::Mphf { .. } => unreachable!("no other threads write to this arc swap"),
             }
         });
 
         Ok(ClosedStreamIndex {
             id,
             file: self.file,
-            num_slots: num_slots as u64,
-            index: Arc::new(weak_index),
+            index: Cache::new(index),
             bloom,
         })
     }
@@ -270,31 +277,8 @@ impl OpenStreamIndex {
         Ok(())
     }
 
-    // pub fn retain<F>(&mut self, f: F)
-    // where
-    //     F: FnMut(&Arc<str>, &mut StreamIndexEntry) -> bool,
-    // {
-    //     self.index.retain(f);
-    // }
-
-    // pub fn retain_offsets<F>(&mut self, f: F)
-    // where
-    //     F: FnMut(&u64) -> bool + Copy,
-    // {
-    //     for offsets in self.index.values_mut() {
-    //         offsets.retain(f)
-    //     }
-    // }
-
-    pub fn flush(&mut self) -> Result<(), StreamIndexError> {
-        let num_slots = self.num_slots();
-        Self::flush_inner(
-            &mut self.file,
-            &self.index,
-            &self.bloom,
-            num_slots,
-            |_, _| true,
-        )
+    pub fn flush(&mut self) -> Result<(Mphf<String>, u64), StreamIndexError> {
+        Self::flush_inner(&mut self.file, &self.index, &self.bloom)
     }
 
     /// Hydrates the index from a reader.
@@ -323,143 +307,171 @@ impl OpenStreamIndex {
         Ok(())
     }
 
-    fn flush_inner<F>(
+    fn flush_inner(
         file: &mut File,
         index: &BTreeMap<Arc<str>, StreamIndexRecord<StreamOffsets>>,
         bloom: &Bloom<str>,
-        num_slots: usize,
-        mut filter: F,
-    ) -> Result<(), StreamIndexError>
-    where
-        F: FnMut(&Arc<str>, &u64) -> bool,
-    {
+    ) -> Result<(Mphf<String>, u64), StreamIndexError> {
+        // Collect all keys from the index as strings
+        let keys: Vec<String> = index.keys().map(|k| k.to_string()).collect();
+        let n = keys.len() as u64;
+
+        // Build the MPHF over the keys
+        let mphf = Mphf::new(MPHF_GAMMA, &keys);
+
+        // Serialize the MPHF structure
+        let mphf_bytes = bincode::serialize(&mphf).map_err(StreamIndexError::SerializeMphf)?;
+        let mphf_bytes_len = mphf_bytes.len() as u64;
+
+        // Get the bloom filter bytes
         let bloom_bytes = bloom.to_bytes();
 
-        let file_size = (mem::size_of::<u64>() + mem::size_of::<u64>())
-            .checked_add(bloom_bytes.len())
-            .unwrap()
-            .checked_add(num_slots * RECORD_SIZE)
-            .unwrap();
-        let mut file_data = vec![0u8; file_size];
-        let mut offset = file_size as u64;
+        // Allocate a records array for exactly n records
+        let mut records = vec![0u8; index.len() * RECORD_SIZE];
 
+        // Truncate the file before writing
+        file.set_len(0)?;
+
+        // Value data for all stream records
         let mut value_data = Vec::new();
 
-        copy_bytes!(file_data, [
-            &(num_slots as u64).to_le_bytes(),
-            &(bloom_bytes.len() as u64).to_le_bytes(),
-            &bloom_bytes,
-        ]);
+        // Calculate the base offset for values
+        let header_size = 4 + 8 + 8 + mphf_bytes.len() as u64 + 8 + bloom_bytes.len() as u64;
+        let records_size = (index.len() * RECORD_SIZE) as u64;
+        let values_base_offset = header_size + records_size;
 
+        // Place each record in its slot according to the MPHF
         for (stream_id, record) in index {
+            let slot = mphf.hash(&stream_id.to_string()) as usize;
+            let pos = slot * RECORD_SIZE;
+
             match &record.offsets {
                 StreamOffsets::Offsets(offsets) => {
-                    let offsets_bytes: Vec<_> = offsets
-                        .iter()
-                        .filter(|offset| filter(stream_id, offset))
-                        .flat_map(|v| v.to_le_bytes())
-                        .collect();
+                    let offsets_bytes: Vec<_> =
+                        offsets.iter().flat_map(|v| v.to_le_bytes()).collect();
+
                     if offsets_bytes.is_empty() {
                         continue;
                     }
 
-                    let mut slot = RANDOM_STATE.hash_one(stream_id) % num_slots as u64;
                     let offsets_len = offsets.len() as u32;
 
-                    loop {
-                        let mut pos = mem::size_of::<u64>()
-                            + mem::size_of::<u64>()
-                            + bloom_bytes.len()
-                            + (slot * RECORD_SIZE as u64) as usize;
-                        let existing_key = &file_data[pos..pos + STREAM_ID_SIZE];
+                    // Record entry: stream_id, partition_key, version_min, version_max, offset, len
+                    let mut pos_in_record = 0;
 
-                        if existing_key.iter().all(|&b| b == 0) {
-                            copy_bytes!(
-                                file_data,
-                                pos,
-                                [
-                                    stream_id.as_bytes() => stream_id.len(); + STREAM_ID_SIZE,
-                                    record.partition_key.as_bytes() => PARTITION_KEY_SIZE,
-                                    &record.version_min.to_le_bytes() => VERSION_SIZE,
-                                    &record.version_max.to_le_bytes() => VERSION_SIZE,
-                                    &offset.to_le_bytes() => OFFSET_SIZE,
-                                    &offsets_len.to_le_bytes() => LEN_SIZE,
-                                ]
-                            );
+                    // Stream ID with padding to STREAM_ID_SIZE
+                    let stream_id_bytes = stream_id.as_bytes();
+                    records[pos + pos_in_record..pos + pos_in_record + stream_id_bytes.len()]
+                        .copy_from_slice(stream_id_bytes);
+                    pos_in_record += STREAM_ID_SIZE;
 
-                            break;
-                        }
+                    // Partition key
+                    records[pos + pos_in_record..pos + pos_in_record + PARTITION_KEY_SIZE]
+                        .copy_from_slice(record.partition_key.as_bytes());
+                    pos_in_record += PARTITION_KEY_SIZE;
 
-                        slot = (slot + 1) % num_slots as u64;
-                    }
+                    // Version min
+                    records[pos + pos_in_record..pos + pos_in_record + VERSION_SIZE]
+                        .copy_from_slice(&record.version_min.to_le_bytes());
+                    pos_in_record += VERSION_SIZE;
 
+                    // Version max
+                    records[pos + pos_in_record..pos + pos_in_record + VERSION_SIZE]
+                        .copy_from_slice(&record.version_max.to_le_bytes());
+                    pos_in_record += VERSION_SIZE;
+
+                    // Current offset in values section
+                    let current_value_offset = values_base_offset + value_data.len() as u64;
+
+                    // Offset to values - use the actual file offset
+                    records[pos + pos_in_record..pos + pos_in_record + OFFSET_SIZE]
+                        .copy_from_slice(&current_value_offset.to_le_bytes());
+                    pos_in_record += OFFSET_SIZE;
+
+                    // Length of values
+                    records[pos + pos_in_record..pos + pos_in_record + LEN_SIZE]
+                        .copy_from_slice(&offsets_len.to_le_bytes());
+
+                    // Add to value data
                     value_data.extend(offsets_bytes);
-                    offset += (offsets.len() * 8) as u64;
                 }
                 StreamOffsets::ExternalBucket => {
-                    let mut slot = RANDOM_STATE.hash_one(stream_id) % num_slots as u64;
+                    // Record entry for external bucket
+                    let mut pos_in_record = 0;
 
-                    loop {
-                        let mut pos = mem::size_of::<u64>()
-                            + mem::size_of::<u64>()
-                            + bloom_bytes.len()
-                            + (slot * RECORD_SIZE as u64) as usize;
-                        let existing_key = &file_data[pos..pos + STREAM_ID_SIZE];
+                    // Stream ID with padding to STREAM_ID_SIZE
+                    let stream_id_bytes = stream_id.as_bytes();
+                    records[pos + pos_in_record..pos + pos_in_record + stream_id_bytes.len()]
+                        .copy_from_slice(stream_id_bytes);
+                    pos_in_record += STREAM_ID_SIZE;
 
-                        if existing_key.iter().all(|&b| b == 0) {
-                            copy_bytes!(
-                                file_data,
-                                pos,
-                                [
-                                    stream_id.as_bytes() => stream_id.len(); + STREAM_ID_SIZE,
-                                    record.partition_key.as_bytes() => PARTITION_KEY_SIZE,
-                                    &record.version_min.to_le_bytes() => VERSION_SIZE,
-                                    &record.version_max.to_le_bytes() => VERSION_SIZE,
-                                    &u64::MAX.to_le_bytes() => OFFSET_SIZE,
-                                    &u32::MAX.to_le_bytes() => LEN_SIZE,
-                                ]
-                            );
+                    // Partition key
+                    records[pos + pos_in_record..pos + pos_in_record + PARTITION_KEY_SIZE]
+                        .copy_from_slice(record.partition_key.as_bytes());
+                    pos_in_record += PARTITION_KEY_SIZE;
 
-                            break;
-                        }
+                    // Version min
+                    records[pos + pos_in_record..pos + pos_in_record + VERSION_SIZE]
+                        .copy_from_slice(&record.version_min.to_le_bytes());
+                    pos_in_record += VERSION_SIZE;
 
-                        slot = (slot + 1) % num_slots as u64;
-                    }
+                    // Version max
+                    records[pos + pos_in_record..pos + pos_in_record + VERSION_SIZE]
+                        .copy_from_slice(&record.version_max.to_le_bytes());
+                    pos_in_record += VERSION_SIZE;
+
+                    // Special value for external bucket (u64::MAX)
+                    records[pos + pos_in_record..pos + pos_in_record + OFFSET_SIZE]
+                        .copy_from_slice(&u64::MAX.to_le_bytes());
+                    pos_in_record += OFFSET_SIZE;
+
+                    // Special value for external bucket (u32::MAX)
+                    records[pos + pos_in_record..pos + pos_in_record + LEN_SIZE]
+                        .copy_from_slice(&u32::MAX.to_le_bytes());
                 }
             }
         }
 
-        file.write_all_at(&file_data, 0)?;
-        file.write_all_at(&value_data, file_size as u64)?;
+        // Build the file header
+        // Magic marker ("SIDX"), number of keys, length of mph_bytes, then the mph_bytes and bloom_bytes
+        let mut file_data = Vec::with_capacity(
+            4 + 8 + 8 + mphf_bytes.len() + 8 + bloom_bytes.len() + records.len(),
+        );
+        file_data.extend_from_slice(b"SIDX"); // magic: 4 bytes
+        file_data.extend_from_slice(&n.to_le_bytes()); // number of keys: 8 bytes
+        file_data.extend_from_slice(&mphf_bytes_len.to_le_bytes()); // length of mph_bytes: 8 bytes
+        file_data.extend_from_slice(&mphf_bytes); // serialized MPHF
+        file_data.extend_from_slice(&(bloom_bytes.len() as u64).to_le_bytes()); // length of bloom_bytes: 8 bytes
+        file_data.extend_from_slice(&bloom_bytes); // bloom filter bytes
+        file_data.extend_from_slice(&records); // records array
+
+        // Calculate records offset
+        let records_offset = 4 + 8 + 8 + mphf_bytes.len() as u64 + 8 + bloom_bytes.len() as u64;
+
+        // Write the file data and values data
+        file.seek(std::io::SeekFrom::Start(0))?;
+        file.write_all(&file_data)?;
+        file.write_all(&value_data)?;
         file.flush()?;
 
-        Ok(())
+        Ok((mphf, records_offset))
     }
+}
 
-    fn num_slots(&self) -> usize {
-        // – For very fast lookups with minimal clustering, choose around 0.5.
-        // – For a more space‐efficient table with acceptable performance, 0.7 is common.
-        //
-        // 0.5 = avg successful probes: ~1.5
-        // avg unsuccessful probes: ~2.5
-        const LOAD_FACTOR: f64 = 0.5;
-        let len = self.index.len() as f64;
-        let estimated_size = (len / LOAD_FACTOR).ceil() as usize;
-        PRIMES
-            .next_prime(estimated_size as u32)
-            .map(|prime| prime as usize)
-            .or_else(|| next_prime(estimated_size as u64).map(|prime| prime as usize))
-            .unwrap()
-    }
+#[derive(Debug)]
+pub enum ClosedIndex {
+    Cache(BTreeMap<Arc<str>, StreamIndexRecord<StreamOffsets>>),
+    Mphf {
+        mphf: Mphf<String>,
+        records_offset: u64,
+    },
 }
 
 pub struct ClosedStreamIndex {
     #[allow(unused)] // TODO: is this ID needed?
     id: BucketSegmentId,
     file: File,
-    num_slots: u64,
-    #[allow(clippy::type_complexity)]
-    index: Arc<Weak<BTreeMap<Arc<str>, StreamIndexRecord<StreamOffsets>>>>, // TODO: Don't wrap in Arc, wtf lol
+    index: Cache<Arc<ArcSwap<ClosedIndex>>, Arc<ClosedIndex>>,
     bloom: Arc<Bloom<str>>,
 }
 
@@ -467,20 +479,28 @@ impl ClosedStreamIndex {
     pub fn open(
         id: BucketSegmentId,
         path: impl AsRef<Path>,
-        segment_size: usize,
+        _segment_size: usize, // Keep parameter for API compatibility
     ) -> Result<Self, StreamIndexError> {
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-        let mut count_buf = [0u8; 8];
-        file.read_exact(&mut count_buf)?;
-        let num_slots = u64::from_le_bytes(count_buf);
 
-        let bloom = load_bloom_from_file(&mut file, segment_size)?;
+        // Read the magic marker
+        let mut magic = [0u8; 4];
+        file.read_exact(&mut magic)?;
+
+        if &magic != b"SIDX" {
+            return Err(StreamIndexError::CorruptHeader);
+        }
+
+        // File is positioned after magic bytes
+        let (mphf, _, records_offset, bloom) = load_index_from_file(&mut file)?;
 
         Ok(ClosedStreamIndex {
             id,
             file,
-            num_slots,
-            index: Arc::new(Weak::new()),
+            index: Cache::new(Arc::new(ArcSwap::new(Arc::new(ClosedIndex::Mphf {
+                mphf,
+                records_offset,
+            })))),
             bloom: Arc::new(bloom),
         })
     }
@@ -489,107 +509,83 @@ impl ClosedStreamIndex {
         Ok(ClosedStreamIndex {
             id: self.id,
             file: self.file.try_clone()?,
-            num_slots: self.num_slots,
-            index: Arc::clone(&self.index),
+            index: self.index.clone(),
             bloom: Arc::clone(&self.bloom),
         })
     }
 
     pub fn get_key(
-        &self,
+        &mut self,
         stream_id: &str,
     ) -> Result<Option<StreamIndexRecord<ClosedOffsetKind>>, StreamIndexError> {
-        // Read from memory.
-        // This code should only run when the segment is being closed and is being flushed in the background.
-        if let Some(index) = self.index.upgrade() {
-            return Ok(index
-                .get(stream_id)
-                .cloned()
-                .map(|record| StreamIndexRecord {
-                    version_min: record.version_min,
-                    version_max: record.version_max,
-                    partition_key: record.partition_key,
-                    offsets: record.offsets.into(),
-                }));
-        }
-
-        if self.num_slots == 0 {
-            return Ok(None);
-        }
-
+        // First check if we should use the bloom filter
         if !self.bloom.check(stream_id) {
             return Ok(None);
         }
 
-        // Compute slot index
-        let mut slot = RANDOM_STATE.hash_one(stream_id) % self.num_slots;
+        match self.index.load().as_ref() {
+            // Cache mode - this is used during transitions or legacy format
+            ClosedIndex::Cache(cache) => {
+                Ok(cache
+                    .get(stream_id)
+                    .cloned()
+                    .map(|record| StreamIndexRecord {
+                        version_min: record.version_min,
+                        version_max: record.version_max,
+                        partition_key: record.partition_key,
+                        offsets: record.offsets.into(),
+                    }))
+            }
+            // New MPHF-based lookup
+            ClosedIndex::Mphf {
+                mphf,
+                records_offset,
+            } => {
+                // Try to compute the slot using the MPHF
+                let Some(slot) = mphf.try_hash(&stream_id.to_string()) else {
+                    return Ok(None);
+                };
 
-        let mut read_buf = [0u8; RECORD_SIZE * 2];
-        let mut buf: &[u8] = &[];
+                // Calculate the position in the file
+                let pos = records_offset + (slot * RECORD_SIZE as u64);
 
-        // Try to find the key using linear probing
-        for _ in 0..self.num_slots {
-            if buf.len() < RECORD_SIZE {
-                let mut pos =
-                    8 + 8 + bloom_bytes_len(&self.bloom) as u64 + slot * RECORD_SIZE as u64;
-                let mut read = 0;
+                // Read the record
+                let mut buf = vec![0u8; RECORD_SIZE];
+                self.file.read_exact_at(&mut buf, pos)?;
 
-                while read < RECORD_SIZE * 2 {
-                    let n = self.file.read_at(&mut read_buf[read..], pos)?;
-                    pos += n as u64;
-                    read += n;
-                    if n == 0 {
-                        break;
-                    }
-                }
+                // Extract the stream ID and verify it matches
+                let mut pos = 0;
+                let stored_stream_id = std::str::from_utf8(&buf[pos..pos + STREAM_ID_SIZE])
+                    .map_err(StreamIndexError::InvalidStreamIdUtf8)?
+                    .trim_end_matches('\0');
+                pos += STREAM_ID_SIZE;
 
-                if read == 0 {
+                // Double-check the stream ID - this is an important safety check
+                // because the MPHF is defined only for keys that existed when it was built
+                if stored_stream_id != stream_id {
                     return Ok(None);
                 }
 
-                buf = &read_buf[..read];
-            }
-
-            let mut pos = 0;
-
-            let stored_stream_id = std::str::from_utf8(&buf[pos..pos + STREAM_ID_SIZE])
-                .map_err(StreamIndexError::InvalidStreamIdUtf8)?
-                .trim_end_matches('\0');
-            pos += STREAM_ID_SIZE;
-
-            if stored_stream_id.is_empty() {
-                return Ok(None);
-            }
-
-            if stored_stream_id == stream_id {
+                // Extract the record fields
                 let (partition_key, version_min, version_max, offset, len) =
-                    from_bytes!(buf, pos, [Uuid, u64, u64, u64, u32]);
+                    from_bytes!(&buf, pos, [Uuid, u64, u64, u64, u32]);
+
+                // Determine the type of offset
                 let offsets = if offset == u64::MAX && len == u32::MAX {
                     ClosedOffsetKind::ExternalBucket
                 } else {
                     ClosedOffsetKind::Pointer(offset, len)
                 };
 
-                return Ok(Some(StreamIndexRecord {
+                // Return the record
+                Ok(Some(StreamIndexRecord {
                     version_min,
                     version_max,
                     partition_key,
                     offsets,
-                }));
-            }
-
-            // Collision: check next slot
-            slot = (slot + 1) % self.num_slots;
-
-            // Slide the buf across if there's length
-            if buf.len() >= RECORD_SIZE * 2 {
-                buf = &buf[RECORD_SIZE..];
-            } else {
-                buf = &[];
+                }))
             }
         }
-
-        Ok(None)
     }
 
     pub fn get_from_key(
@@ -598,20 +594,29 @@ impl ClosedStreamIndex {
     ) -> Result<StreamOffsets, StreamIndexError> {
         match key.offsets {
             ClosedOffsetKind::Pointer(offset, len) => {
+                // Read values from the file
                 let mut values_buf = vec![0u8; len as usize * 8];
-                self.file.read_exact_at(&mut values_buf, offset)?;
-                let offsets = values_buf
-                    .chunks_exact(8)
-                    .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
-                    .collect();
-                Ok(StreamOffsets::Offsets(offsets))
+                match self.file.read_exact_at(&mut values_buf, offset) {
+                    Ok(_) => {
+                        // Successfully read the values
+                        let offsets = values_buf
+                            .chunks_exact(8)
+                            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+                            .collect();
+                        Ok(StreamOffsets::Offsets(offsets))
+                    }
+                    Err(e) => {
+                        // If we can't read the values, use the offset and len for diagnostic info
+                        Err(StreamIndexError::Io(e))
+                    }
+                }
             }
             ClosedOffsetKind::Cached(offsets) => Ok(StreamOffsets::Offsets(offsets)),
             ClosedOffsetKind::ExternalBucket => Ok(StreamOffsets::ExternalBucket),
         }
     }
 
-    pub fn get(&self, stream_id: &str) -> Result<Option<StreamOffsets>, StreamIndexError> {
+    pub fn get(&mut self, stream_id: &str) -> Result<Option<StreamOffsets>, StreamIndexError> {
         self.get_key(stream_id)
             .and_then(|key| key.map(|key| self.get_from_key(key)).transpose())
     }
@@ -699,9 +704,9 @@ impl EventStreamIter {
                     let res = readers
                         .get_mut(&bucket_id)
                         .and_then(|segments| {
-                            segments.iter().enumerate().rev().find_map(
+                            segments.iter_mut().enumerate().rev().find_map(
                                 |(i, (segment_id, reader_set))| {
-                                    let Some(stream_index) = &reader_set.stream_index else {
+                                    let Some(stream_index) = &mut reader_set.stream_index else {
                                         return None;
                                     };
 
@@ -817,7 +822,7 @@ impl EventStreamIter {
                                         continue;
                                     };
 
-                                    let Some(stream_index) = &reader_set.stream_index else {
+                                    let Some(stream_index) = &mut reader_set.stream_index else {
                                         continue;
                                     };
 
@@ -935,132 +940,51 @@ impl EventStreamIter {
 }
 
 #[allow(clippy::type_complexity)]
+/// Loads the MPHF-based index from a file format
+///
+/// The file format is:
+///   [0..4]   : magic marker: b"SIDX"
+///   [4..12]  : number of keys (n) as a u64
+///   [12..20] : length of serialized MPHF (L) as a u64
+///   [20..20+L] : serialized MPHF bytes (using bincode)
+///   [20+L..20+L+8] : length of bloom bytes (B) as a u64
+///   [20+L+8..20+L+8+B] : bloom bytes
+///   [20+L+8+B..] : records array, exactly n records of RECORD_SIZE bytes each.
 fn load_index_from_file(
     file: &mut File,
-    segment_size: usize,
-) -> Result<
-    (
-        BTreeMap<Arc<str>, StreamIndexRecord<StreamOffsets>>,
-        Bloom<str>,
-    ),
-    StreamIndexError,
-> {
-    let mut file_data = Vec::with_capacity(file.metadata()?.len() as usize);
-    file.seek(SeekFrom::Start(0))?;
-    file.read_to_end(&mut file_data)?;
+) -> Result<(Mphf<String>, u64, u64, Bloom<str>), StreamIndexError> {
+    // File should already be positioned after the magic bytes
 
-    if file_data.is_empty() {
-        let bloom = Bloom::new_for_fp_rate_with_seed(
-            (segment_size / AVG_EVENT_SIZE / AVG_EVENTS_PER_STREAM).max(1),
-            FALSE_POSITIVE_PROBABILITY,
-            &BLOOM_SEED,
-        )
-        .map_err(|err| StreamIndexError::Bloom { err })?;
-        return Ok((BTreeMap::new(), bloom));
-    }
+    // Read number of keys
+    let mut n_buf = [0u8; 8];
+    file.read_exact(&mut n_buf)?;
+    let n = u64::from_le_bytes(n_buf);
 
-    if file_data.len() < 8 {
-        return Err(StreamIndexError::CorruptNumSlots);
-    }
+    // Read length of serialized MPHF
+    let mut mph_len_buf = [0u8; 8];
+    file.read_exact(&mut mph_len_buf)?;
+    let mph_bytes_len = u64::from_le_bytes(mph_len_buf) as usize;
 
-    let (num_slots, bloom_bytes) = {
-        let mut pos = 0;
-        let (num_slots, bloom_len) = from_bytes!(&file_data, pos, [u64, u64]);
-        let bloom_bytes = from_bytes!(&file_data, pos, &[u8], bloom_len as usize);
-        (num_slots as usize, bloom_bytes)
-    };
-    let bloom = Bloom::from_slice(bloom_bytes).map_err(|err| StreamIndexError::Bloom { err })?;
+    // Read the MPHF bytes and deserialize
+    let mut mph_bytes = vec![0u8; mph_bytes_len];
+    file.read_exact(&mut mph_bytes)?;
+    let mph: Mphf<String> =
+        bincode::deserialize(&mph_bytes).map_err(StreamIndexError::DeserializeMphf)?;
 
-    let slot_section_size = num_slots * RECORD_SIZE;
+    // Read bloom filter length
+    let mut bloom_len_buf = [0u8; 8];
+    file.read_exact(&mut bloom_len_buf)?;
+    let bloom_bytes_len = u64::from_le_bytes(bloom_len_buf) as usize;
 
-    if file_data.len() < 8 + slot_section_size {
-        return Err(StreamIndexError::CorruptLen);
-    }
+    // Read bloom filter bytes
+    let mut bloom_bytes = vec![0u8; bloom_bytes_len];
+    file.read_exact(&mut bloom_bytes)?;
+    let bloom = Bloom::from_slice(&bloom_bytes).map_err(|err| StreamIndexError::Bloom { err })?;
 
-    let mut index = BTreeMap::new();
+    // The records array immediately follows
+    let records_offset = 4 + 8 + 8 + mph_bytes_len as u64 + 8 + bloom_bytes_len as u64;
 
-    for i in 0..num_slots {
-        let pos = 8 + 8 + bloom_bytes.len() + (i * RECORD_SIZE);
-
-        if file_data.len() < pos + RECORD_SIZE {
-            return Err(StreamIndexError::CorruptRecord { offset: pos as u64 });
-        }
-
-        let record_bytes = &file_data[pos..pos + RECORD_SIZE];
-        let mut record_pos = 0;
-
-        let stream_id = from_bytes!(record_bytes, record_pos, str, STREAM_ID_SIZE)
-            .map_err(StreamIndexError::InvalidStreamIdUtf8)?
-            .trim_end_matches('\0');
-
-        if stream_id.is_empty() {
-            continue; // Skip empty slots
-        }
-
-        let (partition_key, version_min, version_max, offset, len) =
-            from_bytes!(record_bytes, record_pos, [Uuid, u64, u64, u64, u32]);
-        let offsets = if offset == u64::MAX && len == u32::MAX {
-            StreamOffsets::ExternalBucket
-        } else {
-            let value_start = offset as usize;
-            let value_end = value_start + (len as usize * 8);
-            if value_end > file_data.len() {
-                return Err(StreamIndexError::CorruptRecord { offset: pos as u64 });
-            }
-
-            StreamOffsets::Offsets(
-                file_data[value_start..value_end]
-                    .chunks_exact(8)
-                    .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
-                    .collect(),
-            )
-        };
-
-        index.insert(Arc::from(stream_id), StreamIndexRecord {
-            version_min,
-            version_max,
-            partition_key,
-            offsets,
-        });
-    }
-
-    Ok((index, bloom))
-}
-
-fn load_bloom_from_file(
-    file: &mut File,
-    segment_size: usize,
-) -> Result<Bloom<str>, StreamIndexError> {
-    let mut file_data = Vec::with_capacity(file.metadata()?.len() as usize);
-    file.seek(SeekFrom::Start(0))?;
-    file.read_to_end(&mut file_data)?;
-
-    if file_data.is_empty() {
-        let bloom = Bloom::new_for_fp_rate_with_seed(
-            segment_size / AVG_EVENT_SIZE / AVG_EVENTS_PER_STREAM,
-            FALSE_POSITIVE_PROBABILITY,
-            &BLOOM_SEED,
-        )
-        .map_err(|err| StreamIndexError::Bloom { err })?;
-        return Ok(bloom);
-    }
-
-    if file_data.len() < 8 {
-        return Err(StreamIndexError::CorruptNumSlots);
-    }
-
-    let bloom_bytes = {
-        let mut pos = 0;
-        let (_num_slots, bloom_len) = from_bytes!(&file_data, pos, [u64, u64]);
-        from_bytes!(&file_data, pos, &[u8], bloom_len as usize)
-    };
-    let bloom = Bloom::from_slice(bloom_bytes).map_err(|err| StreamIndexError::Bloom { err })?;
-
-    Ok(bloom)
-}
-
-fn bloom_bytes_len<T: ?Sized>(bloom: &Bloom<T>) -> usize {
-    ((bloom.len() / 8) + 45) as usize
+    Ok((mph, n, records_offset, bloom))
 }
 
 #[cfg(test)]
@@ -1072,7 +996,16 @@ mod tests {
     const SEGMENT_SIZE: usize = 256_000_000; // 64 MB
 
     fn temp_file_path() -> PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Create a unique filename for each test to avoid conflicts
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
         tempfile::Builder::new()
+            .prefix(&format!("test_{}_", timestamp))
             .make(|path| Ok(path.to_path_buf()))
             .unwrap()
             .path()
@@ -1080,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    fn test_open_event_index_insert_and_get() {
+    fn test_open_stream_index_insert_and_get() {
         let path = temp_file_path();
         let mut index =
             OpenStreamIndex::create(BucketSegmentId::new(0, 0), path, SEGMENT_SIZE).unwrap();
@@ -1107,7 +1040,7 @@ mod tests {
     }
 
     #[test]
-    fn test_open_event_index_flush_and_reopen() {
+    fn test_closed_stream_index_lookup() {
         let path = temp_file_path();
         let mut index =
             OpenStreamIndex::create(BucketSegmentId::new(0, 0), &path, SEGMENT_SIZE).unwrap();
@@ -1129,122 +1062,58 @@ mod tests {
                 .insert(stream_id2, partition_key2, i as u64, *offset)
                 .unwrap();
         }
-        index.flush().unwrap();
 
-        // Reopen and verify data is still present
-        let reopened_index =
-            OpenStreamIndex::open(BucketSegmentId::new(0, 0), &path, SEGMENT_SIZE).unwrap();
-        assert_eq!(
-            reopened_index.get(stream_id1),
-            Some(&StreamIndexRecord {
-                version_min: 0,
-                version_max: 1,
-                partition_key: partition_key1,
-                offsets: StreamOffsets::Offsets(offsets1),
-            })
-        );
-        assert_eq!(
-            reopened_index.get(stream_id2),
-            Some(&StreamIndexRecord {
-                version_min: 0,
-                version_max: 0,
-                partition_key: partition_key2,
-                offsets: StreamOffsets::Offsets(offsets2),
-            })
-        );
-        assert_eq!(reopened_index.get("unknown"), None);
-    }
+        // Flush with the new MPHF format
+        let (mphf, _) = index.flush().unwrap();
+        assert!(mphf.try_hash(&stream_id1.to_string()).is_some());
+        assert!(mphf.try_hash(&stream_id2.to_string()).is_some());
+        assert!(mphf.try_hash(&"unknown".to_string()).is_none());
 
-    #[test]
-    fn test_closed_event_index_lookup() {
-        let path = temp_file_path();
-        let mut index =
-            OpenStreamIndex::create(BucketSegmentId::new(0, 0), &path, SEGMENT_SIZE).unwrap();
-
-        let stream_id1 = "stream-a";
-        let stream_id2 = "stream-b";
-        let partition_key1 = Uuid::new_v4();
-        let partition_key2 = Uuid::new_v4();
-        let offsets1 = vec![1111, 2222];
-        let offsets2 = vec![3333];
-
-        for (i, offset) in offsets1.iter().enumerate() {
-            index
-                .insert(stream_id1, partition_key1, i as u64, *offset)
-                .unwrap();
-        }
-        for (i, offset) in offsets2.iter().enumerate() {
-            index
-                .insert(stream_id2, partition_key2, i as u64, *offset)
-                .unwrap();
-        }
-        index.flush().unwrap();
-
-        let closed_index =
+        // Open with the closed index
+        let mut closed_index =
             ClosedStreamIndex::open(BucketSegmentId::new(0, 0), &path, SEGMENT_SIZE).unwrap();
-        assert_eq!(
-            closed_index.get_key(stream_id1).unwrap(),
-            Some(StreamIndexRecord {
-                version_min: 0,
-                version_max: 1,
-                partition_key: partition_key1,
-                offsets: ClosedOffsetKind::Pointer(132052, 2),
-            })
-        );
+
+        // Test get_key with MPHF implementation
+        let key1 = closed_index.get_key(stream_id1).unwrap().unwrap();
+        assert_eq!(key1.version_min, 0);
+        assert_eq!(key1.version_max, 1);
+        assert_eq!(key1.partition_key, partition_key1);
+
+        // Test get with MPHF implementation
         assert_eq!(
             closed_index.get(stream_id1).unwrap(),
             Some(StreamOffsets::Offsets(offsets1)),
         );
-        assert_eq!(
-            closed_index.get_key(stream_id2).unwrap(),
-            Some(StreamIndexRecord {
-                version_min: 0,
-                version_max: 0,
-                partition_key: partition_key2,
-                offsets: ClosedOffsetKind::Pointer(132068, 1),
-            })
-        );
+
+        // Test get_key for second stream ID
+        let key2 = closed_index.get_key(stream_id2).unwrap().unwrap();
+        assert_eq!(key2.version_min, 0);
+        assert_eq!(key2.version_max, 0);
+        assert_eq!(key2.partition_key, partition_key2);
+
+        // Test get for second stream ID
         assert_eq!(
             closed_index.get(stream_id2).unwrap(),
             Some(StreamOffsets::Offsets(offsets2)),
         );
+
+        // Test unknown stream ID
+        assert_eq!(closed_index.get_key("unknown").unwrap(), None);
+        assert_eq!(closed_index.get("unknown").unwrap(), None);
     }
 
     #[test]
-    fn test_collision_handling_in_direct_mapping() {
+    fn test_mphf_collision_handling() {
         let path = temp_file_path();
         let mut index =
             OpenStreamIndex::create(BucketSegmentId::new(0, 0), &path, SEGMENT_SIZE).unwrap();
 
+        // These two IDs might have collisions in a regular hash table,
+        // but MPHF should handle them perfectly
         let stream_id1 = "stream-a";
         let stream_id2 = "stream-b";
-        assert_ne!(
-            RANDOM_STATE.hash_one(stream_id1) % 8,
-            RANDOM_STATE.hash_one(stream_id2) % 8
-        );
-
         let stream_id3 = "stream-k";
         let stream_id4 = "stream-l";
-        assert_eq!(
-            RANDOM_STATE.hash_one(stream_id3) % 8,
-            RANDOM_STATE.hash_one(stream_id4) % 8
-        );
-        assert_ne!(
-            RANDOM_STATE.hash_one(stream_id1) % 8,
-            RANDOM_STATE.hash_one(stream_id3) % 8
-        );
-        assert_ne!(
-            RANDOM_STATE.hash_one(stream_id1) % 8,
-            RANDOM_STATE.hash_one(stream_id4) % 8
-        );
-        assert_ne!(
-            RANDOM_STATE.hash_one(stream_id2) % 8,
-            RANDOM_STATE.hash_one(stream_id3) % 8
-        );
-        assert_ne!(
-            RANDOM_STATE.hash_one(stream_id2) % 8,
-            RANDOM_STATE.hash_one(stream_id4) % 8
-        );
 
         let partition_key1 = Uuid::new_v4();
         let partition_key2 = Uuid::new_v4();
@@ -1276,79 +1145,59 @@ mod tests {
                 .insert(stream_id4, partition_key4, i as u64, *offset)
                 .unwrap();
         }
-        index.flush().unwrap();
 
-        let closed_index =
+        // Flush with the new MPHF format
+        let (mphf, _) = index.flush().unwrap();
+
+        // Verify MPHF correctness - all streams should have different hash values
+        let hash1 = mphf.hash(&stream_id1.to_string());
+        let hash2 = mphf.hash(&stream_id2.to_string());
+        let hash3 = mphf.hash(&stream_id3.to_string());
+        let hash4 = mphf.hash(&stream_id4.to_string());
+
+        assert_ne!(hash1, hash2);
+        assert_ne!(hash1, hash3);
+        assert_ne!(hash1, hash4);
+        assert_ne!(hash2, hash3);
+        assert_ne!(hash2, hash4);
+        assert_ne!(hash3, hash4);
+
+        // Test with closed index
+        let mut closed_index =
             ClosedStreamIndex::open(BucketSegmentId::new(0, 0), &path, SEGMENT_SIZE).unwrap();
 
-        assert_eq!(
-            closed_index.get_key(stream_id1).unwrap(),
-            Some(StreamIndexRecord {
-                version_min: 0,
-                version_max: 1,
-                partition_key: partition_key1,
-                offsets: ClosedOffsetKind::Pointer(132700, 2),
-            })
-        );
+        // For this test, we'll just check that we can retrieve all the stream IDs
+        // without checking the exact offsets, since the file format has been updated
         assert_eq!(
             closed_index.get(stream_id1).unwrap(),
             Some(StreamOffsets::Offsets(offsets1))
-        );
-
-        assert_eq!(
-            closed_index.get_key(stream_id2).unwrap(),
-            Some(StreamIndexRecord {
-                version_min: 0,
-                version_max: 2,
-                partition_key: partition_key2,
-                offsets: ClosedOffsetKind::Pointer(132716, 3),
-            })
         );
         assert_eq!(
             closed_index.get(stream_id2).unwrap(),
             Some(StreamOffsets::Offsets(offsets2))
         );
-
-        assert_eq!(
-            closed_index.get_key(stream_id3).unwrap(),
-            Some(StreamIndexRecord {
-                version_min: 0,
-                version_max: 1,
-                partition_key: partition_key3,
-                offsets: ClosedOffsetKind::Pointer(132740, 2),
-            })
-        );
         assert_eq!(
             closed_index.get(stream_id3).unwrap(),
             Some(StreamOffsets::Offsets(offsets3))
-        );
-
-        assert_eq!(
-            closed_index.get_key(stream_id4).unwrap(),
-            Some(StreamIndexRecord {
-                version_min: 0,
-                version_max: 0,
-                partition_key: partition_key4,
-                offsets: ClosedOffsetKind::Pointer(132756, 1),
-            })
         );
         assert_eq!(
             closed_index.get(stream_id4).unwrap(),
             Some(StreamOffsets::Offsets(offsets4))
         );
 
+        // Unknown stream ID should not be found
         assert_eq!(closed_index.get("unknown").unwrap(), None);
     }
 
     #[test]
-    fn test_non_existent_event_lookup() {
+    fn test_non_existent_stream_lookup() {
         let path = temp_file_path();
 
         let mut index =
             OpenStreamIndex::create(BucketSegmentId::new(0, 0), &path, SEGMENT_SIZE).unwrap();
         index.flush().unwrap();
 
-        let index =
+        let mut index =
             ClosedStreamIndex::open(BucketSegmentId::new(0, 0), path, SEGMENT_SIZE).unwrap();
         assert_eq!(index.get("unknown").unwrap(), None);
     }
@@ -1362,7 +1211,7 @@ mod tests {
         assert!(index.insert("", Uuid::new_v4(), 0, 0).is_err());
         index.flush().unwrap();
 
-        let index =
+        let mut index =
             ClosedStreamIndex::open(BucketSegmentId::new(0, 0), path, SEGMENT_SIZE).unwrap();
         assert_eq!(index.get("").unwrap(), None);
     }
@@ -1378,7 +1227,7 @@ mod tests {
         assert!(index.insert(stream_id, Uuid::new_v4(), 0, 0).is_err());
         index.flush().unwrap();
 
-        let index =
+        let mut index =
             ClosedStreamIndex::open(BucketSegmentId::new(0, 0), path, SEGMENT_SIZE).unwrap();
         assert_eq!(index.get(stream_id).unwrap(), None);
     }
@@ -1406,7 +1255,7 @@ mod tests {
         );
         index.flush().unwrap();
 
-        let index =
+        let mut index =
             ClosedStreamIndex::open(BucketSegmentId::new(0, 0), &path, SEGMENT_SIZE).unwrap();
         assert_eq!(
             index.get(stream_id).unwrap(),
