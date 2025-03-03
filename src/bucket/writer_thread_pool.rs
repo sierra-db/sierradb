@@ -25,7 +25,7 @@ use crate::{
     bucket::segment::{COMMIT_SIZE, EVENT_HEADER_SIZE},
     database::{CurrentVersion, ExpectedVersion, StreamLatestVersion},
     error::{EventValidationError, StreamIndexError, WriteError},
-    id::{extract_event_id_bucket, validate_event_id},
+    id::validate_event_id,
 };
 
 use super::{
@@ -164,9 +164,9 @@ impl WriterThreadPool {
 
     pub async fn append_events(
         &self,
-        batch: AppendEventsBatch,
-    ) -> oneshot::Receiver<Result<(), WriteError>> {
-        let bucket_id = extract_event_id_bucket(batch.partition_key, self.num_buckets);
+        bucket_id: u16,
+        batch: Arc<AppendEventsBatch>,
+    ) -> Result<(), WriteError> {
         let target_thread = bucket_to_thread(bucket_id, self.num_buckets, self.num_threads);
 
         let sender = self
@@ -183,15 +183,17 @@ impl WriterThreadPool {
             })))
             .await;
         match send_res {
-            Ok(()) => reply_rx,
+            Ok(()) => reply_rx.await.map_err(|_| WriteError::NoThreadReply)?,
             Err(err) => match err.0 {
                 WriteRequest::AppendEvents(req) => {
                     req.reply_tx
                         .send(Err(WriteError::WriterThreadNotRunning))
                         .unwrap();
-                    reply_rx
+                    reply_rx.await.unwrap()
                 }
-                WriteRequest::FlushPoll => unreachable!("we never send a flush poll here"),
+                WriteRequest::FlushPoll => {
+                    unreachable!("we never send a flush poll here")
+                }
             },
         }
     }
@@ -276,22 +278,34 @@ impl AppendEventsBatch {
         })
     }
 
+    pub fn partition_key(&self) -> Uuid {
+        self.partition_key
+    }
+
     pub fn events(&self) -> &SmallVec<[WriteEventRequest; 4]> {
         &self.events
     }
 }
 
 enum WriteRequest {
+    // ValidateEvents(Box<ValidateEventsRequest>),
     AppendEvents(Box<AppendEventsRequest>),
     FlushPoll,
 }
 
+// struct ValidateEventsRequest {
+//     bucket_id: BucketId,
+//     batch: Arc<AppendEventsBatch>,
+//     reply_tx: oneshot::Sender<Result<HashMap<Arc<str>, CurrentVersion>, WriteError>>,
+// }
+
 struct AppendEventsRequest {
     bucket_id: BucketId,
-    batch: AppendEventsBatch,
+    batch: Arc<AppendEventsBatch>,
     reply_tx: oneshot::Sender<Result<(), WriteError>>,
 }
 
+#[derive(Clone)]
 pub struct WriteEventRequest {
     pub event_id: Uuid,
     pub partition_key: Uuid,
@@ -379,14 +393,14 @@ impl Worker {
                 WriteRequest::AppendEvents(req) => {
                     let AppendEventsRequest {
                         bucket_id,
-                        batch:
-                            AppendEventsBatch {
-                                transaction_id,
-                                events,
-                                ..
-                            },
+                        batch,
                         reply_tx,
                     } = *req;
+                    let AppendEventsBatch {
+                        transaction_id,
+                        events,
+                        ..
+                    } = &*batch;
 
                     let Some(writer_set) = self.writers.get_mut(&bucket_id) else {
                         error!(
@@ -401,7 +415,7 @@ impl Worker {
 
                     let file_size = writer_set.writer.file_size();
 
-                    let res = writer_set.handle_write(transaction_id, events);
+                    let res = writer_set.handle_write(*transaction_id, events);
                     if res.is_err() {
                         if let Err(err) = writer_set.writer.set_len(file_size) {
                             error!("failed to set segment file length after write error: {err}");
@@ -448,11 +462,11 @@ impl WriterSet {
     fn handle_write(
         &mut self,
         transaction_id: Uuid,
-        mut events: SmallVec<[WriteEventRequest; 4]>,
+        events: &SmallVec<[WriteEventRequest; 4]>,
     ) -> Result<(), WriteError> {
         let file_size = self.writer.file_size();
 
-        self.validate_event_versions(&mut events)?;
+        let event_versions = self.validate_event_versions(events)?;
 
         let events_size = events
             .iter()
@@ -481,7 +495,8 @@ impl WriterSet {
         let mut new_pending_indexes: Vec<PendingIndex> = Vec::with_capacity(events.len());
 
         let event_count = events.len();
-        for event in events {
+        for (event, stream_version) in events.into_iter().zip(event_versions) {
+            let stream_version = stream_version.next_version();
             let body = AppendEventBody::new(
                 &event.stream_id,
                 &event.event_name,
@@ -492,10 +507,7 @@ impl WriterSet {
                 &event.event_id,
                 &event.partition_key,
                 &transaction_id,
-                event
-                    .stream_version
-                    .into_next_version()
-                    .ok_or(WriteError::StreamVersionTooHigh)?,
+                stream_version,
                 event.timestamp,
                 body,
             )?;
@@ -505,10 +517,7 @@ impl WriterSet {
                 event_id: event.event_id,
                 partition_key: event.partition_key,
                 stream_id: Arc::clone(&event.stream_id),
-                stream_version: event
-                    .stream_version
-                    .into_next_version()
-                    .ok_or(WriteError::StreamVersionTooHigh)?,
+                stream_version,
                 offset,
             });
         }
@@ -516,7 +525,7 @@ impl WriterSet {
         if !transaction_id.is_nil() {
             let timestamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .expect("time went backwards")
+                .map_err(|_| WriteError::BadSystemTime)?
                 .as_nanos() as u64;
             self.writer
                 .append_commit(&transaction_id, timestamp, event_count as u32)?;
@@ -647,13 +656,20 @@ impl WriterSet {
 
     fn validate_event_versions(
         &self,
-        events: &mut SmallVec<[WriteEventRequest; 4]>,
-    ) -> Result<(), WriteError> {
-        let mut stream_versions: HashMap<&Arc<str>, (u64, Uuid)> = HashMap::new();
+        events: &SmallVec<[WriteEventRequest; 4]>,
+    ) -> Result<Vec<CurrentVersion>, WriteError> {
+        struct StreamVersion {
+            next: u64,
+            partition_key: Uuid,
+        }
+
+        let mut stream_versions: HashMap<&Arc<str>, StreamVersion> = HashMap::new();
+        let mut event_versions = Vec::with_capacity(events.len());
+
         for event in events {
             match stream_versions.entry(&event.stream_id) {
                 Entry::Occupied(mut entry) => {
-                    if entry.get().1 != event.partition_key {
+                    if entry.get().partition_key != event.partition_key {
                         return Err(WriteError::Validation(
                             EventValidationError::PartitionKeyMismatch,
                         ));
@@ -661,8 +677,8 @@ impl WriterSet {
 
                     match event.stream_version {
                         ExpectedVersion::Any => {
-                            entry.get_mut().0 += 1;
-                            event.stream_version = ExpectedVersion::Exact(entry.get().0);
+                            event_versions.push(CurrentVersion::Current(entry.get_mut().next));
+                            entry.get_mut().next += 1;
                         }
                         ExpectedVersion::StreamExists => {
                             todo!()
@@ -670,15 +686,17 @@ impl WriterSet {
                         ExpectedVersion::NoStream => {
                             return Err(WriteError::WrongExpectedVersion {
                                 stream_id: Arc::clone(&event.stream_id),
-                                current: CurrentVersion::Current(entry.get().0),
+                                current: CurrentVersion::Current(entry.get().next),
                                 expected: event.stream_version,
                             });
                         }
                         ExpectedVersion::Exact(expected_version) => {
-                            if entry.get().0 != expected_version {
+                            event_versions.push(CurrentVersion::Current(entry.get_mut().next));
+
+                            if entry.get().next != expected_version {
                                 return Err(WriteError::WrongExpectedVersion {
                                     stream_id: Arc::clone(&event.stream_id),
-                                    current: CurrentVersion::Current(entry.get().0),
+                                    current: CurrentVersion::Current(entry.get().next),
                                     expected: ExpectedVersion::Exact(expected_version),
                                 });
                             }
@@ -719,15 +737,21 @@ impl WriterSet {
                                     ));
                                 }
 
-                                entry.insert((version, partition_key));
-                                event.stream_version = ExpectedVersion::Exact(version);
+                                event_versions.push(CurrentVersion::Current(version));
+                                entry.insert(StreamVersion {
+                                    next: version,
+                                    partition_key,
+                                });
                             }
                             Some(StreamLatestVersion::ExternalBucket { .. }) => {
                                 todo!()
                             }
                             None => {
-                                entry.insert((0, event.partition_key));
-                                event.stream_version = ExpectedVersion::NoStream;
+                                event_versions.push(CurrentVersion::NoStream);
+                                entry.insert(StreamVersion {
+                                    next: 0,
+                                    partition_key: event.partition_key,
+                                });
                             }
                         }
                     }
@@ -775,7 +799,11 @@ impl WriterSet {
                                 todo!()
                             }
                             None => {
-                                entry.insert((0, event.partition_key));
+                                event_versions.push(CurrentVersion::NoStream);
+                                entry.insert(StreamVersion {
+                                    next: 0,
+                                    partition_key: event.partition_key,
+                                });
                             }
                         }
                     }
@@ -820,7 +848,11 @@ impl WriterSet {
                                     });
                                 }
 
-                                entry.insert((expected_version, partition_key));
+                                event_versions.push(CurrentVersion::Current(version));
+                                entry.insert(StreamVersion {
+                                    next: expected_version,
+                                    partition_key,
+                                });
                             }
                             Some(StreamLatestVersion::ExternalBucket { .. }) => {
                                 todo!()
@@ -838,7 +870,7 @@ impl WriterSet {
             }
         }
 
-        Ok(())
+        Ok(event_versions)
     }
 
     fn read_stream_latest_version(

@@ -154,20 +154,18 @@ impl BucketSegmentReader {
         self.file.seek(SeekFrom::Start(MAGIC_BYTES_SIZE as u64))?;
         self.file.read_exact(&mut header_bytes)?;
 
-        let version_bytes = header_bytes[0..VERSION_SIZE]
-            .try_into()
-            .expect("Slice has correct length");
+        let version_bytes = header_bytes[0..VERSION_SIZE].try_into().unwrap();
         let version = u16::from_le_bytes(version_bytes);
 
         let bucket_id_bytes = header_bytes[VERSION_SIZE..VERSION_SIZE + BUCKET_ID_SIZE]
             .try_into()
-            .expect("Slice has correct length");
+            .unwrap();
         let bucket_id = u16::from_le_bytes(bucket_id_bytes);
 
         let created_at_bytes = header_bytes
             [VERSION_SIZE + BUCKET_ID_SIZE..VERSION_SIZE + BUCKET_ID_SIZE + CREATED_AT_SIZE]
             .try_into()
-            .expect("Slice has correct length");
+            .unwrap();
         let created_at = u64::from_le_bytes(created_at_bytes);
 
         Ok(BucketSegmentHeader {
