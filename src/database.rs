@@ -9,11 +9,14 @@ use std::{
     time::Duration,
 };
 
+use arrayvec::ArrayVec;
+use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use tokio::sync::oneshot;
-use tracing::{error, warn};
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
+    MAX_REDUNDANCY,
     bucket::{
         BucketId, BucketSegmentId, SegmentId, SegmentKind,
         event_index::ClosedEventIndex,
@@ -22,8 +25,10 @@ use crate::{
         stream_index::{ClosedStreamIndex, EventStreamIter, StreamIndexRecord, StreamOffsets},
         writer_thread_pool::{AppendEventsBatch, WriterThreadPool},
     },
-    error::{DatabaseError, ReadError, StreamIndexError, WriteError},
-    id::{extract_event_id_bucket, partition_id_to_bucket},
+    error::{DatabaseError, QuorumError, ReadError, StreamIndexError, WriteError},
+    id::{
+        extract_event_id_bucket, extract_stream_hash, get_redundant_buckets, partition_id_to_bucket,
+    },
     pool::create_thread_pool,
 };
 
@@ -32,6 +37,7 @@ pub struct Database {
     reader_pool: ReaderThreadPool,
     writer_pool: WriterThreadPool,
     num_buckets: u16,
+    replication_factor: u8,
 }
 
 impl Database {
@@ -39,83 +45,157 @@ impl Database {
         DatabaseBuilder::new(dir).open()
     }
 
-    pub async fn append_events(&self, events: AppendEventsBatch) -> Result<(), WriteError> {
-        self.writer_pool.append_events(events).await.await.unwrap()
+    pub async fn append_events(
+        &self,
+        events: Arc<AppendEventsBatch>,
+        quorum: Quorum,
+    ) -> QuorumResult<(), WriteError> {
+        let bucket_ids = get_redundant_buckets(
+            extract_stream_hash(events.partition_key()),
+            self.num_buckets,
+            self.replication_factor,
+        );
+        let mut replies: FuturesUnordered<_> = bucket_ids
+            .into_iter()
+            .map(|bucket_id| {
+                let events = Arc::clone(&events);
+                async move {
+                    let result = self.writer_pool.append_events(bucket_id, events).await;
+                    (bucket_id, result)
+                }
+            })
+            .collect();
+
+        let mut results = ArrayVec::new();
+        let required_buckets = quorum.required_buckets(self.replication_factor) as usize;
+        let mut successes = 0;
+        while let Some((bucket_id, result)) = replies.next().await {
+            if result.is_ok() {
+                successes += 1;
+            }
+            results.push((bucket_id, result));
+            if successes >= required_buckets {
+                // Try collecting the remaining results without awaiting
+                while let Some((bucket_id, result)) = replies.next().now_or_never().flatten() {
+                    results.push((bucket_id, result));
+                }
+                return QuorumResult {
+                    results,
+                    quorum,
+                    replication_factor: self.replication_factor,
+                };
+            }
+        }
+
+        QuorumResult {
+            results,
+            quorum,
+            replication_factor: self.replication_factor,
+        }
     }
 
     pub async fn read_event(
         &self,
         event_id: Uuid,
-    ) -> Result<Option<EventRecord<'static>>, ReadError> {
-        let bucket_id = extract_event_id_bucket(event_id, self.num_buckets);
-        let segment_id_offset = self
-            .writer_pool
-            .with_event_index(bucket_id, |segment_id, event_index| {
-                event_index
-                    .get(&event_id)
-                    .map(|offset| (segment_id.load(Ordering::Acquire), offset))
-            })
-            .await
-            .flatten();
+        quorum: Quorum,
+    ) -> QuorumResult<Option<EventRecord<'static>>, ReadError> {
+        let bucket_ids = get_redundant_buckets(
+            extract_stream_hash(event_id),
+            self.num_buckets,
+            self.replication_factor,
+        );
+        let mut replies: FuturesUnordered<_> = bucket_ids.into_iter().map(|bucket_id| async move {
+            let segment_id_offset = self
+                .writer_pool
+                .with_event_index(bucket_id, |segment_id, event_index| {
+                    event_index
+                        .get(&event_id)
+                        .map(|offset| (segment_id.load(Ordering::Acquire), offset))
+                })
+                .await
+                .flatten();
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.reader_pool.spawn(move |with_readers| {
-            with_readers(move |readers| match segment_id_offset {
-                Some((segment_id, offset)) => {
-                    let Some(reader_set) = readers
-                        .get_mut(&bucket_id)
-                        .and_then(|segments| segments.get_mut(&segment_id))
-                    else {
-                        warn!(%bucket_id, %segment_id, "bucket or segment doesn't exist in reader pool");
-                        let _ = reply_tx.send(Ok(None));
-                        return;
-                    };
+            let (reply_tx, reply_rx) = oneshot::channel();
+            self.reader_pool.spawn(move |with_readers| {
+                with_readers(move |readers| match segment_id_offset {
+                    Some((segment_id, offset)) => {
+                        let Some(reader_set) = readers
+                            .get_mut(&bucket_id)
+                            .and_then(|segments| segments.get_mut(&segment_id))
+                        else {
+                            warn!(%bucket_id, %segment_id, "bucket or segment doesn't exist in reader pool");
+                            let _ = reply_tx.send(Ok(None));
+                            return;
+                        };
 
-                    let res = reader_set
-                        .reader
-                        .read_committed_events(offset, false)
-                        .map(|events| events.map(CommittedEvents::into_owned));
-                    let _ = reply_tx.send(res);
-                }
-                None => {
-                    let Some(segments) = readers.get_mut(&bucket_id) else {
-                        let _ = reply_tx.send(Ok(None));
-                        return;
-                    };
+                        let res = reader_set
+                            .reader
+                            .read_committed_events(offset, false)
+                            .map(|events| events.map(CommittedEvents::into_owned));
+                        let _ = reply_tx.send(res);
+                    }
+                    None => {
+                        let Some(segments) = readers.get_mut(&bucket_id) else {
+                            let _ = reply_tx.send(Ok(None));
+                            return;
+                        };
 
-                    for reader_set in segments.values_mut().rev() {
-                        if let Some(event_index) = &mut reader_set.event_index {
-                            match event_index.get(&event_id) {
-                                Ok(Some(offset)) => {
-                                    let res = reader_set
-                                        .reader
-                                        .read_committed_events(offset, false)
-                                        .map(|events| events.map(CommittedEvents::into_owned));
-                                    let _ = reply_tx.send(res);
-                                    return;
-                                }
-                                Ok(None) => {}
-                                Err(err) => {
-                                    let _ = reply_tx.send(Err(Box::new(err).into()));
-                                    return;
+                        for reader_set in segments.values_mut().rev() {
+                            if let Some(event_index) = &mut reader_set.event_index {
+                                match event_index.get(&event_id) {
+                                    Ok(Some(offset)) => {
+                                        let res = reader_set
+                                            .reader
+                                            .read_committed_events(offset, false)
+                                            .map(|events| events.map(CommittedEvents::into_owned));
+                                        let _ = reply_tx.send(res);
+                                        return;
+                                    }
+                                    Ok(None) => {}
+                                    Err(err) => {
+                                        let _ = reply_tx.send(Err(Box::new(err).into()));
+                                        return;
+                                    }
                                 }
                             }
                         }
+
+                        let _ = reply_tx.send(Ok(None));
                     }
+                })
+            });
 
-                    let _ = reply_tx.send(Ok(None));
-                }
+            (bucket_id, match reply_rx.await {
+                Ok(res) => res.map(|events| events.and_then(|events| events.into_iter().next())),
+                Err(_) => Err(ReadError::NoThreadReply),
             })
-        });
+        }).collect();
 
-        match reply_rx.await {
-            Ok(Ok(Some(events))) => Ok(events.into_iter().next()),
-            Ok(Ok(None)) => Ok(None),
-            Ok(Err(err)) => Err(err),
-            Err(_) => {
-                error!("no reply from reader pool");
-                Ok(None)
+        let mut results = ArrayVec::new();
+        let required_buckets = quorum.required_buckets(self.replication_factor) as usize;
+        let mut successes = 0;
+        while let Some((bucket_id, result)) = replies.next().await {
+            if result.is_ok() {
+                successes += 1;
             }
+            results.push((bucket_id, result));
+            if successes >= required_buckets {
+                // Try collecting the remaining results without awaiting
+                while let Some((bucket_id, result)) = replies.next().now_or_never().flatten() {
+                    results.push((bucket_id, result));
+                }
+                return QuorumResult {
+                    results,
+                    quorum,
+                    replication_factor: self.replication_factor,
+                };
+            }
+        }
+
+        QuorumResult {
+            results,
+            quorum,
+            replication_factor: self.replication_factor,
         }
     }
 
@@ -218,6 +298,7 @@ pub struct DatabaseBuilder {
     dir: PathBuf,
     segment_size: usize,
     num_buckets: u16,
+    replication_factor: u8,
     reader_pool_num_threads: u16,
     writer_pool_num_threads: u16,
     flush_interval_duration: Duration,
@@ -234,6 +315,7 @@ impl DatabaseBuilder {
             dir: dir.into(),
             segment_size: 256_000_000,
             num_buckets: 64,
+            replication_factor: 3,
             reader_pool_num_threads: reader_pool_size,
             writer_pool_num_threads: writer_pool_size,
             flush_interval_duration: Duration::from_millis(100),
@@ -345,6 +427,7 @@ impl DatabaseBuilder {
             reader_pool,
             writer_pool,
             num_buckets: self.num_buckets,
+            replication_factor: self.replication_factor,
         })
     }
 
@@ -355,6 +438,16 @@ impl DatabaseBuilder {
 
     pub fn num_buckets(&mut self, n: u16) -> &mut Self {
         self.num_buckets = n;
+        self
+    }
+
+    pub fn replication_factor(&mut self, n: u8) -> &mut Self {
+        assert!(n > 0, "replication factor must be greater than 0");
+        assert!(
+            n <= MAX_REDUNDANCY as u8,
+            "replication factor cannot be not be greater than 12",
+        );
+        self.replication_factor = n;
         self
     }
 
@@ -441,6 +534,13 @@ pub enum CurrentVersion {
 }
 
 impl CurrentVersion {
+    pub fn next_version(&self) -> u64 {
+        match self {
+            CurrentVersion::Current(version) => version + 1,
+            CurrentVersion::NoStream => 0,
+        }
+    }
+
     pub fn as_expected_version(&self) -> ExpectedVersion {
         match self {
             CurrentVersion::Current(version) => ExpectedVersion::Exact(*version),
@@ -475,4 +575,108 @@ impl ops::AddAssign<u64> for CurrentVersion {
 pub enum StreamLatestVersion {
     LatestVersion { partition_key: Uuid, version: u64 },
     ExternalBucket { partition_key: Uuid },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quorum {
+    /// Only one replica needs to acknowledge the write.
+    One,
+    /// A majority of replicas (more than half) must acknowledge the write.
+    Majority,
+    /// Every replica must acknowledge the write.
+    All,
+}
+
+impl Quorum {
+    /// Given the total number of nodes, returns how many nodes are required to
+    /// satisfy the quorum.
+    pub fn required_buckets(self, replication_factor: u8) -> u8 {
+        match self {
+            Quorum::One => 1,
+            Quorum::Majority => (replication_factor / 2) + 1,
+            Quorum::All => replication_factor,
+        }
+    }
+}
+
+pub struct QuorumResult<T, E> {
+    results: ArrayVec<(BucketId, Result<T, E>), MAX_REDUNDANCY>,
+    quorum: Quorum,
+    replication_factor: u8,
+}
+
+impl<T, E> QuorumResult<T, E> {
+    // / Converts into a quorum result by checking if the number of successful responses
+    // / meets the quorum. If so, returns an `Ok` containing all the successful responses.
+    // / Otherwise, returns an `Err` with the original `QuorumResult`.
+    // pub fn into_quorum_result(self) -> Result<ArrayVec<(BucketId, T), MAX_REDUNDANCY>, Self> {
+    //     // Determine how many successful results are required.
+    //     let required = self.quorum.required_buckets(self.replication_factor) as usize;
+    //     let success_count = self.results.iter().filter(|(_, res)| res.is_ok()).count();
+
+    //     if success_count >= required {
+    //         // Collect the successful outcomes.
+    //         let successes = self
+    //             .results
+    //             .into_iter()
+    //             .filter_map(|(bucket_id, res)| res.ok().map(|value| (bucket_id, value)))
+    //             .collect();
+    //         Ok(successes)
+    //     } else {
+    //         Err(self)
+    //     }
+    // }
+
+    pub fn into_quorum_result(self) -> Result<T, QuorumError<E>> {
+        let required = self.quorum.required_buckets(self.replication_factor) as usize;
+        let mut successes = ArrayVec::<(BucketId, T), MAX_REDUNDANCY>::new();
+        let mut errors = ArrayVec::<(BucketId, E), MAX_REDUNDANCY>::new();
+
+        for (bucket_id, result) in self.results {
+            match result {
+                Ok(val) => successes.push((bucket_id, val)),
+                Err(e) => errors.push((bucket_id, e)),
+            }
+        }
+
+        if successes.len() >= required {
+            // Assuming that all successful writes return a consistent T,
+            // we simply return the first one.
+            Ok(successes.into_iter().next().unwrap().1)
+        } else {
+            Err(QuorumError::InsufficientSuccesses {
+                successes: successes.len() as u8,
+                required: required as u8,
+                errors,
+            })
+        }
+    }
+
+    pub fn into_quorum_result_compare(self) -> Result<T, QuorumError<E>>
+    where
+        T: PartialEq,
+    {
+        let required = self.quorum.required_buckets(self.replication_factor) as usize;
+        let mut successes = ArrayVec::<(BucketId, T), MAX_REDUNDANCY>::new();
+        let mut errors = ArrayVec::<(BucketId, E), MAX_REDUNDANCY>::new();
+
+        for (bucket_id, result) in self.results {
+            match result {
+                Ok(val) => successes.push((bucket_id, val)),
+                Err(e) => errors.push((bucket_id, e)),
+            }
+        }
+
+        if successes.len() >= required {
+            // Assuming that all successful writes return a consistent T,
+            // we simply return the first one.
+            Ok(successes.into_iter().next().unwrap().1)
+        } else {
+            Err(QuorumError::InsufficientSuccesses {
+                successes: successes.len() as u8,
+                required: required as u8,
+                errors,
+            })
+        }
+    }
 }

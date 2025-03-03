@@ -17,6 +17,7 @@ const BLOOM_SEED: [u8; 32] = [
     242, 218, 55, 84, 243, 117, 63, 59, 8, 112, 190, 73, 105, 98, 165, 58, 214, 159, 14, 184, 159,
     111, 33, 192, 108, 225, 81, 138, 231, 213, 234, 217,
 ];
+const MAX_REDUNDANCY: usize = 12;
 
 #[macro_export]
 macro_rules! copy_bytes {

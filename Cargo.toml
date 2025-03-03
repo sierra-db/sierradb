@@ -24,6 +24,8 @@ tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.19", features = ["fmt"] }
 uuid = { version = "1", features = ["v4", "v8"] }
 arc-swap = "1.7.1"
+futures = "0.3.31"
+arrayvec = "0.7.6"
 
 [dev-dependencies]
 criterion = "0.5"

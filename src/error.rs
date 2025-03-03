@@ -1,11 +1,13 @@
 use std::{fs::File, io, str::Utf8Error, sync::Arc, time::SystemTimeError};
 
 use arc_swap::ArcSwap;
+use arrayvec::ArrayVec;
 use rayon::ThreadPoolBuildError;
 use thiserror::Error;
 
 use crate::{
-    bucket::{BucketSegmentId, event_index::ClosedIndex},
+    MAX_REDUNDANCY,
+    bucket::{BucketId, BucketSegmentId, event_index::ClosedIndex},
     database::{CurrentVersion, ExpectedVersion},
 };
 
@@ -54,6 +56,8 @@ pub enum ReadError {
     InvalidEventNameUtf8(Utf8Error),
     #[error("unknown record type: {0}")]
     UnknownRecordType(u8),
+    #[error("no reply from the reader thread")]
+    NoThreadReply,
     #[error(transparent)]
     EventIndex(#[from] Box<EventIndexError>),
     #[error(transparent)]
@@ -79,6 +83,8 @@ pub enum WriteError {
         current: CurrentVersion,
         expected: ExpectedVersion,
     },
+    #[error("no reply from the writer thread")]
+    NoThreadReply,
     #[error(transparent)]
     Validation(#[from] EventValidationError),
     #[error(transparent)]
@@ -107,7 +113,7 @@ pub enum EventIndexError {
     CorruptHeader,
     #[error("corrupt number of slots section in event index")]
     CorruptNumSlots,
-    #[error("corrupt record in event index")]
+    #[error("corrupt record in event index at offset {offset}")]
     CorruptRecord { offset: u64 },
     #[error(transparent)]
     Read(#[from] ReadError),
@@ -129,7 +135,7 @@ pub enum StreamIndexError {
     CorruptNumSlots,
     #[error("corrupt stream index length")]
     CorruptLen,
-    #[error("corrupt record in stream index")]
+    #[error("corrupt record in stream index at offset {offset}")]
     CorruptRecord { offset: u64 },
     #[error("invalid stream id: {0}")]
     InvalidStreamIdUtf8(Utf8Error),
@@ -163,4 +169,14 @@ pub enum EventValidationError {
     PartitionKeyMismatch,
     #[error("transaction has no events")]
     EmptyTransaction,
+}
+
+#[derive(Debug, Error)]
+pub enum QuorumError<E> {
+    #[error("quorum failed with {successes}/{required} successes")]
+    InsufficientSuccesses {
+        successes: u8,
+        required: u8,
+        errors: ArrayVec<(BucketId, E), MAX_REDUNDANCY>,
+    },
 }

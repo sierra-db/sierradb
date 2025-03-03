@@ -5,7 +5,7 @@ use std::{
 
 use eventus_v2::{
     bucket::writer_thread_pool::{AppendEventsBatch, WriteEventRequest},
-    database::{DatabaseBuilder, ExpectedVersion},
+    database::{DatabaseBuilder, ExpectedVersion, Quorum},
     id::uuid_v7_with_stream_hash,
 };
 use tokio::sync::Semaphore;
@@ -18,9 +18,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let db = DatabaseBuilder::new("target/db")
-        .segment_size(104 + 48)
-        .num_buckets(1)
-        .writer_pool_num_threads(1)
+        .segment_size(100_000_000)
+        .num_buckets(4)
+        .replication_factor(3)
+        .writer_pool_num_threads(4)
         .reader_pool_num_threads(8)
         .flush_interval_duration(Duration::MAX)
         .flush_interval_events(1) // Flush every event written
@@ -36,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Total number of writes to perform.
-    let num_writes = 5;
+    let num_writes = 1_000;
     let start = Instant::now();
 
     // Use FuturesUnordered for concurrent asynchronous writes.
@@ -61,11 +62,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 payload: vec![1, 2, 3],
             };
             let res = db
-                .append_events(AppendEventsBatch::single(req).unwrap())
+                .append_events(
+                    Arc::new(AppendEventsBatch::single(req).unwrap()),
+                    Quorum::Majority,
+                )
                 .await;
-            if let Err(err) = res {
-                error!("error: {err}");
+            if let Err(err) = res.into_quorum_result() {
+                error!("{err}");
             }
+
             let _permit = permit;
         });
 
