@@ -1,6 +1,8 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::{Seek, SeekFrom, Write},
+    mem,
+    os::unix::fs::FileExt,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -20,7 +22,8 @@ use crate::{
 
 use super::{
     BucketSegmentHeader, COMMIT_SIZE, EVENT_HEADER_SIZE, FlushSender, FlushedOffset, MAGIC_BYTES,
-    PADDING_SIZE, SEGMENT_HEADER_SIZE, calculate_commit_crc32c, calculate_event_crc32c,
+    PADDING_SIZE, RECORD_HEADER_SIZE, SEGMENT_HEADER_SIZE, calculate_commit_crc32c,
+    calculate_event_crc32c,
 };
 
 const WRITE_BUF_SIZE: usize = 16 * 1024; // 16 KB buffer
@@ -252,6 +255,7 @@ impl BucketSegmentWriter {
                 &encoded_timestamp.to_le_bytes() => 8,
                 &crc32c.to_le_bytes() => 4,
                 &event_count.to_le_bytes() => 4,
+                &[0_u8; 1] => 1,
             ]
         );
 
@@ -263,6 +267,18 @@ impl BucketSegmentWriter {
         self.dirty = true;
 
         Ok((offset, COMMIT_SIZE))
+    }
+
+    pub fn set_commit_confirmations(
+        &self,
+        mut offset: u64,
+        confirmation_count: u8,
+    ) -> Result<(), WriteError> {
+        offset += (RECORD_HEADER_SIZE + mem::size_of::<u32> as usize) as u64;
+        self.file
+            .write_all_at(&confirmation_count.to_le_bytes(), offset)?;
+
+        Ok(())
     }
 
     pub fn file_size(&self) -> u64 {

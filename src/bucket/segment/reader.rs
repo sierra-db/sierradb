@@ -2,19 +2,19 @@ use std::{
     borrow::Cow,
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom},
-    os::{
-        fd::AsRawFd,
-        unix::fs::{FileExt, OpenOptionsExt},
-    },
+    mem,
+    os::unix::fs::{FileExt, OpenOptionsExt},
     path::Path,
     vec,
 };
 
-use libc::c_int;
 use polonius_the_crab::{exit_polonius, polonius, polonius_return, polonius_try};
 use uuid::Uuid;
 
-use crate::{bucket::BucketId, error::ReadError};
+use crate::{
+    bucket::BucketId,
+    error::{ReadError, WriteError},
+};
 
 use super::{
     BUCKET_ID_SIZE, BucketSegmentHeader, COMMIT_SIZE, CREATED_AT_SIZE, EVENT_HEADER_SIZE,
@@ -208,6 +208,18 @@ impl BucketSegmentReader {
     #[cfg(not(all(unix, target_os = "linux")))]
     pub fn prefetch(&self, _offset: u64) {}
 
+    pub fn set_commit_confirmations(
+        &self,
+        mut offset: u64,
+        confirmation_count: u8,
+    ) -> Result<(), WriteError> {
+        offset += (RECORD_HEADER_SIZE + mem::size_of::<u32> as usize) as u64;
+        self.file
+            .write_all_at(&confirmation_count.to_le_bytes(), offset)?;
+
+        Ok(())
+    }
+
     /// Validates the segments magic bytes.
     pub fn validate_magic_bytes(&mut self) -> Result<bool, ReadError> {
         let mut magic_bytes = [0u8; MAGIC_BYTES_SIZE];
@@ -343,7 +355,7 @@ impl BucketSegmentReader {
         let record_header = RecordHeader::from_bytes(header_buf);
 
         if record_header.record_type == 0 {
-            offset -= 4;
+            offset -= (mem::size_of::<u32>() + mem::size_of::<u8>()) as u64;
             self.read_event_body(start_offset, record_header, offset, sequential)
                 .map(|event| Some(Record::Event(event)))
         } else if record_header.record_type == 1 {
@@ -352,7 +364,13 @@ impl BucketSegmentReader {
                     .try_into()
                     .unwrap(),
             );
-            self.read_commit_body(start_offset, record_header, event_count)
+            let confirmation_count = u8::from_le_bytes(
+                header_buf[RECORD_HEADER_SIZE + mem::size_of::<u32>()
+                    ..RECORD_HEADER_SIZE + mem::size_of::<u32>() + mem::size_of::<u8>()]
+                    .try_into()
+                    .unwrap(),
+            );
+            self.read_commit_body(start_offset, record_header, event_count, confirmation_count)
                 .map(|commit| Some(Record::Commit(commit)))
         } else {
             Err(ReadError::UnknownRecordType(record_header.record_type))
@@ -399,6 +417,7 @@ impl BucketSegmentReader {
         offset: u64,
         record_header: RecordHeader,
         event_count: u32,
+        confirmation_count: u8,
     ) -> Result<CommitRecord, ReadError> {
         let new_crc32c = calculate_commit_crc32c(
             &record_header.transaction_id,
@@ -414,6 +433,7 @@ impl BucketSegmentReader {
             transaction_id: record_header.transaction_id,
             timestamp: record_header.timestamp,
             event_count,
+            confirmation_count,
         })
     }
 
@@ -618,6 +638,7 @@ pub struct CommitRecord {
     pub transaction_id: Uuid,
     pub timestamp: u64,
     pub event_count: u32,
+    pub confirmation_count: u8,
 }
 
 struct RecordHeader {
