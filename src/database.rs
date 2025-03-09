@@ -10,7 +10,6 @@ use std::{
 };
 
 use arrayvec::ArrayVec;
-use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use tokio::sync::oneshot;
 use tracing::warn;
 use uuid::Uuid;
@@ -26,9 +25,7 @@ use crate::{
         writer_thread_pool::{AppendEventsBatch, WriterThreadPool},
     },
     error::{DatabaseError, QuorumError, ReadError, StreamIndexError, WriteError},
-    id::{
-        extract_event_id_bucket, extract_stream_hash, get_redundant_buckets, partition_id_to_bucket,
-    },
+    id::{extract_event_id_bucket, partition_id_to_bucket},
     pool::create_thread_pool,
 };
 
@@ -37,7 +34,6 @@ pub struct Database {
     reader_pool: ReaderThreadPool,
     writer_pool: WriterThreadPool,
     num_buckets: u16,
-    replication_factor: u8,
 }
 
 impl Database {
@@ -47,76 +43,29 @@ impl Database {
 
     pub async fn append_events(
         &self,
+        bucket_id: BucketId,
         events: Arc<AppendEventsBatch>,
-        quorum: Quorum,
-    ) -> QuorumResult<(), WriteError> {
-        let bucket_ids = get_redundant_buckets(
-            extract_stream_hash(events.partition_key()),
-            self.num_buckets,
-            self.replication_factor,
-        );
-        let mut replies: FuturesUnordered<_> = bucket_ids
-            .into_iter()
-            .map(|bucket_id| {
-                let events = Arc::clone(&events);
-                async move {
-                    let result = self.writer_pool.append_events(bucket_id, events).await;
-                    (bucket_id, result)
-                }
-            })
-            .collect();
-
-        let mut results = ArrayVec::new();
-        let required_buckets = quorum.required_buckets(self.replication_factor) as usize;
-        let mut successes = 0;
-        while let Some((bucket_id, result)) = replies.next().await {
-            if result.is_ok() {
-                successes += 1;
-            }
-            results.push((bucket_id, result));
-            if successes >= required_buckets {
-                // Try collecting the remaining results without awaiting
-                while let Some((bucket_id, result)) = replies.next().now_or_never().flatten() {
-                    results.push((bucket_id, result));
-                }
-                return QuorumResult {
-                    results,
-                    quorum,
-                    replication_factor: self.replication_factor,
-                };
-            }
-        }
-
-        QuorumResult {
-            results,
-            quorum,
-            replication_factor: self.replication_factor,
-        }
+    ) -> Result<(), WriteError> {
+        self.writer_pool.append_events(bucket_id, events).await
     }
 
     pub async fn read_event(
         &self,
+        bucket_id: BucketId,
         event_id: Uuid,
-        quorum: Quorum,
-    ) -> QuorumResult<Option<EventRecord<'static>>, ReadError> {
-        let bucket_ids = get_redundant_buckets(
-            extract_stream_hash(event_id),
-            self.num_buckets,
-            self.replication_factor,
-        );
-        let mut replies: FuturesUnordered<_> = bucket_ids.into_iter().map(|bucket_id| async move {
-            let segment_id_offset = self
-                .writer_pool
-                .with_event_index(bucket_id, |segment_id, event_index| {
-                    event_index
-                        .get(&event_id)
-                        .map(|offset| (segment_id.load(Ordering::Acquire), offset))
-                })
-                .await
-                .flatten();
+    ) -> Result<Option<EventRecord<'static>>, ReadError> {
+        let segment_id_offset = self
+            .writer_pool
+            .with_event_index(bucket_id, |segment_id, event_index| {
+                event_index
+                    .get(&event_id)
+                    .map(|offset| (segment_id.load(Ordering::Acquire), offset))
+            })
+            .await
+            .flatten();
 
-            let (reply_tx, reply_rx) = oneshot::channel();
-            self.reader_pool.spawn(move |with_readers| {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.reader_pool.spawn(move |with_readers| {
                 with_readers(move |readers| match segment_id_offset {
                     Some((segment_id, offset)) => {
                         let Some(reader_set) = readers
@@ -165,37 +114,9 @@ impl Database {
                 })
             });
 
-            (bucket_id, match reply_rx.await {
-                Ok(res) => res.map(|events| events.and_then(|events| events.into_iter().next())),
-                Err(_) => Err(ReadError::NoThreadReply),
-            })
-        }).collect();
-
-        let mut results = ArrayVec::new();
-        let required_buckets = quorum.required_buckets(self.replication_factor) as usize;
-        let mut successes = 0;
-        while let Some((bucket_id, result)) = replies.next().await {
-            if result.is_ok() {
-                successes += 1;
-            }
-            results.push((bucket_id, result));
-            if successes >= required_buckets {
-                // Try collecting the remaining results without awaiting
-                while let Some((bucket_id, result)) = replies.next().now_or_never().flatten() {
-                    results.push((bucket_id, result));
-                }
-                return QuorumResult {
-                    results,
-                    quorum,
-                    replication_factor: self.replication_factor,
-                };
-            }
-        }
-
-        QuorumResult {
-            results,
-            quorum,
-            replication_factor: self.replication_factor,
+        match reply_rx.await {
+            Ok(res) => res.map(|events| events.and_then(|events| events.into_iter().next())),
+            Err(_) => Err(ReadError::NoThreadReply),
         }
     }
 
@@ -427,7 +348,6 @@ impl DatabaseBuilder {
             reader_pool,
             writer_pool,
             num_buckets: self.num_buckets,
-            replication_factor: self.replication_factor,
         })
     }
 

@@ -41,7 +41,7 @@ pub const EVENT_HEADER_SIZE: usize = RECORD_HEADER_SIZE
     + mem::size_of::<u16>() // Event name length
     + mem::size_of::<u32>() // Metadata length
     + mem::size_of::<u32>(); // Payload length
-pub const COMMIT_SIZE: usize = RECORD_HEADER_SIZE + mem::size_of::<u32>(); // Event count
+pub const COMMIT_SIZE: usize = RECORD_HEADER_SIZE + mem::size_of::<u32>() + mem::size_of::<u8>(); // Event count + Confirmation count
 
 pub type WriteFn = Box<dyn FnOnce(&mut BucketSegmentWriter) + Send>;
 
@@ -449,6 +449,7 @@ mod tests {
                     transaction_id: rtid,
                     timestamp: rts,
                     event_count,
+                    confirmation_count: _,
                 }) => {
                     assert_eq!(kind, 1);
                     assert_eq!(rtid, transaction_id);
