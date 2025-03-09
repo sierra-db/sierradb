@@ -7,6 +7,7 @@ pub mod database;
 pub mod error;
 pub mod id;
 pub mod pool;
+pub mod swarm;
 
 const SEED_K0: u64 = 0x53c8ff368077e723;
 const SEED_K1: u64 = 0x586c670340740e26;

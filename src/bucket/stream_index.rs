@@ -713,7 +713,16 @@ impl EventStreamIter {
                                     match stream_index.get_key(&stream_id) {
                                         Ok(Some(key)) if key.version_min == 0 || i == 0 => {
                                             match stream_index.get_from_key(key) {
-                                                Ok(offsets) => Some(Ok((*segment_id, offsets))),
+                                                Ok(offsets) => {
+                                                    if let StreamOffsets::Offsets(offsets) =
+                                                        &offsets
+                                                    {
+                                                        if let Some(offset) = offsets.first() {
+                                                            reader_set.reader.prefetch(*offset);
+                                                        }
+                                                    }
+                                                    Some(Ok((*segment_id, offsets)))
+                                                }
                                                 Err(err) => Some(Err(err)),
                                             }
                                         }
@@ -918,13 +927,6 @@ impl EventStreamIter {
                         offset,
                         segment_id: self.segment_id,
                     });
-                    // if self.segment_offsets.is_empty() {
-                    //     self.segment_id = self.segment_id.saturating_add(1);
-                    //     println!(
-                    //         "segment offsets is empty, incrementing to {}",
-                    //         self.segment_id
-                    //     );
-                    // }
                 }
 
                 Ok(events.and_then(|events| events.into_iter().next()))
