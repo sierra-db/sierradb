@@ -2,6 +2,7 @@ use std::{fs::File, io, str::Utf8Error, sync::Arc, time::SystemTimeError};
 
 use arc_swap::ArcSwap;
 use arrayvec::ArrayVec;
+use libp2p::BehaviourBuilderError;
 use rayon::ThreadPoolBuildError;
 use thiserror::Error;
 
@@ -28,6 +29,14 @@ pub enum ThreadPoolError {
         index: Arc<ArcSwap<crate::bucket::stream_index::ClosedIndex>>,
         err: StreamIndexError,
     },
+}
+
+#[derive(Debug, Error)]
+pub enum SwarmError {
+    #[error(transparent)]
+    Behaviour(#[from] BehaviourBuilderError),
+    #[error("swarm not running")]
+    SwarmNotRunning,
 }
 
 #[derive(Debug, Error)]

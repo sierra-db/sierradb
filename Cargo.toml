@@ -15,7 +15,7 @@ polonius-the-crab = "0.4.1"
 rand = "0.9"
 rayon = "1.10.0"
 # redb = "2.4.0"
-serde = "1.0.218"
+serde = { version = "1.0.218", features = ["derive"] }
 smallvec = "1.14.0"
 thiserror = "2.0.11"
 thread-priority = "1.2.0"
@@ -26,6 +26,20 @@ uuid = { version = "1", features = ["v4", "v8"] }
 arc-swap = "1.7.1"
 futures = "0.3.31"
 arrayvec = "0.7.6"
+libp2p.version = "0.55.0"
+libp2p.features = [
+  "cbor",
+  "identify",
+  "gossipsub",
+  "kad",
+  "macros",
+  "mdns",
+  "ping",
+  "quic",
+  "request-response",
+  "tokio"
+]
+libc = "0.2.170"
 
 [dev-dependencies]
 criterion = "0.5"

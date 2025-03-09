@@ -2,11 +2,15 @@ use std::{
     borrow::Cow,
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom},
-    os::unix::fs::{FileExt, OpenOptionsExt},
+    os::{
+        fd::AsRawFd,
+        unix::fs::{FileExt, OpenOptionsExt},
+    },
     path::Path,
     vec,
 };
 
+use libc::c_int;
 use polonius_the_crab::{exit_polonius, polonius, polonius_return, polonius_try};
 use uuid::Uuid;
 
@@ -188,6 +192,21 @@ impl BucketSegmentReader {
             offset: start_offset,
         }
     }
+
+    #[cfg(all(unix, target_os = "linux"))]
+    pub fn prefetch(&self, offset: u64) {
+        unsafe {
+            libc::posix_fadvise(
+                self.file.as_raw_fd(),
+                offset as i64,
+                PAGE_SIZE as i64,
+                libc::POSIX_FADV_WILLNEED,
+            );
+        }
+    }
+
+    #[cfg(not(all(unix, target_os = "linux")))]
+    pub fn prefetch(&self, _offset: u64) {}
 
     /// Validates the segments magic bytes.
     pub fn validate_magic_bytes(&mut self) -> Result<bool, ReadError> {
