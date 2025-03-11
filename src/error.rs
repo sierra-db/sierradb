@@ -5,6 +5,7 @@ use arrayvec::ArrayVec;
 use libp2p::BehaviourBuilderError;
 use rayon::ThreadPoolBuildError;
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::{
     MAX_REDUNDANCY,
@@ -92,6 +93,18 @@ pub enum WriteError {
         current: CurrentVersion,
         expected: ExpectedVersion,
     },
+    #[error("wrong event id at offset {offset}: expected {expected} but found {found}")]
+    WrongEventId {
+        offset: u64,
+        found: Uuid,
+        expected: Uuid,
+    },
+    #[error("wrong transaction id at offset {offset}: expected {expected} but found {found}")]
+    WrongTransactionId {
+        offset: u64,
+        found: Uuid,
+        expected: Uuid,
+    },
     #[error("no reply from the writer thread")]
     NoThreadReply,
     #[error(transparent)]
@@ -115,9 +128,9 @@ impl From<SystemTimeError> for WriteError {
 #[derive(Debug, Error)]
 pub enum EventIndexError {
     #[error("failed to deserialize MPHF: {0}")]
-    DeserializeMphf(bincode::Error),
-    #[error("failed to serialize MPHF: {0}")]
-    SerializeMphf(bincode::Error),
+    DeserializeMphf(bincode::error::DecodeError),
+    #[error("failed to serialize MPHF: {0:?}")]
+    SerializeMphf(bincode::error::EncodeError),
     #[error("corrupt magic bytes header")]
     CorruptHeader,
     #[error("corrupt number of slots section in event index")]
@@ -135,9 +148,9 @@ pub enum StreamIndexError {
     #[error("bloom filter error: {err}")]
     Bloom { err: &'static str },
     #[error("failed to deserialize MPHF: {0}")]
-    DeserializeMphf(bincode::Error),
+    DeserializeMphf(bincode::error::DecodeError),
     #[error("failed to serialize MPHF: {0}")]
-    SerializeMphf(bincode::Error),
+    SerializeMphf(bincode::error::EncodeError),
     #[error("corrupt magic bytes header in stream index")]
     CorruptHeader,
     #[error("corrupt number of slots section in stream index")]

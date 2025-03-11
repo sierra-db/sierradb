@@ -2,7 +2,8 @@ mod reader;
 mod writer;
 
 use std::{
-    mem,
+    fs, mem,
+    os::unix::fs::FileExt,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -10,6 +11,8 @@ use std::{
 };
 
 use uuid::Uuid;
+
+use crate::{error::WriteError, from_bytes};
 
 pub use self::reader::{
     BucketSegmentIter, BucketSegmentReader, CommitRecord, CommittedEvents, CommittedEventsIntoIter,
@@ -33,7 +36,8 @@ pub const SEGMENT_HEADER_SIZE: usize =
 pub const RECORD_HEADER_SIZE: usize = mem::size_of::<Uuid>() // Event ID
         + mem::size_of::<Uuid>() // Transaction ID
         + mem::size_of::<u64>() // Timestamp nanoseconds
-        + mem::size_of::<u32>(); // CRC32C hash
+        + mem::size_of::<u32>() // CRC32C hash
+        + mem::size_of::<u8>(); // Confirmation count
 pub const EVENT_HEADER_SIZE: usize = RECORD_HEADER_SIZE
     + mem::size_of::<u64>() // Stream version
     + mem::size_of::<Uuid>() // Partition key
@@ -41,7 +45,7 @@ pub const EVENT_HEADER_SIZE: usize = RECORD_HEADER_SIZE
     + mem::size_of::<u16>() // Event name length
     + mem::size_of::<u32>() // Metadata length
     + mem::size_of::<u32>(); // Payload length
-pub const COMMIT_SIZE: usize = RECORD_HEADER_SIZE + mem::size_of::<u32>() + mem::size_of::<u8>(); // Event count + Confirmation count
+pub const COMMIT_SIZE: usize = RECORD_HEADER_SIZE + mem::size_of::<u32>(); // Event count
 
 pub type WriteFn = Box<dyn FnOnce(&mut BucketSegmentWriter) + Send>;
 
@@ -302,6 +306,38 @@ fn calculate_commit_crc32c(transaction_id: &Uuid, timestamp: u64, event_count: u
     hasher.finalize()
 }
 
+fn set_confirmations(
+    file: &fs::File,
+    mut offset: u64,
+    event_id: &Uuid,
+    transaction_id: &Uuid,
+    confirmation_count: u8,
+) -> Result<(), WriteError> {
+    let mut buf = [0; mem::size_of::<Uuid>() + mem::size_of::<Uuid>()];
+    file.read_exact_at(&mut buf, offset)?;
+
+    let (record_event_id, record_transaction_id) = from_bytes!(buf, 0, [Uuid, Uuid]);
+    if &record_event_id != event_id {
+        return Err(WriteError::WrongEventId {
+            offset,
+            found: record_event_id,
+            expected: *event_id,
+        });
+    }
+    if &record_transaction_id != transaction_id {
+        return Err(WriteError::WrongTransactionId {
+            offset,
+            found: record_transaction_id,
+            expected: *transaction_id,
+        });
+    }
+
+    offset += (RECORD_HEADER_SIZE - mem::size_of::<u8> as usize) as u64;
+    file.write_all_at(&confirmation_count.to_le_bytes(), offset)?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -428,6 +464,7 @@ mod tests {
                     transaction_id: rtid,
                     stream_version: rsv,
                     timestamp: rts,
+                    confirmation_count: _,
                     stream_id: rsid,
                     event_name: ren,
                     metadata: rm,

@@ -51,7 +51,7 @@ type Receiver = mpsc::Receiver<WriteRequest>;
 
 #[derive(Clone)]
 pub struct WriterThreadPool {
-    num_buckets: u16,
+    bucket_ids: Arc<[BucketId]>,
     num_threads: u16,
     senders: Arc<[Sender]>,
     indexes: Arc<HashMap<BucketId, (Arc<AtomicU32>, LiveIndexes)>>,
@@ -62,7 +62,7 @@ impl WriterThreadPool {
     pub fn new(
         dir: impl Into<PathBuf>,
         segment_size: usize,
-        num_buckets: u16,
+        bucket_ids: Arc<[BucketId]>,
         num_threads: u16,
         flush_interval_duration: Duration,
         flush_interval_events: u32,
@@ -71,7 +71,7 @@ impl WriterThreadPool {
     ) -> Result<Self, WriteError> {
         assert!(num_threads > 0);
         assert!(
-            num_buckets >= num_threads,
+            bucket_ids.len() >= num_threads as usize,
             "number of buckets cannot be less than number of threads"
         );
 
@@ -84,7 +84,7 @@ impl WriterThreadPool {
                 dir.clone(),
                 segment_size,
                 thread_id,
-                num_buckets,
+                &bucket_ids,
                 num_threads,
                 flush_interval_duration,
                 flush_interval_events,
@@ -151,7 +151,7 @@ impl WriterThreadPool {
         }
 
         Ok(WriterThreadPool {
-            num_buckets,
+            bucket_ids,
             num_threads,
             senders: Arc::from(senders),
             indexes: Arc::new(indexes),
@@ -164,38 +164,59 @@ impl WriterThreadPool {
 
     pub async fn append_events(
         &self,
-        bucket_id: u16,
+        bucket_id: BucketId,
         batch: Arc<AppendEventsBatch>,
     ) -> Result<(), WriteError> {
-        let target_thread = bucket_to_thread(bucket_id, self.num_buckets, self.num_threads);
+        let target_thread = bucket_id_to_thread_id(bucket_id, &self.bucket_ids, self.num_threads)
+            .ok_or(WriteError::BucketWriterNotFound)?;
 
         let sender = self
             .senders
             .get(target_thread as usize)
-            .expect("sender should be present");
+            .ok_or(WriteError::BucketWriterNotFound)?;
 
         let (reply_tx, reply_rx) = oneshot::channel();
-        let send_res = sender
-            .send(WriteRequest::AppendEvents(Box::new(AppendEventsRequest {
+        sender
+            .send(WriteRequest::AppendEvents {
                 bucket_id,
                 batch,
                 reply_tx,
-            })))
-            .await;
-        match send_res {
-            Ok(()) => reply_rx.await.map_err(|_| WriteError::NoThreadReply)?,
-            Err(err) => match err.0 {
-                WriteRequest::AppendEvents(req) => {
-                    req.reply_tx
-                        .send(Err(WriteError::WriterThreadNotRunning))
-                        .unwrap();
-                    reply_rx.await.unwrap()
-                }
-                WriteRequest::FlushPoll => {
-                    unreachable!("we never send a flush poll here")
-                }
-            },
-        }
+            })
+            .await
+            .map_err(|_| WriteError::WriterThreadNotRunning)?;
+        reply_rx.await.map_err(|_| WriteError::NoThreadReply)?
+    }
+
+    /// Marks a transaction commit as confirmed by all replication buckets, meeting the quorum.
+    pub async fn confirm_transaction(
+        &self,
+        bucket_id: BucketId,
+        offset: u64,
+        event_id: Uuid,
+        transaction_id: Uuid,
+        confirmation_count: u8,
+    ) -> Result<(), WriteError> {
+        let target_thread = bucket_id_to_thread_id(bucket_id, &self.bucket_ids, self.num_threads)
+            .ok_or(WriteError::BucketWriterNotFound)?;
+
+        let sender = self
+            .senders
+            .get(target_thread as usize)
+            .ok_or(WriteError::BucketWriterNotFound)?;
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        sender
+            .send(WriteRequest::ConfirmTransaction {
+                bucket_id,
+                offset,
+                event_id,
+                transaction_id,
+                confirmation_count,
+                reply_tx,
+            })
+            .await
+            .map_err(|_| WriteError::WriterThreadNotRunning)?;
+        reply_rx.await.map_err(|_| WriteError::NoThreadReply)?
     }
 
     pub async fn with_event_index<F, R>(&self, bucket_id: BucketId, f: F) -> Option<R>
@@ -289,7 +310,19 @@ impl AppendEventsBatch {
 
 enum WriteRequest {
     // ValidateEvents(Box<ValidateEventsRequest>),
-    AppendEvents(Box<AppendEventsRequest>),
+    AppendEvents {
+        bucket_id: BucketId,
+        batch: Arc<AppendEventsBatch>,
+        reply_tx: oneshot::Sender<Result<(), WriteError>>,
+    },
+    ConfirmTransaction {
+        bucket_id: BucketId,
+        offset: u64,
+        event_id: Uuid,
+        transaction_id: Uuid,
+        confirmation_count: u8,
+        reply_tx: oneshot::Sender<Result<(), WriteError>>,
+    },
     FlushPoll,
 }
 
@@ -298,12 +331,6 @@ enum WriteRequest {
 //     batch: Arc<AppendEventsBatch>,
 //     reply_tx: oneshot::Sender<Result<HashMap<Arc<str>, CurrentVersion>, WriteError>>,
 // }
-
-struct AppendEventsRequest {
-    bucket_id: BucketId,
-    batch: Arc<AppendEventsBatch>,
-    reply_tx: oneshot::Sender<Result<(), WriteError>>,
-}
 
 #[derive(Clone)]
 pub struct WriteEventRequest {
@@ -328,7 +355,7 @@ impl Worker {
         dir: PathBuf,
         segment_size: usize,
         thread_id: u16,
-        num_buckets: u16,
+        bucket_ids: &[BucketId],
         num_threads: u16,
         flush_interval_duration: Duration,
         flush_interval_events: u32,
@@ -337,8 +364,8 @@ impl Worker {
     ) -> Result<Self, WriteError> {
         let mut writers = HashMap::new();
         let now = Instant::now();
-        for bucket_id in 0..num_buckets {
-            if bucket_to_thread(bucket_id, num_buckets, num_threads) == thread_id {
+        for &bucket_id in bucket_ids.iter() {
+            if bucket_id_to_thread_id(bucket_id, bucket_ids, num_threads) == Some(thread_id) {
                 let (bucket_segment_id, writer) =
                     BucketSegmentWriter::latest(bucket_id, &dir, FlushSender::local())?;
                 let mut reader = BucketSegmentReader::open(
@@ -384,18 +411,22 @@ impl Worker {
             }
         }
 
+        println!(
+            "Thread {thread_id} has writers: {:?}",
+            writers.keys().collect::<Vec<_>>()
+        );
+
         Ok(Worker { thread_id, writers })
     }
 
     fn run(mut self, mut rx: Receiver) {
         while let Some(req) = rx.blocking_recv() {
             match req {
-                WriteRequest::AppendEvents(req) => {
-                    let AppendEventsRequest {
-                        bucket_id,
-                        batch,
-                        reply_tx,
-                    } = *req;
+                WriteRequest::AppendEvents {
+                    bucket_id,
+                    batch,
+                    reply_tx,
+                } => {
                     let AppendEventsBatch {
                         transaction_id,
                         events,
@@ -404,8 +435,8 @@ impl Worker {
 
                     let Some(writer_set) = self.writers.get_mut(&bucket_id) else {
                         error!(
-                            "thread {} received a request for bucket {} that isn't assigned here",
-                            self.thread_id, bucket_id
+                            "thread {} received a request for bucket {bucket_id} that isn't assigned here",
+                            self.thread_id
                         );
                         let _ = reply_tx.send(Err(WriteError::BucketWriterNotFound));
                         continue;
@@ -421,6 +452,34 @@ impl Worker {
                             error!("failed to set segment file length after write error: {err}");
                         }
                     }
+
+                    let _ = reply_tx.send(res);
+                }
+                WriteRequest::ConfirmTransaction {
+                    bucket_id,
+                    offset,
+                    event_id,
+                    transaction_id,
+                    confirmation_count,
+                    reply_tx,
+                } => {
+                    let Some(writer_set) = self.writers.get_mut(&bucket_id) else {
+                        error!(
+                            "thread {} received a request for bucket {bucket_id} that isn't assigned here",
+                            self.thread_id
+                        );
+                        let _ = reply_tx.send(Err(WriteError::BucketWriterNotFound));
+                        continue;
+                    };
+
+                    writer_set.flush_if_necessary();
+
+                    let res = writer_set.writer.set_confirmations(
+                        offset,
+                        &event_id,
+                        &transaction_id,
+                        confirmation_count,
+                    );
 
                     let _ = reply_tx.send(res);
                 }
@@ -955,22 +1014,31 @@ struct PendingIndex {
     offset: u64,
 }
 
-fn bucket_to_thread(bucket_id: BucketId, num_buckets: u16, num_threads: u16) -> u16 {
+fn bucket_id_to_thread_id(
+    bucket_id: BucketId,
+    bucket_ids: &[BucketId],
+    num_threads: u16,
+) -> Option<u16> {
+    let num_buckets = bucket_ids.len() as u16;
+
     assert!(
         num_buckets >= num_threads,
         "number of buckets cannot be less than number of threads"
     );
 
     if num_threads == 1 {
-        return 0;
+        return bucket_ids.contains(&bucket_id).then_some(0);
     }
+
+    // Find the position/index of this bucket_id in the bucket_ids array
+    let position = bucket_ids.iter().position(|&id| id == bucket_id)? as u16;
 
     let buckets_per_thread = num_buckets / num_threads;
     let extra = num_buckets % num_threads;
 
-    if bucket_id < (buckets_per_thread + 1) * extra {
-        bucket_id / (buckets_per_thread + 1)
+    if position < (buckets_per_thread + 1) * extra {
+        Some(position / (buckets_per_thread + 1))
     } else {
-        extra + (bucket_id - (buckets_per_thread + 1) * extra) / buckets_per_thread
+        Some(extra + (position - (buckets_per_thread + 1) * extra) / buckets_per_thread)
     }
 }

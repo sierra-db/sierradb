@@ -263,6 +263,22 @@ impl BucketSegmentReader {
         Ok(u64::from_le_bytes(created_at_bytes))
     }
 
+    pub fn set_confirmations(
+        &self,
+        offset: u64,
+        event_id: &Uuid,
+        transaction_id: &Uuid,
+        confirmation_count: u8,
+    ) -> Result<(), WriteError> {
+        super::set_confirmations(
+            &self.file,
+            offset,
+            event_id,
+            transaction_id,
+            confirmation_count,
+        )
+    }
+
     pub fn read_committed_events(
         &mut self,
         mut offset: u64,
@@ -600,6 +616,7 @@ pub struct EventRecord<'a> {
     pub transaction_id: Uuid,
     pub stream_version: u64,
     pub timestamp: u64,
+    pub confirmation_count: u8,
     pub stream_id: Cow<'a, str>,
     pub event_name: Cow<'a, str>,
     pub metadata: Cow<'a, [u8]>,
@@ -615,6 +632,7 @@ impl EventRecord<'_> {
             transaction_id: self.transaction_id,
             stream_version: self.stream_version,
             timestamp: self.timestamp,
+            confirmation_count: self.confirmation_count,
             stream_id: Cow::Owned(self.stream_id.into_owned()),
             event_name: Cow::Owned(self.event_name.into_owned()),
             metadata: Cow::Owned(self.metadata.into_owned()),
@@ -637,8 +655,8 @@ pub struct CommitRecord {
     pub offset: u64,
     pub transaction_id: Uuid,
     pub timestamp: u64,
-    pub event_count: u32,
     pub confirmation_count: u8,
+    pub event_count: u32,
 }
 
 struct RecordHeader {
@@ -646,6 +664,7 @@ struct RecordHeader {
     transaction_id: Uuid,
     timestamp: u64,
     crc32c: u32,
+    confirmation_count: u8,
     record_type: u8,
 }
 
@@ -656,12 +675,14 @@ impl RecordHeader {
         let transaction_id = Uuid::from_bytes(read_bytes!(buf, pos, 16));
         let timestamp = u64::from_le_bytes(read_bytes!(buf, pos, 8));
         let crc32c = u32::from_le_bytes(read_bytes!(buf, pos, 4));
+        let confirmation_count = u8::from_le_bytes(read_bytes!(buf, pos, 1));
         let record_type = (timestamp & 0b1) as u8;
         RecordHeader {
             event_id,
             transaction_id,
             timestamp,
             crc32c,
+            confirmation_count,
             record_type,
         }
     }
@@ -784,6 +805,7 @@ fn validate_and_combine_event(
         transaction_id: record_header.transaction_id,
         stream_version: event_header.stream_version,
         timestamp: record_header.timestamp,
+        confirmation_count: record_header.confirmation_count,
         stream_id: body.stream_id,
         event_name: body.event_name,
         metadata: body.metadata,
