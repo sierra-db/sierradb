@@ -20,6 +20,7 @@ use std::{
 };
 
 use arc_swap::{ArcSwap, Cache};
+use bincode::config;
 use bloomfilter::Bloom;
 use boomphf::Mphf;
 use rayon::ThreadPool;
@@ -320,7 +321,8 @@ impl OpenStreamIndex {
         let mphf = Mphf::new(MPHF_GAMMA, &keys);
 
         // Serialize the MPHF structure
-        let mphf_bytes = bincode::serialize(&mphf).map_err(StreamIndexError::SerializeMphf)?;
+        let mphf_bytes = bincode::serde::encode_to_vec(&mphf, config::standard())
+            .map_err(StreamIndexError::SerializeMphf)?;
         let mphf_bytes_len = mphf_bytes.len() as u64;
 
         // Get the bloom filter bytes
@@ -970,8 +972,9 @@ fn load_index_from_file(
     // Read the MPHF bytes and deserialize
     let mut mph_bytes = vec![0u8; mph_bytes_len];
     file.read_exact(&mut mph_bytes)?;
-    let mph: Mphf<String> =
-        bincode::deserialize(&mph_bytes).map_err(StreamIndexError::DeserializeMphf)?;
+    let (mph, _): (Mphf<String>, _) =
+        bincode::serde::decode_from_slice(&mph_bytes, bincode::config::standard())
+            .map_err(StreamIndexError::DeserializeMphf)?;
 
     // Read bloom filter length
     let mut bloom_len_buf = [0u8; 8];

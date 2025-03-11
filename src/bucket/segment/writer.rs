@@ -1,8 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::{Seek, SeekFrom, Write},
-    mem,
-    os::unix::fs::FileExt,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -22,8 +20,7 @@ use crate::{
 
 use super::{
     BucketSegmentHeader, COMMIT_SIZE, EVENT_HEADER_SIZE, FlushSender, FlushedOffset, MAGIC_BYTES,
-    PADDING_SIZE, RECORD_HEADER_SIZE, SEGMENT_HEADER_SIZE, calculate_commit_crc32c,
-    calculate_event_crc32c,
+    PADDING_SIZE, SEGMENT_HEADER_SIZE, calculate_commit_crc32c, calculate_event_crc32c,
 };
 
 const WRITE_BUF_SIZE: usize = 16 * 1024; // 16 KB buffer
@@ -199,6 +196,7 @@ impl BucketSegmentWriter {
                 header.transaction_id.as_bytes() => 16,
                 &encoded_timestamp.to_le_bytes() => 8,
                 &crc32c.to_le_bytes() => 4,
+                &[0_u8; 1] => 1,
                 &header.stream_version.to_le_bytes() => 8,
                 header.partition_key.as_bytes() => 16,
                 &header.stream_id_len.to_le_bytes() => 2,
@@ -254,8 +252,8 @@ impl BucketSegmentWriter {
                 transaction_id.as_bytes() => 16,
                 &encoded_timestamp.to_le_bytes() => 8,
                 &crc32c.to_le_bytes() => 4,
-                &event_count.to_le_bytes() => 4,
                 &[0_u8; 1] => 1,
+                &event_count.to_le_bytes() => 4,
             ]
         );
 
@@ -269,16 +267,20 @@ impl BucketSegmentWriter {
         Ok((offset, COMMIT_SIZE))
     }
 
-    pub fn set_commit_confirmations(
+    pub fn set_confirmations(
         &self,
-        mut offset: u64,
+        offset: u64,
+        event_id: &Uuid,
+        transaction_id: &Uuid,
         confirmation_count: u8,
     ) -> Result<(), WriteError> {
-        offset += (RECORD_HEADER_SIZE + mem::size_of::<u32> as usize) as u64;
-        self.file
-            .write_all_at(&confirmation_count.to_le_bytes(), offset)?;
-
-        Ok(())
+        super::set_confirmations(
+            &self.file,
+            offset,
+            event_id,
+            transaction_id,
+            confirmation_count,
+        )
     }
 
     pub fn file_size(&self) -> u64 {

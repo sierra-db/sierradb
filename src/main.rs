@@ -1,11 +1,15 @@
 use std::{
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use eventus_v2::{database::DatabaseBuilder, id::uuid_v7_with_stream_hash};
+use eventus_v2::{
+    bucket::writer_thread_pool::{AppendEventsBatch, WriteEventRequest},
+    database::{DatabaseBuilder, ExpectedVersion},
+    id::{id_to_partition, uuid_v7_with_stream_hash},
+};
 use tokio::sync::Semaphore;
-use tracing::Level;
+use tracing::{Level, error};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -13,9 +17,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_max_level(Level::INFO)
         .init();
 
-    let _db = DatabaseBuilder::new("target/db")
+    let bucket_ids = [2, 8, 13, 19, 22, 28, 36, 44];
+    let db = DatabaseBuilder::new("target/db")
         .segment_size(100_000_000)
-        .num_buckets(4)
+        .bucket_ids(bucket_ids)
         .replication_factor(3)
         .writer_pool_num_threads(4)
         .reader_pool_num_threads(8)
@@ -27,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let num_streams = 10_000;
     let mut streams = Vec::with_capacity(num_streams);
     for i in 0..num_streams {
-        let stream_id = Arc::from(format!("stream-{:05}", i));
+        let stream_id = Arc::from(format!("stream-{i:05}"));
         let partition_key = uuid_v7_with_stream_hash(&stream_id);
         streams.push((stream_id, partition_key));
     }
@@ -39,35 +44,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Use FuturesUnordered for concurrent asynchronous writes.
     // let mut futures = FuturesUnordered::new();
     let semaphore = Arc::new(Semaphore::new(num_writes));
-    for _i in 0..num_writes {
+    for i in 0..num_writes {
         // Round-robin through the 10,000 pre-generated stream/partition pairs.
-        // let (stream_id, partition_key) = streams[i % num_streams].clone();
-        // let event_id = uuid_v7_with_stream_hash(&stream_id);
-        // let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
-        // let db = db.clone();
-        // let permit = Arc::clone(&semaphore).try_acquire_owned().unwrap();
+        let (stream_id, partition_key) = streams[i % num_streams].clone();
+        let event_id = uuid_v7_with_stream_hash(&stream_id);
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
+        let db = db.clone();
+        let permit = Arc::clone(&semaphore).try_acquire_owned().unwrap();
         tokio::spawn(async move {
-            // let req = WriteEventRequest {
-            //     event_id,
-            //     partition_key,
-            //     stream_version: ExpectedVersion::Any,
-            //     timestamp,
-            //     stream_id: stream_id.clone(),
-            //     event_name: "SomeEvent".to_string(),
-            //     metadata: vec![],
-            //     payload: vec![1, 2, 3],
-            // };
-            // let res = db
-            //     .append_events(
-            //         Arc::new(AppendEventsBatch::single(req).unwrap()),
-            //         Quorum::Majority,
-            //     )
-            //     .await;
-            // if let Err(err) = res.into_quorum_result() {
-            //     error!("{err}");
-            // }
+            let req = WriteEventRequest {
+                event_id,
+                partition_key,
+                stream_version: ExpectedVersion::Any,
+                timestamp,
+                stream_id: stream_id.clone(),
+                event_name: "SomeEvent".to_string(),
+                metadata: vec![],
+                payload: vec![1, 2, 3],
+            };
+            let res = db
+                .append_events(
+                    bucket_ids[id_to_partition(partition_key) as usize % bucket_ids.len()],
+                    Arc::new(AppendEventsBatch::single(req).unwrap()),
+                )
+                .await;
+            if let Err(err) = res {
+                error!("{err}");
+            }
 
-            // let _permit = permit;
+            let _permit = permit;
         });
 
         // Spawn the async write and add it to the unordered set.

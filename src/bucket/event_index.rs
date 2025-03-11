@@ -147,7 +147,8 @@ impl OpenEventIndex {
         let mphf = Mphf::new(MPHF_GAMMA, &keys);
 
         // Serialize the MPHF structure.
-        let mphf_bytes = bincode::serialize(&mphf).map_err(EventIndexError::SerializeMphf)?;
+        let mphf_bytes = bincode::serde::encode_to_vec(&mphf, bincode::config::standard())
+            .map_err(EventIndexError::SerializeMphf)?;
         let mphf_bytes_len = mphf_bytes.len() as u64;
 
         // Allocate a records array for exactly n records.
@@ -268,8 +269,9 @@ fn load_index_from_file(file: &mut File) -> Result<(Mphf<Uuid>, u64, u64), Event
     // Read the MPHF bytes and deserialize.
     let mut mph_bytes = vec![0u8; mph_bytes_len];
     file.read_exact(&mut mph_bytes)?;
-    let mph: Mphf<Uuid> =
-        bincode::deserialize(&mph_bytes).map_err(EventIndexError::DeserializeMphf)?;
+    let (mph, _): (Mphf<Uuid>, _) =
+        bincode::serde::decode_from_slice(&mph_bytes, bincode::config::standard())
+            .map_err(EventIndexError::DeserializeMphf)?;
 
     // The records array immediately follows.
     let records_offset = 4 + 8 + 8 + mph_bytes_len as u64;

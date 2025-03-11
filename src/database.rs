@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    fmt, fs, ops,
+    fmt, fs,
+    ops::{self, Range},
     path::PathBuf,
     sync::{
         Arc,
@@ -25,7 +26,6 @@ use crate::{
         writer_thread_pool::{AppendEventsBatch, WriterThreadPool},
     },
     error::{DatabaseError, QuorumError, ReadError, StreamIndexError, WriteError},
-    id::{extract_event_id_bucket, partition_id_to_bucket},
     pool::create_thread_pool,
 };
 
@@ -33,7 +33,6 @@ use crate::{
 pub struct Database {
     reader_pool: ReaderThreadPool,
     writer_pool: WriterThreadPool,
-    num_buckets: u16,
 }
 
 impl Database {
@@ -48,6 +47,8 @@ impl Database {
     ) -> Result<(), WriteError> {
         self.writer_pool.append_events(bucket_id, events).await
     }
+
+    // pub async fn confirm_commit(&self, )
 
     pub async fn read_event(
         &self,
@@ -122,12 +123,12 @@ impl Database {
 
     pub async fn read_stream(
         &self,
+        bucket_id: BucketId,
         stream_id: impl Into<Arc<str>>,
-        partition_key: Uuid,
     ) -> Result<EventStreamIter, StreamIndexError> {
         EventStreamIter::new(
             stream_id.into(),
-            extract_event_id_bucket(partition_key, self.num_buckets),
+            bucket_id,
             self.reader_pool.clone(),
             self.writer_pool.indexes(),
         )
@@ -136,13 +137,12 @@ impl Database {
 
     pub async fn read_stream_latest_version(
         &self,
+        bucket_id: BucketId,
         stream_id: &Arc<str>,
-        partition_id: u16,
     ) -> Result<Option<StreamLatestVersion>, StreamIndexError> {
-        let root_bucket_id = partition_id_to_bucket(partition_id, self.num_buckets);
         let latest = self
             .writer_pool
-            .with_stream_index(root_bucket_id, |_, stream_index| {
+            .with_stream_index(bucket_id, |_, stream_index| {
                 stream_index.get(stream_id).map(
                     |StreamIndexRecord {
                          partition_key,
@@ -174,7 +174,7 @@ impl Database {
             move |with_readers| {
                 with_readers(move |readers| {
                     let res = readers
-                        .get_mut(&root_bucket_id)
+                        .get_mut(&bucket_id)
                         .and_then(|segments| {
                             segments.iter_mut().rev().find_map(|(_, reader_set)| {
                                 let stream_index = reader_set.stream_index.as_mut()?;
@@ -218,7 +218,7 @@ impl Database {
 pub struct DatabaseBuilder {
     dir: PathBuf,
     segment_size: usize,
-    num_buckets: u16,
+    bucket_ids: Arc<[BucketId]>,
     replication_factor: u8,
     reader_pool_num_threads: u16,
     writer_pool_num_threads: u16,
@@ -228,6 +228,7 @@ pub struct DatabaseBuilder {
 
 impl DatabaseBuilder {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
+        let num_buckets = 64;
         let cores = num_cpus::get_physical() as u16;
         let reader_pool_size = cores.clamp(4, 32);
         let writer_pool_size = (cores * 2).clamp(4, 64);
@@ -235,7 +236,7 @@ impl DatabaseBuilder {
         DatabaseBuilder {
             dir: dir.into(),
             segment_size: 256_000_000,
-            num_buckets: 64,
+            bucket_ids: Arc::from((0..num_buckets).collect::<Vec<_>>()),
             replication_factor: 3,
             reader_pool_num_threads: reader_pool_size,
             writer_pool_num_threads: writer_pool_size,
@@ -245,13 +246,20 @@ impl DatabaseBuilder {
     }
 
     pub fn open(&self) -> Result<Database, DatabaseError> {
+        assert!(
+            self.bucket_ids.len() % self.writer_pool_num_threads as usize == 0,
+            "number of writer threads ({}) must be a divisor of the number of buckets ({})",
+            self.writer_pool_num_threads,
+            self.bucket_ids.len()
+        );
+
         let _ = fs::create_dir_all(&self.dir);
         let thread_pool = Arc::new(create_thread_pool()?);
         let reader_pool = ReaderThreadPool::new(self.reader_pool_num_threads as usize);
         let writer_pool = WriterThreadPool::new(
             &self.dir,
             self.segment_size,
-            self.num_buckets,
+            self.bucket_ids.clone(),
             self.writer_pool_num_threads,
             self.flush_interval_duration,
             self.flush_interval_events,
@@ -347,7 +355,6 @@ impl DatabaseBuilder {
         Ok(Database {
             reader_pool,
             writer_pool,
-            num_buckets: self.num_buckets,
         })
     }
 
@@ -356,8 +363,13 @@ impl DatabaseBuilder {
         self
     }
 
-    pub fn num_buckets(&mut self, n: u16) -> &mut Self {
-        self.num_buckets = n;
+    pub fn bucket_ids(&mut self, bucket_ids: impl Into<Arc<[BucketId]>>) -> &mut Self {
+        self.bucket_ids = bucket_ids.into();
+        self
+    }
+
+    pub fn bucket_ids_from_range(&mut self, range: Range<BucketId>) -> &mut Self {
+        self.bucket_ids = Arc::from(range.collect::<Vec<_>>());
         self
     }
 
