@@ -28,7 +28,7 @@ pub fn stream_id_bucket(stream_id: &str, num_buckets: u16) -> BucketId {
 ///
 /// # Returns
 /// A vector of bucket IDs where the event should be stored
-pub fn get_redundant_buckets(
+pub fn get_replication_buckets(
     partition_id: u16,
     num_buckets: u16,
     replication_factor: u8,
@@ -48,6 +48,54 @@ pub fn get_redundant_buckets(
 
     // Add the primary bucket first
     let primary_bucket = partition_id_to_bucket(partition_id, num_buckets);
+    buckets.push(primary_bucket);
+
+    // Use a deterministic but well-distributed pattern for additional replicas
+    // We'll use prime numbers as offsets to avoid collision patterns
+    let offsets = [17, 31, 43, 67, 89, 101, 127, 151, 173, 197, 223, 241];
+
+    let mut i = 0;
+    while buckets.len() < actual_redundancy as usize {
+        // Calculate next bucket with a prime number offset
+        let offset = offsets[i % offsets.len()];
+        let next_bucket = (primary_bucket + offset as u16) % num_buckets;
+
+        // Only add if not already in our list
+        if !buckets.contains(&next_bucket) {
+            buckets.push(next_bucket);
+        }
+
+        i += 1;
+
+        // Safety check to prevent infinite loop (very unlikely with prime offsets)
+        if i > num_buckets as usize * 2 {
+            break;
+        }
+    }
+
+    buckets
+}
+
+pub fn get_replication_partitions(
+    partition_id: u16,
+    num_partitions: u16,
+    replication_factor: u8,
+) -> ArrayVec<u16, MAX_REDUNDANCY> {
+    assert!(num_partitions > 0);
+    assert!(replication_factor > 0);
+
+    // Ensure replication_factor doesn't exceed available buckets
+    let actual_redundancy = replication_factor.min(num_partitions.try_into().unwrap_or(u8::MAX));
+
+    // Handle special case - if we only have one bucket or replication is 1
+    if num_partitions == 1 || actual_redundancy == 1 {
+        return ArrayVec::from_iter([partition_id]);
+    }
+
+    let mut buckets = ArrayVec::new();
+
+    // Add the primary bucket first
+    let primary_bucket = partition_id_to_bucket(partition_id, num_partitions);
     buckets.push(primary_bucket);
 
     // Use a deterministic but well-distributed pattern for additional replicas
@@ -235,18 +283,18 @@ mod tests {
         for r in 1..5 {
             for i in 0..u16::MAX {
                 // Test with replication factor of 3, 64 buckets
-                let buckets = get_redundant_buckets(i, 64, r);
+                let buckets = get_replication_buckets(i, 64, r);
                 assert_eq!(buckets.len(), r as usize);
                 assert_eq!(buckets[0], partition_id_to_bucket(i, 64)); // Primary bucket
                 assert!(buckets.iter().all(|&b| b < 64));
                 assert!(buckets.iter().collect::<HashSet<_>>().len() == r as usize); // All unique
 
                 // Test with replication factor exceeding buckets
-                let buckets = get_redundant_buckets(i, 3, r);
+                let buckets = get_replication_buckets(i, 3, r);
                 assert_eq!(buckets.len(), 3.min(r as usize)); // Should be limited to number of buckets
 
                 // Test with single bucket
-                let buckets = get_redundant_buckets(i, 1, r);
+                let buckets = get_replication_buckets(i, 1, r);
                 assert_eq!(&buckets, [0].as_slice());
             }
         }

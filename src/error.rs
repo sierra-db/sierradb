@@ -2,8 +2,12 @@ use std::{fs::File, io, str::Utf8Error, sync::Arc, time::SystemTimeError};
 
 use arc_swap::ArcSwap;
 use arrayvec::ArrayVec;
-use libp2p::BehaviourBuilderError;
+use libp2p::{
+    BehaviourBuilderError,
+    gossipsub::{PublishError, SubscriptionError},
+};
 use rayon::ThreadPoolBuildError;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -32,12 +36,28 @@ pub enum ThreadPoolError {
     },
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Serialize, Deserialize)]
 pub enum SwarmError {
-    #[error(transparent)]
-    Behaviour(#[from] BehaviourBuilderError),
+    #[error("peer not found for bucket {bucket_id}")]
+    BucketPeerNotFound { bucket_id: BucketId },
+    #[error("failed to encode consensus message: {0}")]
+    EncodeConsensusMessage(String),
+    #[error("failed to publish consensus message: {0}")]
+    #[serde(skip)]
+    PublishConsensusMessage(PublishError),
+    #[error("bucket id {bucket_id} not found for request")]
+    RequestBucketIdNotFound { bucket_id: BucketId },
+    #[error("stream version mismatch")]
+    StreamVersionMismatch,
+    #[error("subscription error: {0}")]
+    Subscription(String),
     #[error("swarm not running")]
     SwarmNotRunning,
+    #[error(transparent)]
+    #[serde(skip)]
+    Behaviour(#[from] BehaviourBuilderError),
+    #[error("write error: {0}")]
+    Write(String),
 }
 
 #[derive(Debug, Error)]

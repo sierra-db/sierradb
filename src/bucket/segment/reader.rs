@@ -371,7 +371,7 @@ impl BucketSegmentReader {
         let record_header = RecordHeader::from_bytes(header_buf);
 
         if record_header.record_type == 0 {
-            offset -= (mem::size_of::<u32>() + mem::size_of::<u8>()) as u64;
+            offset -= mem::size_of::<u32>() as u64;
             self.read_event_body(start_offset, record_header, offset, sequential)
                 .map(|event| Some(Record::Event(event)))
         } else if record_header.record_type == 1 {

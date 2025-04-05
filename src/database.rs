@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     fmt, fs,
-    ops::{self, Range},
+    ops::{self, RangeBounds},
     path::PathBuf,
     sync::{
         Arc,
@@ -11,8 +11,9 @@ use std::{
 };
 
 use arrayvec::ArrayVec;
+use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
-use tracing::warn;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -31,6 +32,7 @@ use crate::{
 
 #[derive(Clone)]
 pub struct Database {
+    dir: PathBuf,
     reader_pool: ReaderThreadPool,
     writer_pool: WriterThreadPool,
 }
@@ -40,11 +42,15 @@ impl Database {
         DatabaseBuilder::new(dir).open()
     }
 
+    pub fn dir(&self) -> &PathBuf {
+        &self.dir
+    }
+
     pub async fn append_events(
         &self,
         bucket_id: BucketId,
         events: Arc<AppendEventsBatch>,
-    ) -> Result<(), WriteError> {
+    ) -> Result<HashMap<Arc<str>, CurrentVersion>, WriteError> {
         self.writer_pool.append_events(bucket_id, events).await
     }
 
@@ -284,6 +290,10 @@ impl DatabaseBuilder {
             let Ok(bucket_id) = file_name_str[0..5].parse::<u16>() else {
                 continue;
             };
+            if !self.bucket_ids.contains(&bucket_id) {
+                debug!("ignoring unowned bucket {bucket_id}");
+                continue;
+            }
             let Ok(segment_id) = file_name_str[6..16].parse::<u32>() else {
                 continue;
             };
@@ -353,6 +363,7 @@ impl DatabaseBuilder {
         }
 
         Ok(Database {
+            dir: self.dir.clone(),
             reader_pool,
             writer_pool,
         })
@@ -368,8 +379,18 @@ impl DatabaseBuilder {
         self
     }
 
-    pub fn bucket_ids_from_range(&mut self, range: Range<BucketId>) -> &mut Self {
-        self.bucket_ids = Arc::from(range.collect::<Vec<_>>());
+    pub fn bucket_ids_from_range(&mut self, range: impl RangeBounds<BucketId>) -> &mut Self {
+        let min = match range.start_bound() {
+            ops::Bound::Included(min) => *min,
+            ops::Bound::Excluded(min) => min.checked_sub(1).unwrap(),
+            ops::Bound::Unbounded => panic!("unbounded range not supported"),
+        };
+        let max = match range.end_bound() {
+            ops::Bound::Included(max) => *max,
+            ops::Bound::Excluded(max) => max.checked_sub(1).unwrap(),
+            ops::Bound::Unbounded => panic!("unbounded range not supported"),
+        };
+        self.bucket_ids = Arc::from((min..=max).collect::<Vec<_>>());
         self
     }
 
@@ -412,7 +433,7 @@ struct UnopenedFileSet {
 }
 
 /// The expected version **before** the event is inserted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExpectedVersion {
     /// This write should not conflict with anything and should always succeed.
     Any,
@@ -456,13 +477,13 @@ impl fmt::Display for ExpectedVersion {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 /// Actual position of a stream.
 pub enum CurrentVersion {
-    /// The last event's number.
-    Current(u64),
     /// The stream doesn't exist.
     NoStream,
+    /// The last event's number.
+    Current(u64),
 }
 
 impl CurrentVersion {
