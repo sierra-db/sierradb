@@ -11,6 +11,7 @@ use std::{
 };
 
 use rayon::ThreadPool;
+use serde::{Deserialize, Serialize};
 use smallvec::{SmallVec, smallvec};
 use thread_priority::ThreadBuilderExt;
 use tokio::sync::{
@@ -25,7 +26,6 @@ use crate::{
     bucket::segment::{COMMIT_SIZE, EVENT_HEADER_SIZE},
     database::{CurrentVersion, ExpectedVersion, StreamLatestVersion},
     error::{EventValidationError, StreamIndexError, WriteError},
-    id::validate_event_id,
 };
 
 use super::{
@@ -166,7 +166,7 @@ impl WriterThreadPool {
         &self,
         bucket_id: BucketId,
         batch: Arc<AppendEventsBatch>,
-    ) -> Result<(), WriteError> {
+    ) -> Result<HashMap<Arc<str>, CurrentVersion>, WriteError> {
         let target_thread = bucket_id_to_thread_id(bucket_id, &self.bucket_ids, self.num_threads)
             .ok_or(WriteError::BucketWriterNotFound)?;
 
@@ -240,6 +240,7 @@ impl WriterThreadPool {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppendEventsBatch {
     partition_key: Uuid,
     transaction_id: Uuid,
@@ -248,9 +249,9 @@ pub struct AppendEventsBatch {
 
 impl AppendEventsBatch {
     pub fn single(event: WriteEventRequest) -> Result<Self, EventValidationError> {
-        if !validate_event_id(event.event_id, &event.stream_id) {
-            return Err(EventValidationError::InvalidEventId);
-        }
+        // if !validate_event_id(event.event_id, &event.stream_id) {
+        //     return Err(EventValidationError::InvalidEventId);
+        // }
 
         if !(1..=STREAM_ID_SIZE).contains(&event.stream_id.len()) {
             return Err(EventValidationError::InvalidStreamIdLen);
@@ -276,9 +277,9 @@ impl AppendEventsBatch {
                             return Err(EventValidationError::PartitionKeyMismatch);
                         }
 
-                        if !validate_event_id(event.event_id, &event.stream_id) {
-                            return Err(EventValidationError::InvalidEventId);
-                        }
+                        // if !validate_event_id(event.event_id, &event.stream_id) {
+                        //     return Err(EventValidationError::InvalidEventId);
+                        // }
 
                         if !(1..=STREAM_ID_SIZE).contains(&event.stream_id.len()) {
                             return Err(EventValidationError::InvalidStreamIdLen);
@@ -313,7 +314,7 @@ enum WriteRequest {
     AppendEvents {
         bucket_id: BucketId,
         batch: Arc<AppendEventsBatch>,
-        reply_tx: oneshot::Sender<Result<(), WriteError>>,
+        reply_tx: oneshot::Sender<Result<HashMap<Arc<str>, CurrentVersion>, WriteError>>,
     },
     ConfirmTransaction {
         bucket_id: BucketId,
@@ -332,7 +333,7 @@ enum WriteRequest {
 //     reply_tx: oneshot::Sender<Result<HashMap<Arc<str>, CurrentVersion>, WriteError>>,
 // }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriteEventRequest {
     pub event_id: Uuid,
     pub partition_key: Uuid,
@@ -410,11 +411,6 @@ impl Worker {
                 writers.insert(bucket_id, writer_set);
             }
         }
-
-        println!(
-            "Thread {thread_id} has writers: {:?}",
-            writers.keys().collect::<Vec<_>>()
-        );
 
         Ok(Worker { thread_id, writers })
     }
@@ -522,10 +518,21 @@ impl WriterSet {
         &mut self,
         transaction_id: Uuid,
         events: &SmallVec<[WriteEventRequest; 4]>,
-    ) -> Result<(), WriteError> {
+    ) -> Result<HashMap<Arc<str>, CurrentVersion>, WriteError> {
         let file_size = self.writer.file_size();
 
         let event_versions = self.validate_event_versions(events)?;
+        let latest_stream_versions = events.iter().zip(event_versions.iter()).fold(
+            HashMap::new(),
+            |mut acc, (event, version)| {
+                acc.entry(Arc::clone(&event.stream_id))
+                    .and_modify(|latest: &mut CurrentVersion| {
+                        *latest = (*latest).max(*version);
+                    })
+                    .or_insert(*version);
+                acc
+            },
+        );
 
         let events_size = events
             .iter()
@@ -599,7 +606,7 @@ impl WriterSet {
             }
         }
 
-        Ok(())
+        Ok(latest_stream_versions)
     }
 
     fn flush(&mut self) -> Result<(), WriteError> {
