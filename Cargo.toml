@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["eventus", "eventus-*", "fuzz"]
+members = ["klio", "klio-*", "fuzz"]
 
 [workspace.dependencies]
-eventus-cluster = { path = "eventus-cluster" }
-eventus-core = { path = "eventus-core" }
+klio-cluster = { path = "klio-cluster" }
+klio-core = { path = "klio-core" }

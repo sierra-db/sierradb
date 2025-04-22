@@ -1,5 +1,5 @@
 [package]
-name = "eventus-fuzz"
+name = "klio-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
@@ -8,7 +8,7 @@ edition = "2021"
 cargo-fuzz = true
 
 [dependencies]
-eventus-core.workspace = true
+klio-core.workspace = true
 
 arbitrary = { version = "1", features = ["derive"] }
 lazy_static = "1.5.0"

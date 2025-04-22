@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use eventus_core::StreamId;
-use eventus_core::bucket::segment::{
+use klio_core::StreamId;
+use klio_core::bucket::segment::{
     AppendEvent, BucketSegmentReader, BucketSegmentWriter, FlushedOffset,
 };
 use rand::rng;

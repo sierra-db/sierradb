@@ -106,7 +106,7 @@ impl Swarm {
 
                 let req_resp = request_response::Behaviour::new(
                     [(
-                        StreamProtocol::new("/eventus/events/1"),
+                        StreamProtocol::new("/klio/events/1"),
                         ProtocolSupport::Full,
                     )],
                     request_response::Config::default(),
@@ -175,7 +175,7 @@ impl Swarm {
 
         // Create the gossip actor
         // let gossip_actor = ConsensusGossipActor::new(
-        //     "eventus/consensus/1",
+        //     "klio/consensus/1",
         //     swarm.local_peer_id().clone(),
         //     leadership_ref.clone(),
         // );

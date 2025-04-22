@@ -1,8 +1,8 @@
 pub mod error;
 
 use arrayvec::ArrayVec;
-use eventus_core::bucket::{BucketId, PartitionId};
-use eventus_core::id::partition_id_to_bucket;
+use klio_core::bucket::{BucketId, PartitionId};
+use klio_core::id::partition_id_to_bucket;
 use thiserror::Error;
 
 const MAX_REDUNDANCY: usize = 12;

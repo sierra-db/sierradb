@@ -1,4 +1,4 @@
-use eventus_core::bucket::BucketId;
+use klio_core::bucket::BucketId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 

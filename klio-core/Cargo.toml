@@ -1,5 +1,5 @@
 [package]
-name = "eventus-core"
+name = "klio-core"
 version = "0.0.0"
 edition = "2024"
 
