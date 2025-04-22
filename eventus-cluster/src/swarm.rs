@@ -1,4 +1,5 @@
 pub mod consensus;
+pub mod partition_actor;
 
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
@@ -34,6 +35,8 @@ use libp2p::{
     },
     swarm::{ConnectionId, NetworkBehaviour, SwarmEvent},
 };
+use libp2p_partition_ownership::manager::PartitionManager;
+use partition_actor::PartitionActor;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
@@ -43,7 +46,6 @@ use crate::{
     bucket::{BucketId, writer_thread_pool::AppendEventsBatch},
     database::{CurrentVersion, Database},
     error::SwarmError,
-    id::get_replication_buckets,
 };
 
 #[derive(Clone, Debug)]
@@ -68,34 +70,31 @@ impl SwarmRef {
 }
 
 pub struct Swarm {
-    pub swarm: libp2p::Swarm<Behaviour>,
+    swarm: libp2p::Swarm<Behaviour>,
     database: Database,
-    leadership_ref: ActorRef<LeadershipActor>,
-    gossip_ref: ActorRef<ConsensusGossipActor>,
     num_buckets: u16,
     replication_factor: u8,
     cmd_tx: mpsc::UnboundedSender<Command>,
     cmd_rx: mpsc::UnboundedReceiver<Command>,
-    consensus_event_rx: mpsc::UnboundedReceiver<ConsensusEvent>,
-    consensus_topic: IdentTopic,
-    owned_buckets: HashSet<BucketId>,
     owned_partitions: HashSet<u16>,
-    peer_buckets: HashMap<BucketId, PeerId>,
     pending_appends: HashMap<Uuid, AppendEventsRequest>,
+    partition_actors: HashMap<u16, ActorRef<PartitionActor>>,
 }
 
 impl Swarm {
     pub fn new(
         key: Keypair,
         database: Database,
-        num_buckets: u16,
+        num_partitions: u16,
         replication_factor: u8,
-        owned_buckets: HashSet<BucketId>,
+        assigned_partitions: HashSet<u16>,
     ) -> Result<Self, SwarmError> {
         let swarm = libp2p::SwarmBuilder::with_existing_identity(key)
             .with_tokio()
             .with_quic()
             .with_behaviour(|key| {
+                let local_peer_id = key.public().to_peer_id();
+
                 let gossipsub_config = gossipsub::ConfigBuilder::default()
                     .heartbeat_interval(Duration::from_secs(1))
                     .validation_mode(gossipsub::ValidationMode::Strict)
@@ -113,127 +112,108 @@ impl Swarm {
                     request_response::Config::default(),
                 );
 
-                let mdns =
-                    mdns::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())?;
+                let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?;
 
-                let ping = ping::Behaviour::new(ping::Config::new());
+                let partition_manager = PartitionManager::new(
+                    local_peer_id,
+                    vec![local_peer_id],
+                    num_partitions,
+                    replication_factor,
+                    assigned_partitions.iter().copied().collect(),
+                    None,
+                    Duration::from_secs(6),
+                );
 
-                let buckets_str = owned_buckets
-                    .iter()
-                    .map(|bucket_id| bucket_id.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let identify = identify::Behaviour::new(
-                    identify::Config::new("/eventus/1.0.0".to_string(), key.public())
-                        .with_agent_version(format!("eventus/1/buckets={buckets_str}")),
+                let partition_ownership = libp2p_partition_ownership::behaviour::Behaviour::new(
+                    gossipsub,
+                    partition_manager,
+                    None,
+                    Duration::from_secs(1),
                 );
 
                 Ok(Behaviour {
-                    gossipsub,
-                    req_resp,
+                    partition_ownership,
                     mdns,
-                    ping,
-                    identify,
+                    req_resp,
                 })
             })?
             .build();
 
-        Self::with_swarm(
-            swarm,
-            database,
-            num_buckets,
-            replication_factor,
-            owned_buckets,
-        )
+        Self::with_swarm(swarm, database, num_partitions, replication_factor)
     }
 
     pub fn with_swarm(
-        mut swarm: libp2p::Swarm<Behaviour>,
+        swarm: libp2p::Swarm<Behaviour>,
         database: Database,
         num_buckets: u16,
         replication_factor: u8,
-        owned_buckets: HashSet<BucketId>,
     ) -> Result<Self, SwarmError> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
+        let partition_actors = swarm
+            .behaviour()
+            .partition_ownership
+            .partition_manager
+            .assigned_partitions
+            .iter()
+            .copied()
+            .map(|partition_id| (partition_id, kameo::spawn(PartitionActor)))
+            .collect();
+
         // Create the consensus event channel
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        // let (event_tx, event_rx) = mpsc::unbounded_channel();
 
-        // Create the term store actor
-        let term_store_actor = TermStoreActor::new(database.dir().join("terms"));
-        let term_store_ref = kameo::spawn(term_store_actor);
-
-        // Create the leadership actor
-        let leadership_actor = LeadershipActor::new(
-            SwarmSender(cmd_tx.clone()),
-            swarm.local_peer_id().clone(),
-            term_store_ref.clone(),
-            replication_factor,
-            num_buckets,
-        );
-        let leadership_ref = kameo::spawn(leadership_actor);
+        // // Create the leadership actor
+        // let leadership_actor = LeadershipActor::new(
+        //     SwarmSender(cmd_tx.clone()),
+        //     swarm.local_peer_id().clone(),
+        //     term_store_ref.clone(),
+        //     replication_factor,
+        //     num_buckets,
+        // );
+        // let leadership_ref = kameo::spawn(leadership_actor);
 
         // Create the gossip actor
-        let gossip_actor = ConsensusGossipActor::new(
-            "eventus/consensus/1",
-            swarm.local_peer_id().clone(),
-            leadership_ref.clone(),
-        );
-        let consensus_topic = gossip_actor.topic().clone();
-        let gossip_ref = kameo::spawn(gossip_actor);
+        // let gossip_actor = ConsensusGossipActor::new(
+        //     "eventus/consensus/1",
+        //     swarm.local_peer_id().clone(),
+        //     leadership_ref.clone(),
+        // );
+        // let consensus_topic = gossip_actor.topic().clone();
+        // let gossip_ref = kameo::spawn(gossip_actor);
 
         // Subscribe to the consensus topic
-        swarm
-            .behaviour_mut()
-            .gossipsub
-            .subscribe(&consensus_topic)
-            .unwrap(); // TODO: Unwrap shouldnt be used
+        // swarm
+        //     .behaviour_mut()
+        //     .gossipsub
+        //     .subscribe(&consensus_topic)
+        //     .unwrap(); // TODO: Unwrap shouldnt be used
 
-        leadership_ref
-            .tell(Initialize {
-                gossip_ref: gossip_ref.clone(),
-                event_tx,
-            })
-            .send_sync()
-            .unwrap();
-
-        let leadership_ref_clone = leadership_ref.clone();
-        tokio::spawn(async move {
-            let mut heartbeat_interval = tokio::time::interval(Duration::from_millis(1000));
-            let mut check_interval = tokio::time::interval(Duration::from_millis(2500));
-            let mut diagnostics_interval = tokio::time::interval(Duration::from_secs(30));
-
-            loop {
-                tokio::select! {
-                    _ = heartbeat_interval.tick() => {
-                        let _ = leadership_ref_clone.tell(SendHeartbeats).await;
-                    }
-                    _ = check_interval.tick() => {
-                        let _ = leadership_ref_clone.tell(CheckFailedLeaders).await;
-                    }
-                    _ = diagnostics_interval.tick() => {
-                        let _ = leadership_ref_clone.tell(PrintDiagnostics).await;
-                    }
-                }
-            }
-        });
+        // leadership_ref
+        //     .tell(Initialize {
+        //         gossip_ref: gossip_ref.clone(),
+        //         event_tx,
+        //     })
+        //     .send_sync()
+        //     .unwrap();
 
         Ok(Swarm {
             swarm,
             database,
-            leadership_ref,
-            gossip_ref,
+            // leadership_ref,
+            // gossip_ref,
             num_buckets,
             replication_factor,
             cmd_tx,
             cmd_rx,
-            consensus_event_rx: event_rx,
-            consensus_topic,
-            owned_buckets,
+            // consensus_event_rx: event_rx,
+            // consensus_topic,
+            // owned_buckets,
             owned_partitions: HashSet::new(),
-            peer_buckets: HashMap::new(),
+            // peer_buckets: HashMap::new(),
             pending_appends: HashMap::new(),
             // bucket_owners_topic,
+            partition_actors,
         })
     }
 
@@ -261,7 +241,7 @@ impl Swarm {
         tokio::select! {
             Some(cmd) = self.cmd_rx.recv() => self.handle_command(cmd),
             Some(event) = self.swarm.next() => self.handle_swarm_event(event).await,
-            Some(event) = self.consensus_event_rx.recv() => self.handle_consensus_event(event),
+            // Some(event) = self.consensus_event_rx.recv() => self.handle_consensus_event(event),
         }
     }
 
@@ -269,19 +249,6 @@ impl Swarm {
         loop {
             self.next().await;
         }
-    }
-
-    // Add a method to check if this node is the leader for a partition
-    pub async fn is_partition_leader(&self, partition_id: u16) -> Result<bool, ConsensusError> {
-        Ok(self.leadership_ref.ask(IsLeader { partition_id }).await?)
-    }
-
-    // Add a method to get the leader for a partition
-    pub async fn get_partition_leader(
-        &self,
-        partition_id: u16,
-    ) -> Result<Option<PeerId>, ConsensusError> {
-        Ok(self.leadership_ref.ask(GetLeader { partition_id }).await?)
     }
 
     fn handle_command(&mut self, command: Command) {
@@ -330,64 +297,80 @@ impl Swarm {
                     self.update_pending_request(request_id, bucket_id, status);
                 }
             },
-            Command::PublishConsensusMessage { message } => {
-                let res = self.handle_publish_consensus_message(message);
-                match res {
-                    Ok(_) => {}
-                    Err(SwarmError::PublishConsensusMessage(PublishError::InsufficientPeers)) => {}
-                    Err(err) => {
-                        error!("{err}");
-                    }
-                }
-            }
         }
-    }
-
-    fn handle_publish_consensus_message(
-        &mut self,
-        message: ConsensusMessage,
-    ) -> Result<MessageId, SwarmError> {
-        let encoded = bincode::encode_to_vec(&message, bincode::config::standard())
-            .map_err(|err| SwarmError::EncodeConsensusMessage(err.to_string()))?;
-        self.swarm
-            .behaviour_mut()
-            .gossipsub
-            .publish(self.consensus_topic.clone(), encoded)
-            .map_err(SwarmError::PublishConsensusMessage)
     }
 
     fn handle_append_events_command(
         &mut self,
-        partition_id: u16,
+        partition_key: u16,
         events: Arc<AppendEventsBatch>,
         reply_tx: oneshot::Sender<Result<(), SwarmError>>,
     ) {
-        let mut target_buckets =
-            get_replication_buckets(partition_id, self.num_buckets, self.replication_factor);
+        // Distributed Write Protocol
+        //
+        // Phase 1: Leader Selection & Version Assignment
+        // Step 1: Client request is forwarded to the partition leader (determined by the first alive partition in the replicated partitions)
+        // Step 2: Leader validates its leadership term and reserves sequential stream & partition versions
+        // Step 3: Leader assigns these versions to events in the append request
+        //
+        // Phase 2: Distributed Replication
+        // Step 4: Leader broadcasts write requests to all replica partitions (determined by replication factor)
+        // Step 5: Each replica immediately writes events to disk in "unconfirmed" state
+        // Step 6: Replicas respond to leader with success/failure of their write operation
+        // Step 7: Leader collects responses until quorum threshold is reached: (replication_factor/2)+1
+        //
+        // Phase 3: Commitment & Response
+        // Step 8: If quorum achieved, leader responds to client with success and assigned versions
+        // Step 9: Leader broadcasts confirmation message to all successful replicas
+        // Step 10: Replicas mark events as "confirmed" in their local storage
+        //
+        // Failure Conditions:
+        // - Leadership contention: Replica rejects write if it believes another node is the leader
+        // - Version mismatch: Replica rejects if stream/partition versions don't align with local state
+        // - Timeout: Leader fails the operation if quorum isn't reached within timeout period
+        // - Node failure: Background reconciliation process handles any partially confirmed writes
+        //
+        // Recovery guarantees:
+        // - Events remain in "unconfirmed" state until explicit confirmation
+        // - Background processes reconcile unconfirmed events during node recovery
+        // - Only confirmed events are visible to consumers
 
-        let mut owned_target_buckets = Vec::new();
-        // https://doc.rust-lang.org/stable/std/vec/struct.Vec.html#method.extract_if
-        {
-            let mut i = 0;
-            while i < target_buckets.len() {
-                if self.owned_buckets.contains(&target_buckets[i]) {
-                    let bucket_id = target_buckets.remove(i);
-                    owned_target_buckets.push(bucket_id);
-                } else {
-                    i += 1;
-                }
-            }
-        };
+        let mut target_partition_ids = self
+            .swarm
+            .behaviour()
+            .partition_ownership
+            .partition_manager
+            .get_available_partitions_for_key(partition_key);
 
-        let buckets_peers_res = target_buckets
-            .into_iter()
-            .map(|bucket_id| {
-                self.peer_buckets
-                    .get(&bucket_id)
-                    .map(|peer_id| (bucket_id, peer_id))
-                    .ok_or(SwarmError::BucketPeerNotFound { bucket_id })
-            })
-            .collect::<Result<Vec<_>, _>>();
+        // let mut owned_target_partition_ids = Vec::new();
+        // // https://doc.rust-lang.org/stable/std/vec/struct.Vec.html#method.extract_if
+        // {
+        //     let mut i = 0;
+        //     while i < target_partition_ids.len() {
+        //         if self
+        //             .swarm
+        //             .behaviour()
+        //             .partition_ownership
+        //             .partition_manager
+        //             .has_partition(target_partition_ids[i])
+        //         {
+        //             let bucket_id = target_partition_ids.remove(i);
+        //             owned_target_partition_ids.push(bucket_id);
+        //         } else {
+        //             i += 1;
+        //         }
+        //     }
+        // };
+
+        // let buckets_peers_res = target_partition_ids
+        //     .into_iter()
+        //     .map(|bucket_id| {
+        //         self.peer_buckets
+        //             .get(&bucket_id)
+        //             .map(|peer_id| (bucket_id, peer_id))
+        //             .ok_or(SwarmError::BucketPeerNotFound { bucket_id })
+        //     })
+        //     .collect::<Result<Vec<_>, _>>();
         let buckets_peers = match buckets_peers_res {
             Ok(buckets_peers) => buckets_peers,
             Err(err) => {
@@ -410,7 +393,7 @@ impl Swarm {
             );
             bucket_statuses.insert(bucket_id, AppendEventsStatus::Pending);
         }
-        for bucket_id in owned_target_buckets {
+        for bucket_id in owned_target_partition_ids {
             let db = self.database.clone();
             let cmd_tx = self.cmd_tx.clone();
             let events = Arc::clone(&events);
@@ -506,18 +489,11 @@ impl Swarm {
 
     async fn handle_swarm_event(&mut self, event: SwarmEvent<BehaviourEvent>) {
         match event {
-            SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(event)) => {
-                self.handle_gossipsub_event(event).await
-            }
             SwarmEvent::Behaviour(BehaviourEvent::ReqResp(event)) => {
                 self.handle_req_resp_event(event)
             }
             SwarmEvent::Behaviour(BehaviourEvent::Mdns(event)) => {
                 self.handle_mdns_event(event).await
-            }
-            SwarmEvent::Behaviour(BehaviourEvent::Ping(event)) => self.handle_ping_event(event),
-            SwarmEvent::Behaviour(BehaviourEvent::Identify(event)) => {
-                self.handle_identify_event(event)
             }
             SwarmEvent::ConnectionEstablished {
                 peer_id,
@@ -593,51 +569,6 @@ impl Swarm {
                 peer_id,
                 failed_messages,
             } => todo!(),
-        }
-    }
-
-    async fn handle_gossipsub_message(
-        &mut self,
-        propagation_source: PeerId,
-        message_id: MessageId,
-        message: gossipsub::Message,
-    ) {
-        match message.topic.as_str() {
-            "bucket_owners" => {
-                let msg =
-                    bincode::serde::decode_from_slice(&message.data, bincode::config::standard());
-                match msg {
-                    Ok((
-                        BucketOwnerMsg {
-                            bucket_ids,
-                            peer_id,
-                        },
-                        _,
-                    )) => {
-                        info!(?bucket_ids, %peer_id, "found bucket owners");
-                        for bucket_id in bucket_ids {
-                            self.peer_buckets.insert(bucket_id, peer_id);
-                        }
-                    }
-                    Err(err) => error!("failed to decode gossipsub message: {err}"),
-                }
-            }
-            "eventus/consensus/1" => {
-                // Forward to the consensus gossip actor
-                if let Err(err) = self
-                    .gossip_ref
-                    .tell(ProcessGossipMessage {
-                        message_id,
-                        message,
-                    })
-                    .await
-                {
-                    error!("Failed to forward gossip message: {err}");
-                }
-            }
-            _ => {
-                error!("unknown gossipsub message topic");
-            }
         }
     }
 
@@ -783,48 +714,19 @@ impl Swarm {
                     info!("mDNS discovered a new peer: {peer_id}");
                     self.swarm
                         .behaviour_mut()
-                        .gossipsub
-                        .add_explicit_peer(&peer_id);
-                    let _ = self.leadership_ref.tell(AddKnownPeer { peer_id }).await;
+                        .partition_ownership
+                        .add_explicit_peer(peer_id);
                 }
             }
             mdns::Event::Expired(list) => {
                 for (peer_id, _multiaddr) in list {
                     info!("mDNS discover peer has expired: {peer_id}");
-                    self.swarm
-                        .behaviour_mut()
-                        .gossipsub
-                        .remove_explicit_peer(&peer_id);
-                    let _ = self.leadership_ref.tell(RemoveKnownPeer { peer_id }).await;
+                    // self.swarm
+                    //     .behaviour_mut()
+                    //     .partition_ownership
+                    //     .remove_explicit_peer(&peer_id);
                 }
             }
-        }
-    }
-
-    fn handle_ping_event(&mut self, event: ping::Event) {}
-
-    fn handle_identify_event(&mut self, event: identify::Event) {
-        match event {
-            identify::Event::Received { peer_id, info, .. } => {
-                if let Some(bucket_part) = info.agent_version.split("/buckets=").nth(1) {
-                    let bucket_ids = bucket_part
-                        .split(',')
-                        .map(|bucket_id| bucket_id.parse())
-                        .collect::<Result<Vec<BucketId>, _>>();
-                    match bucket_ids {
-                        Ok(bucket_ids) => {
-                            info!(%peer_id, ?bucket_ids, "discovered peer bucket ids");
-                            for bucket_id in bucket_ids {
-                                self.peer_buckets.insert(bucket_id, peer_id);
-                            }
-                        }
-                        Err(err) => {
-                            error!(agent_version = %info.agent_version, "failed to parse agent version bucket ids: {err}");
-                        }
-                    }
-                }
-            }
-            _ => {}
         }
     }
 
@@ -904,11 +806,9 @@ impl Swarm {
 
 #[derive(NetworkBehaviour)]
 pub struct Behaviour {
-    pub gossipsub: gossipsub::Behaviour,
-    pub req_resp: request_response::cbor::Behaviour<Req, Resp>,
+    pub partition_ownership: libp2p_partition_ownership::behaviour::Behaviour,
     pub mdns: mdns::tokio::Behaviour,
-    pub ping: ping::Behaviour,
-    pub identify: identify::Behaviour,
+    pub req_resp: request_response::cbor::Behaviour<Req, Resp>,
 }
 
 pub enum Command {
@@ -922,9 +822,6 @@ pub enum Command {
         bucket_id: BucketId,
         channel: Option<ResponseChannel<Resp>>,
         result: Result<HashMap<Arc<str>, CurrentVersion>, SwarmError>,
-    },
-    PublishConsensusMessage {
-        message: ConsensusMessage,
     },
 }
 

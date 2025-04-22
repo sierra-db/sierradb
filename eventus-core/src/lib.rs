@@ -1,59 +1,86 @@
-#![deny(elided_lifetimes_in_paths)]
+use core::fmt;
+use std::sync::Arc;
+use std::{borrow, ops};
 
 use ahash::RandomState;
+use error::StreamIdError;
+use serde::{Deserialize, Serialize};
 
 pub mod bucket;
 pub mod database;
 pub mod error;
 pub mod id;
-pub mod pool;
-pub mod swarm;
+pub mod reader_thread_pool;
+pub mod writer_thread_pool;
 
-const SEED_K0: u64 = 0x53c8ff368077e723;
-const SEED_K1: u64 = 0x586c670340740e26;
-const SEED_K2: u64 = 0x34c309d85840faf5;
-const SEED_K3: u64 = 0x392f381a75a0be2b;
+const SEED_K0: u64 = 0x53C8FF368077E723;
+const SEED_K1: u64 = 0x586C670340740E26;
+const SEED_K2: u64 = 0x34C309D85840FAF5;
+const SEED_K3: u64 = 0x392F381A75A0BE2B;
 const RANDOM_STATE: RandomState = RandomState::with_seeds(SEED_K0, SEED_K1, SEED_K2, SEED_K3);
 const BLOOM_SEED: [u8; 32] = [
     242, 218, 55, 84, 243, 117, 63, 59, 8, 112, 190, 73, 105, 98, 165, 58, 214, 159, 14, 184, 159,
     111, 33, 192, 108, 225, 81, 138, 231, 213, 234, 217,
 ];
-const MAX_REDUNDANCY: usize = 12;
+pub const STREAM_ID_SIZE: usize = 64;
 
-#[macro_export]
-macro_rules! copy_bytes {
-    ($dest:expr, [ $( $src:expr $( => $len:expr $( ; + $add:expr )? )? $(,)? )* ]) => {{
-        let mut pos = 0;
-       $(
-           copy_bytes!($dest, pos, $src $(, $len $( ; + $add )? )?);
-       )*
-    }};
-    ($dest:expr, $pos:expr, [ $( $src:expr $( => $len:expr $( ; + $add:expr )? )? $(,)? )* ]) => {{
-       $(
-           copy_bytes!($dest, $pos, $src $(, $len $( ; + $add )? )?);
-       )*
-    }};
-    ($dest:expr, $src:expr) => {{
-        let len = $src.len();
-        copy_bytes!($dest, 0, $src, len);
-    }};
-    ($dest:expr, $pos:expr, $src:expr) => {{
-        let len = $src.len();
-        copy_bytes!($dest, $pos, $src, len);
-    }};
-    ($dest:expr, $pos:expr, $src:expr, $len:expr) => {{
-        let len = $len;
-        copy_bytes!($dest, $pos, $src, len; + len);
-    }};
-    ($dest:expr, $pos:expr, $src:expr, $len:expr; + $add:expr) => {{
-        let dest = &mut $dest;
-        let pos = &mut $pos;
-        let src = $src;
-        let len = $len;
-        let add = $add;
-        dest[*pos..*pos + len].copy_from_slice(src);
-        *pos += add;
-    }};
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct StreamId {
+    inner: Arc<str>,
+}
+
+impl StreamId {
+    pub fn new(s: impl Into<Arc<str>>) -> Result<Self, StreamIdError> {
+        let inner = s.into();
+        if !(1..=STREAM_ID_SIZE).contains(&inner.len()) {
+            return Err(StreamIdError::InvalidLength);
+        }
+
+        if inner.contains('\0') {
+            return Err(StreamIdError::ContainsNullByte);
+        }
+
+        Ok(StreamId { inner })
+    }
+
+    /// # Safety
+    ///
+    /// This function is safe in Rust, however can be unsafe if used with
+    /// eventus when the string is invalid.
+    ///
+    /// Calling this function, you must ensure:
+    /// - The string length is between 1 and 64
+    /// - The string contains no null bytes
+    pub unsafe fn new_unchecked(s: impl Into<Arc<str>>) -> Self {
+        StreamId { inner: s.into() }
+    }
+}
+
+impl fmt::Display for StreamId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+impl AsRef<str> for StreamId {
+    fn as_ref(&self) -> &str {
+        self.inner.as_ref()
+    }
+}
+
+impl ops::Deref for StreamId {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.inner.deref()
+    }
+}
+
+impl borrow::Borrow<str> for StreamId {
+    fn borrow(&self) -> &str {
+        self.inner.borrow()
+    }
 }
 
 #[macro_export]

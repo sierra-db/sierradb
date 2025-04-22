@@ -1,15 +1,14 @@
-use std::{
-    cell::RefCell,
-    collections::{BTreeMap, HashMap},
-    sync::Arc,
-};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
-use super::{
-    BucketId, BucketSegmentId, SegmentId, event_index::ClosedEventIndex,
-    segment::BucketSegmentReader, stream_index::ClosedStreamIndex,
-};
+use crate::bucket::event_index::ClosedEventIndex;
+use crate::bucket::partition_index::ClosedPartitionIndex;
+use crate::bucket::segment::BucketSegmentReader;
+use crate::bucket::stream_index::ClosedStreamIndex;
+use crate::bucket::{BucketId, BucketSegmentId, SegmentId};
 
 thread_local! {
     static READERS: RefCell<HashMap<BucketId, BTreeMap<SegmentId, ReaderSet>>> = RefCell::new(HashMap::new());
@@ -18,6 +17,7 @@ thread_local! {
 pub struct ReaderSet {
     pub reader: BucketSegmentReader,
     pub event_index: Option<ClosedEventIndex>,
+    pub partition_index: Option<ClosedPartitionIndex>,
     pub stream_index: Option<ClosedStreamIndex>,
 }
 
@@ -53,8 +53,8 @@ impl ReaderThreadPool {
     // pub fn install<OP, IN, OPR, INR>(&self, op: OP) -> OPR
     // where
     //     OP: FnOnce(fn(IN)) -> OPR + Send,
-    //     IN: FnOnce(&mut HashMap<BucketId, BTreeMap<SegmentId, ReaderSet>>) -> INR,
-    //     OPR: Send,
+    //     IN: FnOnce(&mut HashMap<BucketId, BTreeMap<SegmentId, ReaderSet>>) ->
+    // INR,     OPR: Send,
     // {
     //     self.pool.install(|| {
     //         let with_reader = |op: IN| READERS.with_borrow_mut(op);
@@ -80,12 +80,14 @@ impl ReaderThreadPool {
         bucket_segment_id: BucketSegmentId,
         reader: &BucketSegmentReader,
         event_index: Option<&ClosedEventIndex>,
+        partition_index: Option<&ClosedPartitionIndex>,
         stream_index: Option<&ClosedStreamIndex>,
     ) {
         self.pool.broadcast(|_| {
             let reader_set = ReaderSet {
                 reader: reader.try_clone().unwrap(),
                 event_index: event_index.map(|index| index.try_clone().unwrap()),
+                partition_index: partition_index.map(|index| index.try_clone().unwrap()),
                 stream_index: stream_index.map(|index| index.try_clone().unwrap()),
             };
             READERS.with_borrow_mut(|readers| {
@@ -103,8 +105,8 @@ impl ReaderThreadPool {
     //     offset: u64,
     // ) -> io::Result<Option<CommittedEvents<'static>>> {
     //     self.pool.install(move || {
-    //         READERS.with_borrow_mut(|readers| match readers.get_mut(&bucket_segment_id) {
-    //             Some(reader) => reader
+    //         READERS.with_borrow_mut(|readers| match
+    // readers.get_mut(&bucket_segment_id) {             Some(reader) => reader
     //                 .read_committed_events(offset, false)
     //                 .map(|record| record.map(CommittedEvents::into_owned)),
     //             None => Ok(None),
@@ -113,8 +115,8 @@ impl ReaderThreadPool {
     // }
 
     // /// Reads a record from the specified bucket and segment at the given offset.
-    // /// This method executes synchronously using the thread pool and returns an owned record.
-    // ///
+    // /// This method executes synchronously using the thread pool and returns an
+    // owned record. ///
     // /// # Arguments
     // /// - `bucket_segment_id`: The bucket segment id.
     // /// - `offset`: The offset within the segment.
@@ -129,8 +131,8 @@ impl ReaderThreadPool {
     //     offset: u64,
     // ) -> io::Result<Option<Record<'static>>> {
     //     self.pool.install(move || {
-    //         READERS.with_borrow_mut(|readers| match readers.get_mut(&bucket_segment_id) {
-    //             Some(reader) => reader
+    //         READERS.with_borrow_mut(|readers| match
+    // readers.get_mut(&bucket_segment_id) {             Some(reader) => reader
     //                 .read_record(offset, false)
     //                 .map(|record| record.map(Record::into_owned)),
     //             None => Ok(None),
@@ -153,27 +155,27 @@ impl ReaderThreadPool {
     //     &self,
     //     bucket_segment_id: BucketSegmentId,
     //     offset: u64,
-    //     handler: impl for<'a> FnOnce(io::Result<Option<Record<'a>>>) -> R + Send + 'static,
-    // ) -> Option<R>
+    //     handler: impl for<'a> FnOnce(io::Result<Option<Record<'a>>>) -> R + Send
+    // + 'static, ) -> Option<R>
     // where
     //     R: Send,
     // {
     //     self.pool
     //         .install(move || {
-    //             READERS.with_borrow_mut(|readers| match readers.get_mut(&bucket_segment_id) {
-    //                 Some(reader) => {
+    //             READERS.with_borrow_mut(|readers| match
+    // readers.get_mut(&bucket_segment_id) {                 Some(reader) => {
     //                     let res = reader.read_record(offset, false);
-    //                     catch_unwind(AssertUnwindSafe(move || Some(handler(res))))
-    //                 }
+    //                     catch_unwind(AssertUnwindSafe(move ||
+    // Some(handler(res))))                 }
     //                 None => Ok(None),
     //             })
     //         })
     //         .unwrap()
     // }
 
-    // /// Spawns an asynchronous task to read a record and process it using the given handler function.
-    // /// This method does not block and executes the handler in a separate thread.
-    // ///
+    // /// Spawns an asynchronous task to read a record and process it using the
+    // given handler function. /// This method does not block and executes the
+    // handler in a separate thread. ///
     // /// # Arguments
     // /// - `bucket_segment_id`: The bucket segment id.
     // /// - `offset`: The offset within the segment.
@@ -186,20 +188,20 @@ impl ReaderThreadPool {
     //     &self,
     //     bucket_segment_id: BucketSegmentId,
     //     offset: u64,
-    //     handler: impl for<'a> FnOnce(io::Result<Option<Record<'a>>>) + Send + 'static,
-    // ) {
+    //     handler: impl for<'a> FnOnce(io::Result<Option<Record<'a>>>) + Send +
+    // 'static, ) {
     //     self.pool.spawn(move || {
-    //         READERS.with_borrow_mut(|readers| match readers.get_mut(&bucket_segment_id) {
-    //             Some(reader) => {
+    //         READERS.with_borrow_mut(|readers| match
+    // readers.get_mut(&bucket_segment_id) {             Some(reader) => {
     //                 let res = reader.read_record(offset, false);
-    //                 let panic_res = catch_unwind(AssertUnwindSafe(move || handler(res)));
-    //                 if let Err(err) = panic_res {
+    //                 let panic_res = catch_unwind(AssertUnwindSafe(move ||
+    // handler(res)));                 if let Err(err) = panic_res {
     //                     error!("reader panicked: {err:?}");
     //                 }
     //             }
     //             None => {
-    //                 error!("spawn_read_record: unknown bucket segment {bucket_segment_id}");
-    //             }
+    //                 error!("spawn_read_record: unknown bucket segment
+    // {bucket_segment_id}");             }
     //         });
     //     });
     // }

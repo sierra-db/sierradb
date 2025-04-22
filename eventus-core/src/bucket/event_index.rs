@@ -1,32 +1,27 @@
 //! The file format for an MPHF-based index is defined as follows:
-//!   [0..4]   : magic marker: b"EIDX"
-//!   [4..12]  : number of keys (n) as a u64
-//!   [12..20] : length of serialized MPHF (L) as a u64
-//!   [20..20+L] : serialized MPHF bytes (using bincode)
-//!   [20+L..] : records array, exactly n records of RECORD_SIZE bytes each.
+//! - `[0..4]`     : magic marker: `b"EIDX"`
+//! - `[4..12]`    : number of keys (n) as a `u64`
+//! - `[12..20]`   : length of serialized MPHF (L) as a `u64`
+//! - `[20..20+L]` : serialized MPHF bytes (using bincode)
+//! - `[20+L..]`   : records array, exactly n records of RECORD_SIZE bytes each.
 
-use std::{
-    collections::BTreeMap,
-    fs::{File, OpenOptions},
-    io::{Read, Write},
-    mem,
-    os::unix::fs::FileExt,
-    panic::panic_any,
-    path::Path,
-    sync::Arc,
-};
+use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::mem;
+use std::os::unix::fs::FileExt;
+use std::panic::panic_any;
+use std::path::Path;
+use std::sync::Arc;
 
 use arc_swap::{ArcSwap, Cache};
 use boomphf::Mphf;
 use rayon::ThreadPool;
 use uuid::Uuid;
 
+use super::BucketSegmentId;
+use super::segment::{BucketSegmentReader, EventRecord, Record};
 use crate::error::{EventIndexError, ThreadPoolError};
-
-use super::{
-    BucketSegmentId,
-    segment::{BucketSegmentReader, EventRecord, Record},
-};
 
 // Each record is 16 bytes for the Uuid and 8 bytes for the offset.
 const RECORD_SIZE: usize = mem::size_of::<Uuid>() + mem::size_of::<u64>();
@@ -143,7 +138,8 @@ impl OpenEventIndex {
         let keys: Vec<Uuid> = index.keys().cloned().collect();
         let n = keys.len() as u64;
 
-        // Build the MPHF over the keys. The parameter (gamma) controls the space/performance trade-off.
+        // Build the MPHF over the keys. The parameter (gamma) controls the
+        // space/performance trade-off.
         let mphf = Mphf::new(MPHF_GAMMA, &keys);
 
         // Serialize the MPHF structure.
@@ -164,7 +160,8 @@ impl OpenEventIndex {
         }
 
         // Build the file header.
-        // Magic marker ("MPHF"), number of keys, length of mph_bytes, then the mph_bytes.
+        // Magic marker ("MPHF"), number of keys, length of mph_bytes, then the
+        // mph_bytes.
         let mut file_data = Vec::with_capacity(20 + mphf_bytes.len() + records.len());
         file_data.extend_from_slice(b"EIDX"); // magic: 4 bytes
         file_data.extend_from_slice(&n.to_le_bytes()); // number of keys: 8 bytes

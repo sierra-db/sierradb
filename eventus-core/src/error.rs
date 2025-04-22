@@ -1,21 +1,17 @@
-use std::{fs::File, io, str::Utf8Error, sync::Arc, time::SystemTimeError};
+use std::fs::File;
+use std::io;
+use std::str::Utf8Error;
+use std::sync::Arc;
+use std::time::SystemTimeError;
 
 use arc_swap::ArcSwap;
-use arrayvec::ArrayVec;
-use libp2p::{
-    BehaviourBuilderError,
-    gossipsub::{PublishError, SubscriptionError},
-};
 use rayon::ThreadPoolBuildError;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{
-    MAX_REDUNDANCY,
-    bucket::{BucketId, BucketSegmentId, event_index::ClosedIndex},
-    database::{CurrentVersion, ExpectedVersion},
-};
+use crate::StreamId;
+use crate::bucket::{BucketSegmentId, event_index, partition_index, stream_index};
+use crate::database::{CurrentVersion, ExpectedVersion};
 
 /// Errors which can occur in background threads.
 #[derive(Debug, Error)]
@@ -24,40 +20,23 @@ pub enum ThreadPoolError {
     FlushEventIndex {
         id: BucketSegmentId,
         file: File,
-        index: Arc<ArcSwap<ClosedIndex>>,
+        index: Arc<ArcSwap<event_index::ClosedIndex>>,
         err: EventIndexError,
+    },
+    #[error("failed to flush partition index for {id}: {err}")]
+    FlushPartitionIndex {
+        id: BucketSegmentId,
+        file: File,
+        index: Arc<ArcSwap<partition_index::ClosedIndex>>,
+        err: PartitionIndexError,
     },
     #[error("failed to flush stream index for {id}: {err}")]
     FlushStreamIndex {
         id: BucketSegmentId,
         file: File,
-        index: Arc<ArcSwap<crate::bucket::stream_index::ClosedIndex>>,
+        index: Arc<ArcSwap<stream_index::ClosedIndex>>,
         err: StreamIndexError,
     },
-}
-
-#[derive(Debug, Error, Serialize, Deserialize)]
-pub enum SwarmError {
-    #[error("peer not found for bucket {bucket_id}")]
-    BucketPeerNotFound { bucket_id: BucketId },
-    #[error("failed to encode consensus message: {0}")]
-    EncodeConsensusMessage(String),
-    #[error("failed to publish consensus message: {0}")]
-    #[serde(skip)]
-    PublishConsensusMessage(PublishError),
-    #[error("bucket id {bucket_id} not found for request")]
-    RequestBucketIdNotFound { bucket_id: BucketId },
-    #[error("stream version mismatch")]
-    StreamVersionMismatch,
-    #[error("subscription error: {0}")]
-    Subscription(String),
-    #[error("swarm not running")]
-    SwarmNotRunning,
-    #[error(transparent)]
-    #[serde(skip)]
-    Behaviour(#[from] BehaviourBuilderError),
-    #[error("write error: {0}")]
-    Write(String),
 }
 
 #[derive(Debug, Error)]
@@ -65,11 +44,13 @@ pub enum DatabaseError {
     #[error(transparent)]
     Read(#[from] ReadError),
     #[error(transparent)]
+    Write(#[from] WriteError),
+    #[error(transparent)]
     EventIndex(#[from] EventIndexError),
     #[error(transparent)]
-    StreamIndex(#[from] StreamIndexError),
+    PartitionIndex(#[from] PartitionIndexError),
     #[error(transparent)]
-    Write(#[from] WriteError),
+    StreamIndex(#[from] StreamIndexError),
     #[error(transparent)]
     ThreadPool(#[from] ThreadPoolBuildError),
     #[error(transparent)]
@@ -80,6 +61,8 @@ pub enum DatabaseError {
 pub enum ReadError {
     #[error("crc32c hash mismatch")]
     Crc32cMismatch { offset: u64 },
+    #[error("confirmation count crc32c hash mismatch")]
+    ConfirmationCountCrc32cMismatch { offset: u64 },
     #[error("invalid stream id: {0}")]
     InvalidStreamIdUtf8(Utf8Error),
     #[error("invalid event name: {0}")]
@@ -88,6 +71,8 @@ pub enum ReadError {
     UnknownRecordType(u8),
     #[error("no reply from the reader thread")]
     NoThreadReply,
+    #[error(transparent)]
+    Bincode(#[from] bincode::error::DecodeError),
     #[error(transparent)]
     EventIndex(#[from] Box<EventIndexError>),
     #[error(transparent)]
@@ -109,7 +94,7 @@ pub enum WriteError {
     /// Wrong expected version
     #[error("current stream version is {current} but expected {expected} for stream {stream_id}")]
     WrongExpectedVersion {
-        stream_id: Arc<str>,
+        stream_id: StreamId,
         current: CurrentVersion,
         expected: ExpectedVersion,
     },
@@ -128,6 +113,8 @@ pub enum WriteError {
     #[error("no reply from the writer thread")]
     NoThreadReply,
     #[error(transparent)]
+    Bincode(#[from] bincode::error::EncodeError),
+    #[error(transparent)]
     Validation(#[from] EventValidationError),
     #[error(transparent)]
     Read(#[from] ReadError),
@@ -135,6 +122,8 @@ pub enum WriteError {
     EventIndex(#[from] EventIndexError),
     #[error(transparent)]
     StreamIndex(#[from] StreamIndexError),
+    #[error(transparent)]
+    PartitionIndex(#[from] PartitionIndexError),
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -159,6 +148,40 @@ pub enum EventIndexError {
     CorruptRecord { offset: u64 },
     #[error(transparent)]
     Read(#[from] ReadError),
+    #[error(transparent)]
+    Io(#[from] io::Error),
+}
+
+#[derive(Debug, Error)]
+pub enum PartitionIndexError {
+    #[error("bloom filter error: {err}")]
+    Bloom { err: &'static str },
+    #[error("failed to deserialize MPHF: {0}")]
+    DeserializeMphf(bincode::error::DecodeError),
+    #[error("failed to serialize MPHF: {0}")]
+    SerializeMphf(bincode::error::EncodeError),
+    #[error("corrupt magic bytes header in partition index")]
+    CorruptHeader,
+    #[error("corrupt number of slots section in partition index")]
+    CorruptNumSlots,
+    #[error("corrupt partition index length")]
+    CorruptLen,
+    #[error("corrupt record in partition index at offset {offset}")]
+    CorruptRecord { offset: u64 },
+    #[error("event count overflow")]
+    EventCountOverflow,
+    #[error("invalid partition id: {0}")]
+    InvalidStreamIdUtf8(Utf8Error),
+    #[error("partition id already exists with an offset")]
+    PartitionIdOffsetExists,
+    #[error("partition id is already mapped to another bucket")]
+    PartitionIdMappedToExternalBucket,
+    #[error("bucket segment not found: {bucket_segment_id}")]
+    SegmentNotFound { bucket_segment_id: BucketSegmentId },
+    #[error(transparent)]
+    Read(#[from] ReadError),
+    #[error(transparent)]
+    Validation(#[from] EventValidationError),
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -197,28 +220,16 @@ pub enum StreamIndexError {
 
 #[derive(Debug, Error)]
 pub enum EventValidationError {
-    #[error("event name too long")]
-    EventNameTooLong,
-    #[error("metadata too long")]
-    MetadataTooLong,
-    #[error("payload too long")]
-    PayloadTooLong,
-    #[error("invalid event id: bits 61..46 should embed stream id hash")]
-    InvalidEventId,
-    #[error("stream id must be between 1 and 64 characters in length")]
-    InvalidStreamIdLen,
     #[error("partition key must be the same for all events in a stream")]
     PartitionKeyMismatch,
     #[error("transaction has no events")]
     EmptyTransaction,
 }
 
-#[derive(Debug, Error)]
-pub enum QuorumError<E> {
-    #[error("quorum failed with {successes}/{required} successes")]
-    InsufficientSuccesses {
-        successes: u8,
-        required: u8,
-        errors: ArrayVec<(BucketId, E), MAX_REDUNDANCY>,
-    },
+#[derive(Clone, Copy, Debug, Error)]
+pub enum StreamIdError {
+    #[error("stream id must be between 1 and 64 characters in length")]
+    InvalidLength,
+    #[error("stream id cannot contain null bytes")]
+    ContainsNullByte,
 }
