@@ -1,47 +1,44 @@
-use std::{
-    collections::{HashMap, hash_map::Entry},
-    mem,
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicU32, Ordering},
-    },
-    thread::{self},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::mem;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::thread::{self};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rayon::ThreadPool;
 use serde::{Deserialize, Serialize};
 use smallvec::{SmallVec, smallvec};
 use thread_priority::ThreadBuilderExt;
-use tokio::sync::{
-    RwLock,
-    mpsc::{self, error::TrySendError},
-    oneshot,
-};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::{self};
+use tokio::sync::{RwLock, oneshot};
 use tracing::{error, trace};
 use uuid::Uuid;
 
-use crate::{
-    bucket::segment::{COMMIT_SIZE, EVENT_HEADER_SIZE},
-    database::{CurrentVersion, ExpectedVersion, StreamLatestVersion},
-    error::{EventValidationError, StreamIndexError, WriteError},
+use crate::StreamId;
+use crate::bucket::event_index::OpenEventIndex;
+use crate::bucket::partition_index::{OpenPartitionIndex, PartitionIndexRecord, PartitionOffsets};
+use crate::bucket::segment::{
+    AppendEvent, BucketSegmentReader, BucketSegmentWriter, COMMIT_SIZE, EVENT_HEADER_SIZE,
+    SEGMENT_HEADER_SIZE,
 };
-
-use super::{
-    BucketId, BucketSegmentId, SegmentKind,
-    event_index::OpenEventIndex,
-    file_name,
-    flusher::FlushSender,
-    reader_thread_pool::ReaderThreadPool,
-    segment::{
-        AppendEvent, AppendEventBody, AppendEventHeader, BucketSegmentReader, BucketSegmentWriter,
-        SEGMENT_HEADER_SIZE,
-    },
-    stream_index::{OpenStreamIndex, STREAM_ID_SIZE, StreamIndexRecord, StreamOffsets},
+use crate::bucket::stream_index::{OpenStreamIndex, StreamIndexRecord, StreamOffsets};
+use crate::bucket::{BucketId, BucketSegmentId, PartitionId, SegmentKind};
+use crate::database::{
+    CurrentVersion, ExpectedVersion, PartitionLatestSequence, StreamLatestVersion,
 };
+use crate::error::{EventValidationError, PartitionIndexError, StreamIndexError, WriteError};
+use crate::reader_thread_pool::ReaderThreadPool;
 
-pub type LiveIndexes = Arc<RwLock<(OpenEventIndex, OpenStreamIndex)>>;
+pub type LiveIndexes = Arc<RwLock<LiveIndexSet>>;
+
+pub struct LiveIndexSet {
+    pub event_index: OpenEventIndex,
+    pub partition_index: OpenPartitionIndex,
+    pub stream_index: OpenStreamIndex,
+}
 
 const TOTAL_BUFFERED_WRITES: usize = 1_000; // At most, there can be 1,000 writes buffered across all threads
 const CHANNEL_BUFFER_MIN: usize = 16;
@@ -158,15 +155,15 @@ impl WriterThreadPool {
         })
     }
 
-    pub fn indexes(&self) -> &Arc<HashMap<u16, (Arc<AtomicU32>, LiveIndexes)>> {
+    pub fn indexes(&self) -> &Arc<HashMap<BucketId, (Arc<AtomicU32>, LiveIndexes)>> {
         &self.indexes
     }
 
     pub async fn append_events(
         &self,
         bucket_id: BucketId,
-        batch: Arc<AppendEventsBatch>,
-    ) -> Result<HashMap<Arc<str>, CurrentVersion>, WriteError> {
+        batch: AppendEventsBatch,
+    ) -> Result<HashMap<StreamId, CurrentVersion>, WriteError> {
         let target_thread = bucket_id_to_thread_id(bucket_id, &self.bucket_ids, self.num_threads)
             .ok_or(WriteError::BucketWriterNotFound)?;
 
@@ -179,7 +176,7 @@ impl WriterThreadPool {
         sender
             .send(WriteRequest::AppendEvents {
                 bucket_id,
-                batch,
+                batch: Box::new(batch),
                 reply_tx,
             })
             .await
@@ -187,12 +184,12 @@ impl WriterThreadPool {
         reply_rx.await.map_err(|_| WriteError::NoThreadReply)?
     }
 
-    /// Marks a transaction commit as confirmed by all replication buckets, meeting the quorum.
+    /// Marks a transaction commit as confirmed by all replication buckets,
+    /// meeting the quorum.
     pub async fn confirm_transaction(
         &self,
         bucket_id: BucketId,
         offset: u64,
-        event_id: Uuid,
         transaction_id: Uuid,
         confirmation_count: u8,
     ) -> Result<(), WriteError> {
@@ -209,7 +206,6 @@ impl WriterThreadPool {
             .send(WriteRequest::ConfirmTransaction {
                 bucket_id,
                 offset,
-                event_id,
                 transaction_id,
                 confirmation_count,
                 reply_tx,
@@ -226,7 +222,17 @@ impl WriterThreadPool {
         let (segment_id, index) = self.indexes.get(&bucket_id)?;
         let lock = index.read().await;
 
-        Some(f(segment_id, &lock.0))
+        Some(f(segment_id, &lock.event_index))
+    }
+
+    pub async fn with_partition_index<F, R>(&self, bucket_id: BucketId, f: F) -> Option<R>
+    where
+        F: FnOnce(&Arc<AtomicU32>, &OpenPartitionIndex) -> R,
+    {
+        let (segment_id, index) = self.indexes.get(&bucket_id)?;
+        let lock = index.read().await;
+
+        Some(f(segment_id, &lock.partition_index))
     }
 
     pub async fn with_stream_index<F, R>(&self, bucket_id: BucketId, f: F) -> Option<R>
@@ -236,11 +242,11 @@ impl WriterThreadPool {
         let (segment_id, index) = self.indexes.get(&bucket_id)?;
         let lock = index.read().await;
 
-        Some(f(segment_id, &lock.1))
+        Some(f(segment_id, &lock.stream_index))
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppendEventsBatch {
     partition_key: Uuid,
     transaction_id: Uuid,
@@ -252,10 +258,6 @@ impl AppendEventsBatch {
         // if !validate_event_id(event.event_id, &event.stream_id) {
         //     return Err(EventValidationError::InvalidEventId);
         // }
-
-        if !(1..=STREAM_ID_SIZE).contains(&event.stream_id.len()) {
-            return Err(EventValidationError::InvalidStreamIdLen);
-        }
 
         Ok(AppendEventsBatch {
             partition_key: event.partition_key,
@@ -280,10 +282,6 @@ impl AppendEventsBatch {
                         // if !validate_event_id(event.event_id, &event.stream_id) {
                         //     return Err(EventValidationError::InvalidEventId);
                         // }
-
-                        if !(1..=STREAM_ID_SIZE).contains(&event.stream_id.len()) {
-                            return Err(EventValidationError::InvalidStreamIdLen);
-                        }
 
                         Ok(Some(partition_key))
                     }
@@ -313,13 +311,12 @@ enum WriteRequest {
     // ValidateEvents(Box<ValidateEventsRequest>),
     AppendEvents {
         bucket_id: BucketId,
-        batch: Arc<AppendEventsBatch>,
-        reply_tx: oneshot::Sender<Result<HashMap<Arc<str>, CurrentVersion>, WriteError>>,
+        batch: Box<AppendEventsBatch>,
+        reply_tx: oneshot::Sender<Result<HashMap<StreamId, CurrentVersion>, WriteError>>,
     },
     ConfirmTransaction {
         bucket_id: BucketId,
         offset: u64,
-        event_id: Uuid,
         transaction_id: Uuid,
         confirmation_count: u8,
         reply_tx: oneshot::Sender<Result<(), WriteError>>,
@@ -330,14 +327,15 @@ enum WriteRequest {
 // struct ValidateEventsRequest {
 //     bucket_id: BucketId,
 //     batch: Arc<AppendEventsBatch>,
-//     reply_tx: oneshot::Sender<Result<HashMap<Arc<str>, CurrentVersion>, WriteError>>,
-// }
+//     reply_tx: oneshot::Sender<Result<HashMap<Arc<str>, CurrentVersion>,
+// WriteError>>, }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriteEventRequest {
     pub event_id: Uuid,
     pub partition_key: Uuid,
-    pub stream_id: Arc<str>,
+    pub partition_id: PartitionId,
+    pub stream_id: StreamId,
     pub stream_version: ExpectedVersion,
     pub event_name: String,
     pub timestamp: u64,
@@ -367,29 +365,37 @@ impl Worker {
         let now = Instant::now();
         for &bucket_id in bucket_ids.iter() {
             if bucket_id_to_thread_id(bucket_id, bucket_ids, num_threads) == Some(thread_id) {
-                let (bucket_segment_id, writer) =
-                    BucketSegmentWriter::latest(bucket_id, &dir, FlushSender::local())?;
+                let (bucket_segment_id, writer) = BucketSegmentWriter::latest(bucket_id, &dir)?;
                 let mut reader = BucketSegmentReader::open(
-                    dir.join(file_name(bucket_segment_id, SegmentKind::Events)),
+                    dir.join(SegmentKind::Events.file_name(bucket_segment_id)),
                     writer.flushed_offset(),
                 )?;
 
                 let mut event_index = OpenEventIndex::open(
                     bucket_segment_id,
-                    dir.join(file_name(bucket_segment_id, SegmentKind::EventIndex)),
+                    dir.join(SegmentKind::EventIndex.file_name(bucket_segment_id)),
+                )?;
+                let mut partition_index = OpenPartitionIndex::open(
+                    bucket_segment_id,
+                    dir.join(SegmentKind::PartitionIndex.file_name(bucket_segment_id)),
                 )?;
                 let mut stream_index = OpenStreamIndex::open(
                     bucket_segment_id,
-                    dir.join(file_name(bucket_segment_id, SegmentKind::StreamIndex)),
+                    dir.join(SegmentKind::StreamIndex.file_name(bucket_segment_id)),
                     segment_size,
                 )?;
 
                 event_index.hydrate(&mut reader)?;
+                partition_index.hydrate(&mut reader)?;
                 stream_index.hydrate(&mut reader)?;
 
-                reader_pool.add_bucket_segment(bucket_segment_id, &reader, None, None);
+                reader_pool.add_bucket_segment(bucket_segment_id, &reader, None, None, None);
 
-                let indexes = Arc::new(RwLock::new((event_index, stream_index)));
+                let indexes = Arc::new(RwLock::new(LiveIndexSet {
+                    event_index,
+                    partition_index,
+                    stream_index,
+                }));
 
                 let writer_set = WriterSet {
                     dir: dir.clone(),
@@ -398,6 +404,7 @@ impl Worker {
                     bucket_segment_id,
                     segment_size,
                     writer,
+                    next_partition_sequences: HashMap::new(),
                     index_segment_id: Arc::new(AtomicU32::new(bucket_segment_id.segment_id)),
                     indexes,
                     pending_indexes: Vec::with_capacity(128),
@@ -442,7 +449,61 @@ impl Worker {
 
                     let file_size = writer_set.writer.file_size();
 
-                    let res = writer_set.handle_write(*transaction_id, events);
+                    let event_versions = match writer_set.validate_event_versions(events) {
+                        Ok(event_versions) => event_versions,
+                        Err(err) => {
+                            let _ = reply_tx.send(Err(err));
+                            continue;
+                        }
+                    };
+                    let latest_stream_versions = events.iter().zip(event_versions.iter()).fold(
+                        HashMap::new(),
+                        |mut acc, (event, version)| {
+                            acc.entry(event.stream_id.clone())
+                                .and_modify(|latest: &mut CurrentVersion| {
+                                    *latest = (*latest).max(*version);
+                                })
+                                .or_insert(*version);
+                            acc
+                        },
+                    );
+
+                    let events_size = events
+                        .iter()
+                        .map(|event| {
+                            EVENT_HEADER_SIZE
+                                + event.stream_id.len()
+                                + event.event_name.len()
+                                + event.metadata.len()
+                                + event.payload.len()
+                        })
+                        .sum::<usize>()
+                        + if transaction_id.is_nil() {
+                            0
+                        } else {
+                            COMMIT_SIZE
+                        };
+
+                    if events_size + SEGMENT_HEADER_SIZE > writer_set.segment_size {
+                        let _ = reply_tx.send(Err(WriteError::EventsExceedSegmentSize));
+                        continue;
+                    }
+
+                    if file_size as usize + writer_set.writer.buf_len() + events_size
+                        > writer_set.segment_size
+                    {
+                        if let Err(err) = writer_set.rollover() {
+                            let _ = reply_tx.send(Err(err));
+                            continue;
+                        }
+                    }
+
+                    let res = writer_set.handle_write(
+                        *transaction_id,
+                        events,
+                        event_versions,
+                        latest_stream_versions,
+                    );
                     if res.is_err() {
                         if let Err(err) = writer_set.writer.set_len(file_size) {
                             error!("failed to set segment file length after write error: {err}");
@@ -454,7 +515,6 @@ impl Worker {
                 WriteRequest::ConfirmTransaction {
                     bucket_id,
                     offset,
-                    event_id,
                     transaction_id,
                     confirmation_count,
                     reply_tx,
@@ -472,7 +532,6 @@ impl Worker {
 
                     let res = writer_set.writer.set_confirmations(
                         offset,
-                        &event_id,
                         &transaction_id,
                         confirmation_count,
                     );
@@ -503,6 +562,7 @@ struct WriterSet {
     bucket_segment_id: BucketSegmentId,
     segment_size: usize,
     writer: BucketSegmentWriter,
+    next_partition_sequences: HashMap<PartitionId, u64>,
     index_segment_id: Arc<AtomicU32>,
     indexes: LiveIndexes,
     pending_indexes: Vec<PendingIndex>,
@@ -518,74 +578,52 @@ impl WriterSet {
         &mut self,
         transaction_id: Uuid,
         events: &SmallVec<[WriteEventRequest; 4]>,
-    ) -> Result<HashMap<Arc<str>, CurrentVersion>, WriteError> {
-        let file_size = self.writer.file_size();
+        event_versions: Vec<CurrentVersion>,
+        mut latest_stream_versions: HashMap<StreamId, CurrentVersion>,
+    ) -> Result<HashMap<StreamId, CurrentVersion>, WriteError> {
+        let Some(WriteEventRequest { partition_id, .. }) = events.first() else {
+            return Ok(latest_stream_versions);
+        };
 
-        let event_versions = self.validate_event_versions(events)?;
-        let latest_stream_versions = events.iter().zip(event_versions.iter()).fold(
-            HashMap::new(),
-            |mut acc, (event, version)| {
-                acc.entry(Arc::clone(&event.stream_id))
-                    .and_modify(|latest: &mut CurrentVersion| {
-                        *latest = (*latest).max(*version);
-                    })
-                    .or_insert(*version);
-                acc
-            },
-        );
-
-        let events_size = events
-            .iter()
-            .map(|event| {
-                EVENT_HEADER_SIZE
-                    + event.stream_id.len()
-                    + event.event_name.len()
-                    + event.metadata.len()
-                    + event.payload.len()
-            })
-            .sum::<usize>()
-            + if transaction_id.is_nil() {
-                0
-            } else {
-                COMMIT_SIZE
-            };
-
-        if events_size + SEGMENT_HEADER_SIZE > self.segment_size {
-            return Err(WriteError::EventsExceedSegmentSize);
-        }
-
-        if file_size as usize + self.writer.buf_len() + events_size > self.segment_size {
-            self.rollover()?;
-        }
-
+        let mut next_partition_sequence = self.next_partition_sequence(*partition_id)?;
         let mut new_pending_indexes: Vec<PendingIndex> = Vec::with_capacity(events.len());
 
         let event_count = events.len();
         for (event, stream_version) in events.into_iter().zip(event_versions) {
+            let partition_sequence = next_partition_sequence;
             let stream_version = stream_version.next_version();
-            let body = AppendEventBody::new(
-                &event.stream_id,
-                &event.event_name,
-                &event.metadata,
-                &event.payload,
+            latest_stream_versions.insert(
+                event.stream_id.clone(),
+                CurrentVersion::Current(stream_version),
             );
-            let header = AppendEventHeader::new(
-                &event.event_id,
-                &event.partition_key,
-                &transaction_id,
+            let append = AppendEvent {
+                event_id: &event.event_id,
+                partition_key: &event.partition_key,
+                partition_id: event.partition_id,
+                partition_sequence,
                 stream_version,
-                event.timestamp,
-                body,
-            )?;
-            let append = AppendEvent::new(header, body);
-            let (offset, _) = self.writer.append_event(append)?;
+                stream_id: &event.stream_id,
+                event_name: &event.event_name,
+                metadata: &event.metadata,
+                payload: &event.payload,
+            };
+            let (offset, _) =
+                self.writer
+                    .append_event(&transaction_id, event.timestamp, 0, append)?;
+            // We need to guarantee:
+            // - partition key is the same as previous event partition keys in the stream
+            // - partition sequence doesn't reach u64::MAX
             new_pending_indexes.push(PendingIndex {
                 event_id: event.event_id,
                 partition_key: event.partition_key,
-                stream_id: Arc::clone(&event.stream_id),
+                partition_id: event.partition_id,
+                partition_sequence,
+                stream_id: event.stream_id.clone(),
                 stream_version,
                 offset,
             });
+
+            next_partition_sequence = next_partition_sequence.checked_add(1).unwrap();
         }
 
         if !transaction_id.is_nil() {
@@ -594,9 +632,11 @@ impl WriterSet {
                 .map_err(|_| WriteError::BadSystemTime)?
                 .as_nanos() as u64;
             self.writer
-                .append_commit(&transaction_id, timestamp, event_count as u32)?;
+                .append_commit(&transaction_id, timestamp, event_count as u32, 0)?;
         }
 
+        self.next_partition_sequences
+            .insert(*partition_id, next_partition_sequence);
         self.pending_indexes.extend(new_pending_indexes);
 
         self.unflushed_events += event_count as u32;
@@ -617,17 +657,27 @@ impl WriterSet {
         for PendingIndex {
             event_id,
             partition_key,
+            partition_id,
+            partition_sequence,
             stream_id,
             stream_version,
             offset,
         } in self.pending_indexes.drain(..)
         {
-            indexes.0.insert(event_id, offset);
-            if let Err(err) = indexes
-                .1
-                .insert(stream_id, partition_key, stream_version, offset)
+            indexes.event_index.insert(event_id, offset);
+            if let Err(err) =
+                indexes
+                    .partition_index
+                    .insert(partition_id, partition_sequence, offset)
             {
-                error!("failed to insert index: {err}");
+                panic!("failed to insert partition index: {err}");
+            }
+            if let Err(err) =
+                indexes
+                    .stream_index
+                    .insert(stream_id, partition_key, stream_version, offset)
+            {
+                panic!("failed to insert stream index: {err}");
             }
         }
 
@@ -652,15 +702,14 @@ impl WriterSet {
 
         self.writer = BucketSegmentWriter::create(
             self.dir
-                .join(file_name(self.bucket_segment_id, SegmentKind::Events)),
+                .join(SegmentKind::Events.file_name(self.bucket_segment_id)),
             self.bucket_segment_id.bucket_id,
-            FlushSender::local(),
         )?;
         let old_reader = mem::replace(
             &mut self.reader,
             BucketSegmentReader::open(
                 self.dir
-                    .join(file_name(self.bucket_segment_id, SegmentKind::Events)),
+                    .join(SegmentKind::Events.file_name(self.bucket_segment_id)),
                 self.writer.flushed_offset(),
             )?,
         );
@@ -668,54 +717,76 @@ impl WriterSet {
         let event_index = OpenEventIndex::create(
             self.bucket_segment_id,
             self.dir
-                .join(file_name(self.bucket_segment_id, SegmentKind::EventIndex)),
+                .join(SegmentKind::EventIndex.file_name(self.bucket_segment_id)),
+        )?;
+        let partition_index = OpenPartitionIndex::create(
+            self.bucket_segment_id,
+            self.dir
+                .join(SegmentKind::PartitionIndex.file_name(self.bucket_segment_id)),
         )?;
         let stream_index = OpenStreamIndex::create(
             self.bucket_segment_id,
             self.dir
-                .join(file_name(self.bucket_segment_id, SegmentKind::StreamIndex)),
+                .join(SegmentKind::StreamIndex.file_name(self.bucket_segment_id)),
             self.segment_size,
         )?;
 
-        let (closed_event_index, closed_stream_index) = {
+        let (closed_event_index, closed_partition_index, closed_stream_index) = {
             let mut indexes = self.indexes.blocking_write();
             for PendingIndex {
                 event_id,
                 partition_key,
+                partition_id,
+                partition_sequence,
                 stream_id,
                 stream_version,
                 offset,
             } in self.pending_indexes.drain(..)
             {
-                indexes.0.insert(event_id, offset);
-                if let Err(err) = indexes
-                    .1
-                    .insert(stream_id, partition_key, stream_version, offset)
+                indexes.event_index.insert(event_id, offset);
+                if let Err(err) =
+                    indexes
+                        .partition_index
+                        .insert(partition_id, partition_sequence, offset)
                 {
-                    error!("failed to insert index: {err}");
+                    panic!("failed to insert partition index: {err}");
+                }
+                if let Err(err) =
+                    indexes
+                        .stream_index
+                        .insert(stream_id, partition_key, stream_version, offset)
+                {
+                    panic!("failed to insert stream index: {err}");
                 }
             }
 
-            let old_event_index = mem::replace(&mut indexes.0, event_index);
-            let old_stream_index = mem::replace(&mut indexes.1, stream_index);
+            let old_event_index = mem::replace(&mut indexes.event_index, event_index);
+            let old_partition_index = mem::replace(&mut indexes.partition_index, partition_index);
+            let old_stream_index = mem::replace(&mut indexes.stream_index, stream_index);
 
             let closed_event_index = old_event_index.close(&self.thread_pool)?;
+            let closed_partition_index = old_partition_index.close(&self.thread_pool)?;
             let closed_stream_index = old_stream_index.close(&self.thread_pool)?;
 
             self.index_segment_id
                 .store(self.bucket_segment_id.segment_id, Ordering::Release);
 
-            (closed_event_index, closed_stream_index)
+            (
+                closed_event_index,
+                closed_partition_index,
+                closed_stream_index,
+            )
         };
 
         self.reader_pool.add_bucket_segment(
             old_bucket_segment_id,
             &old_reader,
             Some(&closed_event_index),
+            Some(&closed_partition_index),
             Some(&closed_stream_index),
         );
         self.reader_pool
-            .add_bucket_segment(self.bucket_segment_id, &self.reader, None, None);
+            .add_bucket_segment(self.bucket_segment_id, &self.reader, None, None, None);
 
         Ok(())
     }
@@ -729,11 +800,11 @@ impl WriterSet {
             partition_key: Uuid,
         }
 
-        let mut stream_versions: HashMap<&Arc<str>, StreamVersion> = HashMap::new();
+        let mut stream_versions: HashMap<StreamId, StreamVersion> = HashMap::new();
         let mut event_versions = Vec::with_capacity(events.len());
 
         for event in events {
-            match stream_versions.entry(&event.stream_id) {
+            match stream_versions.entry(event.stream_id.clone()) {
                 Entry::Occupied(mut entry) => {
                     if entry.get().partition_key != event.partition_key {
                         return Err(WriteError::Validation(
@@ -747,11 +818,12 @@ impl WriterSet {
                             entry.get_mut().next += 1;
                         }
                         ExpectedVersion::StreamExists => {
-                            todo!()
+                            event_versions.push(CurrentVersion::Current(entry.get_mut().next));
+                            entry.get_mut().next += 1;
                         }
                         ExpectedVersion::NoStream => {
                             return Err(WriteError::WrongExpectedVersion {
-                                stream_id: Arc::clone(&event.stream_id),
+                                stream_id: event.stream_id.clone(),
                                 current: CurrentVersion::Current(entry.get().next),
                                 expected: event.stream_version,
                             });
@@ -761,7 +833,7 @@ impl WriterSet {
 
                             if entry.get().next != expected_version {
                                 return Err(WriteError::WrongExpectedVersion {
-                                    stream_id: Arc::clone(&event.stream_id),
+                                    stream_id: event.stream_id.clone(),
                                     current: CurrentVersion::Current(entry.get().next),
                                     expected: ExpectedVersion::Exact(expected_version),
                                 });
@@ -821,7 +893,59 @@ impl WriterSet {
                             }
                         }
                     }
-                    ExpectedVersion::StreamExists => todo!(),
+                    ExpectedVersion::StreamExists => {
+                        let latest_stream_version = self
+                            .pending_indexes
+                            .iter()
+                            .rev()
+                            .find_map(|pending| {
+                                if pending.stream_id == event.stream_id {
+                                    Some(StreamLatestVersion::LatestVersion {
+                                        partition_key: pending.partition_key,
+                                        version: pending.stream_version,
+                                    })
+                                } else {
+                                    None
+                                }
+                            })
+                            .map(Ok)
+                            .or_else(|| {
+                                self.read_stream_latest_version(&event.stream_id)
+                                    .transpose()
+                            })
+                            .transpose()?;
+
+                        match latest_stream_version {
+                            Some(StreamLatestVersion::LatestVersion {
+                                partition_key,
+                                version,
+                            }) => {
+                                // Stream exists, so this is fine
+                                if partition_key != event.partition_key {
+                                    return Err(WriteError::Validation(
+                                        EventValidationError::PartitionKeyMismatch,
+                                    ));
+                                }
+
+                                event_versions.push(CurrentVersion::Current(version));
+                                entry.insert(StreamVersion {
+                                    next: version + 1, // Note: increment for next event
+                                    partition_key,
+                                });
+                            }
+                            Some(StreamLatestVersion::ExternalBucket { .. }) => {
+                                todo!()
+                            }
+                            None => {
+                                // Stream doesn't exist, which violates the StreamExists expectation
+                                return Err(WriteError::WrongExpectedVersion {
+                                    stream_id: event.stream_id.clone(),
+                                    current: CurrentVersion::NoStream,
+                                    expected: ExpectedVersion::StreamExists,
+                                });
+                            }
+                        }
+                    }
                     ExpectedVersion::NoStream => {
                         let latest_stream_version = self
                             .pending_indexes
@@ -856,7 +980,7 @@ impl WriterSet {
                                 }
 
                                 return Err(WriteError::WrongExpectedVersion {
-                                    stream_id: Arc::clone(&event.stream_id),
+                                    stream_id: event.stream_id.clone(),
                                     current: CurrentVersion::Current(version),
                                     expected: event.stream_version,
                                 });
@@ -908,7 +1032,7 @@ impl WriterSet {
 
                                 if version != expected_version {
                                     return Err(WriteError::WrongExpectedVersion {
-                                        stream_id: Arc::clone(&event.stream_id),
+                                        stream_id: event.stream_id.clone(),
                                         current: CurrentVersion::Current(version),
                                         expected: ExpectedVersion::Exact(expected_version),
                                     });
@@ -925,7 +1049,7 @@ impl WriterSet {
                             }
                             None => {
                                 return Err(WriteError::WrongExpectedVersion {
-                                    stream_id: Arc::clone(&event.stream_id),
+                                    stream_id: event.stream_id.clone(),
                                     current: CurrentVersion::NoStream,
                                     expected: ExpectedVersion::Exact(expected_version),
                                 });
@@ -939,28 +1063,117 @@ impl WriterSet {
         Ok(event_versions)
     }
 
+    fn next_partition_sequence(
+        &self,
+        partition_id: PartitionId,
+    ) -> Result<u64, PartitionIndexError> {
+        match self.next_partition_sequences.get(&partition_id) {
+            Some(sequence) => Ok(*sequence),
+            None => match self.read_partition_latest_sequence(partition_id)? {
+                Some(PartitionLatestSequence::LatestSequence { sequence, .. }) => Ok(sequence),
+                Some(PartitionLatestSequence::ExternalBucket { .. }) => todo!(),
+                None => Ok(0),
+            },
+        }
+    }
+
+    fn read_partition_latest_sequence(
+        &self,
+        partition_id: PartitionId,
+    ) -> Result<Option<PartitionLatestSequence>, PartitionIndexError> {
+        let latest = self
+            .indexes
+            .blocking_read()
+            .partition_index
+            .get(partition_id)
+            .map(
+                |PartitionIndexRecord {
+                     sequence_max,
+                     offsets,
+                     ..
+                 }| match offsets {
+                    PartitionOffsets::Offsets(_) => PartitionLatestSequence::LatestSequence {
+                        partition_id,
+                        sequence: *sequence_max,
+                    },
+                    PartitionOffsets::ExternalBucket => {
+                        PartitionLatestSequence::ExternalBucket { partition_id }
+                    }
+                },
+            );
+
+        if let Some(latest) = latest {
+            return Ok(Some(latest));
+        }
+
+        let bucket_id = self.bucket_segment_id.bucket_id;
+
+        let partition_index_sequence = self.reader_pool.install({
+            move |with_readers| {
+                with_readers(move |readers| {
+                    readers
+                        .get_mut(&bucket_id)
+                        .and_then(|segments| {
+                            segments.iter_mut().rev().find_map(|(_, reader_set)| {
+                                let partition_index = reader_set.partition_index.as_mut()?;
+                                let record =
+                                    match partition_index.get_key(partition_id).transpose()? {
+                                        Ok(record) => record,
+                                        Err(err) => return Some(Err(err)),
+                                    };
+                                match partition_index.get(partition_id).transpose()? {
+                                    Ok(offsets) => Some(Ok((record, offsets))),
+                                    Err(err) => Some(Err(err)),
+                                }
+                            })
+                        })
+                        .transpose()
+                })
+            }
+        })?;
+
+        Ok(
+            partition_index_sequence.map(|(PartitionIndexRecord { sequence_max, .. }, offsets)| {
+                match offsets {
+                    PartitionOffsets::Offsets(_) => PartitionLatestSequence::LatestSequence {
+                        partition_id,
+                        sequence: sequence_max,
+                    },
+                    PartitionOffsets::ExternalBucket => {
+                        PartitionLatestSequence::ExternalBucket { partition_id }
+                    }
+                }
+            }),
+        )
+    }
+
     fn read_stream_latest_version(
         &self,
-        stream_id: &Arc<str>,
+        stream_id: &StreamId,
     ) -> Result<Option<StreamLatestVersion>, StreamIndexError> {
-        let latest = self.indexes.blocking_read().1.get(stream_id).map(
-            |StreamIndexRecord {
-                 partition_key,
-                 version_max,
-                 offsets,
-                 ..
-             }| {
-                match offsets {
-                    StreamOffsets::Offsets(_) => StreamLatestVersion::LatestVersion {
-                        partition_key: *partition_key,
-                        version: *version_max,
-                    },
-                    StreamOffsets::ExternalBucket => StreamLatestVersion::ExternalBucket {
-                        partition_key: *partition_key,
-                    },
-                }
-            },
-        );
+        let latest = self
+            .indexes
+            .blocking_read()
+            .stream_index
+            .get(stream_id)
+            .map(
+                |StreamIndexRecord {
+                     partition_key,
+                     version_max,
+                     offsets,
+                     ..
+                 }| {
+                    match offsets {
+                        StreamOffsets::Offsets(_) => StreamLatestVersion::LatestVersion {
+                            partition_key: *partition_key,
+                            version: *version_max,
+                        },
+                        StreamOffsets::ExternalBucket => StreamLatestVersion::ExternalBucket {
+                            partition_key: *partition_key,
+                        },
+                    }
+                },
+            );
 
         if let Some(latest) = latest {
             return Ok(Some(latest));
@@ -969,7 +1182,7 @@ impl WriterSet {
         let bucket_id = self.bucket_segment_id.bucket_id;
 
         let stream_index_version = self.reader_pool.install({
-            let stream_id = Arc::clone(stream_id);
+            let stream_id = stream_id.clone();
             move |with_readers| {
                 with_readers(move |readers| {
                     readers
@@ -1016,7 +1229,9 @@ impl WriterSet {
 struct PendingIndex {
     event_id: Uuid,
     partition_key: Uuid,
-    stream_id: Arc<str>,
+    partition_id: PartitionId,
+    partition_sequence: u64,
+    stream_id: StreamId,
     stream_version: u64,
     offset: u64,
 }

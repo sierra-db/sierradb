@@ -1,0 +1,28 @@
+[package]
+name = "eventus"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eventus-core.workspace = true
+
+clap = { version = "4.5.32", features = ["derive"] }
+tokio = { version = "1.43.0", features = ["fs", "io-std", "io-util", "signal", "sync", "macros", "rt-multi-thread"] }
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["serde", "v4", "v8"] }
+# libp2p.version = "0.55.0"
+# libp2p.features = [
+#   "cbor",
+#   "identify",
+#   "gossipsub",
+#   "kad",
+#   "macros",
+#   "mdns",
+#   "ping",
+#   "quic",
+#   "request-response",
+#   "serde",
+#   "tokio"
+# ]
+# libp2p_partition_ownership = { path = "../../libp2p_partition_consensus" }

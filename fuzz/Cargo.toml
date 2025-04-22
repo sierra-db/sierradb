@@ -1,0 +1,25 @@
+[package]
+name = "eventus-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+eventus-core.workspace = true
+
+arbitrary = { version = "1", features = ["derive"] }
+lazy_static = "1.5.0"
+libfuzzer-sys = "0.4"
+once_cell = "1.21.3"
+tokio = { version = "1.43.0", features = ["fs", "io-std", "io-util", "signal", "sync", "macros", "rt-multi-thread"] }
+uuid = "1"
+
+[[bin]]
+name = "append"
+path = "fuzz_targets/append.rs"
+test = false
+doc = false
+bench = false

@@ -1,53 +1,7 @@
-[package]
-name = "eventus_v2"
-version = "0.0.0"
-edition = "2021"
+[workspace]
+resolver = "3"
+members = ["eventus", "eventus-*", "fuzz"]
 
-[dependencies]
-ahash = "0.8"
-bincode = { version = "2.0.1", features = ["serde"] }
-boomphf = { version = "0.6.0", features = ["parallel", "serde"] }
-bloomfilter = "3.0.1"
-const-primes = "0.10.3"
-crc32fast = "1.4.2"
-kameo = { git = "https://github.com/tqwewe/kameo" }
-num_cpus = "1.16.0"
-polonius-the-crab = "0.4.1"
-rand = "0.9"
-rayon = "1.10.0"
-# redb = "2.4.0"
-serde = { version = "1.0.218", features = ["derive", "rc"] }
-smallvec = { version = "1.14.0", features = ["serde"] }
-thiserror = "2.0.11"
-thread-priority = "1.2.0"
-tokio = { version = "1.43.0", features = ["fs", "io-std", "io-util", "signal", "sync", "macros", "rt-multi-thread"] }
-tracing = "0.1.40"
-tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
-uuid = { version = "1", features = ["serde", "v4", "v8"] }
-arc-swap = "1.7.1"
-futures = "0.3.31"
-arrayvec = "0.7.6"
-libp2p.version = "0.55.0"
-libp2p.features = [
-  "cbor",
-  "identify",
-  "gossipsub",
-  "kad",
-  "macros",
-  "mdns",
-  "ping",
-  "quic",
-  "request-response",
-  "serde",
-  "tokio"
-]
-libc = "0.2.170"
-clap = { version = "4.5.32", features = ["derive"] }
-
-[dev-dependencies]
-criterion = "0.5"
-tempfile = "3.16"
-
-[[bench]]
-name = "random_sequential"
-harness = false
+[workspace.dependencies]
+eventus-cluster = { path = "eventus-cluster" }
+eventus-core = { path = "eventus-core" }

@@ -1,13 +1,14 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use arrayvec::ArrayVec;
 use rand::Rng;
 use uuid::Uuid;
 
-use crate::{MAX_REDUNDANCY, RANDOM_STATE, bucket::BucketId};
+use crate::RANDOM_STATE;
+use crate::bucket::{BucketId, PartitionId};
 
-/// Hashes the stream id, and performs a modulo on the lowest 16 bits of the hash.
-pub fn stream_id_partition_id(stream_id: &str) -> u16 {
+/// Hashes the stream id, and performs a modulo on the lowest 16 bits of the
+/// hash.
+pub fn stream_id_partition_id(stream_id: &str) -> PartitionId {
     (RANDOM_STATE.hash_one(stream_id) & 0xFFFF) as u16
 }
 
@@ -17,111 +18,6 @@ pub fn stream_id_bucket(stream_id: &str, num_buckets: u16) -> BucketId {
     }
 
     stream_id_partition_id(stream_id) % num_buckets
-}
-
-/// Determines all buckets where an event should be stored based on replication factor.
-///
-/// # Arguments
-/// * `partition_id` - The partition ID of the event
-/// * `num_buckets` - Total number of buckets in the system
-/// * `replication_factor` - Number of copies to maintain (replication factor)
-///
-/// # Returns
-/// A vector of bucket IDs where the event should be stored
-pub fn get_replication_buckets(
-    partition_id: u16,
-    num_buckets: u16,
-    replication_factor: u8,
-) -> ArrayVec<u16, MAX_REDUNDANCY> {
-    assert!(num_buckets > 0);
-    assert!(replication_factor > 0);
-
-    // Ensure replication_factor doesn't exceed available buckets
-    let actual_redundancy = replication_factor.min(num_buckets.try_into().unwrap_or(u8::MAX));
-
-    // Handle special case - if we only have one bucket or replication is 1
-    if num_buckets == 1 || actual_redundancy == 1 {
-        return ArrayVec::from_iter([partition_id_to_bucket(partition_id, num_buckets)]);
-    }
-
-    let mut buckets = ArrayVec::new();
-
-    // Add the primary bucket first
-    let primary_bucket = partition_id_to_bucket(partition_id, num_buckets);
-    buckets.push(primary_bucket);
-
-    // Use a deterministic but well-distributed pattern for additional replicas
-    // We'll use prime numbers as offsets to avoid collision patterns
-    let offsets = [17, 31, 43, 67, 89, 101, 127, 151, 173, 197, 223, 241];
-
-    let mut i = 0;
-    while buckets.len() < actual_redundancy as usize {
-        // Calculate next bucket with a prime number offset
-        let offset = offsets[i % offsets.len()];
-        let next_bucket = (primary_bucket + offset as u16) % num_buckets;
-
-        // Only add if not already in our list
-        if !buckets.contains(&next_bucket) {
-            buckets.push(next_bucket);
-        }
-
-        i += 1;
-
-        // Safety check to prevent infinite loop (very unlikely with prime offsets)
-        if i > num_buckets as usize * 2 {
-            break;
-        }
-    }
-
-    buckets
-}
-
-pub fn get_replication_partitions(
-    partition_id: u16,
-    num_partitions: u16,
-    replication_factor: u8,
-) -> ArrayVec<u16, MAX_REDUNDANCY> {
-    assert!(num_partitions > 0);
-    assert!(replication_factor > 0);
-
-    // Ensure replication_factor doesn't exceed available buckets
-    let actual_redundancy = replication_factor.min(num_partitions.try_into().unwrap_or(u8::MAX));
-
-    // Handle special case - if we only have one bucket or replication is 1
-    if num_partitions == 1 || actual_redundancy == 1 {
-        return ArrayVec::from_iter([partition_id]);
-    }
-
-    let mut buckets = ArrayVec::new();
-
-    // Add the primary bucket first
-    let primary_bucket = partition_id_to_bucket(partition_id, num_partitions);
-    buckets.push(primary_bucket);
-
-    // Use a deterministic but well-distributed pattern for additional replicas
-    // We'll use prime numbers as offsets to avoid collision patterns
-    let offsets = [17, 31, 43, 67, 89, 101, 127, 151, 173, 197, 223, 241];
-
-    let mut i = 0;
-    while buckets.len() < actual_redundancy as usize {
-        // Calculate next bucket with a prime number offset
-        let offset = offsets[i % offsets.len()];
-        let next_bucket = (primary_bucket + offset as u16) % num_buckets;
-
-        // Only add if not already in our list
-        if !buckets.contains(&next_bucket) {
-            buckets.push(next_bucket);
-        }
-
-        i += 1;
-
-        // Safety check to prevent infinite loop (very unlikely with prime offsets)
-        if i > num_buckets as usize * 2 {
-            break;
-        }
-    }
-
-    buckets
 }
 
 /// Returns a UUID “inspired” by v7, except that 16 bits from the stream-id hash
@@ -152,7 +48,8 @@ pub fn uuid_v7_with_stream_hash(stream_id: &str) -> Uuid {
     let rand46: u64 = rng.random::<u64>() & ((1u64 << 46) - 1);
 
     // Assemble our 128-bit value. Bit layout (MSB = bit 127):
-    // [timestamp:48] [rand12:12] [version:4] [variant:2] [stream_hash:16] [rand46:46]
+    // [timestamp:48] [rand12:12] [version:4] [variant:2] [stream_hash:16]
+    // [rand46:46]
     let uuid_u128: u128 = ((timestamp48 as u128) << 80)       // bits 127..80: timestamp (48 bits)
         | ((rand12 as u128) << 68)            // bits 79..68: 12-bit random
         | (0x7u128 << 64)                     // bits 67..64: version (4 bits, value 7)
@@ -178,7 +75,7 @@ pub fn extract_event_id_bucket(uuid: Uuid, num_buckets: u16) -> BucketId {
     id_to_partition(uuid) % num_buckets
 }
 
-pub fn partition_id_to_bucket(partition_id: u16, num_buckets: u16) -> BucketId {
+pub fn partition_id_to_bucket(partition_id: PartitionId, num_buckets: u16) -> BucketId {
     if num_buckets == 1 {
         return 0;
     }
@@ -192,8 +89,10 @@ pub fn validate_event_id(event_id: Uuid, stream_id: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::time::Duration;
+
     use super::*;
-    use std::{collections::HashSet, time::Duration};
 
     #[test]
     fn test_uuid_monotonicity() {
@@ -276,27 +175,5 @@ mod tests {
 
         // Ensure that the distribution is roughly even
         assert!(std_dev < avg * 0.1, "Buckets should be evenly distributed");
-    }
-
-    #[test]
-    fn test_redundant_buckets() {
-        for r in 1..5 {
-            for i in 0..u16::MAX {
-                // Test with replication factor of 3, 64 buckets
-                let buckets = get_replication_buckets(i, 64, r);
-                assert_eq!(buckets.len(), r as usize);
-                assert_eq!(buckets[0], partition_id_to_bucket(i, 64)); // Primary bucket
-                assert!(buckets.iter().all(|&b| b < 64));
-                assert!(buckets.iter().collect::<HashSet<_>>().len() == r as usize); // All unique
-
-                // Test with replication factor exceeding buckets
-                let buckets = get_replication_buckets(i, 3, r);
-                assert_eq!(buckets.len(), 3.min(r as usize)); // Should be limited to number of buckets
-
-                // Test with single bucket
-                let buckets = get_replication_buckets(i, 1, r);
-                assert_eq!(&buckets, [0].as_slice());
-            }
-        }
     }
 }

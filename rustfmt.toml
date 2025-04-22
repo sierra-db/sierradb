@@ -1,0 +1,6 @@
+unstable_features = true
+style_edition = "2024"
+group_imports = "StdExternalCrate"
+hex_literal_case = "Upper"
+imports_granularity = "Module"
+wrap_comments = true

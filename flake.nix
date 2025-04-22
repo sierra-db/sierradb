@@ -11,9 +11,9 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ (import rust-overlay) ];
-        rust-bin = pkgs.rust-bin.stable.latest.default.override {
+        rust-bin = pkgs.rust-bin.selectLatestNightlyWith (toolchain: toolchain.default.override {
           extensions = [ "rust-src" "rustfmt" "rust-analyzer" ];
-        };
+        });
         pkgs = import nixpkgs {
           inherit system overlays;
           config.allowUnfree = true;
@@ -24,6 +24,7 @@
         devShells.default = mkShell {
           buildInputs = [
             cargo-flamegraph
+            cargo-fuzz
             openssl
             pkg-config
             protobuf
