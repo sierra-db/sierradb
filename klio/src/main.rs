@@ -1,11 +1,11 @@
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use eventus_core::StreamId;
-use eventus_core::bucket::BucketId;
-use eventus_core::bucket::segment::EventRecord;
-use eventus_core::database::{DatabaseBuilder, ExpectedVersion};
-use eventus_core::writer_thread_pool::{AppendEventsBatch, WriteEventRequest};
+use klio_core::StreamId;
+use klio_core::bucket::BucketId;
+use klio_core::bucket::segment::EventRecord;
+use klio_core::database::{DatabaseBuilder, ExpectedVersion};
+use klio_core::writer_thread_pool::{AppendEventsBatch, WriteEventRequest};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 

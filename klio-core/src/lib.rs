@@ -46,8 +46,8 @@ impl StreamId {
 
     /// # Safety
     ///
-    /// This function is safe in Rust, however can be unsafe if used with
-    /// eventus when the string is invalid.
+    /// This function is safe in Rust, however can be unsafe if used with klio
+    /// when the string is invalid.
     ///
     /// Calling this function, you must ensure:
     /// - The string length is between 1 and 64

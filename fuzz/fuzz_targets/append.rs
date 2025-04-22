@@ -5,11 +5,11 @@ extern crate arbitrary;
 use std::time::Duration;
 
 use arbitrary::{Arbitrary, Unstructured};
-use eventus_core::StreamId;
-use eventus_core::database::ExpectedVersion;
-use eventus_core::database::{Database, DatabaseBuilder};
-use eventus_core::writer_thread_pool::AppendEventsBatch;
-use eventus_core::writer_thread_pool::WriteEventRequest;
+use klio_core::StreamId;
+use klio_core::database::ExpectedVersion;
+use klio_core::database::{Database, DatabaseBuilder};
+use klio_core::writer_thread_pool::AppendEventsBatch;
+use klio_core::writer_thread_pool::WriteEventRequest;
 use libfuzzer_sys::fuzz_target;
 use once_cell::sync::OnceCell;
 use std::path::PathBuf;

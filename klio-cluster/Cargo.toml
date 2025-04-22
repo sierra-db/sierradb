@@ -1,10 +1,10 @@
 [package]
-name = "eventus-cluster"
+name = "klio-cluster"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-eventus-core.workspace = true
+klio-core.workspace = true
 
 arrayvec = "0.7.6"
 serde = { version = "1.0.218", features = ["derive"] }
