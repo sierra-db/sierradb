@@ -1,14 +1,14 @@
 [package]
-name = "klio-fuzz"
+name = "sierradb-fuzz"
 version = "0.0.0"
 publish = false
-edition = "2021"
+edition = "2024"
 
 [package.metadata]
 cargo-fuzz = true
 
 [dependencies]
-klio-core.workspace = true
+sierradb.workspace = true
 
 arbitrary = { version = "1", features = ["derive"] }
 lazy_static = "1.5.0"

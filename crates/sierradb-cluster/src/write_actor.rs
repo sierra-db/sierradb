@@ -2,9 +2,9 @@ use std::collections::HashSet;
 
 use kameo::error::Infallible;
 use kameo::prelude::*;
-use klio_core::bucket::PartitionId;
-use klio_core::database::Database;
-use klio_core::writer_thread_pool::{AppendEventsBatch, AppendResult};
+use sierradb::bucket::PartitionId;
+use sierradb::database::Database;
+use sierradb::writer_thread_pool::{AppendEventsBatch, AppendResult};
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 

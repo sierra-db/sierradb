@@ -3,12 +3,12 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use klio_core::StreamId;
-use klio_core::bucket::segment::{
-    AppendEvent, BucketSegmentReader, BucketSegmentWriter, FlushedOffset,
-};
 use rand::rng;
 use rand::seq::SliceRandom;
+use sierradb::StreamId;
+use sierradb::bucket::segment::{
+    AppendEvent, BucketSegmentReader, BucketSegmentWriter, FlushedOffset,
+};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 

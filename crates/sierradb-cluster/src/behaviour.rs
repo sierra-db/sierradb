@@ -1,20 +1,21 @@
 use std::collections::HashSet;
 
-use klio_core::bucket::PartitionId;
-use klio_core::writer_thread_pool::{AppendEventsBatch, AppendResult};
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::{PeerId, mdns, request_response};
 use serde::{Deserialize, Serialize};
+use sierradb::bucket::PartitionId;
+use sierradb::writer_thread_pool::{AppendEventsBatch, AppendResult};
 use smallvec::SmallVec;
 use uuid::Uuid;
 
 use crate::error::SwarmError;
+use crate::partition_consensus;
 
 #[derive(NetworkBehaviour)]
 pub struct Behaviour {
     pub mdns: mdns::tokio::Behaviour,
     pub req_resp: request_response::cbor::Behaviour<Req, Resp>,
-    pub partition_ownership: klio_partition_consensus::behaviour::Behaviour,
+    pub partition_ownership: partition_consensus::behaviour::Behaviour,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

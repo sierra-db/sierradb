@@ -1,7 +1,7 @@
 use std::cmp;
 
 use arrayvec::ArrayVec;
-use klio_core::MAX_REPLICATION_FACTOR;
+use sierradb::MAX_REPLICATION_FACTOR;
 
 pub mod behaviour;
 pub mod manager;

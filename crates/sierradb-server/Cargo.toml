@@ -1,11 +1,15 @@
 [package]
-name = "klio"
+name = "sierradb-server"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "sierradb"
+path = "src/main.rs"
+
 [dependencies]
-klio-cluster.workspace = true
-klio-core.workspace = true
+sierradb.workspace = true
+sierradb-cluster.workspace = true
 
 clap = { version = "4.5.32", features = ["derive"] }
 kameo.workspace = true

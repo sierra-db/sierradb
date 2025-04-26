@@ -1,7 +1,7 @@
-use klio_core::bucket::{BucketId, PartitionId};
 use libp2p::request_response::OutboundFailure;
 use libp2p::{BehaviourBuilderError, PeerId};
 use serde::{Deserialize, Serialize};
+use sierradb::bucket::{BucketId, PartitionId};
 use thiserror::Error;
 
 #[derive(Debug, Error, Serialize, Deserialize)]

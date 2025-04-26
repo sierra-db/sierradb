@@ -1,8 +1,8 @@
 use std::time::Duration;
 
-use klio_core::StreamId;
-use klio_core::database::{DatabaseBuilder, ExpectedVersion};
-use klio_core::writer_thread_pool::{AppendEventsBatch, WriteEventRequest};
+use sierradb::StreamId;
+use sierradb::database::{DatabaseBuilder, ExpectedVersion};
+use sierradb::writer_thread_pool::{AppendEventsBatch, WriteEventRequest};
 use uuid::Uuid;
 
 #[tokio::main]

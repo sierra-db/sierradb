@@ -47,7 +47,7 @@ impl StreamId {
 
     /// # Safety
     ///
-    /// This function is safe in Rust, however can be unsafe if used with klio
+    /// This function is safe in Rust, however can be unsafe if used with sierra
     /// when the string is invalid.
     ///
     /// Calling this function, you must ensure:
