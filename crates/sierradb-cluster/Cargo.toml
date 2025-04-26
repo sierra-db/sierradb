@@ -22,7 +22,7 @@ libp2p.features = [
   "quic",
   "request-response",
   "serde",
-  "tokio"
+  "tokio",
 ]
 rand.workspace = true
 serde = { workspace = true, features = ["derive"] }

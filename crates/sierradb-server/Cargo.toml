@@ -14,7 +14,15 @@ sierradb-cluster.workspace = true
 clap = { version = "4.5.32", features = ["derive"] }
 kameo.workspace = true
 libp2p.workspace = true
-tokio = { workspace = true, features = ["fs", "io-std", "io-util", "signal", "sync", "macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = [
+  "fs",
+  "io-std",
+  "io-util",
+  "signal",
+  "sync",
+  "macros",
+  "rt-multi-thread",
+] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
 uuid = { workspace = true, features = ["serde", "v4", "v8"] }
