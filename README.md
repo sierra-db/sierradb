@@ -1,2 +1,2 @@
-# Sierra
+![Logo](logo.png)
 
