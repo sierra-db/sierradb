@@ -5,15 +5,13 @@ use std::time::{Duration, Instant};
 
 use arrayvec::ArrayVec;
 use libp2p::PeerId;
+use sierradb::MAX_REPLICATION_FACTOR;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 
-use crate::messages::OwnershipMessage;
-use crate::store::PartitionOwnershipStore;
-use crate::{MAX_REPLICATION_FACTOR, distribute_partition};
-
-// Timeout for considering a node inactive
-// const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(3000); // 3 seconds
+use super::distribute_partition;
+use super::messages::OwnershipMessage;
+use super::store::PartitionOwnershipStore;
 
 /// Manages static assignment of partitions to nodes
 #[derive(Debug, Clone)]

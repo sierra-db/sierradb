@@ -1,11 +1,10 @@
 [package]
-name = "klio-cluster"
+name = "sierradb-cluster"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-klio-core.workspace = true
-klio-partition-consensus.workspace = true
+sierradb.workspace = true
 
 arrayvec.workspace = true
 bincode.workspace = true

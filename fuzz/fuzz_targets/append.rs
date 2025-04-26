@@ -5,13 +5,13 @@ extern crate arbitrary;
 use std::time::Duration;
 
 use arbitrary::{Arbitrary, Unstructured};
-use klio_core::StreamId;
-use klio_core::database::ExpectedVersion;
-use klio_core::database::{Database, DatabaseBuilder};
-use klio_core::writer_thread_pool::AppendEventsBatch;
-use klio_core::writer_thread_pool::WriteEventRequest;
 use libfuzzer_sys::fuzz_target;
 use once_cell::sync::OnceCell;
+use sierradb::StreamId;
+use sierradb::database::ExpectedVersion;
+use sierradb::database::{Database, DatabaseBuilder};
+use sierradb::writer_thread_pool::AppendEventsBatch;
+use sierradb::writer_thread_pool::WriteEventRequest;
 use std::path::PathBuf;
 use tokio::runtime::Runtime;
 use uuid::Uuid;

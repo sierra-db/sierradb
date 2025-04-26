@@ -1,14 +1,14 @@
 pub mod behaviour;
 pub mod error;
 pub mod partition_actor;
-// pub mod swarm;
+pub mod partition_consensus;
 pub mod swarm_actor;
 pub mod write_actor;
 
 use arrayvec::ArrayVec;
-use klio_core::MAX_REPLICATION_FACTOR;
-use klio_core::bucket::{BucketId, PartitionId};
-use klio_core::id::partition_id_to_bucket;
+use sierradb::MAX_REPLICATION_FACTOR;
+use sierradb::bucket::{BucketId, PartitionId};
+use sierradb::id::partition_id_to_bucket;
 use thiserror::Error;
 
 // pub fn replication_factor(&mut self, n: u8) -> &mut Self {

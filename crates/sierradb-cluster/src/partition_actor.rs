@@ -1,7 +1,7 @@
 use kameo::prelude::*;
-use klio_core::bucket::PartitionId;
-use klio_core::database::Database;
-use klio_core::writer_thread_pool::AppendEventsBatch;
+use sierradb::bucket::PartitionId;
+use sierradb::database::Database;
+use sierradb::writer_thread_pool::AppendEventsBatch;
 use tracing::debug;
 use uuid::Uuid;
 

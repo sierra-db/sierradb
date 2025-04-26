@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use klio_core::database::DatabaseBuilder;
+use sierradb::database::DatabaseBuilder;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

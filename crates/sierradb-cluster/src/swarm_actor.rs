@@ -6,16 +6,15 @@ use futures::StreamExt;
 use kameo::error::Infallible;
 use kameo::mailbox::{MailboxReceiver, Signal};
 use kameo::prelude::*;
-use klio_core::bucket::PartitionId;
-use klio_core::database::Database;
-use klio_core::id::uuid_to_partition_id;
-use klio_core::writer_thread_pool::{AppendEventsBatch, AppendResult};
-use klio_partition_consensus::manager::PartitionManager;
 use libp2p::core::transport::ListenerId;
 use libp2p::identity::Keypair;
 use libp2p::request_response::{self, OutboundRequestId, ProtocolSupport, ResponseChannel};
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId, StreamProtocol, TransportError, gossipsub, mdns};
+use sierradb::bucket::PartitionId;
+use sierradb::database::Database;
+use sierradb::id::uuid_to_partition_id;
+use sierradb::writer_thread_pool::{AppendEventsBatch, AppendResult};
 use smallvec::SmallVec;
 use tokio::sync::oneshot;
 use tracing::{debug, error, warn};
@@ -24,6 +23,8 @@ use uuid::Uuid;
 use crate::behaviour::{Behaviour, BehaviourEvent, Req, Resp, WriteRequestMetadata};
 use crate::error::SwarmError;
 use crate::partition_actor::{LeaderWriteRequest, PartitionActor};
+use crate::partition_consensus;
+use crate::partition_consensus::manager::PartitionManager;
 use crate::write_actor::{ReplicaConfirmation, WriteActor};
 
 pub struct Swarm {
@@ -72,7 +73,7 @@ impl Swarm {
 
                 let req_resp = request_response::Behaviour::new(
                     [(
-                        StreamProtocol::new("/klio-cluster/1"),
+                        StreamProtocol::new("/sierra-cluster/1"),
                         ProtocolSupport::Full,
                     )],
                     request_response::Config::default(),
@@ -90,7 +91,7 @@ impl Swarm {
                     heartbeat_timeout,
                 );
 
-                let partition_ownership = klio_partition_consensus::behaviour::Behaviour::new(
+                let partition_ownership = partition_consensus::behaviour::Behaviour::new(
                     gossipsub,
                     partition_manager,
                     None,

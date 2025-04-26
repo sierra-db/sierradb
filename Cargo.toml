@@ -1,11 +1,10 @@
 [workspace]
 resolver = "3"
-members = ["klio", "klio-*", "fuzz"]
+members = ["crates/*"]
 
 [workspace.dependencies]
-klio-cluster = { path = "klio-cluster" }
-klio-core = { path = "klio-core" }
-klio-partition-consensus = { path = "klio-partition-consensus" }
+sierradb = { path = "crates/sierradb" }
+sierradb-cluster = { path = "crates/sierradb-cluster" }
 
 arrayvec = "0.7"
 bincode = "2.0"

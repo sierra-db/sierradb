@@ -16,8 +16,8 @@ use std::{
 use tokio::time::Interval;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::messages::OwnershipMessage;
-use crate::{manager::PartitionManager, messages::Heartbeat};
+use super::messages::Heartbeat;
+use super::{manager::PartitionManager, messages::OwnershipMessage};
 
 // Topic names
 const HEARTBEAT_TOPIC: &str = "eventus/heartbeat";
