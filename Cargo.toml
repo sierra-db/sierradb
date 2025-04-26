@@ -5,3 +5,17 @@ members = ["klio", "klio-*", "fuzz"]
 [workspace.dependencies]
 klio-cluster = { path = "klio-cluster" }
 klio-core = { path = "klio-core" }
+klio-partition-consensus = { path = "klio-partition-consensus" }
+
+arrayvec = "0.7"
+bincode = "2.0"
+futures = "0.3"
+kameo = { git = "https://github.com/tqwewe/kameo", branch = "feat/actor-args" }
+libp2p = "0.55"
+rand = "0.9"
+serde = "1.0"
+smallvec = "1.15"
+tokio = "1.44"
+thiserror = "2.0"
+tracing = "0.1"
+uuid = "1.16"

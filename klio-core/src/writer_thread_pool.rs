@@ -163,7 +163,7 @@ impl WriterThreadPool {
         &self,
         bucket_id: BucketId,
         batch: AppendEventsBatch,
-    ) -> Result<HashMap<StreamId, CurrentVersion>, WriteError> {
+    ) -> Result<AppendResult, WriteError> {
         let target_thread = bucket_id_to_thread_id(bucket_id, &self.bucket_ids, self.num_threads)
             .ok_or(WriteError::BucketWriterNotFound)?;
 
@@ -184,12 +184,12 @@ impl WriterThreadPool {
         reply_rx.await.map_err(|_| WriteError::NoThreadReply)?
     }
 
-    /// Marks a transaction commit as confirmed by all replication buckets,
-    /// meeting the quorum.
-    pub async fn confirm_transaction(
+    /// Marks an event/events as confirmed by `confirmation_count` partitions,
+    /// meeting quorum.
+    pub async fn set_confirmations(
         &self,
         bucket_id: BucketId,
-        offset: u64,
+        offsets: SmallVec<[u64; 4]>,
         transaction_id: Uuid,
         confirmation_count: u8,
     ) -> Result<(), WriteError> {
@@ -203,9 +203,9 @@ impl WriterThreadPool {
 
         let (reply_tx, reply_rx) = oneshot::channel();
         sender
-            .send(WriteRequest::ConfirmTransaction {
+            .send(WriteRequest::SetConfirmations {
                 bucket_id,
-                offset,
+                offsets,
                 transaction_id,
                 confirmation_count,
                 reply_tx,
@@ -246,29 +246,32 @@ impl WriterThreadPool {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppendEventsBatch {
     partition_key: Uuid,
     transaction_id: Uuid,
     events: SmallVec<[WriteEventRequest; 4]>,
+    expected_partition_sequence: ExpectedVersion,
 }
 
 impl AppendEventsBatch {
     pub fn single(event: WriteEventRequest) -> Result<Self, EventValidationError> {
+        let transaction_id = set_uuid_flag(Uuid::new_v4(), true);
+
         // if !validate_event_id(event.event_id, &event.stream_id) {
         //     return Err(EventValidationError::InvalidEventId);
         // }
 
         Ok(AppendEventsBatch {
             partition_key: event.partition_key,
-            transaction_id: Uuid::nil(),
+            transaction_id,
             events: smallvec![event],
+            expected_partition_sequence: ExpectedVersion::Any,
         })
     }
 
     pub fn transaction(
         events: SmallVec<[WriteEventRequest; 4]>,
-        transaction_id: Uuid,
     ) -> Result<Self, EventValidationError> {
         let Some(partition_key) =
             events
@@ -291,15 +294,27 @@ impl AppendEventsBatch {
             return Err(EventValidationError::EmptyTransaction);
         };
 
+        let transaction_id = set_uuid_flag(Uuid::new_v4(), false);
+
         Ok(AppendEventsBatch {
             partition_key,
             transaction_id,
             events,
+            expected_partition_sequence: ExpectedVersion::Any,
         })
+    }
+
+    pub fn expected_partition_sequence(mut self, sequence: ExpectedVersion) -> Self {
+        self.expected_partition_sequence = sequence;
+        self
     }
 
     pub fn partition_key(&self) -> Uuid {
         self.partition_key
+    }
+
+    pub fn transaction_id(&self) -> Uuid {
+        self.transaction_id
     }
 
     pub fn events(&self) -> &SmallVec<[WriteEventRequest; 4]> {
@@ -307,28 +322,12 @@ impl AppendEventsBatch {
     }
 }
 
-enum WriteRequest {
-    // ValidateEvents(Box<ValidateEventsRequest>),
-    AppendEvents {
-        bucket_id: BucketId,
-        batch: Box<AppendEventsBatch>,
-        reply_tx: oneshot::Sender<Result<HashMap<StreamId, CurrentVersion>, WriteError>>,
-    },
-    ConfirmTransaction {
-        bucket_id: BucketId,
-        offset: u64,
-        transaction_id: Uuid,
-        confirmation_count: u8,
-        reply_tx: oneshot::Sender<Result<(), WriteError>>,
-    },
-    FlushPoll,
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppendResult {
+    pub offsets: SmallVec<[u64; 4]>,
+    pub partition_sequence: u64,
+    pub stream_versions: HashMap<StreamId, u64>,
 }
-
-// struct ValidateEventsRequest {
-//     bucket_id: BucketId,
-//     batch: Arc<AppendEventsBatch>,
-//     reply_tx: oneshot::Sender<Result<HashMap<Arc<str>, CurrentVersion>,
-// WriteError>>, }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriteEventRequest {
@@ -341,6 +340,22 @@ pub struct WriteEventRequest {
     pub timestamp: u64,
     pub metadata: Vec<u8>,
     pub payload: Vec<u8>,
+}
+
+enum WriteRequest {
+    AppendEvents {
+        bucket_id: BucketId,
+        batch: Box<AppendEventsBatch>,
+        reply_tx: oneshot::Sender<Result<AppendResult, WriteError>>,
+    },
+    SetConfirmations {
+        bucket_id: BucketId,
+        offsets: SmallVec<[u64; 4]>,
+        transaction_id: Uuid,
+        confirmation_count: u8,
+        reply_tx: oneshot::Sender<Result<(), WriteError>>,
+    },
+    FlushPoll,
 }
 
 struct Worker {
@@ -423,7 +438,7 @@ impl Worker {
     }
 
     fn run(mut self, mut rx: Receiver) {
-        while let Some(req) = rx.blocking_recv() {
+        'outer: while let Some(req) = rx.blocking_recv() {
             match req {
                 WriteRequest::AppendEvents {
                     bucket_id,
@@ -433,6 +448,7 @@ impl Worker {
                     let AppendEventsBatch {
                         transaction_id,
                         events,
+                        expected_partition_sequence,
                         ..
                     } = &*batch;
 
@@ -446,8 +462,6 @@ impl Worker {
                     };
 
                     writer_set.flush_if_necessary();
-
-                    let file_size = writer_set.writer.file_size();
 
                     let event_versions = match writer_set.validate_event_versions(events) {
                         Ok(event_versions) => event_versions,
@@ -468,6 +482,7 @@ impl Worker {
                         },
                     );
 
+                    let file_size = writer_set.writer.file_size();
                     let events_size = events
                         .iter()
                         .map(|event| {
@@ -478,7 +493,7 @@ impl Worker {
                                 + event.payload.len()
                         })
                         .sum::<usize>()
-                        + if transaction_id.is_nil() {
+                        + if get_uuid_flag(transaction_id) {
                             0
                         } else {
                             COMMIT_SIZE
@@ -502,7 +517,8 @@ impl Worker {
                         *transaction_id,
                         events,
                         event_versions,
-                        latest_stream_versions,
+                        *expected_partition_sequence,
+                        latest_stream_versions.len(),
                     );
                     if res.is_err() {
                         if let Err(err) = writer_set.writer.set_len(file_size) {
@@ -512,9 +528,9 @@ impl Worker {
 
                     let _ = reply_tx.send(res);
                 }
-                WriteRequest::ConfirmTransaction {
+                WriteRequest::SetConfirmations {
                     bucket_id,
-                    offset,
+                    offsets,
                     transaction_id,
                     confirmation_count,
                     reply_tx,
@@ -530,13 +546,19 @@ impl Worker {
 
                     writer_set.flush_if_necessary();
 
-                    let res = writer_set.writer.set_confirmations(
-                        offset,
-                        &transaction_id,
-                        confirmation_count,
-                    );
+                    for offset in offsets {
+                        let res = writer_set.writer.set_confirmations(
+                            offset,
+                            &transaction_id,
+                            confirmation_count,
+                        );
+                        if let Err(err) = res {
+                            let _ = reply_tx.send(Err(err));
+                            continue 'outer;
+                        }
+                    }
 
-                    let _ = reply_tx.send(res);
+                    let _ = reply_tx.send(Ok(()));
                 }
                 WriteRequest::FlushPoll => {
                     for writer_set in self.writers.values_mut() {
@@ -579,23 +601,28 @@ impl WriterSet {
         transaction_id: Uuid,
         events: &SmallVec<[WriteEventRequest; 4]>,
         event_versions: Vec<CurrentVersion>,
-        mut latest_stream_versions: HashMap<StreamId, CurrentVersion>,
-    ) -> Result<HashMap<StreamId, CurrentVersion>, WriteError> {
+        expected_partition_sequence: ExpectedVersion,
+        unique_streams: usize,
+    ) -> Result<AppendResult, WriteError> {
         let Some(WriteEventRequest { partition_id, .. }) = events.first() else {
-            return Ok(latest_stream_versions);
+            unreachable!("append event batch does not allow empty transactions");
         };
 
         let mut next_partition_sequence = self.next_partition_sequence(*partition_id)?;
+        validate_partition_sequence(
+            *partition_id,
+            expected_partition_sequence,
+            next_partition_sequence,
+        )?;
         let mut new_pending_indexes: Vec<PendingIndex> = Vec::with_capacity(events.len());
+        let mut offsets = SmallVec::with_capacity(events.len());
+        let mut stream_versions = HashMap::with_capacity(unique_streams);
 
         let event_count = events.len();
         for (event, stream_version) in events.into_iter().zip(event_versions) {
             let partition_sequence = next_partition_sequence;
-            let stream_version = stream_version.next_version();
-            latest_stream_versions.insert(
-                event.stream_id.clone(),
-                CurrentVersion::Current(stream_version),
-            );
+            let stream_version = stream_version.next();
+            stream_versions.insert(event.stream_id.clone(), stream_version);
             let append = AppendEvent {
                 event_id: &event.event_id,
                 partition_key: &event.partition_key,
@@ -610,6 +637,7 @@ impl WriterSet {
             let (offset, _) =
                 self.writer
                     .append_event(&transaction_id, event.timestamp, 0, append)?;
+            offsets.push(offset);
             // We need to guarantee:
             // - partition key is the same as previous event partition keys in the stream
             // - partition sequence doesn't reach u64::MAX
@@ -626,7 +654,7 @@ impl WriterSet {
             next_partition_sequence = next_partition_sequence.checked_add(1).unwrap();
         }
 
-        if !transaction_id.is_nil() {
+        if !get_uuid_flag(&transaction_id) {
             let timestamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|_| WriteError::BadSystemTime)?
@@ -646,7 +674,13 @@ impl WriterSet {
             }
         }
 
-        Ok(latest_stream_versions)
+        Ok(AppendResult {
+            offsets,
+            partition_sequence: next_partition_sequence
+                .checked_sub(1)
+                .expect("next partition sequence should be greather than zero"),
+            stream_versions,
+        })
     }
 
     fn flush(&mut self) -> Result<(), WriteError> {
@@ -817,11 +851,11 @@ impl WriterSet {
                             event_versions.push(CurrentVersion::Current(entry.get_mut().next));
                             entry.get_mut().next += 1;
                         }
-                        ExpectedVersion::StreamExists => {
+                        ExpectedVersion::Exists => {
                             event_versions.push(CurrentVersion::Current(entry.get_mut().next));
                             entry.get_mut().next += 1;
                         }
-                        ExpectedVersion::NoStream => {
+                        ExpectedVersion::Empty => {
                             return Err(WriteError::WrongExpectedVersion {
                                 stream_id: event.stream_id.clone(),
                                 current: CurrentVersion::Current(entry.get().next),
@@ -885,7 +919,7 @@ impl WriterSet {
                                 todo!()
                             }
                             None => {
-                                event_versions.push(CurrentVersion::NoStream);
+                                event_versions.push(CurrentVersion::Empty);
                                 entry.insert(StreamVersion {
                                     next: 0,
                                     partition_key: event.partition_key,
@@ -893,7 +927,7 @@ impl WriterSet {
                             }
                         }
                     }
-                    ExpectedVersion::StreamExists => {
+                    ExpectedVersion::Exists => {
                         let latest_stream_version = self
                             .pending_indexes
                             .iter()
@@ -940,13 +974,13 @@ impl WriterSet {
                                 // Stream doesn't exist, which violates the StreamExists expectation
                                 return Err(WriteError::WrongExpectedVersion {
                                     stream_id: event.stream_id.clone(),
-                                    current: CurrentVersion::NoStream,
-                                    expected: ExpectedVersion::StreamExists,
+                                    current: CurrentVersion::Empty,
+                                    expected: ExpectedVersion::Exists,
                                 });
                             }
                         }
                     }
-                    ExpectedVersion::NoStream => {
+                    ExpectedVersion::Empty => {
                         let latest_stream_version = self
                             .pending_indexes
                             .iter()
@@ -989,7 +1023,7 @@ impl WriterSet {
                                 todo!()
                             }
                             None => {
-                                event_versions.push(CurrentVersion::NoStream);
+                                event_versions.push(CurrentVersion::Empty);
                                 entry.insert(StreamVersion {
                                     next: 0,
                                     partition_key: event.partition_key,
@@ -1050,7 +1084,7 @@ impl WriterSet {
                             None => {
                                 return Err(WriteError::WrongExpectedVersion {
                                     stream_id: event.stream_id.clone(),
-                                    current: CurrentVersion::NoStream,
+                                    current: CurrentVersion::Empty,
                                     expected: ExpectedVersion::Exact(expected_version),
                                 });
                             }
@@ -1263,4 +1297,78 @@ fn bucket_id_to_thread_id(
     } else {
         Some(extra + (position - (buckets_per_thread + 1) * extra) / buckets_per_thread)
     }
+}
+
+fn validate_partition_sequence(
+    partition_id: PartitionId,
+    expected: ExpectedVersion,
+    next_partition_sequence: u64,
+) -> Result<(), WriteError> {
+    match expected {
+        ExpectedVersion::Any => Ok(()),
+        ExpectedVersion::Exists => {
+            if next_partition_sequence == 0 {
+                Err(WriteError::WrongExpectedSequence {
+                    partition_id,
+                    current: CurrentVersion::Empty,
+                    expected,
+                })
+            } else {
+                Ok(())
+            }
+        }
+        ExpectedVersion::Empty => {
+            if next_partition_sequence == 0 {
+                Ok(())
+            } else {
+                Err(WriteError::WrongExpectedSequence {
+                    partition_id,
+                    current: CurrentVersion::Current(next_partition_sequence - 1),
+                    expected,
+                })
+            }
+        }
+        ExpectedVersion::Exact(sequence) => {
+            if next_partition_sequence == 0 {
+                Err(WriteError::WrongExpectedSequence {
+                    partition_id,
+                    current: CurrentVersion::Empty,
+                    expected,
+                })
+            } else if next_partition_sequence - 1 == sequence {
+                Ok(())
+            } else {
+                Err(WriteError::WrongExpectedSequence {
+                    partition_id,
+                    current: CurrentVersion::Current(next_partition_sequence - 1),
+                    expected,
+                })
+            }
+        }
+    }
+}
+
+fn set_uuid_flag(uuid: Uuid, flag: bool) -> Uuid {
+    // Convert UUID to bytes
+    let mut bytes = *uuid.as_bytes();
+
+    // Bit 65 is the first bit of the 9th byte (index 8)
+    if flag {
+        // Set the bit (ensure it's 1)
+        bytes[8] |= 0b10000000;
+    } else {
+        // Clear the bit (ensure it's 0)
+        bytes[8] &= 0b01111111;
+    }
+
+    // Create a new UUID from the modified bytes
+    Uuid::from_bytes(bytes)
+}
+
+pub(crate) fn get_uuid_flag(uuid: &Uuid) -> bool {
+    // Get the bytes of the UUID
+    let bytes = uuid.as_bytes();
+
+    // Check if bit 65 (first bit of byte 8) is set
+    (bytes[8] & 0b10000000) != 0
 }

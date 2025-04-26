@@ -124,12 +124,8 @@ fn set_confirmations(
 ) -> Result<(), WriteError> {
     offset += 8 + 16 + 4; // timestamp + transaction id + main crc32c
 
-    let confirmation_count_crc32c = {
-        let mut hasher = crc32fast::Hasher::new();
-        hasher.update(transaction_id.as_bytes());
-        hasher.update(&confirmation_count.to_le_bytes());
-        hasher.finalize()
-    };
+    let confirmation_count_crc32c =
+        calculate_confirmation_count_crc32c(transaction_id, confirmation_count);
 
     let mut buf = [0; mem::size_of::<u8>() + mem::size_of::<u32>()];
     buf[0] = confirmation_count;

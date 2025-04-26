@@ -23,6 +23,7 @@ const BLOOM_SEED: [u8; 32] = [
     111, 33, 192, 108, 225, 81, 138, 231, 213, 234, 217,
 ];
 pub const STREAM_ID_SIZE: usize = 64;
+pub const MAX_REPLICATION_FACTOR: usize = 12;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]

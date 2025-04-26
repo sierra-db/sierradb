@@ -10,7 +10,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::StreamId;
-use crate::bucket::{BucketSegmentId, event_index, partition_index, stream_index};
+use crate::bucket::{BucketSegmentId, PartitionId, event_index, partition_index, stream_index};
 use crate::database::{CurrentVersion, ExpectedVersion};
 
 /// Errors which can occur in background threads.
@@ -91,6 +91,15 @@ pub enum WriteError {
     WriterThreadNotRunning,
     #[error("events exceed the size of a single segment")]
     EventsExceedSegmentSize,
+    /// Wrong expected version
+    #[error(
+        "current partition sequence is {current} but expected {expected} for partition {partition_id}"
+    )]
+    WrongExpectedSequence {
+        partition_id: PartitionId,
+        current: CurrentVersion,
+        expected: ExpectedVersion,
+    },
     /// Wrong expected version
     #[error("current stream version is {current} but expected {expected} for stream {stream_id}")]
     WrongExpectedVersion {

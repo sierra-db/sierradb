@@ -20,6 +20,7 @@ use super::{
 use crate::StreamId;
 use crate::bucket::{BucketId, PartitionId};
 use crate::error::{ReadError, WriteError};
+use crate::writer_thread_pool::get_uuid_flag;
 
 const HEADER_BUF_SIZE: usize = EVENT_HEADER_SIZE - RECORD_HEADER_SIZE;
 const PAGE_SIZE: usize = 4096; // Usually a page is 4KB on Linux
@@ -181,18 +182,6 @@ impl BucketSegmentReader {
     #[cfg(not(all(unix, target_os = "linux")))]
     pub fn prefetch(&self, _offset: u64) {}
 
-    pub fn set_commit_confirmations(
-        &self,
-        mut offset: u64,
-        confirmation_count: u8,
-    ) -> Result<(), WriteError> {
-        offset += (RECORD_HEADER_SIZE + mem::size_of::<u32> as usize) as u64;
-        self.file
-            .write_all_at(&confirmation_count.to_le_bytes(), offset)?;
-
-        Ok(())
-    }
-
     /// Validates the segments magic bytes.
     pub fn validate_magic_bytes(&mut self) -> Result<bool, ReadError> {
         let mut magic_bytes = [0u8; MAGIC_BYTES_SIZE];
@@ -266,8 +255,8 @@ impl BucketSegmentReader {
                     )) => {
                         let next_offset = offset + event.len();
 
-                        if transaction_id.is_nil() {
-                            // Events with nil transaction ids are always approved
+                        if get_uuid_flag(&transaction_id) {
+                            // Events with a true transaction id flag are always approved
                             if events.is_empty() {
                                 // If its the first event we encountered, then return it alone
                                 polonius_return!(Ok(Some(CommittedEvents::Single(event))));
