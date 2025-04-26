@@ -1,0 +1,13 @@
+[package]
+name = "klio-partition-consensus"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+klio-core.workspace = true
+
+arrayvec.workspace = true
+bincode = { workspace = true, features = ["serde"] }
+libp2p = { workspace = true, features = ["gossipsub", "serde"] }
+tokio = { workspace = true, features = ["rt", "time"] }
+tracing.workspace = true

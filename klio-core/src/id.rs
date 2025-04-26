@@ -50,11 +50,11 @@ pub fn uuid_v7_with_stream_hash(stream_id: &str) -> Uuid {
     // Assemble our 128-bit value. Bit layout (MSB = bit 127):
     // [timestamp:48] [rand12:12] [version:4] [variant:2] [stream_hash:16]
     // [rand46:46]
-    let uuid_u128: u128 = ((timestamp48 as u128) << 80)       // bits 127..80: timestamp (48 bits)
-        | ((rand12 as u128) << 68)            // bits 79..68: 12-bit random
-        | (0x7u128 << 64)                     // bits 67..64: version (4 bits, value 7)
-        | (0x2u128 << 62)                     // bits 63..62: variant (2 bits, binary 10)
-        | ((stream_hash as u128) << 46)        // bits 61..46: stream-id hash (16 bits)
+    let uuid_u128: u128 = ((timestamp48 as u128) << 80) // bits 127..80: timestamp (48 bits)
+        | ((rand12 as u128) << 68)      // bits 79..68: 12-bit random
+        | (0x7u128 << 64)               // bits 67..64: version (4 bits, value 7)
+        | (0x2u128 << 62)               // bits 63..62: variant (2 bits, binary 10)
+        | ((stream_hash as u128) << 46) // bits 61..46: stream-id hash (16 bits)
         | (rand46 as u128); // bits 45..0: 46-bit random
 
     // Convert the u128 into a big-endian 16-byte array and create a UUID.
@@ -62,7 +62,7 @@ pub fn uuid_v7_with_stream_hash(stream_id: &str) -> Uuid {
 }
 
 /// Extracts the embedded 16-bit stream hash from a UUID.
-pub fn id_to_partition(uuid: Uuid) -> u16 {
+pub fn uuid_to_partition_id(uuid: Uuid) -> u16 {
     let uuid_u128 = u128::from_be_bytes(uuid.into_bytes());
     ((uuid_u128 >> 46) & 0xFFFF) as u16
 }
@@ -72,7 +72,7 @@ pub fn extract_event_id_bucket(uuid: Uuid, num_buckets: u16) -> BucketId {
         return 0;
     }
 
-    id_to_partition(uuid) % num_buckets
+    uuid_to_partition_id(uuid) % num_buckets
 }
 
 pub fn partition_id_to_bucket(partition_id: PartitionId, num_buckets: u16) -> BucketId {
@@ -84,7 +84,7 @@ pub fn partition_id_to_bucket(partition_id: PartitionId, num_buckets: u16) -> Bu
 }
 
 pub fn validate_event_id(event_id: Uuid, stream_id: &str) -> bool {
-    id_to_partition(event_id) == stream_id_partition_id(stream_id)
+    uuid_to_partition_id(event_id) == stream_id_partition_id(stream_id)
 }
 
 #[cfg(test)]
@@ -132,10 +132,10 @@ mod tests {
         let id3 = uuid_v7_with_stream_hash("my-stream-abc");
         let id4 = uuid_v7_with_stream_hash("my-stream-abc");
 
-        let hash1 = id_to_partition(id1);
-        let hash2 = id_to_partition(id2);
-        let hash3 = id_to_partition(id3);
-        let hash4 = id_to_partition(id4);
+        let hash1 = uuid_to_partition_id(id1);
+        let hash2 = uuid_to_partition_id(id2);
+        let hash3 = uuid_to_partition_id(id3);
+        let hash4 = uuid_to_partition_id(id4);
 
         assert_eq!(hash1, hash2, "Same partition key should have the same hash");
         assert_eq!(hash2, hash3, "Same partition key should have the same hash");
@@ -161,7 +161,7 @@ mod tests {
         for i in 0..10_000 {
             let stream_id = format!("my-stream-{i}");
             let id = uuid_v7_with_stream_hash(&stream_id);
-            let bucket = id_to_partition(id) % num_buckets;
+            let bucket = uuid_to_partition_id(id) % num_buckets;
             counts[bucket as usize] += 1;
         }
 

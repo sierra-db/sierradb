@@ -1,16 +1,20 @@
+pub mod behaviour;
 pub mod error;
+pub mod partition_actor;
+// pub mod swarm;
+pub mod swarm_actor;
+pub mod write_actor;
 
 use arrayvec::ArrayVec;
+use klio_core::MAX_REPLICATION_FACTOR;
 use klio_core::bucket::{BucketId, PartitionId};
 use klio_core::id::partition_id_to_bucket;
 use thiserror::Error;
 
-const MAX_REDUNDANCY: usize = 12;
-
 // pub fn replication_factor(&mut self, n: u8) -> &mut Self {
 //     assert!(n > 0, "replication factor must be greater than 0");
 //     assert!(
-//         n <= MAX_REDUNDANCY as u8,
+//         n <= MAX_REPLICATION_FACTOR as u8,
 //         "replication factor cannot be not be greater than 12",
 //     );
 //     self.replication_factor = n;
@@ -40,7 +44,7 @@ impl Quorum {
 }
 
 pub struct QuorumResult<T, E> {
-    results: ArrayVec<(BucketId, Result<T, E>), MAX_REDUNDANCY>,
+    results: ArrayVec<(BucketId, Result<T, E>), MAX_REPLICATION_FACTOR>,
     quorum: Quorum,
     replication_factor: u8,
 }
@@ -50,8 +54,8 @@ impl<T, E> QuorumResult<T, E> {
     // responses / meets the quorum. If so, returns an `Ok` containing all the
     // successful responses. / Otherwise, returns an `Err` with the original
     // `QuorumResult`. pub fn into_quorum_result(self) ->
-    // Result<ArrayVec<(BucketId, T), MAX_REDUNDANCY>, Self> {     // Determine
-    // how many successful results are required.     let required =
+    // Result<ArrayVec<(BucketId, T), MAX_REPLICATION_FACTOR>, Self> {     //
+    // Determine how many successful results are required.     let required =
     // self.quorum.required_buckets(self.replication_factor) as usize;
     //     let success_count = self.results.iter().filter(|(_, res)|
     // res.is_ok()).count();
@@ -71,8 +75,8 @@ impl<T, E> QuorumResult<T, E> {
 
     pub fn into_quorum_result(self) -> Result<T, QuorumError<E>> {
         let required = self.quorum.required_buckets(self.replication_factor) as usize;
-        let mut successes = ArrayVec::<(BucketId, T), MAX_REDUNDANCY>::new();
-        let mut errors = ArrayVec::<(BucketId, E), MAX_REDUNDANCY>::new();
+        let mut successes = ArrayVec::<(BucketId, T), MAX_REPLICATION_FACTOR>::new();
+        let mut errors = ArrayVec::<(BucketId, E), MAX_REPLICATION_FACTOR>::new();
 
         for (bucket_id, result) in self.results {
             match result {
@@ -99,8 +103,8 @@ impl<T, E> QuorumResult<T, E> {
         T: PartialEq,
     {
         let required = self.quorum.required_buckets(self.replication_factor) as usize;
-        let mut successes = ArrayVec::<(BucketId, T), MAX_REDUNDANCY>::new();
-        let mut errors = ArrayVec::<(BucketId, E), MAX_REDUNDANCY>::new();
+        let mut successes = ArrayVec::<(BucketId, T), MAX_REPLICATION_FACTOR>::new();
+        let mut errors = ArrayVec::<(BucketId, E), MAX_REPLICATION_FACTOR>::new();
 
         for (bucket_id, result) in self.results {
             match result {
@@ -129,7 +133,7 @@ pub enum QuorumError<E> {
     InsufficientSuccesses {
         successes: u8,
         required: u8,
-        errors: ArrayVec<(BucketId, E), MAX_REDUNDANCY>,
+        errors: ArrayVec<(BucketId, E), MAX_REPLICATION_FACTOR>,
     },
 }
 
@@ -147,7 +151,7 @@ pub fn get_replication_buckets(
     partition_id: PartitionId,
     num_buckets: u16,
     replication_factor: u8,
-) -> ArrayVec<BucketId, MAX_REDUNDANCY> {
+) -> ArrayVec<BucketId, MAX_REPLICATION_FACTOR> {
     assert!(num_buckets > 0);
     assert!(replication_factor > 0);
 
@@ -195,7 +199,7 @@ pub fn get_replication_partitions(
     partition_id: PartitionId,
     num_partitions: u16,
     replication_factor: u8,
-) -> ArrayVec<PartitionId, MAX_REDUNDANCY> {
+) -> ArrayVec<PartitionId, MAX_REPLICATION_FACTOR> {
     assert!(num_partitions > 0);
     assert!(replication_factor > 0);
 

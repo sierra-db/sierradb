@@ -5,10 +5,30 @@ edition = "2024"
 
 [dependencies]
 klio-core.workspace = true
+klio-partition-consensus.workspace = true
 
-arrayvec = "0.7.6"
-serde = { version = "1.0.218", features = ["derive"] }
-thiserror = "2.0.11"
-# tokio = { version = "1.43.0", features = ["fs", "sync"] }
-# tracing = "0.1.40"
-# uuid = { version = "1", features = ["serde", "v4", "v8"] }
+arrayvec.workspace = true
+bincode.workspace = true
+futures.workspace = true
+kameo.workspace = true
+libp2p.workspace = true
+libp2p.features = [
+  "cbor",
+  "identify",
+  "gossipsub",
+  "kad",
+  "macros",
+  "mdns",
+  "ping",
+  "quic",
+  "request-response",
+  "serde",
+  "tokio"
+]
+rand.workspace = true
+serde = { workspace = true, features = ["derive"] }
+smallvec = { workspace = true, features = ["serde"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "sync"] }
+tracing.workspace = true
+uuid.workspace = true

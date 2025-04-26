@@ -23,6 +23,7 @@
       {
         devShells.default = mkShell {
           buildInputs = [
+            cargo-expand
             cargo-flamegraph
             cargo-fuzz
             openssl

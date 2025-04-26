@@ -6,28 +6,27 @@ edition = "2024"
 [dependencies]
 ahash = "0.8"
 arc-swap = "1.7.1"
-arrayvec = "0.7.6"
-bincode = { version = "2.0.1", features = ["serde"] }
+bincode = { workspace = true, features = ["serde"] }
 bloomfilter = "3.0.1"
 boomphf = { version = "0.6.0", features = ["serde"] }
 crc32fast = "1.4.2"
 libc = "0.2.170"
 num_cpus = "1.16.0"
 polonius-the-crab = "0.4.1"
-rand = "0.9"
+rand.workspace = true
 rayon = "1.10.0"
-serde = { version = "1.0.218", features = ["derive", "rc"] }
-smallvec = { version = "1.14.0", features = ["serde"] }
-thiserror = "2.0.11"
+serde = { workspace = true, features = ["derive", "rc"] }
+smallvec = { workspace = true, features = ["serde"] }
+thiserror.workspace = true
 thread-priority = "1.2.0"
-tokio = { version = "1.43.0", features = ["fs", "sync"] }
-tracing = "0.1.40"
-uuid = { version = "1", features = ["serde", "v4", "v8"] }
+tokio = { workspace = true, features = ["fs", "sync"] }
+tracing.workspace = true
+uuid = { workspace = true, features = ["serde", "v4", "v8"] }
 
 [dev-dependencies]
 criterion = "0.3"
 tempfile = "3.16"
-tokio = { version = "1.43.0", features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints.rust]
 elided_lifetimes_in_paths = "deny"

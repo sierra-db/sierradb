@@ -1,190 +1,195 @@
-use std::time::{Duration, Instant};
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::Parser;
+use kameo::Actor;
+use klio_cluster::swarm_actor::Swarm;
 use klio_core::StreamId;
-use klio_core::bucket::BucketId;
-use klio_core::bucket::segment::EventRecord;
+use klio_core::bucket::{BucketId, PartitionId};
 use klio_core::database::{DatabaseBuilder, ExpectedVersion};
+use klio_core::id::uuid_to_partition_id;
 use klio_core::writer_thread_pool::{AppendEventsBatch, WriteEventRequest};
+use libp2p::Multiaddr;
+use libp2p::identity::Keypair;
+use tracing::info;
 use tracing_subscriber::EnvFilter;
-use uuid::Uuid;
+use uuid::{Uuid, uuid};
 
 /// Distributed event store
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// Address to listen on
-    #[arg(long)]
-    listen_addr: String,
+    /// Database data directory
+    #[arg(long, default_value = "target/db")]
+    data_dir: PathBuf,
+
+    /// Max segment size in bytes
+    #[arg(long, default_value_t = 256_000_000)]
+    segment_size: usize,
 
     /// Total number of buckets
-    #[arg(long)]
-    num_buckets: u16,
+    #[arg(long, default_value_t = 64)]
+    total_buckets: u16,
 
-    /// Buckets range
-    #[arg(long)]
-    buckets_min: BucketId,
-
-    /// Buckets range
-    #[arg(long)]
-    buckets_max: BucketId,
-
-    /// Buckets range
-    #[arg(long)]
-    replication_factor: u8,
-
-    /// Buckets range
-    #[arg(long)]
-    writer_pool_num_threads: u16,
-
-    /// Buckets range
+    /// Number of worker threads for readers
     #[arg(long, default_value_t = 8)]
     read_pool_num_threads: u16,
+
+    /// Number of worker threads for writers
+    #[arg(long, default_value_t = 16)]
+    writer_pool_num_threads: u16,
+
+    /// Maximum time between flushes
+    #[arg(long, default_value_t = u64::MAX)]
+    flush_interval_ms: u64,
+
+    /// Maximum events between flushes
+    #[arg(long, default_value_t = 1)]
+    flush_interval_events: u32,
+
+    /// Number of partitions in the system
+    #[arg(short = 'p', long, default_value_t = 1024)]
+    partitions: u16,
+
+    /// Replication factor
+    #[arg(short = 'r', long, default_value_t = 3)]
+    replication_factor: u8,
+
+    /// Listen address
+    #[arg(long, default_value = "/ip4/0.0.0.0/udp/0/quic-v1")]
+    listen_address: Multiaddr,
+
+    /// Node index
+    #[arg(short = 'i', long, default_value_t = 0)]
+    node_index: usize,
+
+    /// Total number of nodes
+    #[arg(short = 'n', long, default_value_t = 1)]
+    num_nodes: usize,
+
+    /// Explicit partition list (comma separated)
+    #[arg(short = 'l', long)]
+    partitions_list: Option<String>,
+
+    /// Explicit bucket list (comma separated)
+    #[arg(short = 'b', long)]
+    buckets_list: Option<String>,
+
+    /// Heartbeat interval in milliseconds
+    #[arg(long, default_value_t = 1000)]
+    heartbeat_interval_ms: u64,
+
+    /// Heartbeat timeout in milliseconds
+    #[arg(long, default_value_t = 6000)]
+    heartbeat_timeout_ms: u64,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::SubscriberBuilder::default()
         .without_time()
-        .with_env_filter(EnvFilter::new("WARN"))
+        .with_env_filter(EnvFilter::new("INFO"))
         .init();
 
-    // let args = Args::parse();
+    let args = Args::parse();
 
-    let db = DatabaseBuilder::new("target/fuzz_db")
-        // .segment_size(100_000_000)
-        // .total_buckets(args.num_buckets)
-        // .bucket_ids_from_range(args.buckets_min..=args.buckets_max)
-        // // .replication_factor(args.replication_factor)
-        // .writer_pool_num_threads(args.writer_pool_num_threads)
-        // .reader_pool_num_threads(args.read_pool_num_threads)
-        // .flush_interval_duration(Duration::MAX)
-        // .flush_interval_events(1) // Flush every event written
-        .segment_size(64 * 1024 * 1024)
-        .total_buckets(4)
-        .bucket_ids_from_range(0..4)
-        .writer_pool_num_threads(4)
-        .reader_pool_num_threads(4)
-        .flush_interval_duration(Duration::MAX)
-        .flush_interval_events(1) // Flush every event written
+    let assigned_partitions =
+        calculate_partition_assignment(args.num_nodes, args.node_index, args.partitions);
+    let assigned_buckets =
+        calculate_bucket_assignment(args.num_nodes, args.node_index, args.total_buckets);
+
+    let db = DatabaseBuilder::new(args.data_dir)
+        .segment_size(args.segment_size)
+        .total_buckets(args.total_buckets)
+        .bucket_ids(assigned_buckets.into_iter().collect::<Vec<_>>())
+        .reader_pool_num_threads(args.read_pool_num_threads)
+        .writer_pool_num_threads(args.writer_pool_num_threads)
+        .flush_interval_duration(Duration::from_millis(args.flush_interval_ms))
+        .flush_interval_events(args.flush_interval_events)
         .open()?;
 
-    // let event_id = Uuid::new_v4();
-    // db.append_events(
-    //     0,
-    //     AppendEventsBatch::single(WriteEventRequest {
-    //         event_id,
-    //         partition_key: Uuid::nil(),
-    //         partition_id: 0,
-    //         stream_id: StreamId::new("my-stream")?,
-    //         stream_version: ExpectedVersion::NoStream,
-    //         event_name: "FirstEvent".to_string(),
-    //         timestamp: 1233456,
-    //         metadata: vec![1, 2, 3],
-    //         payload: b"my payload".to_vec(),
-    //     })?,
-    // )
-    // .await?;
+    let local_key = Keypair::generate_ed25519();
+    let local_peer_id = local_key.public().to_peer_id();
+    info!("local peer id: {local_peer_id}");
 
-    // let event_name = db
-    //     .read_event(0, event_id)
-    //     .await
-    //     .unwrap()
-    //     .unwrap()
-    //     .event_name;
-    // println!("Read event: {event_name}");
+    let mut swarm = Swarm::new(
+        local_key,
+        db,
+        args.partitions,
+        args.replication_factor,
+        assigned_partitions.into_iter().collect(),
+        Duration::from_millis(args.heartbeat_timeout_ms),
+        Duration::from_millis(args.heartbeat_interval_ms),
+    )?;
 
-    // let event_id = Uuid::new_v4();
-    // db.append_events(
-    //     0,
-    //     AppendEventsBatch::single(WriteEventRequest {
-    //         event_id,
-    //         partition_key: Uuid::nil(),
-    //         partition_id: 0,
-    //         stream_id: StreamId::new("my-other-stream")?,
-    //         stream_version: ExpectedVersion::NoStream,
-    //         event_name: "SecondEvent".to_string(),
-    //         timestamp: 1233456,
-    //         metadata: vec![1, 2, 3],
-    //         payload: b"my payload".to_vec(),
-    //     })?,
-    // )
-    // .await?;
+    swarm.listen_on(args.listen_address)?;
 
-    // let event_name = db
-    //     .read_event(0, event_id)
-    //     .await
-    //     .unwrap()
-    //     .unwrap()
-    //     .event_name;
-    // println!("Read event: {event_name}");
+    let swarm_ref = Swarm::spawn(swarm);
 
-    // let event_id = Uuid::new_v4();
-    // db.append_events(
-    //     0,
-    //     AppendEventsBatch::single(WriteEventRequest {
-    //         event_id,
-    //         partition_key: Uuid::nil(),
-    //         partition_id: 0,
-    //         stream_id: StreamId::new("my-stream")?,
-    //         stream_version: ExpectedVersion::Exact(0),
-    //         event_name: "ThirdEvent".to_string(),
-    //         timestamp: 1233456,
-    //         metadata: vec![1, 2, 3],
-    //         payload: b"my payload".to_vec(),
-    //     })?,
-    // )
-    // .await?;
+    if args.node_index == 1 {
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let partition_key = uuid!("0d73f574-3d91-4491-a152-181bd04f9ab2"); // Uuid::new_v4();
+        let res = swarm_ref
+            .ask(AppendEventsBatch::single(WriteEventRequest {
+                event_id: Uuid::new_v4(),
+                partition_key,
+                partition_id: uuid_to_partition_id(partition_key) % args.partitions,
+                stream_id: StreamId::new("my-stream")?,
+                stream_version: ExpectedVersion::Any,
+                event_name: "HelloWorld".to_string(),
+                timestamp: 0,
+                metadata: vec![1, 2, 3],
+                payload: b"hellow!".to_vec(),
+            })?)
+            .await?
+            .await?;
 
-    // let event_name = db
-    //     .read_event(0, event_id)
-    //     .await
-    //     .unwrap()
-    //     .unwrap()
-    //     .event_name;
-    // println!("Read event: {event_name}");
-
-    // println!("\n-------\n");
-
-    // let mut events = db.read_stream(3, StreamId::new("￿򏿿򭴠")?).await?;
-    // let mut count = 0;
-    // let mut total_len = 0;
-    // let start = Instant::now();
-    // while let Some(event) = events.next().await? {
-    //     count += 1;
-    //     total_len += event.len();
-    //     // let EventRecord {
-    //     //     partition_id,
-    //     //     partition_sequence,
-    //     //     stream_version,
-    //     //     stream_id,
-    //     //     event_name,
-    //     //     ..
-    //     // } = event;
-    //     // println!(
-    //     //     "[p:{partition_id}/{partition_sequence}]
-    //     // [s:{stream_id}/{stream_version}] {event_name}", );
-    // }
-
-    let mut count = 0;
-    let mut total_len = 0;
-    let start = Instant::now();
-    for partition_id in 0..4 {
-        let mut events = db.read_partition(partition_id).await?;
-        while let Some(event) = events.next().await? {
-            count += 1;
-            total_len += event.len();
-            //         println!(
-            //             "[p:{partition_id}/{partition_sequence}]
-            // [s:{stream_id}/{stream_version}] {event_name}",
-            //         );
-        }
+        let _ = dbg!(res);
     }
 
-    let end = start.elapsed();
-    println!("Took {end:?}");
-    println!("COUNT IS {count}");
-    println!("Total size is {total_len}");
+    swarm_ref.wait_for_shutdown().await;
 
     Ok(())
+}
+
+fn calculate_partition_assignment(
+    num_nodes: usize,
+    node_index: usize,
+    partitions: u16,
+) -> HashSet<PartitionId> {
+    // Assign partitions based on modulo of partition ID
+    if num_nodes == 0 {
+        info!("num_nodes is 0, assigning no partitions");
+        return HashSet::new();
+    }
+
+    let partitions: HashSet<_> = (0..partitions)
+        .filter(|p| (*p as usize % num_nodes) == node_index)
+        .collect();
+
+    info!(
+        "modulo assignment: node {}/{} gets {} partitions",
+        node_index + 1,
+        num_nodes,
+        partitions.len()
+    );
+
+    partitions
+}
+
+fn calculate_bucket_assignment(
+    num_nodes: usize,
+    node_index: usize,
+    total_buckets: u16,
+) -> HashSet<BucketId> {
+    if num_nodes == 0 {
+        return HashSet::new();
+    }
+
+    let buckets: HashSet<_> = (0..total_buckets)
+        .filter(|b| (*b as usize % num_nodes) == node_index)
+        .collect();
+
+    buckets
 }

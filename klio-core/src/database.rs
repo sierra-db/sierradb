@@ -8,6 +8,7 @@ use std::{fmt, fs, process};
 
 use rayon::{ThreadPool, ThreadPoolBuildError, ThreadPoolBuilder};
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 use tokio::sync::oneshot;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
@@ -26,7 +27,7 @@ use crate::error::{
     DatabaseError, PartitionIndexError, ReadError, StreamIndexError, ThreadPoolError, WriteError,
 };
 use crate::reader_thread_pool::ReaderThreadPool;
-use crate::writer_thread_pool::{AppendEventsBatch, WriterThreadPool};
+use crate::writer_thread_pool::{AppendEventsBatch, AppendResult, WriterThreadPool};
 
 #[derive(Clone)]
 pub struct Database {
@@ -49,9 +50,22 @@ impl Database {
         &self,
         partition_id: PartitionId,
         events: AppendEventsBatch,
-    ) -> Result<HashMap<StreamId, CurrentVersion>, WriteError> {
+    ) -> Result<AppendResult, WriteError> {
         let bucket_id = partition_id % self.total_buckets;
         self.writer_pool.append_events(bucket_id, events).await
+    }
+
+    pub async fn set_confirmations(
+        &self,
+        partition_id: PartitionId,
+        offsets: SmallVec<[u64; 4]>,
+        transaction_id: Uuid,
+        confirmation_count: u8,
+    ) -> Result<(), WriteError> {
+        let bucket_id = partition_id % self.total_buckets;
+        self.writer_pool
+            .set_confirmations(bucket_id, offsets, transaction_id, confirmation_count)
+            .await
     }
 
     pub async fn read_event(
@@ -535,23 +549,20 @@ struct UnopenedFileSet {
 /// The expected version **before** the event is inserted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExpectedVersion {
-    /// This write should not conflict with anything and should always succeed.
+    /// Accept any version, whether the stream/partition exists or not.
     Any,
-    /// The stream should exist. If it or a metadata stream does not exist,
-    /// treats that as a concurrency problem.
-    StreamExists,
-    /// The stream being written to should not yet exist. If it does exist,
-    /// treats that as a concurrency problem.
-    NoStream,
-    /// States that the last event written to the stream should have an event
-    /// number matching your expected value.
+    /// The stream/partition must exist (have at least one event).
+    Exists,
+    /// The stream/partition must be empty (have no events yet).
+    Empty,
+    /// The stream/partition must be exactly at this version.
     Exact(u64),
 }
 
 impl ExpectedVersion {
     pub fn from_next_version(version: u64) -> Self {
         if version == 0 {
-            ExpectedVersion::NoStream
+            ExpectedVersion::Empty
         } else {
             ExpectedVersion::Exact(version - 1)
         }
@@ -559,7 +570,7 @@ impl ExpectedVersion {
 
     pub fn into_next_version(self) -> Option<u64> {
         match self {
-            ExpectedVersion::NoStream => Some(0),
+            ExpectedVersion::Empty => Some(0),
             ExpectedVersion::Exact(version) => version.checked_add(1),
             _ => panic!("expected no stream or exact version"),
         }
@@ -570,8 +581,8 @@ impl fmt::Display for ExpectedVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ExpectedVersion::Any => write!(f, "any"),
-            ExpectedVersion::StreamExists => write!(f, "stream exists"),
-            ExpectedVersion::NoStream => write!(f, "no stream"),
+            ExpectedVersion::Exists => write!(f, "exists"),
+            ExpectedVersion::Empty => write!(f, "empty"),
             ExpectedVersion::Exact(version) => version.fmt(f),
         }
     }
@@ -580,24 +591,24 @@ impl fmt::Display for ExpectedVersion {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 /// Actual position of a stream.
 pub enum CurrentVersion {
-    /// The stream doesn't exist.
-    NoStream,
-    /// The last event's number.
+    /// The stream/partition doesn't exist.
+    Empty,
+    /// The last stream version/partition sequence.
     Current(u64),
 }
 
 impl CurrentVersion {
-    pub fn next_version(&self) -> u64 {
+    pub fn next(&self) -> u64 {
         match self {
             CurrentVersion::Current(version) => version + 1,
-            CurrentVersion::NoStream => 0,
+            CurrentVersion::Empty => 0,
         }
     }
 
     pub fn as_expected_version(&self) -> ExpectedVersion {
         match self {
             CurrentVersion::Current(version) => ExpectedVersion::Exact(*version),
-            CurrentVersion::NoStream => ExpectedVersion::NoStream,
+            CurrentVersion::Empty => ExpectedVersion::Empty,
         }
     }
 }
@@ -606,7 +617,7 @@ impl fmt::Display for CurrentVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CurrentVersion::Current(version) => version.fmt(f),
-            CurrentVersion::NoStream => write!(f, "<no stream>"),
+            CurrentVersion::Empty => write!(f, "<empty>"),
         }
     }
 }
@@ -615,7 +626,7 @@ impl ops::AddAssign<u64> for CurrentVersion {
     fn add_assign(&mut self, rhs: u64) {
         match self {
             CurrentVersion::Current(current) => *current += rhs,
-            CurrentVersion::NoStream => {
+            CurrentVersion::Empty => {
                 if rhs > 0 {
                     *self = CurrentVersion::Current(rhs - 1)
                 }
@@ -767,22 +778,18 @@ mod tests {
             partition_key,
             partition_id,
             stream_id_str,
-            ExpectedVersion::NoStream,
+            ExpectedVersion::Empty,
         );
 
         let batch = AppendEventsBatch::single(event).expect("Failed to create batch");
         let result = db.append_events(partition_id, batch).await;
 
         assert!(result.is_ok(), "Failed to append event: {:?}", result.err());
-        let versions = result.unwrap();
+        let versions = result.unwrap().stream_versions;
 
         let stream_id = StreamId::new(stream_id_str).unwrap();
         assert!(versions.contains_key(&stream_id), "Stream ID not in result");
-        assert_eq!(
-            versions[&stream_id],
-            CurrentVersion::Current(0),
-            "Expected version 0"
-        );
+        assert_eq!(versions[&stream_id], 0, "Expected version 0");
     }
 
     #[tokio::test]
@@ -801,7 +808,7 @@ mod tests {
                 partition_id,
                 stream_id_str,
                 if i == 0 {
-                    ExpectedVersion::NoStream
+                    ExpectedVersion::Empty
                 } else {
                     ExpectedVersion::Exact(i - 1)
                 },
@@ -812,19 +819,13 @@ mod tests {
 
             assert!(
                 result.is_ok(),
-                "Failed to append event {}: {:?}",
-                i,
+                "Failed to append event {i}: {:?}",
                 result.err()
             );
-            let versions = result.unwrap();
+            let versions = result.unwrap().stream_versions;
 
             let stream_id = StreamId::new(stream_id_str).unwrap();
-            assert_eq!(
-                versions[&stream_id],
-                CurrentVersion::Current(i),
-                "Expected version {}",
-                i
-            );
+            assert_eq!(versions[&stream_id], i, "Expected version {i}");
         }
     }
 
@@ -834,7 +835,6 @@ mod tests {
 
         let partition_id = 1;
         let partition_key = Uuid::new_v4();
-        let transaction_id = Uuid::new_v4();
 
         // Create events for two different streams in the same transaction
         let event1 = create_test_event(
@@ -842,7 +842,7 @@ mod tests {
             partition_key,
             partition_id,
             "stream-1",
-            ExpectedVersion::NoStream,
+            ExpectedVersion::Empty,
         );
 
         let event2 = create_test_event(
@@ -850,11 +850,11 @@ mod tests {
             partition_key,
             partition_id,
             "stream-2",
-            ExpectedVersion::NoStream,
+            ExpectedVersion::Empty,
         );
 
         let events = smallvec![event1, event2];
-        let batch = AppendEventsBatch::transaction(events, transaction_id).unwrap();
+        let batch = AppendEventsBatch::transaction(events).unwrap();
 
         let result = db.append_events(partition_id, batch).await;
         assert!(
@@ -863,22 +863,14 @@ mod tests {
             result.err()
         );
 
-        let versions = result.unwrap();
+        let versions = result.unwrap().stream_versions;
         assert_eq!(versions.len(), 2, "Expected two stream versions");
 
         let stream1_id = StreamId::new("stream-1").unwrap();
         let stream2_id = StreamId::new("stream-2").unwrap();
 
-        assert_eq!(
-            versions[&stream1_id],
-            CurrentVersion::Current(0),
-            "Stream1 should be at version 0"
-        );
-        assert_eq!(
-            versions[&stream2_id],
-            CurrentVersion::Current(0),
-            "Stream2 should be at version 0"
-        );
+        assert_eq!(versions[&stream1_id], 0, "Stream1 should be at version 0");
+        assert_eq!(versions[&stream2_id], 0, "Stream2 should be at version 0");
     }
 
     // Event reading tests
@@ -897,7 +889,7 @@ mod tests {
             partition_key,
             partition_id,
             stream_id_str,
-            ExpectedVersion::NoStream,
+            ExpectedVersion::Empty,
         );
 
         let batch = AppendEventsBatch::single(event).unwrap();
@@ -961,7 +953,7 @@ mod tests {
                 partition_key,
                 partition_id,
                 &format!("stream-{}", i),
-                ExpectedVersion::NoStream,
+                ExpectedVersion::Empty,
             );
 
             let batch = AppendEventsBatch::single(event).unwrap();
@@ -1010,7 +1002,7 @@ mod tests {
                 partition_id,
                 "test-stream",
                 if i == 0 {
-                    ExpectedVersion::NoStream
+                    ExpectedVersion::Empty
                 } else {
                     ExpectedVersion::Exact(i - 1)
                 },
@@ -1065,7 +1057,7 @@ mod tests {
                 partition_id,
                 stream_id_str,
                 if i == 0 {
-                    ExpectedVersion::NoStream
+                    ExpectedVersion::Empty
                 } else {
                     ExpectedVersion::Exact(i - 1)
                 },
@@ -1120,7 +1112,7 @@ mod tests {
                 partition_id,
                 stream_id_str,
                 if i == 0 {
-                    ExpectedVersion::NoStream
+                    ExpectedVersion::Empty
                 } else {
                     ExpectedVersion::Exact(i - 1)
                 },
@@ -1173,7 +1165,7 @@ mod tests {
             partition_key,
             partition_id,
             stream_id_str,
-            ExpectedVersion::NoStream,
+            ExpectedVersion::Empty,
         );
 
         let batch1 = AppendEventsBatch::single(event1).unwrap();
@@ -1188,7 +1180,7 @@ mod tests {
             partition_key,
             partition_id,
             stream_id_str,
-            ExpectedVersion::NoStream, // This should fail as stream now exists
+            ExpectedVersion::Empty, // This should fail as stream now exists
         );
 
         let batch2 = AppendEventsBatch::single(event2).unwrap();
@@ -1212,7 +1204,7 @@ mod tests {
             partition_key,
             partition_id,
             stream_id_str,
-            ExpectedVersion::NoStream,
+            ExpectedVersion::Empty,
         );
 
         let batch1 = AppendEventsBatch::single(event1).unwrap();
@@ -1282,7 +1274,7 @@ mod tests {
             partition_key,
             partition_id,
             stream_id_str,
-            ExpectedVersion::NoStream,
+            ExpectedVersion::Empty,
         );
 
         let batch1 = AppendEventsBatch::single(event1).unwrap();
@@ -1297,7 +1289,7 @@ mod tests {
             partition_key,
             partition_id,
             stream_id_str,
-            ExpectedVersion::StreamExists,
+            ExpectedVersion::Exists,
         );
 
         let batch2 = AppendEventsBatch::single(event2).unwrap();
@@ -1372,7 +1364,7 @@ mod tests {
                 partition_key,
                 partition_id,
                 &format!("stream-{}", partition_id),
-                ExpectedVersion::NoStream,
+                ExpectedVersion::Empty,
             );
 
             let batch = AppendEventsBatch::single(event).unwrap();
@@ -1415,7 +1407,7 @@ mod tests {
     fn test_expected_version_from_next() {
         assert_eq!(
             ExpectedVersion::from_next_version(0),
-            ExpectedVersion::NoStream
+            ExpectedVersion::Empty
         );
         assert_eq!(
             ExpectedVersion::from_next_version(1),
@@ -1429,23 +1421,23 @@ mod tests {
 
     #[test]
     fn test_expected_version_into_next() {
-        assert_eq!(ExpectedVersion::NoStream.into_next_version(), Some(0));
+        assert_eq!(ExpectedVersion::Empty.into_next_version(), Some(0));
         assert_eq!(ExpectedVersion::Exact(0).into_next_version(), Some(1));
         assert_eq!(ExpectedVersion::Exact(41).into_next_version(), Some(42));
     }
 
     #[test]
     fn test_current_version_next() {
-        assert_eq!(CurrentVersion::NoStream.next_version(), 0);
-        assert_eq!(CurrentVersion::Current(0).next_version(), 1);
-        assert_eq!(CurrentVersion::Current(41).next_version(), 42);
+        assert_eq!(CurrentVersion::Empty.next(), 0);
+        assert_eq!(CurrentVersion::Current(0).next(), 1);
+        assert_eq!(CurrentVersion::Current(41).next(), 42);
     }
 
     #[test]
     fn test_current_version_as_expected() {
         assert_eq!(
-            CurrentVersion::NoStream.as_expected_version(),
-            ExpectedVersion::NoStream
+            CurrentVersion::Empty.as_expected_version(),
+            ExpectedVersion::Empty
         );
         assert_eq!(
             CurrentVersion::Current(0).as_expected_version(),
@@ -1459,7 +1451,7 @@ mod tests {
 
     #[test]
     fn test_current_version_add_assign() {
-        let mut version = CurrentVersion::NoStream;
+        let mut version = CurrentVersion::Empty;
         version += 1;
         assert_eq!(version, CurrentVersion::Current(0));
 
