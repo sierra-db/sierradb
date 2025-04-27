@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::time::Duration;
 
 use clap::Parser;
@@ -8,10 +9,10 @@ use libp2p::Multiaddr;
 use libp2p::identity::Keypair;
 use sierradb::StreamId;
 use sierradb::bucket::{BucketId, PartitionId};
-use sierradb::database::{DatabaseBuilder, ExpectedVersion};
-use sierradb::id::uuid_to_partition_id;
-use sierradb::writer_thread_pool::{AppendEventsBatch, WriteEventRequest};
+use sierradb::database::{DatabaseBuilder, ExpectedVersion, NewEvent, Transaction};
+use sierradb::id::uuid_to_partition_hash;
 use sierradb_cluster::swarm_actor::Swarm;
+use smallvec::smallvec;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use uuid::{Uuid, uuid};
@@ -34,11 +35,11 @@ struct Args {
 
     /// Number of worker threads for readers
     #[arg(long, default_value_t = 8)]
-    read_pool_num_threads: u16,
+    reader_threads: u16,
 
     /// Number of worker threads for writers
     #[arg(long, default_value_t = 16)]
-    writer_pool_num_threads: u16,
+    writer_threads: u16,
 
     /// Maximum time between flushes
     #[arg(long, default_value_t = u64::MAX)]
@@ -94,20 +95,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    let assigned_partitions =
-        calculate_partition_assignment(args.num_nodes, args.node_index, args.partitions);
-    let assigned_buckets =
-        calculate_bucket_assignment(args.num_nodes, args.node_index, args.total_buckets);
+    let assigned_partitions = args
+        .partitions_list
+        .map(|partitions| partitions.split(',').map(FromStr::from_str).collect())
+        .transpose()?
+        .unwrap_or_else(|| {
+            calculate_partition_assignment(args.num_nodes, args.node_index, args.partitions)
+        });
+    let assigned_buckets = args
+        .buckets_list
+        .map(|buckets| buckets.split(',').map(FromStr::from_str).collect())
+        .transpose()?
+        .unwrap_or_else(|| {
+            calculate_bucket_assignment(args.num_nodes, args.node_index, args.total_buckets)
+        });
 
-    let db = DatabaseBuilder::new(args.data_dir)
+    let db = DatabaseBuilder::new()
         .segment_size(args.segment_size)
         .total_buckets(args.total_buckets)
         .bucket_ids(assigned_buckets.into_iter().collect::<Vec<_>>())
-        .reader_pool_num_threads(args.read_pool_num_threads)
-        .writer_pool_num_threads(args.writer_pool_num_threads)
+        .reader_threads(args.reader_threads)
+        .writer_threads(args.writer_threads)
         .flush_interval_duration(Duration::from_millis(args.flush_interval_ms))
         .flush_interval_events(args.flush_interval_events)
-        .open()?;
+        .open(args.data_dir)?;
 
     let local_key = Keypair::generate_ed25519();
     let local_peer_id = local_key.public().to_peer_id();
@@ -131,17 +142,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::time::sleep(Duration::from_secs(6)).await;
         let partition_key = uuid!("0d73f574-3d91-4491-a152-181bd04f9ab2"); // Uuid::new_v4();
         let res = swarm_ref
-            .ask(AppendEventsBatch::single(WriteEventRequest {
-                event_id: Uuid::new_v4(),
-                partition_key,
-                partition_id: uuid_to_partition_id(partition_key) % args.partitions,
-                stream_id: StreamId::new("my-stream")?,
-                stream_version: ExpectedVersion::Any,
-                event_name: "HelloWorld".to_string(),
-                timestamp: 0,
-                metadata: vec![1, 2, 3],
-                payload: b"hellow!".to_vec(),
-            })?)
+            .ask(Transaction::new(
+                uuid_to_partition_hash(partition_key),
+                smallvec![NewEvent {
+                    event_id: Uuid::new_v4(),
+                    partition_key,
+                    partition_id: uuid_to_partition_hash(partition_key) % args.partitions,
+                    stream_id: StreamId::new("my-stream")?,
+                    stream_version: ExpectedVersion::Any,
+                    event_name: "HelloWorld".to_string(),
+                    timestamp: 0,
+                    metadata: vec![1, 2, 3],
+                    payload: b"hellow!".to_vec(),
+                }],
+            )?)
             .await?
             .await?;
 

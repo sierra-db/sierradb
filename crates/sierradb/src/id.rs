@@ -4,7 +4,7 @@ use rand::Rng;
 use uuid::Uuid;
 
 use crate::RANDOM_STATE;
-use crate::bucket::{BucketId, PartitionId};
+use crate::bucket::{BucketId, PartitionHash, PartitionId};
 
 /// Hashes the stream id, and performs a modulo on the lowest 16 bits of the
 /// hash.
@@ -30,16 +30,13 @@ pub fn stream_id_bucket(stream_id: &str, num_buckets: u16) -> BucketId {
 /// - 2 bits: variant (binary 10)
 /// - 16 bits: stream-id hash (lower 16 bits)
 /// - 46 bits: random
-pub fn uuid_v7_with_stream_hash(stream_id: &str) -> Uuid {
+pub fn uuid_v7_with_partition_hash(partition_hash: PartitionHash) -> Uuid {
     // Get current timestamp in milliseconds (48 bits)
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("Time went backwards");
     let timestamp_ms = now.as_millis() as u64;
     let timestamp48 = timestamp_ms & 0xFFFFFFFFFFFF; // mask to 48 bits
-
-    // Compute stream-id hash
-    let stream_hash = stream_id_partition_id(stream_id);
 
     let mut rng = rand::rng();
     // 12 bits of randomness
@@ -54,15 +51,15 @@ pub fn uuid_v7_with_stream_hash(stream_id: &str) -> Uuid {
         | ((rand12 as u128) << 68)      // bits 79..68: 12-bit random
         | (0x7u128 << 64)               // bits 67..64: version (4 bits, value 7)
         | (0x2u128 << 62)               // bits 63..62: variant (2 bits, binary 10)
-        | ((stream_hash as u128) << 46) // bits 61..46: stream-id hash (16 bits)
+        | ((partition_hash as u128) << 46) // bits 61..46: stream-id hash (16 bits)
         | (rand46 as u128); // bits 45..0: 46-bit random
 
     // Convert the u128 into a big-endian 16-byte array and create a UUID.
     Uuid::from_bytes(uuid_u128.to_be_bytes())
 }
 
-/// Extracts the embedded 16-bit stream hash from a UUID.
-pub fn uuid_to_partition_id(uuid: Uuid) -> u16 {
+/// Extracts the embedded 16-bit hash from a UUID.
+pub fn uuid_to_partition_hash(uuid: Uuid) -> PartitionHash {
     let uuid_u128 = u128::from_be_bytes(uuid.into_bytes());
     ((uuid_u128 >> 46) & 0xFFFF) as u16
 }
@@ -72,7 +69,7 @@ pub fn extract_event_id_bucket(uuid: Uuid, num_buckets: u16) -> BucketId {
         return 0;
     }
 
-    uuid_to_partition_id(uuid) % num_buckets
+    uuid_to_partition_hash(uuid) % num_buckets
 }
 
 pub fn partition_id_to_bucket(partition_id: PartitionId, num_buckets: u16) -> BucketId {
@@ -83,8 +80,33 @@ pub fn partition_id_to_bucket(partition_id: PartitionId, num_buckets: u16) -> Bu
     partition_id % num_buckets
 }
 
-pub fn validate_event_id(event_id: Uuid, stream_id: &str) -> bool {
-    uuid_to_partition_id(event_id) == stream_id_partition_id(stream_id)
+pub fn validate_event_id(event_id: Uuid, partition_hash: PartitionHash) -> bool {
+    uuid_to_partition_hash(event_id) == partition_hash
+}
+
+pub fn set_uuid_flag(uuid: Uuid, flag: bool) -> Uuid {
+    // Convert UUID to bytes
+    let mut bytes = *uuid.as_bytes();
+
+    // Bit 65 is the first bit of the 9th byte (index 8)
+    if flag {
+        // Set the bit (ensure it's 1)
+        bytes[8] |= 0b10000000;
+    } else {
+        // Clear the bit (ensure it's 0)
+        bytes[8] &= 0b01111111;
+    }
+
+    // Create a new UUID from the modified bytes
+    Uuid::from_bytes(bytes)
+}
+
+pub fn get_uuid_flag(uuid: &Uuid) -> bool {
+    // Get the bytes of the UUID
+    let bytes = uuid.as_bytes();
+
+    // Check if bit 65 (first bit of byte 8) is set
+    (bytes[8] & 0b10000000) != 0
 }
 
 #[cfg(test)]
@@ -96,8 +118,8 @@ mod tests {
 
     #[test]
     fn test_uuid_monotonicity() {
-        let id1 = uuid_v7_with_stream_hash("my-stream");
-        let id2 = uuid_v7_with_stream_hash("my-stream");
+        let id1 = uuid_v7_with_partition_hash(0);
+        let id2 = uuid_v7_with_partition_hash(0);
 
         // Ensure the first few bytes (timestamp) are increasing
         let ts1 = u64::from_be_bytes([
@@ -126,16 +148,16 @@ mod tests {
 
     #[test]
     fn test_extract_bucket_is_deterministic() {
-        let id1 = uuid_v7_with_stream_hash("my-stream-abc");
-        let id2 = uuid_v7_with_stream_hash("my-stream-abc");
+        let id1 = uuid_v7_with_partition_hash(0);
+        let id2 = uuid_v7_with_partition_hash(0);
         std::thread::sleep(Duration::from_millis(2));
-        let id3 = uuid_v7_with_stream_hash("my-stream-abc");
-        let id4 = uuid_v7_with_stream_hash("my-stream-abc");
+        let id3 = uuid_v7_with_partition_hash(0);
+        let id4 = uuid_v7_with_partition_hash(0);
 
-        let hash1 = uuid_to_partition_id(id1);
-        let hash2 = uuid_to_partition_id(id2);
-        let hash3 = uuid_to_partition_id(id3);
-        let hash4 = uuid_to_partition_id(id4);
+        let hash1 = uuid_to_partition_hash(id1);
+        let hash2 = uuid_to_partition_hash(id2);
+        let hash3 = uuid_to_partition_hash(id3);
+        let hash4 = uuid_to_partition_hash(id4);
 
         assert_eq!(hash1, hash2, "Same partition key should have the same hash");
         assert_eq!(hash2, hash3, "Same partition key should have the same hash");
@@ -147,7 +169,7 @@ mod tests {
         let mut seen = HashSet::new();
 
         for _ in 0..10_000 {
-            let id = uuid_v7_with_stream_hash("my-stream");
+            let id = uuid_v7_with_partition_hash(0);
             assert!(seen.insert(id), "Duplicate UUID generated!");
         }
     }
@@ -159,9 +181,8 @@ mod tests {
 
         // Generate 10,000 unique ids
         for i in 0..10_000 {
-            let stream_id = format!("my-stream-{i}");
-            let id = uuid_v7_with_stream_hash(&stream_id);
-            let bucket = uuid_to_partition_id(id) % num_buckets;
+            let id = uuid_v7_with_partition_hash(i);
+            let bucket = uuid_to_partition_hash(id) % num_buckets;
             counts[bucket as usize] += 1;
         }
 

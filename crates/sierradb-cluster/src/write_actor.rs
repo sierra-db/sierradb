@@ -3,8 +3,8 @@ use std::collections::HashSet;
 use kameo::error::Infallible;
 use kameo::prelude::*;
 use sierradb::bucket::PartitionId;
-use sierradb::database::Database;
-use sierradb::writer_thread_pool::{AppendEventsBatch, AppendResult};
+use sierradb::database::{Database, Transaction};
+use sierradb::writer_thread_pool::AppendResult;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
@@ -18,7 +18,7 @@ pub struct WriteActor {
     database: Database,
     partition_id: PartitionId,
     transaction_id: Uuid,
-    append: AppendEventsBatch,
+    append: Transaction,
     reply: Option<ReplyKind>,
     replica_partitions: Vec<PartitionId>,
 
@@ -31,12 +31,13 @@ pub struct WriteActor {
 }
 
 impl WriteActor {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         swarm_ref: ActorRef<Swarm>,
         database: Database,
         partition_id: PartitionId,
         transaction_id: Uuid,
-        append: AppendEventsBatch,
+        append: Transaction,
         reply: ReplyKind,
         replica_partitions: Vec<PartitionId>,
         replication_factor: u8,
@@ -50,8 +51,7 @@ impl WriteActor {
             reply: Some(reply),
             replica_partitions,
             append_result: None,
-            confirmed_partitions: HashSet::from([partition_id]), /* Primary partition is
-                                                                  * auto-confirmed */
+            confirmed_partitions: HashSet::from([partition_id]), // Primary partition auto-confirmed
             replication_factor,
             response_sent: false,
         }
@@ -69,7 +69,7 @@ impl WriteActor {
             return;
         }
 
-        debug!(transaction_id = ?self.transaction_id, "Sending success response");
+        debug!(transaction_id = %self.transaction_id, "Sending success response");
 
         // Take ownership of the reply
         if let Some(reply) = self.reply.take() {
@@ -99,7 +99,7 @@ impl WriteActor {
             return;
         }
 
-        error!(transaction_id = ?self.transaction_id, ?error, "Sending failure response");
+        error!(transaction_id = %self.transaction_id, ?error, "Sending failure response");
 
         // Take ownership of the reply
         if let Some(reply) = self.reply.take() {
@@ -125,8 +125,8 @@ impl WriteActor {
     async fn complete_write(&self) {
         if let Some(ref result) = self.append_result {
             debug!(
-                transaction_id = ?self.transaction_id,
-                partition_id = ?self.partition_id,
+                transaction_id = %self.transaction_id,
+                partition_id = %self.partition_id,
                 "Completing write operation"
             );
 
@@ -142,8 +142,8 @@ impl WriteActor {
                 .await
             {
                 error!(
-                    transaction_id = ?self.transaction_id,
-                    partition_id = ?self.partition_id,
+                    transaction_id = %self.transaction_id,
+                    partition_id = %self.partition_id,
                     ?err,
                     "Failed to mark confirmations"
                 );
@@ -155,8 +155,8 @@ impl WriteActor {
             for replica_id in &self.replica_partitions {
                 if self.confirmed_partitions.contains(replica_id) {
                     debug!(
-                        transaction_id = ?self.transaction_id,
-                        replica_id = ?replica_id,
+                        transaction_id = %self.transaction_id,
+                        replica_id = %replica_id,
                         "Sending confirmation to replica"
                     );
 
@@ -194,8 +194,8 @@ impl Actor for WriteActor {
         {
             Ok(result) => {
                 debug!(
-                    transaction_id = ?state.transaction_id,
-                    partition_id = ?state.partition_id,
+                    transaction_id = %state.transaction_id,
+                    partition_id = %state.partition_id,
                     "Local write successful"
                 );
 
@@ -207,9 +207,9 @@ impl Actor for WriteActor {
                 // Begin replication to replica partitions
                 for replica_id in &state.replica_partitions {
                     debug!(
-                        transaction_id = ?state.transaction_id,
-                        partition_id = ?state.partition_id,
-                        replica_id = ?replica_id,
+                        transaction_id = %state.transaction_id,
+                        partition_id = %state.partition_id,
+                        replica_id = %replica_id,
                         "Replicating write"
                     );
 
@@ -228,8 +228,8 @@ impl Actor for WriteActor {
                 // Check if we've already achieved quorum (e.g., if replication factor is 1)
                 if state.has_quorum() {
                     debug!(
-                        transaction_id = ?state.transaction_id,
-                        partition_id = ?state.partition_id,
+                        transaction_id = %state.transaction_id,
+                        partition_id = %state.partition_id,
                         "Quorum already achieved"
                     );
 
@@ -242,8 +242,8 @@ impl Actor for WriteActor {
             }
             Err(err) => {
                 error!(
-                    transaction_id = ?state.transaction_id,
-                    partition_id = ?state.partition_id,
+                    transaction_id = %state.transaction_id,
+                    partition_id = %state.partition_id,
                     ?err,
                     "Local write failed"
                 );
@@ -274,16 +274,16 @@ impl Message<ReplicaConfirmation> for WriteActor {
     ) -> Self::Reply {
         if msg.transaction_id != self.transaction_id {
             warn!(
-                received_id = ?msg.transaction_id,
-                expected_id = ?self.transaction_id,
+                received_id = %msg.transaction_id,
+                expected_id = %self.transaction_id,
                 "Received confirmation for wrong request"
             );
             return;
         }
 
         debug!(
-            transaction_id = ?self.transaction_id,
-            partition_id = ?msg.partition_id,
+            transaction_id = %self.transaction_id,
+            partition_id = %msg.partition_id,
             success = msg.success,
             "Received replica confirmation"
         );
@@ -295,7 +295,7 @@ impl Message<ReplicaConfirmation> for WriteActor {
             // Check if we've achieved quorum
             if self.has_quorum() && self.append_result.is_some() && !self.response_sent {
                 debug!(
-                    transaction_id = ?self.transaction_id,
+                    transaction_id = %self.transaction_id,
                     confirmed = self.confirmed_partitions.len(),
                     "Quorum achieved"
                 );
@@ -313,8 +313,8 @@ impl Message<ReplicaConfirmation> for WriteActor {
             // For now, we'll just log it and continue
             // In a more advanced implementation, we might adjust the quorum calculation
             warn!(
-                transaction_id = ?self.transaction_id,
-                partition_id = ?msg.partition_id,
+                transaction_id = %self.transaction_id,
+                partition_id = %msg.partition_id,
                 "Replica failed to process write"
             );
 
@@ -325,7 +325,7 @@ impl Message<ReplicaConfirmation> for WriteActor {
 
             if max_possible < required_quorum {
                 error!(
-                    transaction_id = ?self.transaction_id,
+                    transaction_id = %self.transaction_id,
                     confirmed = self.confirmed_partitions.len(),
                     required = required_quorum,
                     "Cannot achieve quorum"

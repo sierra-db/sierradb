@@ -1,6 +1,7 @@
 use std::{fmt, str};
 
 use thiserror::Error;
+use uuid::Uuid;
 
 pub mod event_index;
 pub mod partition_index;
@@ -9,6 +10,8 @@ pub mod stream_index;
 
 pub type BucketId = u16;
 pub type SegmentId = u32;
+pub type PartitionKey = Uuid;
+pub type PartitionHash = u16;
 pub type PartitionId = u16;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]

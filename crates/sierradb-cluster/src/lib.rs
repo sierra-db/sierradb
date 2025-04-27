@@ -11,16 +11,6 @@ use sierradb::bucket::{BucketId, PartitionId};
 use sierradb::id::partition_id_to_bucket;
 use thiserror::Error;
 
-// pub fn replication_factor(&mut self, n: u8) -> &mut Self {
-//     assert!(n > 0, "replication factor must be greater than 0");
-//     assert!(
-//         n <= MAX_REPLICATION_FACTOR as u8,
-//         "replication factor cannot be not be greater than 12",
-//     );
-//     self.replication_factor = n;
-//     self
-// }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Quorum {
     /// Only one replica needs to acknowledge the write.

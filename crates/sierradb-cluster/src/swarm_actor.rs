@@ -12,9 +12,9 @@ use libp2p::request_response::{self, OutboundRequestId, ProtocolSupport, Respons
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId, StreamProtocol, TransportError, gossipsub, mdns};
 use sierradb::bucket::PartitionId;
-use sierradb::database::Database;
-use sierradb::id::uuid_to_partition_id;
-use sierradb::writer_thread_pool::{AppendEventsBatch, AppendResult};
+use sierradb::database::{Database, Transaction};
+use sierradb::id::uuid_to_partition_hash;
+use sierradb::writer_thread_pool::AppendResult;
 use smallvec::SmallVec;
 use tokio::sync::oneshot;
 use tracing::{debug, error, warn};
@@ -39,7 +39,7 @@ pub struct Swarm {
 
 struct AppendRequest {
     /// Event batch to append
-    append: AppendEventsBatch,
+    transaction: Transaction,
     /// How to reply to the request
     reply: ReplyKind,
     /// Request tracking metadata
@@ -133,18 +133,18 @@ impl Swarm {
     /// Handle client write request (entry point for local client requests)
     pub fn client_write_request(
         &mut self,
-        append: AppendEventsBatch,
+        append: Transaction,
     ) -> oneshot::Receiver<Result<AppendResult, SwarmError>> {
         let (reply_tx, reply_rx) = oneshot::channel();
 
-        let partition_key = uuid_to_partition_id(append.partition_key());
+        let partition_hash = uuid_to_partition_hash(append.partition_key());
         let request = AppendRequest {
-            append,
+            transaction: append,
             reply: ReplyKind::Local(reply_tx),
             metadata: WriteRequestMetadata {
                 hop_count: 0,
                 tried_peers: HashSet::from([*self.swarm.local_peer_id()]),
-                partition_key,
+                partition_hash,
             },
         };
 
@@ -158,18 +158,18 @@ impl Swarm {
     fn handle_forwarded_append(
         &mut self,
         channel: ResponseChannel<Resp>,
-        append: AppendEventsBatch,
+        append: Transaction,
         metadata: WriteRequestMetadata,
     ) {
         // Increment hop count when receiving a forwarded request
         let metadata = WriteRequestMetadata {
             hop_count: metadata.hop_count + 1,
             tried_peers: metadata.tried_peers,
-            partition_key: metadata.partition_key,
+            partition_hash: metadata.partition_hash,
         };
 
         let request = AppendRequest {
-            append,
+            transaction: append,
             reply: ReplyKind::Remote(channel),
             metadata,
         };
@@ -204,7 +204,7 @@ impl Swarm {
         // Get partition distribution
         let partitions = self
             .partition_manager()
-            .get_available_partitions_for_key(request.metadata.partition_key);
+            .get_available_partitions_for_key(request.metadata.partition_hash);
 
         // Check quorum requirements
         let required_quorum = (self.partition_manager().replication_factor as usize / 2) + 1;
@@ -248,7 +248,7 @@ impl Swarm {
                 }
             };
 
-            let transaction_id = request.append.transaction_id();
+            let transaction_id = request.transaction.transaction_id();
 
             // Extract replica partitions from the partitions list
             // Skip the first partition (primary) and only include partitions we're not the
@@ -261,7 +261,7 @@ impl Swarm {
 
             // Forward to partition actor
             let leader_request = LeaderWriteRequest {
-                append: request.append,
+                transaction: request.transaction,
                 reply: request.reply,
                 replica_partitions,
                 transaction_id,
@@ -320,7 +320,7 @@ impl Swarm {
                 let req_id = self.swarm.behaviour_mut().req_resp.send_request(
                     &peer_id,
                     Req::AppendEvents {
-                        append: request.append,
+                        transaction: request.transaction,
                         metadata: request.metadata,
                     },
                 );
@@ -348,8 +348,8 @@ impl Swarm {
         // Look up the request details
         if let Some(partition_id) = self.pending_requests.remove(&transaction_id) {
             debug!(
-                transaction_id = ?transaction_id,
-                partition_id = ?partition_id,
+                transaction_id = %transaction_id,
+                partition_id = %partition_id,
                 success,
                 "Received replication response from network"
             );
@@ -369,14 +369,14 @@ impl Swarm {
                     .try_send();
             } else {
                 warn!(
-                    transaction_id = ?transaction_id,
-                    partition_id = ?partition_id,
+                    transaction_id = %transaction_id,
+                    partition_id = %partition_id,
                     "No write actor found for replication response"
                 );
             }
         } else {
             warn!(
-                req_id = ?transaction_id,
+                req_id = %transaction_id,
                 "No pending request found for response"
             );
         }
@@ -476,12 +476,12 @@ impl Message<AppendEventsFailed> for Swarm {
     }
 }
 
-impl Message<AppendEventsBatch> for Swarm {
+impl Message<Transaction> for Swarm {
     type Reply = oneshot::Receiver<Result<AppendResult, SwarmError>>;
 
     async fn handle(
         &mut self,
-        append: AppendEventsBatch,
+        append: Transaction,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         self.client_write_request(append)
@@ -502,7 +502,10 @@ impl Message<SwarmEvent<BehaviourEvent>> for Swarm {
                     request_response::Message::Request {
                         request, channel, ..
                     } => match request {
-                        Req::AppendEvents { append, metadata } => {
+                        Req::AppendEvents {
+                            transaction: append,
+                            metadata,
+                        } => {
                             self.handle_forwarded_append(channel, append, metadata);
                         }
                         Req::ReplicateWrite {
@@ -513,9 +516,9 @@ impl Message<SwarmEvent<BehaviourEvent>> for Swarm {
                             origin_peer,
                         } => {
                             debug!(
-                                transaction_id = ?transaction_id,
-                                partition_id = ?partition_id,
-                                origin_peer = ?origin_peer,
+                                transaction_id = %transaction_id,
+                                partition_id = %partition_id,
+                                origin_peer = %origin_peer,
                                 "Received ReplicateWrite request from network"
                             );
 
@@ -556,8 +559,8 @@ impl Message<SwarmEvent<BehaviourEvent>> for Swarm {
                             confirmation_count,
                         } => {
                             debug!(
-                                transaction_id = ?transaction_id,
-                                partition_id = ?partition_id,
+                                transaction_id = %transaction_id,
+                                partition_id = %partition_id,
                                 "Received ConfirmWrite request from network"
                             );
 
@@ -653,7 +656,7 @@ impl Message<SwarmEvent<BehaviourEvent>> for Swarm {
 
 pub struct ReplicateWrite {
     pub partition_id: PartitionId,
-    pub append: AppendEventsBatch,
+    pub append: Transaction,
     pub transaction_id: Uuid,
     pub origin_partition: PartitionId,
     pub write_actor_ref: ActorRef<WriteActor>,
@@ -668,9 +671,9 @@ impl Message<ReplicateWrite> for Swarm {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         debug!(
-            transaction_id = ?msg.transaction_id,
-            partition_id = ?msg.partition_id,
-            origin_partition = ?msg.origin_partition,
+            transaction_id = %msg.transaction_id,
+            partition_id = %msg.partition_id,
+            origin_partition = %msg.origin_partition,
             "Handling replication request"
         );
 
@@ -678,8 +681,8 @@ impl Message<ReplicateWrite> for Swarm {
         if self.partition_manager().has_partition(msg.partition_id) {
             // We own this partition, so handle the replication locally
             debug!(
-                transaction_id = ?msg.transaction_id,
-                partition_id = ?msg.partition_id,
+                transaction_id = %msg.transaction_id,
+                partition_id = %msg.partition_id,
                 "Replicating write to local partition"
             );
 
@@ -693,8 +696,8 @@ impl Message<ReplicateWrite> for Swarm {
             let success = result.is_ok();
 
             debug!(
-                transaction_id = ?msg.transaction_id,
-                partition_id = ?msg.partition_id,
+                transaction_id = %msg.transaction_id,
+                partition_id = %msg.partition_id,
                 success,
                 "Local replication result"
             );
@@ -716,9 +719,9 @@ impl Message<ReplicateWrite> for Swarm {
 
             if let Some((_, peer_id)) = partitions.first() {
                 debug!(
-                    transaction_id = ?msg.transaction_id,
-                    partition_id = ?msg.partition_id,
-                    peer_id = ?peer_id,
+                    transaction_id = %msg.transaction_id,
+                    partition_id = %msg.partition_id,
+                    peer_id = %peer_id,
                     "Forwarding replication request to remote node"
                 );
 
@@ -748,8 +751,8 @@ impl Message<ReplicateWrite> for Swarm {
             } else {
                 // Can't find a node for this partition
                 warn!(
-                    transaction_id = ?msg.transaction_id,
-                    partition_id = ?msg.partition_id,
+                    transaction_id = %msg.transaction_id,
+                    partition_id = %msg.partition_id,
                     "No node found for partition"
                 );
 
@@ -782,8 +785,8 @@ impl Message<ConfirmWrite> for Swarm {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         debug!(
-            transaction_id = ?msg.transaction_id,
-            partition_id = ?msg.partition_id,
+            transaction_id = %msg.transaction_id,
+            partition_id = %msg.partition_id,
             "Handling confirmation request"
         );
 
@@ -791,8 +794,8 @@ impl Message<ConfirmWrite> for Swarm {
         if self.partition_manager().has_partition(msg.partition_id) {
             // We own this partition, so handle the confirmation locally
             debug!(
-                transaction_id = ?msg.transaction_id,
-                partition_id = ?msg.partition_id,
+                transaction_id = %msg.transaction_id,
+                partition_id = %msg.partition_id,
                 "Confirming write locally"
             );
 
@@ -809,15 +812,15 @@ impl Message<ConfirmWrite> for Swarm {
             {
                 Ok(_) => {
                     debug!(
-                        transaction_id = ?msg.transaction_id,
-                        partition_id = ?msg.partition_id,
+                        transaction_id = %msg.transaction_id,
+                        partition_id = %msg.partition_id,
                         "Successfully confirmed write"
                     );
                 }
                 Err(err) => {
                     error!(
-                        transaction_id = ?msg.transaction_id,
-                        partition_id = ?msg.partition_id,
+                        transaction_id = %msg.transaction_id,
+                        partition_id = %msg.partition_id,
                         ?err,
                         "Failed to confirm write"
                     );
@@ -831,9 +834,9 @@ impl Message<ConfirmWrite> for Swarm {
 
             if let Some((_, peer_id)) = partitions.first() {
                 debug!(
-                    transaction_id = ?msg.transaction_id,
-                    partition_id = ?msg.partition_id,
-                    peer_id = ?peer_id,
+                    transaction_id = %msg.transaction_id,
+                    partition_id = %msg.partition_id,
+                    peer_id = %peer_id,
                     "Forwarding confirmation to remote node"
                 );
 
@@ -849,8 +852,8 @@ impl Message<ConfirmWrite> for Swarm {
                 );
             } else {
                 warn!(
-                    transaction_id = ?msg.transaction_id,
-                    partition_id = ?msg.partition_id,
+                    transaction_id = %msg.transaction_id,
+                    partition_id = %msg.partition_id,
                     "No node found for partition"
                 );
             }
@@ -880,7 +883,7 @@ impl Message<SendReplicaResponse> for Swarm {
                 Resp::AppendEventsSuccess { result }
             }
             Err(error) => {
-                debug!(error = ?error, "Sending failure response");
+                debug!(?error, "Sending failure response");
                 Resp::AppendEventsFailure { error }
             }
         };
