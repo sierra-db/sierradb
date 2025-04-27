@@ -1,7 +1,6 @@
 use kameo::prelude::*;
 use sierradb::bucket::PartitionId;
-use sierradb::database::Database;
-use sierradb::writer_thread_pool::AppendEventsBatch;
+use sierradb::database::{Database, Transaction};
 use tracing::debug;
 use uuid::Uuid;
 
@@ -29,7 +28,7 @@ impl PartitionActor {
 
 /// Message sent to PartitionActor to initiate a write operation.
 pub struct LeaderWriteRequest {
-    pub append: AppendEventsBatch,
+    pub transaction: Transaction,
     pub reply: ReplyKind,
     pub replica_partitions: Vec<PartitionId>,
     pub transaction_id: Uuid,
@@ -44,7 +43,7 @@ impl Message<LeaderWriteRequest> for PartitionActor {
         msg: LeaderWriteRequest,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        debug!(partition_id = ?self.partition_id, request_id = ?msg.transaction_id, "Handling leader write request");
+        debug!(partition_id = %self.partition_id, request_id = %msg.transaction_id, "Handling leader write request");
 
         // Create a WriteActor to handle this write operation
         let write_actor = WriteActor::new(
@@ -52,7 +51,7 @@ impl Message<LeaderWriteRequest> for PartitionActor {
             self.database.clone(),
             self.partition_id,
             msg.transaction_id,
-            msg.append,
+            msg.transaction,
             msg.reply,
             msg.replica_partitions,
             msg.replication_factor,

@@ -20,7 +20,7 @@ use super::{
 use crate::StreamId;
 use crate::bucket::{BucketId, PartitionId};
 use crate::error::{ReadError, WriteError};
-use crate::writer_thread_pool::get_uuid_flag;
+use crate::id::get_uuid_flag;
 
 const HEADER_BUF_SIZE: usize = EVENT_HEADER_SIZE - RECORD_HEADER_SIZE;
 const PAGE_SIZE: usize = 4096; // Usually a page is 4KB on Linux

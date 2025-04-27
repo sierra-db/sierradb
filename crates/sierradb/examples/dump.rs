@@ -4,15 +4,15 @@ use sierradb::database::DatabaseBuilder;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let db = DatabaseBuilder::new("./target/db-0")
+    let db = DatabaseBuilder::new()
         .segment_size(256_000_000)
         .total_buckets(4)
         .bucket_ids(vec![0, 2])
-        .reader_pool_num_threads(4)
-        .writer_pool_num_threads(2)
+        .reader_threads(4)
+        .writer_threads(2)
         .flush_interval_duration(Duration::MAX)
         .flush_interval_events(1)
-        .open()?;
+        .open("./target/db-0")?;
 
     for partition_id in 0..8 {
         let mut events = db.read_partition(partition_id).await?;

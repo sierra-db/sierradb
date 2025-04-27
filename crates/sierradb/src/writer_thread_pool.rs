@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rayon::ThreadPool;
 use serde::{Deserialize, Serialize};
-use smallvec::{SmallVec, smallvec};
+use smallvec::SmallVec;
 use thread_priority::ThreadBuilderExt;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{self};
@@ -27,9 +27,11 @@ use crate::bucket::segment::{
 use crate::bucket::stream_index::{OpenStreamIndex, StreamIndexRecord, StreamOffsets};
 use crate::bucket::{BucketId, BucketSegmentId, PartitionId, SegmentKind};
 use crate::database::{
-    CurrentVersion, ExpectedVersion, PartitionLatestSequence, StreamLatestVersion,
+    CurrentVersion, ExpectedVersion, NewEvent, PartitionLatestSequence, StreamLatestVersion,
+    Transaction,
 };
 use crate::error::{EventValidationError, PartitionIndexError, StreamIndexError, WriteError};
+use crate::id::get_uuid_flag;
 use crate::reader_thread_pool::ReaderThreadPool;
 
 pub type LiveIndexes = Arc<RwLock<LiveIndexSet>>;
@@ -162,7 +164,7 @@ impl WriterThreadPool {
     pub async fn append_events(
         &self,
         bucket_id: BucketId,
-        batch: AppendEventsBatch,
+        batch: Transaction,
     ) -> Result<AppendResult, WriteError> {
         let target_thread = bucket_id_to_thread_id(bucket_id, &self.bucket_ids, self.num_threads)
             .ok_or(WriteError::BucketWriterNotFound)?;
@@ -247,105 +249,16 @@ impl WriterThreadPool {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AppendEventsBatch {
-    partition_key: Uuid,
-    transaction_id: Uuid,
-    events: SmallVec<[WriteEventRequest; 4]>,
-    expected_partition_sequence: ExpectedVersion,
-}
-
-impl AppendEventsBatch {
-    pub fn single(event: WriteEventRequest) -> Result<Self, EventValidationError> {
-        let transaction_id = set_uuid_flag(Uuid::new_v4(), true);
-
-        // if !validate_event_id(event.event_id, &event.stream_id) {
-        //     return Err(EventValidationError::InvalidEventId);
-        // }
-
-        Ok(AppendEventsBatch {
-            partition_key: event.partition_key,
-            transaction_id,
-            events: smallvec![event],
-            expected_partition_sequence: ExpectedVersion::Any,
-        })
-    }
-
-    pub fn transaction(
-        events: SmallVec<[WriteEventRequest; 4]>,
-    ) -> Result<Self, EventValidationError> {
-        let Some(partition_key) =
-            events
-                .iter()
-                .try_fold(None, |partition_key, event| match partition_key {
-                    Some(partition_key) => {
-                        if event.partition_key != partition_key {
-                            return Err(EventValidationError::PartitionKeyMismatch);
-                        }
-
-                        // if !validate_event_id(event.event_id, &event.stream_id) {
-                        //     return Err(EventValidationError::InvalidEventId);
-                        // }
-
-                        Ok(Some(partition_key))
-                    }
-                    None => Ok(Some(event.partition_key)),
-                })?
-        else {
-            return Err(EventValidationError::EmptyTransaction);
-        };
-
-        let transaction_id = set_uuid_flag(Uuid::new_v4(), false);
-
-        Ok(AppendEventsBatch {
-            partition_key,
-            transaction_id,
-            events,
-            expected_partition_sequence: ExpectedVersion::Any,
-        })
-    }
-
-    pub fn expected_partition_sequence(mut self, sequence: ExpectedVersion) -> Self {
-        self.expected_partition_sequence = sequence;
-        self
-    }
-
-    pub fn partition_key(&self) -> Uuid {
-        self.partition_key
-    }
-
-    pub fn transaction_id(&self) -> Uuid {
-        self.transaction_id
-    }
-
-    pub fn events(&self) -> &SmallVec<[WriteEventRequest; 4]> {
-        &self.events
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppendResult {
     pub offsets: SmallVec<[u64; 4]>,
     pub partition_sequence: u64,
     pub stream_versions: HashMap<StreamId, u64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WriteEventRequest {
-    pub event_id: Uuid,
-    pub partition_key: Uuid,
-    pub partition_id: PartitionId,
-    pub stream_id: StreamId,
-    pub stream_version: ExpectedVersion,
-    pub event_name: String,
-    pub timestamp: u64,
-    pub metadata: Vec<u8>,
-    pub payload: Vec<u8>,
-}
-
 enum WriteRequest {
     AppendEvents {
         bucket_id: BucketId,
-        batch: Box<AppendEventsBatch>,
+        batch: Box<Transaction>,
         reply_tx: oneshot::Sender<Result<AppendResult, WriteError>>,
     },
     SetConfirmations {
@@ -438,95 +351,14 @@ impl Worker {
     }
 
     fn run(mut self, mut rx: Receiver) {
-        'outer: while let Some(req) = rx.blocking_recv() {
+        while let Some(req) = rx.blocking_recv() {
             match req {
                 WriteRequest::AppendEvents {
                     bucket_id,
                     batch,
                     reply_tx,
                 } => {
-                    let AppendEventsBatch {
-                        transaction_id,
-                        events,
-                        expected_partition_sequence,
-                        ..
-                    } = &*batch;
-
-                    let Some(writer_set) = self.writers.get_mut(&bucket_id) else {
-                        error!(
-                            "thread {} received a request for bucket {bucket_id} that isn't assigned here",
-                            self.thread_id
-                        );
-                        let _ = reply_tx.send(Err(WriteError::BucketWriterNotFound));
-                        continue;
-                    };
-
-                    writer_set.flush_if_necessary();
-
-                    let event_versions = match writer_set.validate_event_versions(events) {
-                        Ok(event_versions) => event_versions,
-                        Err(err) => {
-                            let _ = reply_tx.send(Err(err));
-                            continue;
-                        }
-                    };
-                    let latest_stream_versions = events.iter().zip(event_versions.iter()).fold(
-                        HashMap::new(),
-                        |mut acc, (event, version)| {
-                            acc.entry(event.stream_id.clone())
-                                .and_modify(|latest: &mut CurrentVersion| {
-                                    *latest = (*latest).max(*version);
-                                })
-                                .or_insert(*version);
-                            acc
-                        },
-                    );
-
-                    let file_size = writer_set.writer.file_size();
-                    let events_size = events
-                        .iter()
-                        .map(|event| {
-                            EVENT_HEADER_SIZE
-                                + event.stream_id.len()
-                                + event.event_name.len()
-                                + event.metadata.len()
-                                + event.payload.len()
-                        })
-                        .sum::<usize>()
-                        + if get_uuid_flag(transaction_id) {
-                            0
-                        } else {
-                            COMMIT_SIZE
-                        };
-
-                    if events_size + SEGMENT_HEADER_SIZE > writer_set.segment_size {
-                        let _ = reply_tx.send(Err(WriteError::EventsExceedSegmentSize));
-                        continue;
-                    }
-
-                    if file_size as usize + writer_set.writer.buf_len() + events_size
-                        > writer_set.segment_size
-                    {
-                        if let Err(err) = writer_set.rollover() {
-                            let _ = reply_tx.send(Err(err));
-                            continue;
-                        }
-                    }
-
-                    let res = writer_set.handle_write(
-                        *transaction_id,
-                        events,
-                        event_versions,
-                        *expected_partition_sequence,
-                        latest_stream_versions.len(),
-                    );
-                    if res.is_err() {
-                        if let Err(err) = writer_set.writer.set_len(file_size) {
-                            error!("failed to set segment file length after write error: {err}");
-                        }
-                    }
-
-                    let _ = reply_tx.send(res);
+                    self.handle_append_events(bucket_id, *batch, reply_tx);
                 }
                 WriteRequest::SetConfirmations {
                     bucket_id,
@@ -535,35 +367,16 @@ impl Worker {
                     confirmation_count,
                     reply_tx,
                 } => {
-                    let Some(writer_set) = self.writers.get_mut(&bucket_id) else {
-                        error!(
-                            "thread {} received a request for bucket {bucket_id} that isn't assigned here",
-                            self.thread_id
-                        );
-                        let _ = reply_tx.send(Err(WriteError::BucketWriterNotFound));
-                        continue;
-                    };
-
-                    writer_set.flush_if_necessary();
-
-                    for offset in offsets {
-                        let res = writer_set.writer.set_confirmations(
-                            offset,
-                            &transaction_id,
-                            confirmation_count,
-                        );
-                        if let Err(err) = res {
-                            let _ = reply_tx.send(Err(err));
-                            continue 'outer;
-                        }
-                    }
-
-                    let _ = reply_tx.send(Ok(()));
+                    self.handle_set_confirmations(
+                        bucket_id,
+                        offsets,
+                        transaction_id,
+                        confirmation_count,
+                        reply_tx,
+                    );
                 }
                 WriteRequest::FlushPoll => {
-                    for writer_set in self.writers.values_mut() {
-                        writer_set.flush_if_necessary();
-                    }
+                    self.handle_flush_poll();
                 }
             }
         }
@@ -573,6 +386,134 @@ impl Worker {
             if let Err(err) = writer_set.writer.flush() {
                 error!("failed to flush writer during shutdown: {err}");
             }
+        }
+    }
+
+    fn handle_append_events(
+        &mut self,
+        bucket_id: BucketId,
+        batch: Transaction,
+        reply_tx: oneshot::Sender<Result<AppendResult, WriteError>>,
+    ) {
+        let Transaction {
+            transaction_id,
+            events,
+            expected_partition_sequence,
+            ..
+        } = batch;
+
+        let Some(writer_set) = self.writers.get_mut(&bucket_id) else {
+            error!(
+                "thread {} received a request for bucket {bucket_id} that isn't assigned here",
+                self.thread_id
+            );
+            let _ = reply_tx.send(Err(WriteError::BucketWriterNotFound));
+            return;
+        };
+
+        writer_set.flush_if_necessary();
+
+        let event_versions = match writer_set.validate_event_versions(&events) {
+            Ok(event_versions) => event_versions,
+            Err(err) => {
+                let _ = reply_tx.send(Err(err));
+                return;
+            }
+        };
+        let latest_stream_versions = events.iter().zip(event_versions.iter()).fold(
+            HashMap::new(),
+            |mut acc, (event, version)| {
+                acc.entry(event.stream_id.clone())
+                    .and_modify(|latest: &mut CurrentVersion| {
+                        *latest = (*latest).max(*version);
+                    })
+                    .or_insert(*version);
+                acc
+            },
+        );
+
+        let file_size = writer_set.writer.file_size();
+        let events_size = events
+            .iter()
+            .map(|event| {
+                EVENT_HEADER_SIZE
+                    + event.stream_id.len()
+                    + event.event_name.len()
+                    + event.metadata.len()
+                    + event.payload.len()
+            })
+            .sum::<usize>()
+            + if get_uuid_flag(&transaction_id) {
+                0
+            } else {
+                COMMIT_SIZE
+            };
+
+        if events_size + SEGMENT_HEADER_SIZE > writer_set.segment_size {
+            let _ = reply_tx.send(Err(WriteError::EventsExceedSegmentSize));
+            return;
+        }
+
+        if file_size as usize + writer_set.writer.buf_len() + events_size > writer_set.segment_size
+        {
+            if let Err(err) = writer_set.rollover() {
+                let _ = reply_tx.send(Err(err));
+                return;
+            }
+        }
+
+        let res = writer_set.handle_write(
+            transaction_id,
+            &events,
+            event_versions,
+            expected_partition_sequence,
+            latest_stream_versions.len(),
+        );
+        if res.is_err() {
+            if let Err(err) = writer_set.writer.set_len(file_size) {
+                error!("failed to set segment file length after write error: {err}");
+            }
+        }
+
+        let _ = reply_tx.send(res);
+    }
+
+    fn handle_set_confirmations(
+        &mut self,
+        bucket_id: BucketId,
+        offsets: SmallVec<[u64; 4]>,
+        transaction_id: Uuid,
+        confirmation_count: u8,
+        reply_tx: oneshot::Sender<Result<(), WriteError>>,
+    ) {
+        let Some(writer_set) = self.writers.get_mut(&bucket_id) else {
+            error!(
+                "thread {} received a request for bucket {bucket_id} that isn't assigned here",
+                self.thread_id
+            );
+            let _ = reply_tx.send(Err(WriteError::BucketWriterNotFound));
+            return;
+        };
+
+        writer_set.flush_if_necessary();
+
+        for offset in offsets {
+            let res =
+                writer_set
+                    .writer
+                    .set_confirmations(offset, &transaction_id, confirmation_count);
+            if let Err(err) = res {
+                let _ = reply_tx.send(Err(err));
+                return;
+            }
+        }
+
+        let _ = reply_tx.send(Ok(()));
+    }
+
+    fn handle_flush_poll(&mut self) {
+        for writer_set in self.writers.values_mut() {
+            writer_set.flush_if_necessary();
         }
     }
 }
@@ -599,12 +540,12 @@ impl WriterSet {
     fn handle_write(
         &mut self,
         transaction_id: Uuid,
-        events: &SmallVec<[WriteEventRequest; 4]>,
+        events: &SmallVec<[NewEvent; 4]>,
         event_versions: Vec<CurrentVersion>,
         expected_partition_sequence: ExpectedVersion,
         unique_streams: usize,
     ) -> Result<AppendResult, WriteError> {
-        let Some(WriteEventRequest { partition_id, .. }) = events.first() else {
+        let Some(NewEvent { partition_id, .. }) = events.first() else {
             unreachable!("append event batch does not allow empty transactions");
         };
 
@@ -827,7 +768,7 @@ impl WriterSet {
 
     fn validate_event_versions(
         &self,
-        events: &SmallVec<[WriteEventRequest; 4]>,
+        events: &SmallVec<[NewEvent; 4]>,
     ) -> Result<Vec<CurrentVersion>, WriteError> {
         struct StreamVersion {
             next: u64,
@@ -1346,29 +1287,4 @@ fn validate_partition_sequence(
             }
         }
     }
-}
-
-fn set_uuid_flag(uuid: Uuid, flag: bool) -> Uuid {
-    // Convert UUID to bytes
-    let mut bytes = *uuid.as_bytes();
-
-    // Bit 65 is the first bit of the 9th byte (index 8)
-    if flag {
-        // Set the bit (ensure it's 1)
-        bytes[8] |= 0b10000000;
-    } else {
-        // Clear the bit (ensure it's 0)
-        bytes[8] &= 0b01111111;
-    }
-
-    // Create a new UUID from the modified bytes
-    Uuid::from_bytes(bytes)
-}
-
-pub(crate) fn get_uuid_flag(uuid: &Uuid) -> bool {
-    // Get the bytes of the UUID
-    let bytes = uuid.as_bytes();
-
-    // Check if bit 65 (first bit of byte 8) is set
-    (bytes[8] & 0b10000000) != 0
 }

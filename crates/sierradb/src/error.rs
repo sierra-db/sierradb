@@ -229,6 +229,8 @@ pub enum StreamIndexError {
 
 #[derive(Debug, Error)]
 pub enum EventValidationError {
+    #[error("the event id must embed the partition hash")]
+    InvalidEventId,
     #[error("partition key must be the same for all events in a stream")]
     PartitionKeyMismatch,
     #[error("transaction has no events")]

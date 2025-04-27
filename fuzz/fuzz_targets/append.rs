@@ -8,10 +8,10 @@ use arbitrary::{Arbitrary, Unstructured};
 use libfuzzer_sys::fuzz_target;
 use once_cell::sync::OnceCell;
 use sierradb::StreamId;
-use sierradb::database::ExpectedVersion;
 use sierradb::database::{Database, DatabaseBuilder};
-use sierradb::writer_thread_pool::AppendEventsBatch;
-use sierradb::writer_thread_pool::WriteEventRequest;
+use sierradb::database::{ExpectedVersion, NewEvent, Transaction};
+use sierradb::id::uuid_to_partition_hash;
+use smallvec::smallvec;
 use std::path::PathBuf;
 use tokio::runtime::Runtime;
 use uuid::Uuid;
@@ -38,15 +38,15 @@ fn init() -> (&'static Runtime, &'static Database) {
 
         // Create the database using the runtime
         let db = runtime.block_on(async {
-            DatabaseBuilder::new(db_path)
+            DatabaseBuilder::new()
                 .segment_size(64 * 1024 * 1024)
                 .total_buckets(TOTAL_BUCKETS)
                 .bucket_ids_from_range(0..TOTAL_BUCKETS)
-                .writer_pool_num_threads(TOTAL_BUCKETS)
-                .reader_pool_num_threads(TOTAL_BUCKETS)
+                .writer_threads(TOTAL_BUCKETS)
+                .reader_threads(TOTAL_BUCKETS)
                 .flush_interval_duration(Duration::MAX)
                 .flush_interval_events(1) // Flush every event written
-                .open()
+                .open(db_path)
                 .unwrap()
         });
 
@@ -173,17 +173,20 @@ fuzz_target!(|event: AppendEvent| {
     runtime.block_on(async move {
         db.append_events(
             event.bucket_id % 8,
-            AppendEventsBatch::single(WriteEventRequest {
-                event_id: event.event_id,
-                partition_key: Uuid::nil(),
-                partition_id: event.partition_id % TOTAL_BUCKETS,
-                stream_id: event.stream_id,
-                stream_version: ExpectedVersion::Any,
-                event_name: event.event_name,
-                timestamp: event.timestamp,
-                metadata: event.metadata,
-                payload: event.payload,
-            })
+            Transaction::new(
+                uuid_to_partition_hash(Uuid::nil()),
+                smallvec![NewEvent {
+                    event_id: event.event_id,
+                    partition_key: Uuid::nil(),
+                    partition_id: event.partition_id % TOTAL_BUCKETS,
+                    stream_id: event.stream_id,
+                    stream_version: ExpectedVersion::Any,
+                    event_name: event.event_name,
+                    timestamp: event.timestamp,
+                    metadata: event.metadata,
+                    payload: event.payload,
+                }],
+            )
             .unwrap(),
         )
         .await

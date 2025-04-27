@@ -14,6 +14,7 @@ sierradb-cluster.workspace = true
 clap = { version = "4.5.32", features = ["derive"] }
 kameo.workspace = true
 libp2p.workspace = true
+smallvec.workspace = true
 tokio = { workspace = true, features = [
   "fs",
   "io-std",

@@ -4,7 +4,8 @@ use libp2p::swarm::NetworkBehaviour;
 use libp2p::{PeerId, mdns, request_response};
 use serde::{Deserialize, Serialize};
 use sierradb::bucket::PartitionId;
-use sierradb::writer_thread_pool::{AppendEventsBatch, AppendResult};
+use sierradb::database::Transaction;
+use sierradb::writer_thread_pool::AppendResult;
 use smallvec::SmallVec;
 use uuid::Uuid;
 
@@ -21,12 +22,12 @@ pub struct Behaviour {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Req {
     AppendEvents {
-        append: AppendEventsBatch,
+        transaction: Transaction,
         metadata: WriteRequestMetadata,
     },
     ReplicateWrite {
         partition_id: PartitionId,
-        append: AppendEventsBatch,
+        append: Transaction,
         transaction_id: Uuid,
         origin_partition: PartitionId,
         origin_peer: PeerId,
@@ -73,6 +74,6 @@ pub struct WriteRequestMetadata {
     pub hop_count: u8,
     /// Nodes that have already tried to process this request
     pub tried_peers: HashSet<PeerId>,
-    /// Original partition key calculated from stream ID
-    pub partition_key: u16,
+    /// Original partition hash
+    pub partition_hash: u16,
 }

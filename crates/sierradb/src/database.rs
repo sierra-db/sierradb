@@ -22,12 +22,16 @@ use crate::bucket::segment::{BucketSegmentReader, EventRecord, FlushedOffset};
 use crate::bucket::stream_index::{
     ClosedStreamIndex, EventStreamIter, StreamIndexRecord, StreamOffsets,
 };
-use crate::bucket::{BucketId, BucketSegmentId, PartitionId, SegmentId, SegmentKind};
-use crate::error::{
-    DatabaseError, PartitionIndexError, ReadError, StreamIndexError, ThreadPoolError, WriteError,
+use crate::bucket::{
+    BucketId, BucketSegmentId, PartitionHash, PartitionId, SegmentId, SegmentKind,
 };
+use crate::error::{
+    DatabaseError, EventValidationError, PartitionIndexError, ReadError, StreamIndexError,
+    ThreadPoolError, WriteError,
+};
+use crate::id::{set_uuid_flag, validate_event_id};
 use crate::reader_thread_pool::ReaderThreadPool;
-use crate::writer_thread_pool::{AppendEventsBatch, AppendResult, WriterThreadPool};
+use crate::writer_thread_pool::{AppendResult, WriterThreadPool};
 
 #[derive(Clone)]
 pub struct Database {
@@ -39,7 +43,7 @@ pub struct Database {
 
 impl Database {
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, DatabaseError> {
-        DatabaseBuilder::new(dir).open()
+        DatabaseBuilder::new().open(dir)
     }
 
     pub fn dir(&self) -> &PathBuf {
@@ -49,7 +53,7 @@ impl Database {
     pub async fn append_events(
         &self,
         partition_id: PartitionId,
-        events: AppendEventsBatch,
+        events: Transaction,
     ) -> Result<AppendResult, WriteError> {
         let bucket_id = partition_id % self.total_buckets;
         self.writer_pool.append_events(bucket_id, events).await
@@ -325,51 +329,73 @@ impl Database {
 }
 
 pub struct DatabaseBuilder {
-    dir: PathBuf,
     segment_size: usize,
     bucket_ids: Arc<[BucketId]>,
     total_buckets: u16,
-    reader_pool_num_threads: u16,
-    writer_pool_num_threads: u16,
+    reader_threads: u16,
+    writer_threads: Option<u16>,
     flush_interval_duration: Duration,
     flush_interval_events: u32,
+    cores: u16,
 }
 
 impl DatabaseBuilder {
-    pub fn new(dir: impl Into<PathBuf>) -> Self {
+    pub fn new() -> Self {
         let total_buckets = 64;
         let cores = num_cpus::get_physical() as u16;
         let reader_pool_size = cores.clamp(4, 32);
-        let writer_pool_size = (cores * 2).clamp(4, 64);
 
         DatabaseBuilder {
-            dir: dir.into(),
             segment_size: 256_000_000,
             bucket_ids: Arc::from((0..total_buckets).collect::<Vec<_>>()),
             total_buckets,
-            reader_pool_num_threads: reader_pool_size,
-            writer_pool_num_threads: writer_pool_size,
+            reader_threads: reader_pool_size,
+            writer_threads: None,
             flush_interval_duration: Duration::from_millis(100),
             flush_interval_events: 1_000,
+            cores,
         }
     }
 
-    pub fn open(&self) -> Result<Database, DatabaseError> {
+    pub fn open(&self, dir: impl Into<PathBuf>) -> Result<Database, DatabaseError> {
         assert!(
-            self.bucket_ids.len() % self.writer_pool_num_threads as usize == 0,
-            "number of writer threads ({}) must be a divisor of the number of buckets ({})",
-            self.writer_pool_num_threads,
+            self.bucket_ids.len() <= self.total_buckets as usize,
+            "bucket ids length cannot exceed total number of buckets ({})",
+            self.total_buckets
+        );
+
+        let writer_threads = self.writer_threads.unwrap_or_else(|| {
+            let bucket_ids_len = self.bucket_ids.len() as u16;
+            // Calculate ideal thread count (clamped)
+            let ideal_threads = (self.cores * 2).clamp(4, 64).min(bucket_ids_len);
+
+            (1..=bucket_ids_len)
+                .filter(|i| bucket_ids_len % i == 0)
+                .min_by_key(|&d| (d as isize - ideal_threads as isize).abs())
+                .unwrap_or(1)
+        });
+
+        assert!(
+            self.bucket_ids.len() % writer_threads as usize == 0,
+            "number of writer threads ({writer_threads}) must be a divisor of the number of buckets ({})",
+            self.bucket_ids.len()
+        );
+        assert!(
+            self.bucket_ids.len() % writer_threads as usize == 0,
+            "number of writer threads ({writer_threads}) cannot be more than the number of buckets ({})",
             self.bucket_ids.len()
         );
 
-        let _ = fs::create_dir_all(&self.dir);
+        let dir = dir.into();
+
+        let _ = fs::create_dir_all(&dir);
         let thread_pool = Arc::new(create_thread_pool()?);
-        let reader_pool = ReaderThreadPool::new(self.reader_pool_num_threads as usize);
+        let reader_pool = ReaderThreadPool::new(self.reader_threads as usize);
         let writer_pool = WriterThreadPool::new(
-            &self.dir,
+            &dir,
             self.segment_size,
             self.bucket_ids.clone(),
-            self.writer_pool_num_threads,
+            writer_threads,
             self.flush_interval_duration,
             self.flush_interval_events,
             &reader_pool,
@@ -378,7 +404,7 @@ impl DatabaseBuilder {
 
         // Scan all previous segments and add to reader pool
         let mut segments: BTreeMap<BucketSegmentId, UnopenedFileSet> = BTreeMap::new();
-        for entry in fs::read_dir(&self.dir)? {
+        for entry in fs::read_dir(&dir)? {
             let entry = entry?;
             let file_name = entry.file_name();
             let Some(file_name_str) = file_name.to_str() else {
@@ -474,7 +500,7 @@ impl DatabaseBuilder {
         }
 
         Ok(Database {
-            dir: self.dir.clone(),
+            dir,
             reader_pool,
             writer_pool,
             total_buckets: self.total_buckets,
@@ -492,13 +518,7 @@ impl DatabaseBuilder {
     }
 
     pub fn bucket_ids(&mut self, bucket_ids: impl Into<Arc<[BucketId]>>) -> &mut Self {
-        let bucket_ids: Arc<[BucketId]> = bucket_ids.into();
-        assert!(
-            bucket_ids.len() <= self.total_buckets as usize,
-            "bucket ids length cannot exceed total number of buckets ({})",
-            self.total_buckets
-        );
-        self.bucket_ids = bucket_ids;
+        self.bucket_ids = bucket_ids.into();
         self
     }
 
@@ -517,13 +537,13 @@ impl DatabaseBuilder {
         self.bucket_ids(bucket_ids)
     }
 
-    pub fn reader_pool_num_threads(&mut self, n: u16) -> &mut Self {
-        self.reader_pool_num_threads = n;
+    pub fn reader_threads(&mut self, n: u16) -> &mut Self {
+        self.reader_threads = n;
         self
     }
 
-    pub fn writer_pool_num_threads(&mut self, n: u16) -> &mut Self {
-        self.writer_pool_num_threads = n;
+    pub fn writer_threads(&mut self, n: u16) -> &mut Self {
+        self.writer_threads = Some(n);
         self
     }
 
@@ -535,6 +555,12 @@ impl DatabaseBuilder {
     pub fn flush_interval_events(&mut self, events: u32) -> &mut Self {
         self.flush_interval_events = events;
         self
+    }
+}
+
+impl Default for DatabaseBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -691,6 +717,80 @@ fn create_thread_pool() -> Result<ThreadPool, ThreadPoolBuildError> {
         .build()
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Transaction {
+    pub(crate) partition_key: Uuid,
+    pub(crate) transaction_id: Uuid,
+    pub(crate) events: SmallVec<[NewEvent; 4]>,
+    pub(crate) expected_partition_sequence: ExpectedVersion,
+}
+
+impl Transaction {
+    pub fn new(
+        partition_hash: PartitionHash,
+        events: SmallVec<[NewEvent; 4]>,
+    ) -> Result<Self, EventValidationError> {
+        let Some(partition_key) = events.iter().try_fold(None, |partition_key, event| {
+            if !validate_event_id(event.event_id, partition_hash) {
+                return Err(EventValidationError::InvalidEventId);
+            }
+
+            match partition_key {
+                Some(partition_key) => {
+                    if event.partition_key != partition_key {
+                        return Err(EventValidationError::PartitionKeyMismatch);
+                    }
+
+                    Ok(Some(partition_key))
+                }
+                None => Ok(Some(event.partition_key)),
+            }
+        })?
+        else {
+            return Err(EventValidationError::EmptyTransaction);
+        };
+
+        let transaction_id = set_uuid_flag(Uuid::new_v4(), events.len() == 1);
+
+        Ok(Transaction {
+            partition_key,
+            transaction_id,
+            events,
+            expected_partition_sequence: ExpectedVersion::Any,
+        })
+    }
+
+    pub fn expected_partition_sequence(mut self, sequence: ExpectedVersion) -> Self {
+        self.expected_partition_sequence = sequence;
+        self
+    }
+
+    pub fn partition_key(&self) -> Uuid {
+        self.partition_key
+    }
+
+    pub fn transaction_id(&self) -> Uuid {
+        self.transaction_id
+    }
+
+    pub fn events(&self) -> &SmallVec<[NewEvent; 4]> {
+        &self.events
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewEvent {
+    pub event_id: Uuid,
+    pub partition_key: Uuid,
+    pub partition_id: PartitionId,
+    pub stream_id: StreamId,
+    pub stream_version: ExpectedVersion,
+    pub event_name: String,
+    pub timestamp: u64,
+    pub metadata: Vec<u8>,
+    pub payload: Vec<u8>,
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -700,27 +800,26 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::writer_thread_pool::WriteEventRequest;
+    use crate::id::{uuid_to_partition_hash, uuid_v7_with_partition_hash};
 
     // Helper functions for test setup
     async fn create_temp_db() -> (tempfile::TempDir, Database) {
         let temp_dir = tempdir().expect("Failed to create temp directory");
-        let db = DatabaseBuilder::new(temp_dir.path())
+        let db = DatabaseBuilder::new()
             .flush_interval_events(1)
-            .open()
+            .open(temp_dir.path())
             .expect("Failed to open database");
         (temp_dir, db)
     }
 
     fn create_test_event(
-        event_id: Uuid,
         partition_key: Uuid,
         partition_id: PartitionId,
         stream_id_str: &str,
         version: ExpectedVersion,
-    ) -> WriteEventRequest {
-        WriteEventRequest {
-            event_id,
+    ) -> NewEvent {
+        NewEvent {
+            event_id: uuid_v7_with_partition_hash(uuid_to_partition_hash(partition_key)),
             partition_key,
             partition_id,
             stream_id: StreamId::new(stream_id_str).expect("Invalid stream ID"),
@@ -751,14 +850,15 @@ mod tests {
     async fn test_database_builder_options() {
         let temp_dir = tempdir().expect("Failed to create temp directory");
 
-        let db = DatabaseBuilder::new(temp_dir.path())
+        let db = DatabaseBuilder::new()
             .segment_size(1_000_000)
             .total_buckets(32)
-            .reader_pool_num_threads(4)
-            .writer_pool_num_threads(4)
+            .bucket_ids_from_range(0..32)
+            .reader_threads(4)
+            .writer_threads(4)
             .flush_interval_duration(Duration::from_millis(50))
             .flush_interval_events(500)
-            .open();
+            .open(temp_dir.path());
 
         assert!(db.is_ok(), "Failed to open database with custom options");
     }
@@ -770,18 +870,17 @@ mod tests {
 
         let partition_id = 1;
         let partition_key = Uuid::new_v4();
-        let event_id = Uuid::new_v4();
         let stream_id_str = "test-stream";
 
         let event = create_test_event(
-            event_id,
             partition_key,
             partition_id,
             stream_id_str,
             ExpectedVersion::Empty,
         );
 
-        let batch = AppendEventsBatch::single(event).expect("Failed to create batch");
+        let batch = Transaction::new(uuid_to_partition_hash(partition_key), smallvec![event])
+            .expect("Failed to create batch");
         let result = db.append_events(partition_id, batch).await;
 
         assert!(result.is_ok(), "Failed to append event: {:?}", result.err());
@@ -803,7 +902,6 @@ mod tests {
         // Append 3 events to the same stream with sequential versions
         for i in 0..3 {
             let event = create_test_event(
-                Uuid::new_v4(),
                 partition_key,
                 partition_id,
                 stream_id_str,
@@ -814,7 +912,8 @@ mod tests {
                 },
             );
 
-            let batch = AppendEventsBatch::single(event).unwrap();
+            let batch =
+                Transaction::new(uuid_to_partition_hash(partition_key), smallvec![event]).unwrap();
             let result = db.append_events(partition_id, batch).await;
 
             assert!(
@@ -838,7 +937,6 @@ mod tests {
 
         // Create events for two different streams in the same transaction
         let event1 = create_test_event(
-            Uuid::new_v4(),
             partition_key,
             partition_id,
             "stream-1",
@@ -846,7 +944,6 @@ mod tests {
         );
 
         let event2 = create_test_event(
-            Uuid::new_v4(),
             partition_key,
             partition_id,
             "stream-2",
@@ -854,7 +951,7 @@ mod tests {
         );
 
         let events = smallvec![event1, event2];
-        let batch = AppendEventsBatch::transaction(events).unwrap();
+        let batch = Transaction::new(uuid_to_partition_hash(partition_key), events).unwrap();
 
         let result = db.append_events(partition_id, batch).await;
         assert!(
@@ -881,18 +978,18 @@ mod tests {
         // Append an event first
         let partition_id = 1;
         let partition_key = Uuid::new_v4();
-        let event_id = Uuid::new_v4();
         let stream_id_str = "test-stream";
 
         let event = create_test_event(
-            event_id,
             partition_key,
             partition_id,
             stream_id_str,
             ExpectedVersion::Empty,
         );
+        let event_id = event.event_id;
 
-        let batch = AppendEventsBatch::single(event).unwrap();
+        let batch =
+            Transaction::new(uuid_to_partition_hash(partition_key), smallvec![event]).unwrap();
         let _ = db
             .append_events(partition_id, batch)
             .await
@@ -949,14 +1046,14 @@ mod tests {
         // Create and append 3 events
         for i in 0..3 {
             let event = create_test_event(
-                Uuid::new_v4(),
                 partition_key,
                 partition_id,
                 &format!("stream-{}", i),
                 ExpectedVersion::Empty,
             );
 
-            let batch = AppendEventsBatch::single(event).unwrap();
+            let batch =
+                Transaction::new(uuid_to_partition_hash(partition_key), smallvec![event]).unwrap();
             let _ = db
                 .append_events(partition_id, batch)
                 .await
@@ -997,7 +1094,6 @@ mod tests {
         // Create and append 3 events
         for i in 0..3 {
             let event = create_test_event(
-                Uuid::new_v4(),
                 partition_key,
                 partition_id,
                 "test-stream",
@@ -1008,7 +1104,8 @@ mod tests {
                 },
             );
 
-            let batch = AppendEventsBatch::single(event).unwrap();
+            let batch =
+                Transaction::new(uuid_to_partition_hash(partition_key), smallvec![event]).unwrap();
             let _ = db
                 .append_events(partition_id, batch)
                 .await
@@ -1052,7 +1149,6 @@ mod tests {
         // Create and append 3 events
         for i in 0..3 {
             let event = create_test_event(
-                Uuid::new_v4(),
                 partition_key,
                 partition_id,
                 stream_id_str,
@@ -1063,7 +1159,8 @@ mod tests {
                 },
             );
 
-            let batch = AppendEventsBatch::single(event).unwrap();
+            let batch =
+                Transaction::new(uuid_to_partition_hash(partition_key), smallvec![event]).unwrap();
             let _ = db
                 .append_events(partition_id, batch)
                 .await
@@ -1107,7 +1204,6 @@ mod tests {
         // Create and append 3 events
         for i in 0..3 {
             let event = create_test_event(
-                Uuid::new_v4(),
                 partition_key,
                 partition_id,
                 stream_id_str,
@@ -1118,7 +1214,8 @@ mod tests {
                 },
             );
 
-            let batch = AppendEventsBatch::single(event).unwrap();
+            let batch =
+                Transaction::new(uuid_to_partition_hash(partition_key), smallvec![event]).unwrap();
             let _ = db
                 .append_events(partition_id, batch)
                 .await
@@ -1161,14 +1258,14 @@ mod tests {
 
         // First event - create stream
         let event1 = create_test_event(
-            Uuid::new_v4(),
             partition_key,
             partition_id,
             stream_id_str,
             ExpectedVersion::Empty,
         );
 
-        let batch1 = AppendEventsBatch::single(event1).unwrap();
+        let batch1 =
+            Transaction::new(uuid_to_partition_hash(partition_key), smallvec![event1]).unwrap();
         let _ = db
             .append_events(partition_id, batch1)
             .await
@@ -1176,14 +1273,14 @@ mod tests {
 
         // Second event - tries to create stream again (should fail)
         let event2 = create_test_event(
-            Uuid::new_v4(),
             partition_key,
             partition_id,
             stream_id_str,
             ExpectedVersion::Empty, // This should fail as stream now exists
         );
 
-        let batch2 = AppendEventsBatch::single(event2).unwrap();
+        let batch2 =
+            Transaction::new(uuid_to_partition_hash(partition_key), smallvec![event2]).unwrap();
         let result = db.append_events(partition_id, batch2).await;
 
         assert!(result.is_err(), "Expected version conflict error");
@@ -1200,14 +1297,14 @@ mod tests {
 
         // Create stream
         let event1 = create_test_event(
-            Uuid::new_v4(),
             partition_key,
             partition_id,
             stream_id_str,
             ExpectedVersion::Empty,
         );
 
-        let batch1 = AppendEventsBatch::single(event1).unwrap();
+        let batch1 =
+            Transaction::new(uuid_to_partition_hash(partition_key), smallvec![event1]).unwrap();
         let _ = db
             .append_events(partition_id, batch1)
             .await
@@ -1215,14 +1312,14 @@ mod tests {
 
         // Try to append with wrong version
         let event2 = create_test_event(
-            Uuid::new_v4(),
             partition_key,
             partition_id,
             stream_id_str,
             ExpectedVersion::Exact(1), // Wrong, should be 0
         );
 
-        let batch2 = AppendEventsBatch::single(event2).unwrap();
+        let batch2 =
+            Transaction::new(uuid_to_partition_hash(partition_key), smallvec![event2]).unwrap();
         let result = db.append_events(partition_id, batch2).await;
 
         assert!(result.is_err(), "Expected version conflict error");
@@ -1270,14 +1367,14 @@ mod tests {
 
         // First create the stream
         let event1 = create_test_event(
-            Uuid::new_v4(),
             partition_key,
             partition_id,
             stream_id_str,
             ExpectedVersion::Empty,
         );
 
-        let batch1 = AppendEventsBatch::single(event1).unwrap();
+        let batch1 =
+            Transaction::new(uuid_to_partition_hash(partition_key), smallvec![event1]).unwrap();
         let _ = db
             .append_events(partition_id, batch1)
             .await
@@ -1285,14 +1382,14 @@ mod tests {
 
         // Append with StreamExists expectation (should succeed)
         let event2 = create_test_event(
-            Uuid::new_v4(),
             partition_key,
             partition_id,
             stream_id_str,
             ExpectedVersion::Exists,
         );
 
-        let batch2 = AppendEventsBatch::single(event2).unwrap();
+        let batch2 =
+            Transaction::new(uuid_to_partition_hash(partition_key), smallvec![event2]).unwrap();
         let result = db.append_events(partition_id, batch2).await;
 
         assert!(
@@ -1311,14 +1408,14 @@ mod tests {
 
         // For a new stream, Any should work
         let event1 = create_test_event(
-            Uuid::new_v4(),
             partition_key,
             partition_id,
             stream_id_str,
             ExpectedVersion::Any,
         );
 
-        let batch1 = AppendEventsBatch::single(event1).unwrap();
+        let batch1 =
+            Transaction::new(uuid_to_partition_hash(partition_key), smallvec![event1]).unwrap();
         let result1 = db.append_events(partition_id, batch1).await;
         assert!(
             result1.is_ok(),
@@ -1327,14 +1424,14 @@ mod tests {
 
         // For an existing stream, Any should also work
         let event2 = create_test_event(
-            Uuid::new_v4(),
             partition_key,
             partition_id,
             stream_id_str,
             ExpectedVersion::Any,
         );
 
-        let batch2 = AppendEventsBatch::single(event2).unwrap();
+        let batch2 =
+            Transaction::new(uuid_to_partition_hash(partition_key), smallvec![event2]).unwrap();
         let result2 = db.append_events(partition_id, batch2).await;
         assert!(
             result2.is_ok(),
@@ -1348,10 +1445,11 @@ mod tests {
         let temp_dir = tempdir().expect("Failed to create temp directory");
 
         // Create a database with 4 buckets
-        let db = DatabaseBuilder::new(temp_dir.path())
+        let db = DatabaseBuilder::new()
             .total_buckets(4)
+            .bucket_ids_from_range(0..4)
             .flush_interval_events(1)
-            .open()
+            .open(temp_dir.path())
             .expect("Failed to open database");
 
         // Events for different partitions should go to different buckets
@@ -1360,14 +1458,14 @@ mod tests {
         for &partition_id in &partition_ids {
             let partition_key = Uuid::new_v4();
             let event = create_test_event(
-                Uuid::new_v4(),
                 partition_key,
                 partition_id,
                 &format!("stream-{}", partition_id),
                 ExpectedVersion::Empty,
             );
 
-            let batch = AppendEventsBatch::single(event).unwrap();
+            let batch =
+                Transaction::new(uuid_to_partition_hash(partition_key), smallvec![event]).unwrap();
             let result = db.append_events(partition_id, batch).await;
             assert!(
                 result.is_ok(),

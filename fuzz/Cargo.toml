@@ -14,6 +14,7 @@ arbitrary = { version = "1", features = ["derive"] }
 lazy_static = "1.5.0"
 libfuzzer-sys = "0.4"
 once_cell = "1.21.3"
+smallvec.workspace = true
 tokio = { workspace = true, features = [
   "fs",
   "io-std",
