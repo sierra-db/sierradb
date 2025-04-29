@@ -35,6 +35,8 @@ pub enum SwarmError {
     Subscription(String),
     #[error("swarm not running")]
     SwarmNotRunning,
+    #[error("timeout")]
+    Timeout,
     #[error("too many forwards")]
     TooManyForwards,
     #[error("write error: {0}")]
