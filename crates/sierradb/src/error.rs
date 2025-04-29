@@ -91,6 +91,8 @@ pub enum WriteError {
     WriterThreadNotRunning,
     #[error("events exceed the size of a single segment")]
     EventsExceedSegmentSize,
+    #[error("offset {offset} exceeds the file size {size}")]
+    OffsetExceedsFileSize { offset: u64, size: u64 },
     /// Wrong expected version
     #[error(
         "current partition sequence is {current} but expected {expected} for partition {partition_id}"

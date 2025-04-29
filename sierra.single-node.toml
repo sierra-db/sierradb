@@ -1,0 +1,12 @@
+# A single node config
+
+dir = "target/db"
+replication_factor = 1
+
+[network]
+cluster_enabled = false
+client_address = "0.0.0.0:9090"
+
+[node]
+count = 1
+index = 0

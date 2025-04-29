@@ -1,209 +1,70 @@
-use std::collections::HashSet;
-use std::path::PathBuf;
-use std::str::FromStr;
 use std::time::Duration;
 
 use clap::Parser;
 use kameo::Actor;
-use libp2p::Multiaddr;
 use libp2p::identity::Keypair;
-use sierradb::StreamId;
-use sierradb::bucket::{BucketId, PartitionId};
-use sierradb::database::{DatabaseBuilder, ExpectedVersion, NewEvent, Transaction};
-use sierradb::id::uuid_to_partition_hash;
-use sierradb_cluster::swarm_actor::Swarm;
-use smallvec::smallvec;
-use tracing::info;
+use sierradb::database::DatabaseBuilder;
+use sierradb_cluster::swarm::actor::{ListenOn, Swarm, SwarmArgs};
+use sierradb_server::config::{AppConfig, Args};
+use sierradb_server::server::Server;
+use tracing::debug;
 use tracing_subscriber::EnvFilter;
-use uuid::{Uuid, uuid};
-
-/// Distributed event store
-#[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-struct Args {
-    /// Database data directory
-    #[arg(long, default_value = "target/db")]
-    data_dir: PathBuf,
-
-    /// Max segment size in bytes
-    #[arg(long, default_value_t = 256_000_000)]
-    segment_size: usize,
-
-    /// Total number of buckets
-    #[arg(long, default_value_t = 64)]
-    total_buckets: u16,
-
-    /// Number of worker threads for readers
-    #[arg(long, default_value_t = 8)]
-    reader_threads: u16,
-
-    /// Number of worker threads for writers
-    #[arg(long, default_value_t = 16)]
-    writer_threads: u16,
-
-    /// Maximum time between flushes
-    #[arg(long, default_value_t = u64::MAX)]
-    flush_interval_ms: u64,
-
-    /// Maximum events between flushes
-    #[arg(long, default_value_t = 1)]
-    flush_interval_events: u32,
-
-    /// Number of partitions in the system
-    #[arg(short = 'p', long, default_value_t = 1024)]
-    partitions: u16,
-
-    /// Replication factor
-    #[arg(short = 'r', long, default_value_t = 3)]
-    replication_factor: u8,
-
-    /// Listen address
-    #[arg(long, default_value = "/ip4/0.0.0.0/udp/0/quic-v1")]
-    listen_address: Multiaddr,
-
-    /// Node index
-    #[arg(short = 'i', long, default_value_t = 0)]
-    node_index: usize,
-
-    /// Total number of nodes
-    #[arg(short = 'n', long, default_value_t = 1)]
-    num_nodes: usize,
-
-    /// Explicit partition list (comma separated)
-    #[arg(short = 'l', long)]
-    partitions_list: Option<String>,
-
-    /// Explicit bucket list (comma separated)
-    #[arg(short = 'b', long)]
-    buckets_list: Option<String>,
-
-    /// Heartbeat interval in milliseconds
-    #[arg(long, default_value_t = 1000)]
-    heartbeat_interval_ms: u64,
-
-    /// Heartbeat timeout in milliseconds
-    #[arg(long, default_value_t = 6000)]
-    heartbeat_timeout_ms: u64,
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::SubscriberBuilder::default()
-        .without_time()
-        .with_env_filter(EnvFilter::new("INFO"))
-        .init();
-
     let args = Args::parse();
 
-    let assigned_partitions = args
-        .partitions_list
-        .map(|partitions| partitions.split(',').map(FromStr::from_str).collect())
-        .transpose()?
-        .unwrap_or_else(|| {
-            calculate_partition_assignment(args.num_nodes, args.node_index, args.partitions)
-        });
-    let assigned_buckets = args
-        .buckets_list
-        .map(|buckets| buckets.split(',').map(FromStr::from_str).collect())
-        .transpose()?
-        .unwrap_or_else(|| {
-            calculate_bucket_assignment(args.num_nodes, args.node_index, args.total_buckets)
-        });
+    tracing_subscriber::fmt::SubscriberBuilder::default()
+        .without_time()
+        .with_env_filter(EnvFilter::new(args.log.as_deref().unwrap_or("INFO")))
+        .init();
 
-    let db = DatabaseBuilder::new()
-        .segment_size(args.segment_size)
-        .total_buckets(args.total_buckets)
+    let config = AppConfig::load(args)?;
+    debug!("Configuration:\n{config}");
+
+    let assigned_buckets = config.assigned_buckets()?;
+    let assigned_partitions = config.assigned_partitions()?;
+
+    let mut builder = DatabaseBuilder::new();
+    builder
+        .segment_size(config.segment.size_bytes)
+        .total_buckets(config.bucket.count)
         .bucket_ids(assigned_buckets.into_iter().collect::<Vec<_>>())
-        .reader_threads(args.reader_threads)
-        .writer_threads(args.writer_threads)
-        .flush_interval_duration(Duration::from_millis(args.flush_interval_ms))
-        .flush_interval_events(args.flush_interval_events)
-        .open(args.data_dir)?;
+        .flush_interval_duration(Duration::from_millis(config.flush.interval_ms))
+        .flush_interval_events(config.flush.events_threshold);
+
+    if let Some(count) = config.threads.read {
+        builder.reader_threads(count);
+    }
+    if let Some(count) = config.threads.write {
+        builder.writer_threads(count);
+    }
+
+    let db = builder.open(config.dir)?;
 
     let local_key = Keypair::generate_ed25519();
-    let local_peer_id = local_key.public().to_peer_id();
-    info!("local peer id: {local_peer_id}");
 
-    let mut swarm = Swarm::new(
-        local_key,
-        db,
-        args.partitions,
-        args.replication_factor,
-        assigned_partitions.into_iter().collect(),
-        Duration::from_millis(args.heartbeat_timeout_ms),
-        Duration::from_millis(args.heartbeat_interval_ms),
-    )?;
+    let swarm_ref = Swarm::spawn(SwarmArgs {
+        key: local_key,
+        database: db,
+        partition_count: config.partition.count,
+        replication_factor: config.replication_factor,
+        assigned_partitions,
+        heartbeat_timeout: Duration::from_millis(config.heartbeat.timeout_ms),
+        heartbeat_interval: Duration::from_millis(config.heartbeat.interval_ms),
+    });
 
-    swarm.listen_on(args.listen_address)?;
-
-    let swarm_ref = Swarm::spawn(swarm);
-
-    if args.node_index == 1 {
-        tokio::time::sleep(Duration::from_secs(6)).await;
-        let partition_key = uuid!("0d73f574-3d91-4491-a152-181bd04f9ab2"); // Uuid::new_v4();
-        let res = swarm_ref
-            .ask(Transaction::new(
-                uuid_to_partition_hash(partition_key),
-                smallvec![NewEvent {
-                    event_id: Uuid::new_v4(),
-                    partition_key,
-                    partition_id: uuid_to_partition_hash(partition_key) % args.partitions,
-                    stream_id: StreamId::new("my-stream")?,
-                    stream_version: ExpectedVersion::Any,
-                    event_name: "HelloWorld".to_string(),
-                    timestamp: 0,
-                    metadata: vec![1, 2, 3],
-                    payload: b"hellow!".to_vec(),
-                }],
-            )?)
-            .await?
+    if config.network.cluster_enabled {
+        swarm_ref
+            .ask(ListenOn {
+                addr: config.network.cluster_address,
+            })
             .await?;
-
-        let _ = dbg!(res);
     }
 
-    swarm_ref.wait_for_shutdown().await;
+    Server::new(swarm_ref, config.partition.count)
+        .listen(config.network.client_address)
+        .await?;
 
     Ok(())
-}
-
-fn calculate_partition_assignment(
-    num_nodes: usize,
-    node_index: usize,
-    partitions: u16,
-) -> HashSet<PartitionId> {
-    // Assign partitions based on modulo of partition ID
-    if num_nodes == 0 {
-        info!("num_nodes is 0, assigning no partitions");
-        return HashSet::new();
-    }
-
-    let partitions: HashSet<_> = (0..partitions)
-        .filter(|p| (*p as usize % num_nodes) == node_index)
-        .collect();
-
-    info!(
-        "modulo assignment: node {}/{} gets {} partitions",
-        node_index + 1,
-        num_nodes,
-        partitions.len()
-    );
-
-    partitions
-}
-
-fn calculate_bucket_assignment(
-    num_nodes: usize,
-    node_index: usize,
-    total_buckets: u16,
-) -> HashSet<BucketId> {
-    if num_nodes == 0 {
-        return HashSet::new();
-    }
-
-    let buckets: HashSet<_> = (0..total_buckets)
-        .filter(|b| (*b as usize % num_nodes) == node_index)
-        .collect();
-
-    buckets
 }

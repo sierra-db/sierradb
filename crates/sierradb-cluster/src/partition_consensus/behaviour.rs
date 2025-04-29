@@ -1,7 +1,7 @@
 use libp2p::{
     Multiaddr, PeerId,
     core::{Endpoint, transport::PortUse},
-    gossipsub::{self, IdentTopic},
+    gossipsub::{self, IdentTopic, PublishError},
     swarm::{
         ConnectionDenied, ConnectionId, FromSwarm, NetworkBehaviour, THandler, THandlerInEvent,
         THandlerOutEvent, ToSwarm,
@@ -20,11 +20,8 @@ use super::messages::Heartbeat;
 use super::{manager::PartitionManager, messages::OwnershipMessage};
 
 // Topic names
-const HEARTBEAT_TOPIC: &str = "eventus/heartbeat";
-const OWNERSHIP_TOPIC: &str = "eventus/ownership";
-
-// const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
-// const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+const HEARTBEAT_TOPIC: &str = "sierra/heartbeat";
+const OWNERSHIP_TOPIC: &str = "sierra/ownership";
 
 pub struct Behaviour {
     pub gossipsub: gossipsub::Behaviour,
@@ -67,11 +64,14 @@ impl Behaviour {
         .unwrap()
         .into();
 
-        info!("initialized partition ownership behaviour");
         info!(
-            "node owns {} partitions: {:?}",
+            "node owns {}/{} partitions",
             partition_manager.assigned_partitions.len(),
-            partition_manager.assigned_partitions
+            partition_manager.num_partitions,
+        );
+        trace!(
+            "node owns partitions: {:?}",
+            partition_manager.assigned_partitions,
         );
 
         Self {
@@ -277,7 +277,9 @@ impl Behaviour {
             .gossipsub
             .publish(self.heartbeat_topic.hash(), self.heartbeat_bytes.clone())
         {
-            error!("error publishing heartbeat: {err}");
+            if !matches!(err, PublishError::InsufficientPeers) {
+                error!("error publishing heartbeat: {err}");
+            }
         }
     }
 }

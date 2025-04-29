@@ -212,6 +212,12 @@ impl BucketSegmentWriter {
         transaction_id: &Uuid,
         confirmation_count: u8,
     ) -> Result<(), WriteError> {
+        if offset > self.file_size {
+            return Err(WriteError::OffsetExceedsFileSize {
+                offset,
+                size: self.file_size,
+            });
+        }
         super::set_confirmations(
             self.writer.get_ref(),
             offset,
@@ -249,29 +255,7 @@ impl BucketSegmentWriter {
 
         Ok(())
     }
-
-    // / Asynchronously flushes data, ensuring all data is persisted to disk.
-    // /
-    // / If the `FlushSender` is not local, then the flush will occur in a
-    // background thread, and will not be persisted / when the function returns.
-    // pub fn flush_async(&mut self) -> Result<(), WriteError> {
-    //     self.flush_tx
-    //         .flush_async(&mut self.file, self.file_size, &self.flushed_offset)
-    // }
 }
-
-// impl Writer for BucketSegmentWriter {
-//     fn write(&mut self, bytes: &[u8]) -> Result<(), EncodeError> {
-//         self.writer
-//             .write_all(bytes)
-//             .map_err(|err| EncodeError::Io {
-//                 inner: err,
-//                 index: self.file_size as usize,
-//             })?;
-//         self.file_size += bytes.len() as u64;
-//         Ok(())
-//     }
-// }
 
 struct AppendRecord<'a> {
     timestamp: u64,

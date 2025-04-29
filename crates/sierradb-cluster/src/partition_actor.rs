@@ -1,10 +1,11 @@
+use std::time::Duration;
+
 use kameo::prelude::*;
 use sierradb::bucket::PartitionId;
 use sierradb::database::{Database, Transaction};
-use tracing::debug;
-use uuid::Uuid;
+use tracing::{debug, warn};
 
-use crate::swarm_actor::{ReplyKind, Swarm};
+use crate::swarm::actor::{ReplyKind, Swarm};
 use crate::write_actor::WriteActor;
 
 /// Actor responsible for managing writes to a specific partition.
@@ -31,7 +32,6 @@ pub struct LeaderWriteRequest {
     pub transaction: Transaction,
     pub reply: ReplyKind,
     pub replica_partitions: Vec<PartitionId>,
-    pub transaction_id: Uuid,
     pub replication_factor: u8,
 }
 
@@ -43,14 +43,15 @@ impl Message<LeaderWriteRequest> for PartitionActor {
         msg: LeaderWriteRequest,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        debug!(partition_id = %self.partition_id, request_id = %msg.transaction_id, "Handling leader write request");
+        let transaction_id = msg.transaction.transaction_id();
+        debug!(partition_id = %self.partition_id, %transaction_id, "Handling leader write request");
 
         // Create a WriteActor to handle this write operation
         let write_actor = WriteActor::new(
             self.swarm_ref.clone(),
             self.database.clone(),
             self.partition_id,
-            msg.transaction_id,
+            transaction_id,
             msg.transaction,
             msg.reply,
             msg.replica_partitions,
@@ -59,6 +60,16 @@ impl Message<LeaderWriteRequest> for PartitionActor {
 
         // Run the write actor until completion
         // This blocks the partition actor (ensuring one-at-a-time processing)
-        let _ = WriteActor::prepare().run(write_actor).await;
+        let res = tokio::time::timeout(
+            Duration::from_secs(30),
+            WriteActor::prepare().run(write_actor),
+        )
+        .await;
+        match res {
+            Ok(_) => {}
+            Err(_) => {
+                warn!("write actor timed out after 30 seconds");
+            }
+        }
     }
 }

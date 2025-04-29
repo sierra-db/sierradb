@@ -162,11 +162,7 @@ mod tests {
 
         BucketSegmentWriter::create(&path, 62).unwrap();
 
-        let mut reader = BucketSegmentReader::open(
-            &path,
-            FlushedOffset::new(Arc::new(AtomicU64::new(u64::MAX))),
-        )
-        .unwrap();
+        let mut reader = BucketSegmentReader::open(&path, None).unwrap();
         let read_header = reader.read_segment_header().unwrap();
 
         assert_eq!(read_header.version, 0);
@@ -189,11 +185,7 @@ mod tests {
             writer.flush().unwrap();
         }
 
-        let mut reader = BucketSegmentReader::open(
-            &path,
-            FlushedOffset::new(Arc::new(AtomicU64::new(u64::MAX))),
-        )
-        .unwrap();
+        let mut reader = BucketSegmentReader::open(&path, None).unwrap();
         assert!(reader.validate_magic_bytes().unwrap());
     }
 
@@ -250,7 +242,7 @@ mod tests {
 
         offsets.shuffle(&mut rng());
 
-        let mut reader = BucketSegmentReader::open(&path, flushed_offset.clone()).unwrap();
+        let mut reader = BucketSegmentReader::open(&path, Some(flushed_offset.clone())).unwrap();
 
         for (i, (kind, offset)) in offsets.into_iter().enumerate() {
             let record = reader.read_record(offset, i % 2 == 0).unwrap().unwrap();

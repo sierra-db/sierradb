@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::{self, RangeBounds};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::{fmt, fs, process};
 
@@ -18,7 +18,7 @@ use crate::bucket::event_index::ClosedEventIndex;
 use crate::bucket::partition_index::{
     ClosedPartitionIndex, PartitionEventIter, PartitionIndexRecord, PartitionOffsets,
 };
-use crate::bucket::segment::{BucketSegmentReader, EventRecord, FlushedOffset};
+use crate::bucket::segment::{BucketSegmentReader, CommittedEvents, EventRecord};
 use crate::bucket::stream_index::{
     ClosedStreamIndex, EventStreamIter, StreamIndexRecord, StreamOffsets,
 };
@@ -77,12 +77,23 @@ impl Database {
         partition_id: PartitionId,
         event_id: Uuid,
     ) -> Result<Option<EventRecord>, ReadError> {
+        Ok(self
+            .read_transaction(partition_id, event_id)
+            .await?
+            .and_then(|events| events.into_iter().next()))
+    }
+
+    pub async fn read_transaction(
+        &self,
+        partition_id: PartitionId,
+        first_event_id: Uuid,
+    ) -> Result<Option<CommittedEvents>, ReadError> {
         let bucket_id = partition_id % self.total_buckets;
         let segment_id_offset = self
             .writer_pool
             .with_event_index(bucket_id, |segment_id, event_index| {
                 event_index
-                    .get(&event_id)
+                    .get(&first_event_id)
                     .map(|offset| (segment_id.load(Ordering::Acquire), offset))
             })
             .await
@@ -114,7 +125,7 @@ impl Database {
 
                         for reader_set in segments.values_mut().rev() {
                             if let Some(event_index) = &mut reader_set.event_index {
-                                match event_index.get(&event_id) {
+                                match event_index.get(&first_event_id) {
                                     Ok(Some(offset)) => {
                                         let res = reader_set
                                             .reader
@@ -137,7 +148,7 @@ impl Database {
             });
 
         match reply_rx.await {
-            Ok(res) => res.map(|events| events.and_then(|events| events.into_iter().next())),
+            Ok(res) => res,
             Err(_) => Err(ReadError::NoThreadReply),
         }
     }
@@ -475,10 +486,7 @@ impl DatabaseBuilder {
                 continue;
             };
 
-            let reader = BucketSegmentReader::open(
-                events,
-                FlushedOffset::new(Arc::new(AtomicU64::new(u64::MAX))),
-            )?;
+            let reader = BucketSegmentReader::open(events, None)?;
 
             let event_index = event_index
                 .map(|path| ClosedEventIndex::open(bucket_segment_id, path))
@@ -573,9 +581,10 @@ struct UnopenedFileSet {
 }
 
 /// The expected version **before** the event is inserted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExpectedVersion {
     /// Accept any version, whether the stream/partition exists or not.
+    #[default]
     Any,
     /// The stream/partition must exist (have at least one event).
     Exists,

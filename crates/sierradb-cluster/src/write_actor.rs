@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use futures::FutureExt;
 use kameo::error::Infallible;
 use kameo::prelude::*;
 use sierradb::bucket::PartitionId;
@@ -9,7 +10,7 @@ use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use crate::error::SwarmError;
-use crate::swarm_actor::{ConfirmWrite, ReplicateWrite, ReplyKind, SendReplicaResponse, Swarm};
+use crate::swarm::actor::{ConfirmWrite, ReplicateWrite, ReplyKind, SendReplicaResponse, Swarm};
 
 /// Handles a single write operation, coordinating the distributed consensus
 /// process.
@@ -18,7 +19,7 @@ pub struct WriteActor {
     database: Database,
     partition_id: PartitionId,
     transaction_id: Uuid,
-    append: Transaction,
+    transaction: Transaction,
     reply: Option<ReplyKind>,
     replica_partitions: Vec<PartitionId>,
 
@@ -37,7 +38,7 @@ impl WriteActor {
         database: Database,
         partition_id: PartitionId,
         transaction_id: Uuid,
-        append: Transaction,
+        transaction: Transaction,
         reply: ReplyKind,
         replica_partitions: Vec<PartitionId>,
         replication_factor: u8,
@@ -47,7 +48,7 @@ impl WriteActor {
             database,
             partition_id,
             transaction_id,
-            append,
+            transaction,
             reply: Some(reply),
             replica_partitions,
             append_result: None,
@@ -83,7 +84,7 @@ impl WriteActor {
                     let _ = self
                         .swarm_ref
                         .tell(SendReplicaResponse {
-                            channel, // Pass channel by value, don't clone
+                            channel,
                             result: Ok(result),
                         })
                         .await;
@@ -122,7 +123,7 @@ impl WriteActor {
     }
 
     /// Marks events as confirmed and broadcasts confirmation to replicas
-    async fn complete_write(&self) {
+    async fn complete_write(&self, actor_ref: ActorRef<WriteActor>) {
         if let Some(ref result) = self.append_result {
             debug!(
                 transaction_id = %self.transaction_id,
@@ -165,12 +166,22 @@ impl WriteActor {
                         .tell(ConfirmWrite {
                             partition_id: *replica_id,
                             transaction_id: self.transaction_id,
-                            offsets: result.offsets.clone(),
+                            event_ids: self
+                                .transaction
+                                .events()
+                                .into_iter()
+                                .map(|event| event.event_id)
+                                .collect(),
                             confirmation_count: self.confirmed_partitions.len() as u8,
                         })
                         .await;
                 }
             }
+        }
+
+        if actor_ref.stop_gracefully().now_or_never().is_none() {
+            warn!("write actors mailbox is full, killing");
+            actor_ref.kill();
         }
     }
 }
@@ -189,7 +200,7 @@ impl Actor for WriteActor {
         // Write events locally and assign versions
         match state
             .database
-            .append_events(state.partition_id, state.append.clone())
+            .append_events(state.partition_id, state.transaction.clone())
             .await
         {
             Ok(result) => {
@@ -217,7 +228,7 @@ impl Actor for WriteActor {
                         .swarm_ref
                         .tell(ReplicateWrite {
                             partition_id: *replica_id,
-                            append: state.append.clone(),
+                            transaction: state.transaction.clone(),
                             transaction_id: state.transaction_id,
                             origin_partition: state.partition_id,
                             write_actor_ref: actor_ref.clone(),
@@ -237,7 +248,7 @@ impl Actor for WriteActor {
                     state.send_success(result_clone).await;
 
                     // Mark events as confirmed
-                    state.complete_write().await;
+                    state.complete_write(actor_ref).await;
                 }
             }
             Err(err) => {
@@ -250,6 +261,11 @@ impl Actor for WriteActor {
 
                 // Send failure response
                 state.send_failure(SwarmError::Write(err.to_string())).await;
+
+                if actor_ref.stop_gracefully().now_or_never().is_none() {
+                    warn!("write actors mailbox is full, killing");
+                    actor_ref.kill();
+                }
             }
         }
 
@@ -270,7 +286,7 @@ impl Message<ReplicaConfirmation> for WriteActor {
     async fn handle(
         &mut self,
         msg: ReplicaConfirmation,
-        _ctx: &mut Context<Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         if msg.transaction_id != self.transaction_id {
             warn!(
@@ -306,7 +322,7 @@ impl Message<ReplicaConfirmation> for WriteActor {
                 }
 
                 // Mark events as confirmed
-                self.complete_write().await;
+                self.complete_write(ctx.actor_ref()).await;
             }
         } else {
             // A replica failed to process the write
@@ -337,6 +353,12 @@ impl Message<ReplicaConfirmation> for WriteActor {
                     required: required_quorum as u8,
                 })
                 .await;
+
+                let self_ref = ctx.actor_ref();
+                if self_ref.stop_gracefully().now_or_never().is_none() {
+                    warn!("write actors mailbox is full, killing");
+                    self_ref.kill();
+                }
             }
         }
     }

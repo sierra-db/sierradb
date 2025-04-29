@@ -1,0 +1,14 @@
+# Demonstrates a 3 node setup
+# The specific node is determined by the --node-index cli argument
+
+[[nodes]]
+dir = "target/db-0"
+network.client_address = "0.0.0.0:9090"
+
+[[nodes]]
+dir = "target/db-1"
+network.client_address = "0.0.0.0:9091"
+
+[[nodes]]
+dir = "target/db-2"
+network.client_address = "0.0.0.0:9093"

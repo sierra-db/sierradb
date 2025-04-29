@@ -2,6 +2,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::{mem, vec};
 
 use bincode::Decode;
@@ -27,6 +29,7 @@ const PAGE_SIZE: usize = 4096; // Usually a page is 4KB on Linux
 const READ_AHEAD_SIZE: usize = 64 * 1024; // 64 KB read ahead buffer
 const READ_BUF_SIZE: usize = PAGE_SIZE - COMMIT_SIZE;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommittedEvents {
     None {
         next_offset: u64,
@@ -89,7 +92,10 @@ pub struct BucketSegmentReader {
 
 impl BucketSegmentReader {
     /// Opens a segment as read only.
-    pub fn open(path: impl AsRef<Path>, flushed_offset: FlushedOffset) -> Result<Self, ReadError> {
+    pub fn open(
+        path: impl AsRef<Path>,
+        flushed_offset: Option<FlushedOffset>,
+    ) -> Result<Self, ReadError> {
         // On OSX, gives ~5% better performance for both random and sequential reads
         const O_DIRECT: i32 = 0o0040000;
         let file = OpenOptions::new()
@@ -99,6 +105,14 @@ impl BucketSegmentReader {
             .open(path)?;
         let header_buf = [0u8; HEADER_BUF_SIZE];
         let body_buf = [0u8; READ_BUF_SIZE];
+
+        let flushed_offset = match flushed_offset {
+            Some(flushed_offset) => flushed_offset,
+            None => {
+                let len = file.metadata()?.len();
+                FlushedOffset::new(Arc::new(AtomicU64::new(len)))
+            }
+        };
 
         Ok(BucketSegmentReader {
             file,

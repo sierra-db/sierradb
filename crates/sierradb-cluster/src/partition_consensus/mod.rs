@@ -1,12 +1,18 @@
 use std::cmp;
 
 use arrayvec::ArrayVec;
-use sierradb::MAX_REPLICATION_FACTOR;
+use sierradb::{
+    MAX_REPLICATION_FACTOR,
+    bucket::{PartitionHash, PartitionId},
+};
 
-pub mod behaviour;
-pub mod manager;
-pub mod messages;
-pub mod store;
+mod behaviour;
+mod manager;
+mod messages;
+mod store;
+
+pub use behaviour::{Behaviour, PartitionBehaviourEvent};
+pub use manager::PartitionManager;
 
 /// Distributes a partition across the cluster for replication
 ///
@@ -22,10 +28,10 @@ pub mod store;
 /// # Returns
 /// An array of partition IDs where the data should be stored
 pub fn distribute_partition(
-    partition_key: u16,
+    partition_hash: PartitionHash,
     num_partitions: u16,
     replication_factor: u8,
-) -> ArrayVec<u16, MAX_REPLICATION_FACTOR> {
+) -> ArrayVec<PartitionId, MAX_REPLICATION_FACTOR> {
     let mut result = ArrayVec::new();
 
     // Validate inputs
@@ -44,7 +50,7 @@ pub fn distribute_partition(
     }
 
     // Start with the primary partition (simple modulo distribution)
-    let primary_partition = partition_key % num_partitions;
+    let primary_partition = partition_hash % num_partitions;
     result.push(primary_partition);
 
     // For additional replicas, use a deterministic distribution method
