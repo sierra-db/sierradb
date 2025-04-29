@@ -19,6 +19,8 @@ pub enum SwarmError {
     PartitionActorNotFound { partition_id: PartitionId },
     #[error("failed to send write to partition actor")]
     PartitionActorSendError,
+    #[error("failed to send to swarm actor")]
+    SwarmActorSendError,
     #[error("partition unavailable")]
     PartitionUnavailable,
     #[error("bucket id {bucket_id} not found for request")]

@@ -1,10 +1,12 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::Rng;
-use uuid::Uuid;
+use uuid::{Uuid, uuid};
 
 use crate::RANDOM_STATE;
 use crate::bucket::{BucketId, PartitionHash, PartitionId};
+
+pub const NAMESPACE_PARTITION_KEY: Uuid = uuid!("bd804425-2e2e-499f-b61d-e045d035ca86");
 
 /// Hashes the stream id, and performs a modulo on the lowest 16 bits of the
 /// hash.

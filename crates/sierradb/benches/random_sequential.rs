@@ -1,14 +1,10 @@
 use std::fs;
-use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use rand::rng;
 use rand::seq::SliceRandom;
 use sierradb::StreamId;
-use sierradb::bucket::segment::{
-    AppendEvent, BucketSegmentReader, BucketSegmentWriter, FlushedOffset,
-};
+use sierradb::bucket::segment::{AppendEvent, BucketSegmentReader, BucketSegmentWriter};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
@@ -52,11 +48,7 @@ fn setup_test_file() -> (BucketSegmentWriter, Vec<u64>) {
 
 fn benchmark_reads(c: &mut Criterion) {
     let (_writer, offsets) = setup_test_file();
-    let mut reader = BucketSegmentReader::open(
-        FILE_PATH,
-        FlushedOffset::new(Arc::new(AtomicU64::new(u64::MAX))),
-    )
-    .expect("Failed to open reader");
+    let mut reader = BucketSegmentReader::open(FILE_PATH, None).expect("Failed to open reader");
 
     let mut shuffled_offsets = offsets.clone();
     shuffled_offsets.shuffle(&mut rng());

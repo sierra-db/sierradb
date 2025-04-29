@@ -11,14 +11,19 @@ path = "src/main.rs"
 sierradb.workspace = true
 sierradb-cluster.workspace = true
 
+bytes.workspace = true
 clap = { version = "4.5.32", features = ["derive"] }
+config.workspace = true
+directories.workspace = true
 kameo.workspace = true
 libp2p.workspace = true
+serde = { workspace = true, features = ["derive"] }
 smallvec.workspace = true
 tokio = { workspace = true, features = [
   "fs",
   "io-std",
   "io-util",
+  "net",
   "signal",
   "sync",
   "macros",
@@ -26,4 +31,4 @@ tokio = { workspace = true, features = [
 ] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
-uuid = { workspace = true, features = ["serde", "v4", "v8"] }
+uuid = { workspace = true, features = ["serde", "v4", "v5", "v8"] }

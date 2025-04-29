@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use arrayvec::ArrayVec;
 use libp2p::PeerId;
 use sierradb::MAX_REPLICATION_FACTOR;
+use sierradb::bucket::{PartitionHash, PartitionId};
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 
@@ -99,72 +100,6 @@ impl PartitionManager {
         distribute_partition(partition_key, self.num_partitions, self.replication_factor)
     }
 
-    // /// Distributes a partition key across multiple partitions with the
-    // /// specified replication factor.
-    // ///
-    // /// # Arguments
-    // /// * `partition_key` - The input partition key
-    // ///
-    // /// # Returns
-    // /// A vector of partition IDs where the data should be stored
-    // pub fn distribute_partition(&self, partition_key: u16) -> Vec<u16> {
-    //     // Validate inputs
-    //     if self.num_partitions == 0 {
-    //         return Vec::new();
-    //     }
-
-    //     if self.replication_factor == 0 {
-    //         return Vec::new();
-    //     }
-
-    //     if self.replication_factor as u16 > self.num_partitions {
-    //         error!("replication factor exceeds number of partitions");
-    //         return Vec::new();
-    //     }
-
-    //     let mut result = Vec::with_capacity(self.replication_factor as usize);
-
-    //     // Start with the primary partition (simple modulo distribution)
-    //     let primary_partition = partition_key % self.num_partitions;
-    //     result.push(primary_partition);
-
-    //     // For additional replicas, use a deterministic distribution method
-    //     // that ensures partitions are spread out
-    //     if self.replication_factor > 1 {
-    //         // Use a jump value that's relatively prime to num_partitions to
-    // ensure         // we visit all partitions before repeating
-    //         let jump = self.compute_jump();
-
-    //         let mut current = primary_partition;
-    //         for _ in 1..self.replication_factor {
-    //             // Jump to the next partition, wrapping around if necessary
-    //             current = (current + jump) % self.num_partitions;
-    //             result.push(current);
-    //         }
-    //     }
-
-    //     result
-    // }
-
-    // /// Computes a jump value that's relatively prime to num_partitions
-    // /// This ensures we'll visit all partitions before repeating
-    // fn compute_jump(&self) -> u16 {
-    //     // A common approach is to use a value close to num_partitions/2
-    //     // For even numbers, we use an odd number to ensure relative primality
-    //     if self.num_partitions <= 2 {
-    //         return 1;
-    //     }
-
-    //     let candidate = self.num_partitions / 2 + 1;
-
-    //     // If num_partitions is even and candidate is even, add 1 to make it odd
-    //     if self.num_partitions % 2 == 0 && candidate % 2 == 0 {
-    //         return candidate + 1;
-    //     }
-
-    //     candidate
-    // }
-
     /// Determine whether this node has the specified partition
     pub fn has_partition(&self, partition_id: u16) -> bool {
         self.assigned_partitions.contains(&partition_id)
@@ -192,13 +127,17 @@ impl PartitionManager {
         false
     }
 
+    pub fn get_partition_owner(&self, partition_id: PartitionId) -> Option<&PeerId> {
+        self.partition_owners.get(&partition_id)
+    }
+
     /// Get a list of available partitions for a given key
     pub fn get_available_partitions_for_key(
         &self,
-        partition_key: u16,
-    ) -> ArrayVec<(u16, PeerId), MAX_REPLICATION_FACTOR> {
+        partition_hash: PartitionHash,
+    ) -> ArrayVec<(PartitionId, PeerId), MAX_REPLICATION_FACTOR> {
         let partition_ids =
-            distribute_partition(partition_key, self.num_partitions, self.replication_factor);
+            distribute_partition(partition_hash, self.num_partitions, self.replication_factor);
 
         partition_ids
             .into_iter()

@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::{PeerId, mdns, request_response};
 use serde::{Deserialize, Serialize};
-use sierradb::bucket::PartitionId;
+use sierradb::bucket::{PartitionHash, PartitionId};
 use sierradb::database::Transaction;
 use sierradb::writer_thread_pool::AppendResult;
 use smallvec::SmallVec;
@@ -16,7 +16,7 @@ use crate::partition_consensus;
 pub struct Behaviour {
     pub mdns: mdns::tokio::Behaviour,
     pub req_resp: request_response::cbor::Behaviour<Req, Resp>,
-    pub partition_ownership: partition_consensus::behaviour::Behaviour,
+    pub partition_ownership: partition_consensus::Behaviour,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -27,7 +27,7 @@ pub enum Req {
     },
     ReplicateWrite {
         partition_id: PartitionId,
-        append: Transaction,
+        transaction: Transaction,
         transaction_id: Uuid,
         origin_partition: PartitionId,
         origin_peer: PeerId,
@@ -35,7 +35,7 @@ pub enum Req {
     ConfirmWrite {
         partition_id: PartitionId,
         transaction_id: Uuid,
-        offsets: SmallVec<[u64; 4]>,
+        event_ids: SmallVec<[Uuid; 4]>,
         confirmation_count: u8,
     },
 }
@@ -75,5 +75,5 @@ pub struct WriteRequestMetadata {
     /// Nodes that have already tried to process this request
     pub tried_peers: HashSet<PeerId>,
     /// Original partition hash
-    pub partition_hash: u16,
+    pub partition_hash: PartitionHash,
 }

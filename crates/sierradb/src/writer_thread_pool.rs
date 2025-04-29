@@ -113,7 +113,7 @@ impl WriterThreadPool {
         }
 
         // Spawn flusher thread
-        if flush_interval_duration < Duration::MAX {
+        if flush_interval_duration > Duration::ZERO && flush_interval_duration < Duration::MAX {
             thread::Builder::new()
                 .name("writer-pool-flusher".to_string())
                 .spawn({
@@ -296,7 +296,7 @@ impl Worker {
                 let (bucket_segment_id, writer) = BucketSegmentWriter::latest(bucket_id, &dir)?;
                 let mut reader = BucketSegmentReader::open(
                     dir.join(SegmentKind::Events.file_name(bucket_segment_id)),
-                    writer.flushed_offset(),
+                    Some(writer.flushed_offset()),
                 )?;
 
                 let mut event_index = OpenEventIndex::open(
@@ -313,9 +313,15 @@ impl Worker {
                     segment_size,
                 )?;
 
-                event_index.hydrate(&mut reader)?;
-                partition_index.hydrate(&mut reader)?;
-                stream_index.hydrate(&mut reader)?;
+                if let Err(err) = event_index.hydrate(&mut reader) {
+                    error!("failed to hydrate event index for {bucket_segment_id}: {err}");
+                }
+                if let Err(err) = partition_index.hydrate(&mut reader) {
+                    error!("failed to hydrate partition index for {bucket_segment_id}: {err}");
+                }
+                if let Err(err) = stream_index.hydrate(&mut reader) {
+                    error!("failed to hydrate stream index for {bucket_segment_id}: {err}");
+                }
 
                 reader_pool.add_bucket_segment(bucket_segment_id, &reader, None, None, None);
 
@@ -685,7 +691,7 @@ impl WriterSet {
             BucketSegmentReader::open(
                 self.dir
                     .join(SegmentKind::Events.file_name(self.bucket_segment_id)),
-                self.writer.flushed_offset(),
+                Some(self.writer.flushed_offset()),
             )?,
         );
 
@@ -1045,7 +1051,7 @@ impl WriterSet {
         match self.next_partition_sequences.get(&partition_id) {
             Some(sequence) => Ok(*sequence),
             None => match self.read_partition_latest_sequence(partition_id)? {
-                Some(PartitionLatestSequence::LatestSequence { sequence, .. }) => Ok(sequence),
+                Some(PartitionLatestSequence::LatestSequence { sequence, .. }) => Ok(sequence + 1),
                 Some(PartitionLatestSequence::ExternalBucket { .. }) => todo!(),
                 None => Ok(0),
             },
