@@ -46,7 +46,6 @@ pub struct WriteManager {
     forwarded_appends:
         HashMap<OutboundRequestId, oneshot::Sender<Result<AppendResult, SwarmError>>>,
     pending_replications: HashMap<(Uuid, PartitionId), ActorRef<WriteActor>>,
-    pending_requests: HashMap<Uuid, PartitionId>,
 }
 
 impl WriteManager {
@@ -64,7 +63,6 @@ impl WriteManager {
             partition_actors,
             forwarded_appends: HashMap::new(),
             pending_replications: HashMap::new(),
-            pending_requests: HashMap::new(),
         }
     }
 
@@ -189,6 +187,10 @@ impl WriteManager {
                 "Local replication result"
             );
 
+            if let Err(err) = &result {
+                error!(%transaction_id, partition_id, ?err, "Local replication failed with error");
+            }
+
             // Send confirmation back to the write actor
             let _ = write_actor_ref
                 .tell(ReplicaConfirmation {
@@ -237,9 +239,6 @@ impl WriteManager {
                     origin_peer: self.local_peer_id,
                 },
             );
-
-            // Map the transaction_id to the partition_id for later lookup
-            self.pending_requests.insert(transaction_id, partition_id);
         } else {
             // Can't find a node for this partition
             warn!(
@@ -290,34 +289,22 @@ impl WriteManager {
     }
 
     /// Handles a replication response from the network
-    pub fn process_replication_response(&mut self, transaction_id: Uuid, success: bool) {
-        if let Some(partition_id) = self.pending_requests.remove(&transaction_id) {
-            debug!(
-                %transaction_id,
+    pub fn process_replication_response(
+        &mut self,
+        transaction_id: Uuid,
+        partition_id: PartitionId,
+        success: bool,
+    ) {
+        if let Some(write_actor_ref) = self
+            .pending_replications
+            .remove(&(transaction_id, partition_id))
+        {
+            self.send_replication_confirmation(
+                transaction_id,
                 partition_id,
                 success,
-                "Received replication response from network"
+                write_actor_ref,
             );
-
-            if let Some(write_actor_ref) = self
-                .pending_replications
-                .remove(&(transaction_id, partition_id))
-            {
-                self.send_replication_confirmation(
-                    transaction_id,
-                    partition_id,
-                    success,
-                    write_actor_ref,
-                );
-            } else {
-                warn!(
-                    %transaction_id,
-                    partition_id,
-                    "No write actor found for replication response"
-                );
-            }
-        } else {
-            warn!(%transaction_id, "No pending request found for replication response");
         }
     }
 

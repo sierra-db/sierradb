@@ -23,7 +23,7 @@ use sierradb::{
 };
 use smallvec::SmallVec;
 use tokio::sync::oneshot;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, trace};
 use uuid::Uuid;
 
 use crate::{
@@ -366,15 +366,25 @@ impl Swarm {
                 self.write_manager
                     .process_append_result(&request_id, Err(error));
             }
-            Resp::ReplicateWriteSuccess { transaction_id, .. } => {
+            Resp::ReplicateWriteSuccess {
+                transaction_id,
+                partition_id,
+            } => {
                 debug!(%transaction_id, "Received successful replication response");
                 self.write_manager
-                    .process_replication_response(transaction_id, true);
+                    .process_replication_response(transaction_id, partition_id, true);
             }
-            Resp::ReplicateWriteFailure { transaction_id, .. } => {
+            Resp::ReplicateWriteFailure {
+                transaction_id,
+                partition_id,
+                ..
+            } => {
                 debug!(%transaction_id, "Received failed replication response");
-                self.write_manager
-                    .process_replication_response(transaction_id, false);
+                self.write_manager.process_replication_response(
+                    transaction_id,
+                    partition_id,
+                    false,
+                );
             }
             _ => {}
         }
@@ -469,7 +479,8 @@ impl Message<ConfirmWrite> for Swarm {
 
         // Verify we own the target partition
         if !self.partition_manager().has_partition(partition_id) {
-            warn!(%transaction_id, partition_id, "Received confirmation request for unowned partition");
+            // warn!(%transaction_id, partition_id, "Received confirmation request for
+            // unowned partition");
             return;
         }
 

@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::time::Duration;
 
 use futures::FutureExt;
 use kameo::error::Infallible;
@@ -29,6 +30,7 @@ pub struct WriteActor {
     replication_factor: u8,
     // Track whether we've already sent the success response to avoid duplicate responses
     response_sent: bool,
+    expected_confirmations: usize,
 }
 
 impl WriteActor {
@@ -43,6 +45,7 @@ impl WriteActor {
         replica_partitions: Vec<PartitionId>,
         replication_factor: u8,
     ) -> Self {
+        let expected_confirmations = 1 + replica_partitions.len();
         Self {
             swarm_ref,
             database,
@@ -55,6 +58,7 @@ impl WriteActor {
             confirmed_partitions: HashSet::from([partition_id]), // Primary partition auto-confirmed
             replication_factor,
             response_sent: false,
+            expected_confirmations,
         }
     }
 
@@ -123,7 +127,7 @@ impl WriteActor {
     }
 
     /// Marks events as confirmed and broadcasts confirmation to replicas
-    async fn complete_write(&self, actor_ref: ActorRef<WriteActor>) {
+    async fn complete_write(&self) {
         if let Some(ref result) = self.append_result {
             debug!(
                 transaction_id = %self.transaction_id,
@@ -178,11 +182,6 @@ impl WriteActor {
                 }
             }
         }
-
-        if actor_ref.stop_gracefully().now_or_never().is_none() {
-            warn!("write actors mailbox is full, killing");
-            actor_ref.kill();
-        }
     }
 }
 
@@ -195,6 +194,12 @@ impl Actor for WriteActor {
         actor_ref: ActorRef<Self>,
     ) -> Result<Self, Self::Error> {
         debug!(transaction_id = %state.transaction_id, "Beginning write operation");
+
+        let actor_ref_clone = actor_ref.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let _ = actor_ref_clone.tell(TimeoutMessage).await;
+        });
 
         // PHASE 1: LOCAL WRITE
         // Write events locally and assign versions
@@ -248,7 +253,7 @@ impl Actor for WriteActor {
                     state.send_success(result_clone).await;
 
                     // Mark events as confirmed
-                    state.complete_write(actor_ref).await;
+                    state.complete_write().await;
                 }
             }
             Err(err) => {
@@ -322,7 +327,20 @@ impl Message<ReplicaConfirmation> for WriteActor {
                 }
 
                 // Mark events as confirmed
-                self.complete_write(ctx.actor_ref()).await;
+                self.complete_write().await;
+            }
+
+            // Stop the actor only after all expected confirmations are received
+            if self.confirmed_partitions.len() >= self.expected_confirmations {
+                debug!(
+                    transaction_id = %self.transaction_id,
+                    "All expected partitions confirmed, stopping actor"
+                );
+
+                if ctx.actor_ref().stop_gracefully().now_or_never().is_none() {
+                    warn!("write actors mailbox is full, killing");
+                    ctx.actor_ref().kill();
+                }
             }
         } else {
             // A replica failed to process the write
@@ -360,6 +378,30 @@ impl Message<ReplicaConfirmation> for WriteActor {
                     self_ref.kill();
                 }
             }
+        }
+    }
+}
+
+struct TimeoutMessage;
+
+impl Message<TimeoutMessage> for WriteActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        _: TimeoutMessage,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        // Only stop if we haven't already
+        if !self.response_sent {
+            // If timeout occurs before quorum, send failure to client
+            self.send_failure(SwarmError::Timeout).await;
+        }
+
+        // Stop the actor
+        if ctx.actor_ref().stop_gracefully().now_or_never().is_none() {
+            warn!("write actors mailbox is full, killing");
+            ctx.actor_ref().kill();
         }
     }
 }

@@ -6,7 +6,7 @@ use sierradb::bucket::{
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    'outer: for entry in fs::read_dir("./target/db-1")? {
+    'outer: for entry in fs::read_dir("./target/db-0")? {
         let entry = entry?;
         let file_name = entry.file_name();
         let Some(file_name_str) = file_name.to_str() else {
@@ -26,12 +26,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match record {
                     Ok(Record::Event(event)) => {
                         println!(
-                            "{bsid} -- {}/{} {}@{} - {}",
+                            "{bsid} -- {}/{} {}@{} - {} (confirmations: {})",
                             event.partition_id,
                             event.partition_sequence,
                             event.stream_id,
                             event.stream_version,
-                            event.event_name
+                            event.event_name,
+                            event.confirmation_count,
                         )
                     }
                     Ok(Record::Commit(_)) => {}

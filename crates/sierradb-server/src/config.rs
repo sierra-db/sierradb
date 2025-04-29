@@ -225,15 +225,12 @@ impl AppConfig {
         }
     }
 
-    pub fn assigned_partitions(&self) -> Result<HashSet<PartitionId>, ConfigError> {
+    pub fn assigned_partitions(&self, bucket_ids: &HashSet<BucketId>) -> HashSet<PartitionId> {
         match &self.partition.ids {
-            Some(ids) => Ok(ids.iter().copied().collect()),
-            None => {
-                let node_count = self.node_count()?;
-                Ok((0..self.partition.count)
-                    .filter(|p| (*p as usize % node_count) == self.node.index as usize)
-                    .collect())
-            }
+            Some(ids) => ids.iter().copied().collect(),
+            None => (0..self.partition.count)
+                .filter(|p| bucket_ids.contains(&(p % self.bucket.count)))
+                .collect(),
         }
     }
 

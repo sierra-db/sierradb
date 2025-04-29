@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     debug!("Configuration:\n{config}");
 
     let assigned_buckets = config.assigned_buckets()?;
-    let assigned_partitions = config.assigned_partitions()?;
+    let assigned_partitions = config.assigned_partitions(&assigned_buckets);
 
     let mut builder = DatabaseBuilder::new();
     builder

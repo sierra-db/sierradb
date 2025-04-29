@@ -1,6 +1,9 @@
 # Demonstrates a 3 node setup
 # The specific node is determined by the --node-index cli argument
 
+[bucket]
+count = 64
+
 [[nodes]]
 dir = "target/db-0"
 network.client_address = "0.0.0.0:9090"
@@ -11,4 +14,4 @@ network.client_address = "0.0.0.0:9091"
 
 [[nodes]]
 dir = "target/db-2"
-network.client_address = "0.0.0.0:9093"
+network.client_address = "0.0.0.0:9092"
