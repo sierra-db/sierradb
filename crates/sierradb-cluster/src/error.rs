@@ -39,6 +39,8 @@ pub enum SwarmError {
     Timeout,
     #[error("too many forwards")]
     TooManyForwards,
+    #[error("read error: {0}")]
+    Read(String),
     #[error("write error: {0}")]
     Write(String),
     #[error("wrong leader node for append")]

@@ -12,7 +12,7 @@ sierradb.workspace = true
 sierradb-cluster.workspace = true
 
 bytes.workspace = true
-clap = { version = "4.5.32", features = ["derive"] }
+clap = { workspace = true, features = ["derive"] }
 config.workspace = true
 directories.workspace = true
 kameo.workspace = true
@@ -30,5 +30,5 @@ tokio = { workspace = true, features = [
   "rt-multi-thread",
 ] }
 tracing.workspace = true
-tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 uuid = { workspace = true, features = ["serde", "v4", "v5", "v8"] }

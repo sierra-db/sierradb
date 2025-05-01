@@ -442,7 +442,6 @@ pub enum ClosedIndex {
 }
 
 pub struct ClosedStreamIndex {
-    #[allow(unused)] // TODO: is this ID needed?
     id: BucketSegmentId,
     file: File,
     index: Cache<Arc<ArcSwap<ClosedIndex>>, Arc<ClosedIndex>>,

@@ -34,7 +34,7 @@ use crate::{
     write_actor::WriteActor,
 };
 
-use super::write::{ConfirmTransactionError, WriteManager};
+use super::write_manager::{ConfirmTransactionError, WriteManager};
 
 /// Manages the peer-to-peer network communication for distributed database
 /// operations
@@ -618,10 +618,34 @@ impl Message<SendConfirmTransactionResponse> for Swarm {
     }
 }
 
+pub struct SendResponse {
+    pub channel: ResponseChannel<Resp>,
+    pub response: Resp,
+}
+
+impl Message<SendResponse> for Swarm {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        SendResponse { channel, response }: SendResponse,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        if let Err(err) = self
+            .swarm
+            .behaviour_mut()
+            .req_resp
+            .send_response(channel, response)
+        {
+            error!(?err, "Failed to send response");
+        }
+    }
+}
+
 /// Represents the kind of reply to send for a write operation
-pub enum ReplyKind {
+pub enum ReplyKind<T> {
     /// Reply to a local request with a oneshot channel
-    Local(oneshot::Sender<Result<AppendResult, SwarmError>>),
+    Local(oneshot::Sender<Result<T, SwarmError>>),
     /// Reply to a remote request with a libp2p response channel
     Remote(ResponseChannel<Resp>),
 }
