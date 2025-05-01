@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::{PeerId, mdns, request_response};
 use serde::{Deserialize, Serialize};
+use sierradb::bucket::segment::EventRecord;
 use sierradb::bucket::{PartitionHash, PartitionId};
 use sierradb::database::Transaction;
 use sierradb::writer_thread_pool::AppendResult;
@@ -66,6 +67,17 @@ pub enum Resp {
         partition_id: PartitionId,
         error: String,
     },
+    Read(Result<Option<EventRecord>, SwarmError>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadRequestMetadata {
+    /// Number of hops this request has taken
+    pub hop_count: u8,
+    /// Nodes that have already tried to process this request
+    pub tried_peers: HashSet<PeerId>,
+    /// Original partition hash
+    pub partition_hash: PartitionHash,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

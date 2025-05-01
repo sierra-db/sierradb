@@ -3,6 +3,7 @@ use std::time::Duration;
 use kameo::prelude::*;
 use sierradb::bucket::PartitionId;
 use sierradb::database::{Database, Transaction};
+use sierradb::writer_thread_pool::AppendResult;
 use tracing::{debug, warn};
 
 use crate::swarm::actor::{ReplyKind, Swarm};
@@ -30,7 +31,7 @@ impl PartitionActor {
 /// Message sent to PartitionActor to initiate a write operation.
 pub struct LeaderWriteRequest {
     pub transaction: Transaction,
-    pub reply: ReplyKind,
+    pub reply: ReplyKind<AppendResult>,
     pub replica_partitions: Vec<PartitionId>,
     pub replication_factor: u8,
 }
@@ -66,6 +67,14 @@ impl Message<LeaderWriteRequest> for PartitionActor {
         )
         .await;
         match res {
+            Ok(Ok((write_actor, _))) => {
+                if write_actor.has_quorum() {
+                    tokio::spawn(async move {
+                        // Mark events as confirmed
+                        write_actor.complete_write().await;
+                    });
+                }
+            }
             Ok(_) => {}
             Err(_) => {
                 warn!("write actor timed out after 30 seconds");

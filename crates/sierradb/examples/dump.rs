@@ -1,4 +1,4 @@
-use std::fs;
+use std::{env, fs};
 
 use sierradb::bucket::{
     SegmentKind,
@@ -6,7 +6,9 @@ use sierradb::bucket::{
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    'outer: for entry in fs::read_dir("./target/db-0")? {
+    let dir = env::args().nth(1).ok_or("missing db path argument")?;
+
+    'outer: for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let file_name = entry.file_name();
         let Some(file_name_str) = file_name.to_str() else {

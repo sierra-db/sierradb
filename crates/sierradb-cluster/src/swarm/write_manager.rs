@@ -502,7 +502,7 @@ impl WriteManager {
         destination: WriteDestination,
         transaction: Transaction,
         metadata: WriteRequestMetadata,
-        reply: ReplyKind,
+        reply: ReplyKind<AppendResult>,
     ) {
         match destination {
             WriteDestination::Local {
@@ -546,7 +546,7 @@ impl WriteManager {
         partitions: ArrayVec<(PartitionId, PeerId), MAX_REPLICATION_FACTOR>,
         transaction: Transaction,
         metadata: WriteRequestMetadata,
-        reply: ReplyKind,
+        reply: ReplyKind<AppendResult>,
     ) {
         // Check if we've already tried this peer (to prevent loops)
         if metadata.tried_peers.contains(&primary_peer_id) {
@@ -575,7 +575,7 @@ impl WriteManager {
         req_resp: &mut request_response::cbor::Behaviour<Req, Resp>,
         transaction: Transaction,
         mut metadata: WriteRequestMetadata,
-        reply: ReplyKind,
+        reply: ReplyKind<AppendResult>,
     ) {
         // Add this peer to the tried list
         metadata.tried_peers.insert(peer_id);
@@ -610,7 +610,7 @@ impl WriteManager {
     }
 
     /// Handles the case when no available peers are left to forward to
-    fn handle_no_available_peers(&self, reply: ReplyKind) {
+    fn handle_no_available_peers(&self, reply: ReplyKind<AppendResult>) {
         match reply {
             ReplyKind::Local(tx) => {
                 let _ = tx.send(Err(SwarmError::NoAvailableLeaders));

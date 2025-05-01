@@ -21,7 +21,7 @@ pub struct WriteActor {
     partition_id: PartitionId,
     transaction_id: Uuid,
     transaction: Transaction,
-    reply: Option<ReplyKind>,
+    reply: Option<ReplyKind<AppendResult>>,
     replica_partitions: Vec<PartitionId>,
 
     // State that tracks the progress of the write operation
@@ -41,7 +41,7 @@ impl WriteActor {
         partition_id: PartitionId,
         transaction_id: Uuid,
         transaction: Transaction,
-        reply: ReplyKind,
+        reply: ReplyKind<AppendResult>,
         replica_partitions: Vec<PartitionId>,
         replication_factor: u8,
     ) -> Self {
@@ -63,7 +63,7 @@ impl WriteActor {
     }
 
     /// Calculates if quorum has been achieved
-    fn has_quorum(&self) -> bool {
+    pub fn has_quorum(&self) -> bool {
         let required_quorum = (self.replication_factor as usize / 2) + 1;
         self.confirmed_partitions.len() >= required_quorum
     }
@@ -127,8 +127,8 @@ impl WriteActor {
     }
 
     /// Marks events as confirmed and broadcasts confirmation to replicas
-    async fn complete_write(&self) {
-        if let Some(ref result) = self.append_result {
+    pub async fn complete_write(mut self) {
+        if let Some(result) = self.append_result.take() {
             debug!(
                 transaction_id = %self.transaction_id,
                 partition_id = %self.partition_id,
@@ -140,7 +140,7 @@ impl WriteActor {
                 .database
                 .set_confirmations(
                     self.partition_id,
-                    result.offsets.clone(),
+                    result.offsets,
                     self.transaction_id,
                     self.confirmed_partitions.len() as u8,
                 )
@@ -251,9 +251,6 @@ impl Actor for WriteActor {
 
                     // Send success response to client with the cloned result
                     state.send_success(result_clone).await;
-
-                    // Mark events as confirmed
-                    state.complete_write().await;
                 }
             }
             Err(err) => {
@@ -325,9 +322,6 @@ impl Message<ReplicaConfirmation> for WriteActor {
                 if let Some(ref result) = self.append_result.clone() {
                     self.send_success(result.clone()).await;
                 }
-
-                // Mark events as confirmed
-                self.complete_write().await;
             }
 
             // Stop the actor only after all expected confirmations are received

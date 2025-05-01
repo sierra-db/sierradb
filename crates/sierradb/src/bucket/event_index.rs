@@ -177,7 +177,6 @@ impl OpenEventIndex {
 }
 
 pub struct ClosedEventIndex {
-    #[allow(unused)] // TODO: is this ID needed?
     id: BucketSegmentId,
     file: File,
     index: Cache<Arc<ArcSwap<ClosedIndex>>, Arc<ClosedIndex>>,

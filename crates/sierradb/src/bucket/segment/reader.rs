@@ -11,6 +11,7 @@ use bincode::de::Decoder;
 use bincode::de::read::Reader;
 use bincode::error::DecodeError;
 use polonius_the_crab::{exit_polonius, polonius, polonius_return, polonius_try};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
@@ -552,7 +553,7 @@ impl Record {
 ///
 /// Each record contains both system metadata for efficient storage and
 /// retrieval, and domain-specific data in the payload and metadata fields.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventRecord {
     /// The byte offset location of this event in its storage segment file.
     /// Used for direct access to event data during reads.

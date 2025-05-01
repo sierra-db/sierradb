@@ -8,7 +8,7 @@ ahash = "0.8"
 arc-swap = "1.7.1"
 bincode = { workspace = true, features = ["serde"] }
 bloomfilter = "3.0.1"
-boomphf = { version = "0.6.0", features = ["serde"] }
+boomphf = { workspace = true, features = ["serde"] }
 crc32fast = "1.4.2"
 libc = "0.2.170"
 num_cpus = "1.16.0"
