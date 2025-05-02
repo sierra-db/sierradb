@@ -6,7 +6,7 @@ use sierradb::database::{Database, Transaction};
 use sierradb::writer_thread_pool::AppendResult;
 use tracing::{debug, warn};
 
-use crate::swarm::actor::{ReplyKind, Swarm};
+use crate::swarm::{ReplyKind, Swarm};
 use crate::write_actor::WriteActor;
 
 /// Actor responsible for managing writes to a specific partition.

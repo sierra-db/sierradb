@@ -43,29 +43,16 @@ pub enum Req {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Resp {
-    AppendEventsSuccess {
-        result: AppendResult,
-    },
-    AppendEventsFailure {
-        error: SwarmError,
-    },
-    ReplicateWriteSuccess {
-        transaction_id: Uuid,
+    AppendEvents(Result<AppendResult, SwarmError>),
+    ReplicateWrite {
         partition_id: PartitionId,
-    },
-    ReplicateWriteFailure {
         transaction_id: Uuid,
-        partition_id: PartitionId,
-        error: String,
+        result: Result<AppendResult, SwarmError>,
     },
-    ConfirmWriteSuccess {
-        transaction_id: Uuid,
+    ConfirmWrite {
         partition_id: PartitionId,
-    },
-    ConfirmWriteFailure {
         transaction_id: Uuid,
-        partition_id: PartitionId,
-        error: String,
+        result: Result<(), SwarmError>,
     },
     Read(Result<Option<EventRecord>, SwarmError>),
 }

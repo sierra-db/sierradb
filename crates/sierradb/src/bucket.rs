@@ -1,5 +1,6 @@
 use std::{fmt, str};
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -14,7 +15,7 @@ pub type PartitionKey = Uuid;
 pub type PartitionHash = u16;
 pub type PartitionId = u16;
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct BucketSegmentId {
     pub bucket_id: BucketId,
     pub segment_id: SegmentId,
@@ -52,10 +53,10 @@ pub enum SegmentKind {
 
 impl SegmentKind {
     pub const BUCKET_ID_LEN: usize = 5;
-    pub const SEGMENT_ID_LEN: usize = 10;
     pub const EXTENSION_LEN: usize = 4;
     pub const FILE_NAME_LEN: usize =
         Self::BUCKET_ID_LEN + "-".len() + Self::SEGMENT_ID_LEN + ".".len() + Self::EXTENSION_LEN;
+    pub const SEGMENT_ID_LEN: usize = 10;
 
     pub fn file_name(
         &self,
