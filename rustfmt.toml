@@ -3,4 +3,5 @@ style_edition = "2024"
 group_imports = "StdExternalCrate"
 hex_literal_case = "Upper"
 imports_granularity = "Module"
+reorder_impl_items = true
 wrap_comments = true

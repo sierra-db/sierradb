@@ -4,7 +4,7 @@ use clap::Parser;
 use kameo::Actor;
 use libp2p::identity::Keypair;
 use sierradb::database::DatabaseBuilder;
-use sierradb_cluster::swarm::actor::{ListenOn, Swarm, SwarmArgs};
+use sierradb_cluster::swarm::{ListenOn, Swarm, SwarmArgs};
 use sierradb_server::config::{AppConfig, Args};
 use sierradb_server::server::Server;
 use tracing::debug;

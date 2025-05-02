@@ -10,8 +10,9 @@ use sierradb::writer_thread_pool::AppendResult;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
+use crate::behaviour::Resp;
 use crate::error::SwarmError;
-use crate::swarm::actor::{ConfirmWrite, ReplicateWrite, ReplyKind, SendReplicaResponse, Swarm};
+use crate::swarm::{ConfirmWrite, ReplicateWrite, ReplyKind, SendResponse, Swarm};
 
 /// Handles a single write operation, coordinating the distributed consensus
 /// process.
@@ -87,9 +88,9 @@ impl WriteActor {
                     // Send response through libp2p response channel for remote clients
                     let _ = self
                         .swarm_ref
-                        .tell(SendReplicaResponse {
+                        .tell(SendResponse {
                             channel,
-                            result: Ok(result),
+                            response: Resp::AppendEvents(Ok(result)),
                         })
                         .await;
                 }
@@ -99,25 +100,25 @@ impl WriteActor {
     }
 
     /// Sends failure response to client
-    async fn send_failure(&mut self, error: SwarmError) {
+    async fn send_failure(&mut self, err: SwarmError) {
         if self.response_sent {
             return;
         }
 
-        error!(transaction_id = %self.transaction_id, ?error, "Sending failure response");
+        error!(transaction_id = %self.transaction_id, ?err, "Sending failure response");
 
         // Take ownership of the reply
         if let Some(reply) = self.reply.take() {
             match reply {
                 ReplyKind::Local(tx) => {
-                    let _ = tx.send(Err(error));
+                    let _ = tx.send(Err(err));
                 }
                 ReplyKind::Remote(channel) => {
                     let _ = self
                         .swarm_ref
-                        .tell(SendReplicaResponse {
+                        .tell(SendResponse {
                             channel,
-                            result: Err(error),
+                            response: Resp::AppendEvents(Err(err)),
                         })
                         .await;
                 }
@@ -279,7 +280,7 @@ impl Actor for WriteActor {
 pub struct ReplicaConfirmation {
     pub partition_id: PartitionId,
     pub transaction_id: Uuid,
-    pub success: bool,
+    pub result: Result<AppendResult, SwarmError>,
 }
 
 impl Message<ReplicaConfirmation> for WriteActor {
@@ -301,75 +302,73 @@ impl Message<ReplicaConfirmation> for WriteActor {
 
         debug!(
             transaction_id = %self.transaction_id,
-            partition_id = %msg.partition_id,
-            success = msg.success,
+            partition_id = msg.partition_id,
+            result = ?msg.result,
             "Received replica confirmation"
         );
 
-        if msg.success {
-            // Add partition to confirmed set
-            self.confirmed_partitions.insert(msg.partition_id);
+        match msg.result {
+            Ok(_) => {
+                self.confirmed_partitions.insert(msg.partition_id);
+                if self.has_quorum() && self.append_result.is_some() && !self.response_sent {
+                    debug!(
+                        transaction_id = %self.transaction_id,
+                        confirmed = self.confirmed_partitions.len(),
+                        "Quorum achieved"
+                    );
 
-            // Check if we've achieved quorum
-            if self.has_quorum() && self.append_result.is_some() && !self.response_sent {
-                debug!(
-                    transaction_id = %self.transaction_id,
-                    confirmed = self.confirmed_partitions.len(),
-                    "Quorum achieved"
-                );
+                    // Send success response to client with a clone of the result
+                    if let Some(ref result) = self.append_result.clone() {
+                        self.send_success(result.clone()).await;
+                    }
+                }
+                if self.confirmed_partitions.len() >= self.expected_confirmations {
+                    debug!(
+                        transaction_id = %self.transaction_id,
+                        "All expected partitions confirmed, stopping actor"
+                    );
 
-                // Send success response to client with a clone of the result
-                if let Some(ref result) = self.append_result.clone() {
-                    self.send_success(result.clone()).await;
+                    if ctx.actor_ref().stop_gracefully().now_or_never().is_none() {
+                        warn!("write actors mailbox is full, killing");
+                        ctx.actor_ref().kill();
+                    }
                 }
             }
-
-            // Stop the actor only after all expected confirmations are received
-            if self.confirmed_partitions.len() >= self.expected_confirmations {
-                debug!(
+            Err(_) => {
+                // A replica failed to process the write
+                // For now, we'll just log it and continue
+                // In a more advanced implementation, we might adjust the quorum calculation
+                warn!(
                     transaction_id = %self.transaction_id,
-                    "All expected partitions confirmed, stopping actor"
+                    partition_id = %msg.partition_id,
+                    "Replica failed to process write"
                 );
 
-                if ctx.actor_ref().stop_gracefully().now_or_never().is_none() {
-                    warn!("write actors mailbox is full, killing");
-                    ctx.actor_ref().kill();
-                }
-            }
-        } else {
-            // A replica failed to process the write
-            // For now, we'll just log it and continue
-            // In a more advanced implementation, we might adjust the quorum calculation
-            warn!(
-                transaction_id = %self.transaction_id,
-                partition_id = %msg.partition_id,
-                "Replica failed to process write"
-            );
+                // Check if we can still achieve quorum
+                let required_quorum = (self.replication_factor as usize / 2) + 1;
+                let max_possible = self.confirmed_partitions.len() + self.replica_partitions.len()
+                    - self.confirmed_partitions.len();
 
-            // Check if we can still achieve quorum
-            let required_quorum = (self.replication_factor as usize / 2) + 1;
-            let max_possible = self.confirmed_partitions.len() + self.replica_partitions.len()
-                - self.confirmed_partitions.len();
+                if max_possible < required_quorum {
+                    error!(
+                        transaction_id = %self.transaction_id,
+                        confirmed = self.confirmed_partitions.len(),
+                        required = required_quorum,
+                        "Cannot achieve quorum"
+                    );
 
-            if max_possible < required_quorum {
-                error!(
-                    transaction_id = %self.transaction_id,
-                    confirmed = self.confirmed_partitions.len(),
-                    required = required_quorum,
-                    "Cannot achieve quorum"
-                );
+                    // Send failure response
+                    self.send_failure(SwarmError::QuorumNotAchieved {
+                        confirmed: self.confirmed_partitions.len() as u8,
+                        required: required_quorum as u8,
+                    })
+                    .await;
 
-                // Send failure response
-                self.send_failure(SwarmError::QuorumNotAchieved {
-                    confirmed: self.confirmed_partitions.len() as u8,
-                    required: required_quorum as u8,
-                })
-                .await;
-
-                let self_ref = ctx.actor_ref();
-                if self_ref.stop_gracefully().now_or_never().is_none() {
-                    warn!("write actors mailbox is full, killing");
-                    self_ref.kill();
+                    let self_ref = ctx.actor_ref();
+                    if self_ref.stop_gracefully().now_or_never().is_none() {
+                        warn!("write actors mailbox is full, killing");
+                        self_ref.kill();
+                    }
                 }
             }
         }
@@ -389,7 +388,7 @@ impl Message<TimeoutMessage> for WriteActor {
         // Only stop if we haven't already
         if !self.response_sent {
             // If timeout occurs before quorum, send failure to client
-            self.send_failure(SwarmError::Timeout).await;
+            self.send_failure(SwarmError::WriteTimeout).await;
         }
 
         // Stop the actor

@@ -1,38 +1,30 @@
-use std::{
-    collections::{HashMap, HashSet},
-    iter,
-};
+use std::collections::{HashMap, HashSet};
+use std::iter;
 
 use arrayvec::ArrayVec;
 use kameo::actor::ActorRef;
-use libp2p::{
-    PeerId,
-    request_response::{self, OutboundFailure, OutboundRequestId, ResponseChannel},
-};
-use sierradb::{
-    MAX_REPLICATION_FACTOR,
-    bucket::{PartitionId, segment::CommittedEvents},
-    database::{Database, Transaction},
-    error::{ReadError, WriteError},
-    id::uuid_to_partition_hash,
-    writer_thread_pool::AppendResult,
-};
+use libp2p::PeerId;
+use libp2p::request_response::{self, OutboundFailure, OutboundRequestId, ResponseChannel};
+use sierradb::MAX_REPLICATION_FACTOR;
+use sierradb::bucket::PartitionId;
+use sierradb::bucket::segment::CommittedEvents;
+use sierradb::database::{Database, Transaction};
+use sierradb::error::{ReadError, WriteError};
+use sierradb::id::uuid_to_partition_hash;
+use sierradb::writer_thread_pool::AppendResult;
 use smallvec::{SmallVec, smallvec};
 use thiserror::Error;
 use tokio::sync::oneshot;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
-use crate::{
-    behaviour::{Req, Resp, WriteRequestMetadata},
-    error::SwarmError,
-    partition_actor::{LeaderWriteRequest, PartitionActor},
-    partition_consensus::PartitionManager,
-    swarm::actor::{SendAppendResponse, Swarm},
-    write_actor::{ReplicaConfirmation, WriteActor},
-};
-
-use super::actor::{ReplyKind, SendConfirmTransactionResponse};
+use super::ReplyKind;
+use crate::behaviour::{Req, Resp, WriteRequestMetadata};
+use crate::error::SwarmError;
+use crate::partition_actor::{LeaderWriteRequest, PartitionActor};
+use crate::partition_consensus::PartitionManager;
+use crate::swarm::{SendResponse, Swarm};
+use crate::write_actor::{ReplicaConfirmation, WriteActor};
 
 /// Maximum number of request forwards allowed to prevent loops
 const MAX_FORWARDS: u8 = 3;
@@ -122,7 +114,7 @@ impl WriteManager {
                 ReplyKind::Remote(channel),
             ),
             Err(err) => {
-                let _ = req_resp.send_response(channel, Resp::AppendEventsFailure { error: err });
+                let _ = req_resp.send_response(channel, Resp::AppendEvents(Err(err)));
             }
         }
     }
@@ -178,12 +170,11 @@ impl WriteManager {
         tokio::spawn(async move {
             // Replicate the write to our local database
             let result = database.append_events(partition_id, transaction).await;
-            let success = result.is_ok();
 
             debug!(
                 %transaction_id,
                 partition_id,
-                success,
+                ?result,
                 "Local replication result"
             );
 
@@ -196,7 +187,7 @@ impl WriteManager {
                 .tell(ReplicaConfirmation {
                     partition_id,
                     transaction_id,
-                    success,
+                    result: result.map_err(|err| SwarmError::Write(err.to_string())),
                 })
                 .await;
         });
@@ -251,6 +242,7 @@ impl WriteManager {
                 transaction_id,
                 partition_id,
                 write_actor_ref,
+                SwarmError::NoAvailableLeaders,
             );
         }
     }
@@ -276,13 +268,18 @@ impl WriteManager {
 
         tokio::spawn(async move {
             // Process the replication locally
-            let result = database.append_events(partition_id, transaction).await;
+            let result = database
+                .append_events(partition_id, transaction)
+                .await
+                .map_err(|err| SwarmError::Write(err.to_string()));
             let _ = swarm_ref
-                .tell(SendAppendResponse {
+                .tell(SendResponse {
                     channel,
-                    partition_id,
-                    transaction_id,
-                    result,
+                    response: Resp::ReplicateWrite {
+                        partition_id,
+                        transaction_id,
+                        result,
+                    },
                 })
                 .await;
         });
@@ -293,7 +290,7 @@ impl WriteManager {
         &mut self,
         transaction_id: Uuid,
         partition_id: PartitionId,
-        success: bool,
+        result: Result<AppendResult, SwarmError>,
     ) {
         if let Some(write_actor_ref) = self
             .pending_replications
@@ -302,7 +299,7 @@ impl WriteManager {
             self.send_replication_confirmation(
                 transaction_id,
                 partition_id,
-                success,
+                result,
                 write_actor_ref,
             );
         }
@@ -361,11 +358,13 @@ impl WriteManager {
             }
 
             let _ = swarm_ref
-                .tell(SendConfirmTransactionResponse {
+                .tell(SendResponse {
                     channel,
-                    partition_id,
-                    transaction_id,
-                    result,
+                    response: Resp::ConfirmWrite {
+                        partition_id,
+                        transaction_id,
+                        result: result.map_err(|err| SwarmError::Write(err.to_string())),
+                    },
                 })
                 .await;
         });
@@ -399,13 +398,14 @@ impl WriteManager {
         transaction_id: Uuid,
         partition_id: PartitionId,
         write_actor_ref: ActorRef<WriteActor>,
+        err: SwarmError,
     ) {
         tokio::spawn(async move {
             let _ = write_actor_ref
                 .tell(ReplicaConfirmation {
                     partition_id,
                     transaction_id,
-                    success: false,
+                    result: Err(err),
                 })
                 .await;
         });
@@ -416,7 +416,7 @@ impl WriteManager {
         &self,
         transaction_id: Uuid,
         partition_id: PartitionId,
-        success: bool,
+        result: Result<AppendResult, SwarmError>,
         write_actor_ref: ActorRef<WriteActor>,
     ) {
         tokio::spawn(async move {
@@ -424,7 +424,7 @@ impl WriteManager {
                 .tell(ReplicaConfirmation {
                     partition_id,
                     transaction_id,
-                    success,
+                    result,
                 })
                 .await;
         });
@@ -599,11 +599,9 @@ impl WriteManager {
                 // For simplicity, respond that they should try again with the correct leader
                 let _ = req_resp.send_response(
                     channel,
-                    Resp::AppendEventsFailure {
-                        error: SwarmError::WrongLeaderNode {
-                            correct_leader: peer_id,
-                        },
-                    },
+                    Resp::AppendEvents(Err(SwarmError::WrongLeaderNode {
+                        correct_leader: peer_id,
+                    })),
                 );
             }
         }

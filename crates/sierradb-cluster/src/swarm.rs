@@ -1,3 +1,5 @@
+mod write_manager;
+
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::time::Duration;
@@ -5,36 +7,25 @@ use std::time::Duration;
 use futures::StreamExt;
 use kameo::mailbox::{MailboxReceiver, Signal};
 use kameo::prelude::*;
-use libp2p::request_response::OutboundRequestId;
-use libp2p::{
-    Multiaddr, StreamProtocol, TransportError,
-    core::transport::ListenerId,
-    gossipsub,
-    identity::Keypair,
-    mdns,
-    request_response::{self, ProtocolSupport, ResponseChannel},
-    swarm::SwarmEvent,
-};
-use sierradb::{
-    bucket::PartitionId,
-    database::{Database, Transaction},
-    error::WriteError,
-    writer_thread_pool::AppendResult,
-};
+use libp2p::core::transport::ListenerId;
+use libp2p::identity::Keypair;
+use libp2p::request_response::{self, OutboundRequestId, ProtocolSupport, ResponseChannel};
+use libp2p::swarm::SwarmEvent;
+use libp2p::{Multiaddr, StreamProtocol, TransportError, gossipsub, mdns};
+use sierradb::bucket::PartitionId;
+use sierradb::database::{Database, Transaction};
+use sierradb::writer_thread_pool::AppendResult;
 use smallvec::SmallVec;
 use tokio::sync::oneshot;
 use tracing::{debug, error, trace};
 use uuid::Uuid;
 
-use crate::{
-    behaviour::{Behaviour, BehaviourEvent, Req, Resp},
-    error::SwarmError,
-    partition_actor::PartitionActor,
-    partition_consensus::{self, PartitionManager},
-    write_actor::WriteActor,
-};
-
-use super::write_manager::{ConfirmTransactionError, WriteManager};
+use self::write_manager::WriteManager;
+use crate::behaviour::{Behaviour, BehaviourEvent, Req, Resp};
+use crate::error::SwarmError;
+use crate::partition_actor::PartitionActor;
+use crate::partition_consensus::{self, PartitionManager};
+use crate::write_actor::WriteActor;
 
 /// Manages the peer-to-peer network communication for distributed database
 /// operations
@@ -75,18 +66,121 @@ impl Swarm {
         &self.swarm.behaviour().partition_ownership.partition_manager
     }
 
-    /// Sends a response through the libp2p response channel
-    fn send_response<T>(&mut self, channel: ResponseChannel<Resp>, response: Resp, context: T)
-    where
-        T: std::fmt::Debug,
-    {
-        if let Err(err) = self
-            .swarm
-            .behaviour_mut()
-            .req_resp
-            .send_response(channel, response)
-        {
-            error!(?err, ?context, "Failed to send response");
+    /// Handles a request/response event from the network
+    async fn handle_req_resp_event(&mut self, event: request_response::Event<Req, Resp>) {
+        match event {
+            request_response::Event::Message { message, .. } => match message {
+                request_response::Message::Request {
+                    request, channel, ..
+                } => {
+                    self.handle_network_request(request, channel).await;
+                }
+                request_response::Message::Response {
+                    request_id,
+                    response,
+                } => {
+                    self.handle_network_response(request_id, response);
+                }
+            },
+            request_response::Event::OutboundFailure {
+                request_id, error, ..
+            } => {
+                self.write_manager
+                    .process_outbound_failure(&request_id, error);
+            }
+            _ => {}
+        }
+    }
+
+    /// Handles incoming network requests
+    async fn handle_network_request(&mut self, request: Req, channel: ResponseChannel<Resp>) {
+        let behaviour = self.swarm.behaviour_mut();
+
+        match request {
+            Req::AppendEvents {
+                transaction,
+                metadata,
+            } => {
+                debug!("Received append request from network");
+                self.write_manager.process_network_write(
+                    &behaviour.partition_ownership.partition_manager,
+                    &mut behaviour.req_resp,
+                    channel,
+                    transaction,
+                    metadata,
+                );
+            }
+            Req::ReplicateWrite {
+                partition_id,
+                transaction,
+                transaction_id,
+                origin_partition: _,
+                origin_peer,
+            } => {
+                debug!(%transaction_id, partition_id, "Received replication request from network");
+                self.write_manager.process_network_replication(
+                    channel,
+                    partition_id,
+                    transaction,
+                    transaction_id,
+                    origin_peer,
+                );
+            }
+            Req::ConfirmWrite {
+                partition_id,
+                transaction_id,
+                event_ids,
+                confirmation_count,
+            } => {
+                debug!(%transaction_id, partition_id, "Received confirm write request from network");
+                self.write_manager.process_network_commit(
+                    channel,
+                    partition_id,
+                    transaction_id,
+                    event_ids,
+                    confirmation_count,
+                );
+            }
+        }
+    }
+
+    /// Handles responses received from the network
+    fn handle_network_response(&mut self, request_id: OutboundRequestId, response: Resp) {
+        match response {
+            Resp::AppendEvents(result) => {
+                debug!(?result, "Received append response");
+                self.write_manager
+                    .process_append_result(&request_id, result);
+            }
+            Resp::ReplicateWrite {
+                transaction_id,
+                partition_id,
+                result,
+            } => {
+                debug!(%transaction_id, ?result, "Received replication response");
+                self.write_manager.process_replication_response(
+                    transaction_id,
+                    partition_id,
+                    result,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// Handles mDNS discovery events
+    fn handle_mdns_event(&mut self, event: mdns::Event) {
+        match event {
+            mdns::Event::Discovered(peers) => {
+                for (peer_id, _) in peers {
+                    debug!(%peer_id, "Discovered peer via mDNS");
+                    self.swarm
+                        .behaviour_mut()
+                        .partition_ownership
+                        .add_explicit_peer(peer_id);
+                }
+            }
+            mdns::Event::Expired(_) => {}
         }
     }
 }
@@ -236,24 +330,6 @@ impl Message<ListenOn> for Swarm {
     }
 }
 
-impl Message<Transaction> for Swarm {
-    type Reply = oneshot::Receiver<Result<AppendResult, SwarmError>>;
-
-    async fn handle(
-        &mut self,
-        transaction: Transaction,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        debug!("Processing local transaction");
-        let behaviour = self.swarm.behaviour_mut();
-        self.write_manager.process_local_write(
-            &behaviour.partition_ownership.partition_manager,
-            &mut behaviour.req_resp,
-            transaction,
-        )
-    }
-}
-
 impl Message<SwarmEvent<BehaviourEvent>> for Swarm {
     type Reply = ();
 
@@ -274,136 +350,22 @@ impl Message<SwarmEvent<BehaviourEvent>> for Swarm {
     }
 }
 
-impl Swarm {
-    /// Handles a request/response event from the network
-    async fn handle_req_resp_event(&mut self, event: request_response::Event<Req, Resp>) {
-        match event {
-            request_response::Event::Message { message, .. } => match message {
-                request_response::Message::Request {
-                    request, channel, ..
-                } => {
-                    self.handle_network_request(request, channel).await;
-                }
-                request_response::Message::Response {
-                    request_id,
-                    response,
-                } => {
-                    self.handle_network_response(request_id, response);
-                }
-            },
-            request_response::Event::OutboundFailure {
-                request_id, error, ..
-            } => {
-                self.write_manager
-                    .process_outbound_failure(&request_id, error);
-            }
-            _ => {}
-        }
-    }
+/// Initiates a write
+impl Message<Transaction> for Swarm {
+    type Reply = oneshot::Receiver<Result<AppendResult, SwarmError>>;
 
-    /// Handles incoming network requests
-    async fn handle_network_request(&mut self, request: Req, channel: ResponseChannel<Resp>) {
+    async fn handle(
+        &mut self,
+        transaction: Transaction,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        debug!("Processing local transaction");
         let behaviour = self.swarm.behaviour_mut();
-
-        match request {
-            Req::AppendEvents {
-                transaction,
-                metadata,
-            } => {
-                debug!("Received append request from network");
-                self.write_manager.process_network_write(
-                    &behaviour.partition_ownership.partition_manager,
-                    &mut behaviour.req_resp,
-                    channel,
-                    transaction,
-                    metadata,
-                );
-            }
-            Req::ReplicateWrite {
-                partition_id,
-                transaction,
-                transaction_id,
-                origin_partition: _,
-                origin_peer,
-            } => {
-                debug!(%transaction_id, partition_id, "Received replication request from network");
-                self.write_manager.process_network_replication(
-                    channel,
-                    partition_id,
-                    transaction,
-                    transaction_id,
-                    origin_peer,
-                );
-            }
-            Req::ConfirmWrite {
-                partition_id,
-                transaction_id,
-                event_ids,
-                confirmation_count,
-            } => {
-                debug!(%transaction_id, partition_id, "Received confirm write request from network");
-                self.write_manager.process_network_commit(
-                    channel,
-                    partition_id,
-                    transaction_id,
-                    event_ids,
-                    confirmation_count,
-                );
-            }
-        }
-    }
-
-    /// Handles responses received from the network
-    fn handle_network_response(&mut self, request_id: OutboundRequestId, response: Resp) {
-        match response {
-            Resp::AppendEventsSuccess { result } => {
-                debug!("Received successful append response");
-                self.write_manager
-                    .process_append_result(&request_id, Ok(result));
-            }
-            Resp::AppendEventsFailure { error } => {
-                debug!(?error, "Received failed append response");
-                self.write_manager
-                    .process_append_result(&request_id, Err(error));
-            }
-            Resp::ReplicateWriteSuccess {
-                transaction_id,
-                partition_id,
-            } => {
-                debug!(%transaction_id, "Received successful replication response");
-                self.write_manager
-                    .process_replication_response(transaction_id, partition_id, true);
-            }
-            Resp::ReplicateWriteFailure {
-                transaction_id,
-                partition_id,
-                ..
-            } => {
-                debug!(%transaction_id, "Received failed replication response");
-                self.write_manager.process_replication_response(
-                    transaction_id,
-                    partition_id,
-                    false,
-                );
-            }
-            _ => {}
-        }
-    }
-
-    /// Handles mDNS discovery events
-    fn handle_mdns_event(&mut self, event: mdns::Event) {
-        match event {
-            mdns::Event::Discovered(peers) => {
-                for (peer_id, _) in peers {
-                    debug!(%peer_id, "Discovered peer via mDNS");
-                    self.swarm
-                        .behaviour_mut()
-                        .partition_ownership
-                        .add_explicit_peer(peer_id);
-                }
-            }
-            mdns::Event::Expired(_) => {}
-        }
+        self.write_manager.process_local_write(
+            &behaviour.partition_ownership.partition_manager,
+            &mut behaviour.req_resp,
+            transaction,
+        )
     }
 }
 
@@ -490,131 +452,6 @@ impl Message<ConfirmWrite> for Swarm {
             event_ids,
             confirmation_count,
         );
-    }
-}
-
-/// Message to send an append response through the network
-pub struct SendAppendResponse {
-    pub channel: ResponseChannel<Resp>,
-    pub partition_id: PartitionId,
-    pub transaction_id: Uuid,
-    pub result: Result<AppendResult, WriteError>,
-}
-
-impl Message<SendAppendResponse> for Swarm {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        SendAppendResponse {
-            channel,
-            partition_id,
-            transaction_id,
-            result,
-        }: SendAppendResponse,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        let context = format!(
-            "transaction_id={} partition_id={}",
-            transaction_id, partition_id
-        );
-
-        let resp = if result.is_ok() {
-            debug!(%transaction_id, partition_id, "Sending successful replication response");
-            Resp::ReplicateWriteSuccess {
-                transaction_id,
-                partition_id,
-            }
-        } else {
-            debug!(%transaction_id, partition_id, "Sending failed replication response");
-            Resp::ReplicateWriteFailure {
-                transaction_id,
-                partition_id,
-                error: "Failed to replicate write".into(),
-            }
-        };
-
-        self.send_response(channel, resp, context);
-    }
-}
-
-/// Message to send a replica response to a request
-pub struct SendReplicaResponse {
-    pub channel: ResponseChannel<Resp>,
-    pub result: Result<AppendResult, SwarmError>,
-}
-
-impl Message<SendReplicaResponse> for Swarm {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        SendReplicaResponse { channel, result }: SendReplicaResponse,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        let context = "replica_response";
-
-        // Prepare response based on result
-        let resp = match result {
-            Ok(result) => {
-                debug!("Sending successful append response");
-                Resp::AppendEventsSuccess { result }
-            }
-            Err(error) => {
-                debug!(?error, "Sending failed append response");
-                Resp::AppendEventsFailure { error }
-            }
-        };
-
-        self.send_response(channel, resp, context);
-    }
-}
-
-/// Message to send a transaction confirmation response
-pub struct SendConfirmTransactionResponse {
-    pub channel: ResponseChannel<Resp>,
-    pub partition_id: PartitionId,
-    pub transaction_id: Uuid,
-    pub result: Result<(), ConfirmTransactionError>,
-}
-
-impl Message<SendConfirmTransactionResponse> for Swarm {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        SendConfirmTransactionResponse {
-            channel,
-            partition_id,
-            transaction_id,
-            result,
-        }: SendConfirmTransactionResponse,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        let context = format!(
-            "transaction_id={} partition_id={}",
-            transaction_id, partition_id
-        );
-
-        let resp = match result {
-            Ok(()) => {
-                debug!(%transaction_id, partition_id, "Sending successful confirmation response");
-                Resp::ConfirmWriteSuccess {
-                    transaction_id,
-                    partition_id,
-                }
-            }
-            Err(err) => {
-                debug!(%transaction_id, partition_id, ?err, "Sending failed confirmation response");
-                Resp::ConfirmWriteFailure {
-                    transaction_id,
-                    partition_id,
-                    error: err.to_string(),
-                }
-            }
-        };
-
-        self.send_response(channel, resp, context);
     }
 }
 
