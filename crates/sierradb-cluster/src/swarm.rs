@@ -1,6 +1,6 @@
 mod write_manager;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io;
 use std::time::Duration;
 
@@ -23,7 +23,6 @@ use uuid::Uuid;
 use self::write_manager::WriteManager;
 use crate::behaviour::{Behaviour, BehaviourEvent, Req, Resp};
 use crate::error::SwarmError;
-use crate::partition_actor::PartitionActor;
 use crate::partition_consensus::{self, PartitionManager};
 use crate::write_actor::WriteActor;
 
@@ -262,29 +261,8 @@ impl Actor for Swarm {
             })?
             .build();
 
-        // Create actors for each assigned partition
-        let partition_actors: HashMap<_, _> = swarm
-            .behaviour()
-            .partition_ownership
-            .partition_manager
-            .assigned_partitions
-            .iter()
-            .copied()
-            .map(|partition_id| {
-                (
-                    partition_id,
-                    PartitionActor::spawn(PartitionActor::new(
-                        actor_ref.clone(),
-                        database.clone(),
-                        partition_id,
-                    )),
-                )
-            })
-            .collect();
-
         // Create write manager to handle distributed writes
-        let write_manager =
-            WriteManager::new(actor_ref.clone(), database, local_peer_id, partition_actors);
+        let write_manager = WriteManager::new(actor_ref.clone(), database, local_peer_id);
 
         Ok(Swarm {
             swarm,
