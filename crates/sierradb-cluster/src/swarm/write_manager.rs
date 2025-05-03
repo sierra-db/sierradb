@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::iter;
 
 use arrayvec::ArrayVec;
+use kameo::Actor;
 use kameo::actor::ActorRef;
 use libp2p::PeerId;
 use libp2p::request_response::{self, OutboundFailure, OutboundRequestId, ResponseChannel};
@@ -21,7 +22,6 @@ use uuid::Uuid;
 use super::ReplyKind;
 use crate::behaviour::{Req, Resp, WriteRequestMetadata};
 use crate::error::SwarmError;
-use crate::partition_actor::{LeaderWriteRequest, PartitionActor};
 use crate::partition_consensus::PartitionManager;
 use crate::swarm::{SendResponse, Swarm};
 use crate::write_actor::{ReplicaConfirmation, WriteActor};
@@ -34,7 +34,6 @@ pub struct WriteManager {
     swarm_ref: ActorRef<Swarm>,
     database: Database,
     local_peer_id: PeerId,
-    partition_actors: HashMap<u16, ActorRef<PartitionActor>>,
     forwarded_appends:
         HashMap<OutboundRequestId, oneshot::Sender<Result<AppendResult, SwarmError>>>,
     pending_replications: HashMap<(Uuid, PartitionId), ActorRef<WriteActor>>,
@@ -42,17 +41,11 @@ pub struct WriteManager {
 
 impl WriteManager {
     /// Creates a new WriteManager
-    pub fn new(
-        swarm_ref: ActorRef<Swarm>,
-        database: Database,
-        local_peer_id: PeerId,
-        partition_actors: HashMap<u16, ActorRef<PartitionActor>>,
-    ) -> Self {
+    pub fn new(swarm_ref: ActorRef<Swarm>, database: Database, local_peer_id: PeerId) -> Self {
         WriteManager {
             swarm_ref,
             database,
             local_peer_id,
-            partition_actors,
             forwarded_appends: HashMap::new(),
             pending_replications: HashMap::new(),
         }
@@ -170,13 +163,6 @@ impl WriteManager {
         tokio::spawn(async move {
             // Replicate the write to our local database
             let result = database.append_events(partition_id, transaction).await;
-
-            debug!(
-                %transaction_id,
-                partition_id,
-                ?result,
-                "Local replication result"
-            );
 
             if let Err(err) = &result {
                 error!(%transaction_id, partition_id, ?err, "Local replication failed with error");
@@ -464,15 +450,6 @@ impl WriteManager {
         if partition_manager.has_partition(primary_partition_id)
             && primary_peer_id == self.local_peer_id
         {
-            // We are the leader - get the partition actor
-            let partition_actor_ref = self
-                .partition_actors
-                .get(&primary_partition_id)
-                .ok_or(SwarmError::PartitionActorNotFound {
-                    partition_id: primary_partition_id,
-                })?
-                .clone();
-
             // Extract replica partitions from the partitions list
             // Skip the first partition (primary) and only include partitions we're not the
             // leader for
@@ -483,7 +460,7 @@ impl WriteManager {
                 .collect::<Vec<_>>();
 
             Ok(WriteDestination::Local {
-                partition_actor_ref,
+                primary_partition_id,
                 replica_partitions,
             })
         } else {
@@ -506,20 +483,20 @@ impl WriteManager {
     ) {
         match destination {
             WriteDestination::Local {
-                partition_actor_ref,
+                primary_partition_id,
                 replica_partitions,
             } => {
-                // Process locally as the leader
-                let leader_request = LeaderWriteRequest {
+                let write_actor = WriteActor::new(
+                    self.swarm_ref.clone(),
+                    self.database.clone(),
+                    primary_partition_id,
                     transaction,
                     reply,
                     replica_partitions,
-                    replication_factor: partition_manager.replication_factor,
-                };
+                    partition_manager.replication_factor,
+                );
 
-                tokio::spawn(async move {
-                    let _ = partition_actor_ref.tell(leader_request).await;
-                });
+                WriteActor::spawn(write_actor);
             }
             WriteDestination::Remote {
                 primary_peer_id,
@@ -625,7 +602,7 @@ impl WriteManager {
 enum WriteDestination {
     /// Process locally as the leader
     Local {
-        partition_actor_ref: ActorRef<PartitionActor>,
+        primary_partition_id: PartitionId,
         replica_partitions: Vec<PartitionId>,
     },
     /// Forward to a remote leader

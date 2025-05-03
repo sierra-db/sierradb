@@ -1,6 +1,5 @@
 pub mod behaviour;
 pub mod error;
-pub mod partition_actor;
 pub mod partition_consensus;
 pub mod swarm;
 pub mod write_actor;

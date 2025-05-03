@@ -1,18 +1,23 @@
 use std::collections::HashSet;
+use std::pin::Pin;
 use std::time::Duration;
 
 use futures::FutureExt;
 use kameo::error::Infallible;
+use kameo::mailbox::Signal;
 use kameo::prelude::*;
 use sierradb::bucket::PartitionId;
 use sierradb::database::{Database, Transaction};
 use sierradb::writer_thread_pool::AppendResult;
+use tokio::time::Sleep;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use crate::behaviour::Resp;
 use crate::error::SwarmError;
 use crate::swarm::{ConfirmWrite, ReplicateWrite, ReplyKind, SendResponse, Swarm};
+
+const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Handles a single write operation, coordinating the distributed consensus
 /// process.
@@ -24,14 +29,12 @@ pub struct WriteActor {
     transaction: Transaction,
     reply: Option<ReplyKind<AppendResult>>,
     replica_partitions: Vec<PartitionId>,
+    timeout: Pin<Box<Sleep>>,
 
     // State that tracks the progress of the write operation
     append_result: Option<AppendResult>,
     confirmed_partitions: HashSet<PartitionId>,
     replication_factor: u8,
-    // Track whether we've already sent the success response to avoid duplicate responses
-    response_sent: bool,
-    expected_confirmations: usize,
 }
 
 impl WriteActor {
@@ -40,26 +43,23 @@ impl WriteActor {
         swarm_ref: ActorRef<Swarm>,
         database: Database,
         partition_id: PartitionId,
-        transaction_id: Uuid,
         transaction: Transaction,
         reply: ReplyKind<AppendResult>,
         replica_partitions: Vec<PartitionId>,
         replication_factor: u8,
     ) -> Self {
-        let expected_confirmations = 1 + replica_partitions.len();
         Self {
             swarm_ref,
             database,
             partition_id,
-            transaction_id,
+            transaction_id: transaction.transaction_id(),
             transaction,
             reply: Some(reply),
             replica_partitions,
+            timeout: Box::pin(tokio::time::sleep(TIMEOUT)),
             append_result: None,
             confirmed_partitions: HashSet::from([partition_id]), // Primary partition auto-confirmed
             replication_factor,
-            response_sent: false,
-            expected_confirmations,
         }
     }
 
@@ -71,10 +71,6 @@ impl WriteActor {
 
     /// Sends success response to client
     async fn send_success(&mut self, result: AppendResult) {
-        if self.response_sent {
-            return;
-        }
-
         debug!(transaction_id = %self.transaction_id, "Sending success response");
 
         // Take ownership of the reply
@@ -95,16 +91,11 @@ impl WriteActor {
                         .await;
                 }
             }
-            self.response_sent = true;
         }
     }
 
     /// Sends failure response to client
     async fn send_failure(&mut self, err: SwarmError) {
-        if self.response_sent {
-            return;
-        }
-
         error!(transaction_id = %self.transaction_id, ?err, "Sending failure response");
 
         // Take ownership of the reply
@@ -123,7 +114,6 @@ impl WriteActor {
                         .await;
                 }
             }
-            self.response_sent = true;
         }
     }
 
@@ -196,12 +186,6 @@ impl Actor for WriteActor {
     ) -> Result<Self, Self::Error> {
         debug!(transaction_id = %state.transaction_id, "Beginning write operation");
 
-        let actor_ref_clone = actor_ref.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            let _ = actor_ref_clone.tell(TimeoutMessage).await;
-        });
-
         // PHASE 1: LOCAL WRITE
         // Write events locally and assign versions
         match state
@@ -215,10 +199,6 @@ impl Actor for WriteActor {
                     partition_id = %state.partition_id,
                     "Local write successful"
                 );
-
-                // Store the result for later use and create a clone for sending
-                let result_clone = result.clone();
-                state.append_result = Some(result);
 
                 // PHASE 2: REPLICATION
                 // Begin replication to replica partitions
@@ -250,8 +230,16 @@ impl Actor for WriteActor {
                         "Quorum already achieved"
                     );
 
-                    // Send success response to client with the cloned result
-                    state.send_success(result_clone).await;
+                    // Send success response to client with the result
+                    state.send_success(result).await;
+
+                    if actor_ref.stop_gracefully().now_or_never().is_none() {
+                        warn!("write actors mailbox is full, killing");
+                        actor_ref.kill();
+                    }
+                } else {
+                    // Store the result for later use for sending
+                    state.append_result = Some(result);
                 }
             }
             Err(err) => {
@@ -273,6 +261,21 @@ impl Actor for WriteActor {
         }
 
         Ok(state)
+    }
+
+    async fn next(
+        &mut self,
+        _actor_ref: WeakActorRef<Self>,
+        mailbox_rx: &mut MailboxReceiver<Self>,
+    ) -> Option<Signal<Self>> {
+        tokio::select! {
+            biased;
+            _ = &mut self.timeout => {
+                self.send_failure(SwarmError::WriteTimeout).await;
+                None // Stop the actor when the timeout has been reached
+            },
+            msg = mailbox_rx.recv() => msg,
+        }
     }
 }
 
@@ -310,23 +313,17 @@ impl Message<ReplicaConfirmation> for WriteActor {
         match msg.result {
             Ok(_) => {
                 self.confirmed_partitions.insert(msg.partition_id);
-                if self.has_quorum() && self.append_result.is_some() && !self.response_sent {
+                if self.has_quorum() && self.append_result.is_some() {
                     debug!(
                         transaction_id = %self.transaction_id,
                         confirmed = self.confirmed_partitions.len(),
                         "Quorum achieved"
                     );
 
-                    // Send success response to client with a clone of the result
-                    if let Some(ref result) = self.append_result.clone() {
-                        self.send_success(result.clone()).await;
+                    // Send success response to client with the result
+                    if let Some(result) = self.append_result.take() {
+                        self.send_success(result).await;
                     }
-                }
-                if self.confirmed_partitions.len() >= self.expected_confirmations {
-                    debug!(
-                        transaction_id = %self.transaction_id,
-                        "All expected partitions confirmed, stopping actor"
-                    );
 
                     if ctx.actor_ref().stop_gracefully().now_or_never().is_none() {
                         warn!("write actors mailbox is full, killing");
@@ -371,30 +368,6 @@ impl Message<ReplicaConfirmation> for WriteActor {
                     }
                 }
             }
-        }
-    }
-}
-
-struct TimeoutMessage;
-
-impl Message<TimeoutMessage> for WriteActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        _: TimeoutMessage,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        // Only stop if we haven't already
-        if !self.response_sent {
-            // If timeout occurs before quorum, send failure to client
-            self.send_failure(SwarmError::WriteTimeout).await;
-        }
-
-        // Stop the actor
-        if ctx.actor_ref().stop_gracefully().now_or_never().is_none() {
-            warn!("write actors mailbox is full, killing");
-            ctx.actor_ref().kill();
         }
     }
 }
