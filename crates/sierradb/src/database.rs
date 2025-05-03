@@ -22,9 +22,7 @@ use crate::bucket::segment::{BucketSegmentReader, CommittedEvents, EventRecord};
 use crate::bucket::stream_index::{
     ClosedStreamIndex, EventStreamIter, StreamIndexRecord, StreamOffsets,
 };
-use crate::bucket::{
-    BucketId, BucketSegmentId, PartitionHash, PartitionId, SegmentId, SegmentKind,
-};
+use crate::bucket::{BucketId, BucketSegmentId, PartitionHash, PartitionId, SegmentId};
 use crate::error::{
     DatabaseError, EventValidationError, PartitionIndexError, ReadError, StreamIndexError,
     ThreadPoolError, WriteError,
@@ -399,6 +397,11 @@ impl DatabaseBuilder {
 
         let dir = dir.into();
 
+        let buckets_dir = dir.join("buckets");
+        if !buckets_dir.exists() {
+            fs::create_dir_all(&buckets_dir)?;
+        }
+
         let _ = fs::create_dir_all(&dir);
         let thread_pool = Arc::new(create_thread_pool()?);
         let reader_pool = ReaderThreadPool::new(self.reader_threads as usize);
@@ -415,38 +418,77 @@ impl DatabaseBuilder {
 
         // Scan all previous segments and add to reader pool
         let mut segments: BTreeMap<BucketSegmentId, UnopenedFileSet> = BTreeMap::new();
-        for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
-            let file_name = entry.file_name();
-            let Some(file_name_str) = file_name.to_str() else {
-                continue;
-            };
 
-            let Some((bucket_segment_id, segment_kind)) =
-                SegmentKind::parse_file_name(file_name_str)
-            else {
-                continue;
-            };
-
-            if !self.bucket_ids.contains(&bucket_segment_id.bucket_id) {
-                debug!("ignoring unowned bucket {}", bucket_segment_id.bucket_id);
+        for bucket_entry in fs::read_dir(&buckets_dir)? {
+            let bucket_entry = bucket_entry?;
+            if !bucket_entry.file_type()?.is_dir() {
                 continue;
             }
 
-            let segment = segments.entry(bucket_segment_id).or_default();
+            // Extract bucket ID from directory name
+            let bucket_name = bucket_entry.file_name();
+            let Some(bucket_name_str) = bucket_name.to_str() else {
+                continue;
+            };
+            let Ok(bucket_id) = bucket_name_str.parse::<BucketId>() else {
+                continue;
+            };
 
-            match segment_kind {
-                SegmentKind::Events => {
-                    segment.events = Some(entry.path());
+            if !self.bucket_ids.contains(&bucket_id) {
+                debug!("ignoring unowned bucket {}", bucket_id);
+                continue;
+            }
+
+            // Access the 'segments' subdirectory within this bucket
+            let segments_dir = bucket_entry.path().join("segments");
+            let _ = fs::create_dir_all(&segments_dir);
+            if !segments_dir.exists() {
+                continue;
+            }
+
+            // Iterate through each segment directory
+            for segment_entry in fs::read_dir(&segments_dir)? {
+                let segment_entry = segment_entry?;
+                if !segment_entry.file_type()?.is_dir() {
+                    continue;
                 }
-                SegmentKind::EventIndex => {
-                    segment.event_index = Some(entry.path());
-                }
-                SegmentKind::PartitionIndex => {
-                    segment.partition_index = Some(entry.path());
-                }
-                SegmentKind::StreamIndex => {
-                    segment.stream_index = Some(entry.path());
+
+                // Extract segment ID from directory name
+                let segment_name = segment_entry.file_name();
+                let Some(segment_name_str) = segment_name.to_str() else {
+                    continue;
+                };
+                let Ok(segment_id) = segment_name_str.parse::<SegmentId>() else {
+                    continue;
+                };
+
+                let bucket_segment_id = BucketSegmentId::new(bucket_id, segment_id);
+                let segment = segments.entry(bucket_segment_id).or_default();
+
+                // Check for each file type within this segment directory
+                for file_entry in fs::read_dir(segment_entry.path())? {
+                    let file_entry = file_entry?;
+                    let file_name = file_entry.file_name();
+                    let Some(file_name_str) = file_name.to_str() else {
+                        continue;
+                    };
+
+                    // Match the file to its type
+                    match file_name_str {
+                        "data.evts" => {
+                            segment.events = Some(file_entry.path());
+                        }
+                        "index.eidx" => {
+                            segment.event_index = Some(file_entry.path());
+                        }
+                        "partition.pidx" => {
+                            segment.partition_index = Some(file_entry.path());
+                        }
+                        "stream.sidx" => {
+                            segment.stream_index = Some(file_entry.path());
+                        }
+                        _ => continue,
+                    }
                 }
             }
         }

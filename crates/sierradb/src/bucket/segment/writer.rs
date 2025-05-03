@@ -1,6 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -79,43 +79,60 @@ impl BucketSegmentWriter {
         dir: impl AsRef<Path>,
     ) -> Result<(BucketSegmentId, Self), WriteError> {
         let dir = dir.as_ref();
-        let prefix = format!("{:05}-", bucket_id);
-        let suffix = format!(".{}", SegmentKind::Events);
-        let mut latest_segment: Option<(SegmentId, PathBuf)> = None;
+        let bucket_dir = dir.join("buckets").join(format!("{:05}", bucket_id));
+        let segments_dir = bucket_dir.join("segments");
 
-        // Iterate through the directory and look for matching segment files.
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let file_name = entry.file_name();
-            let file_name_str = file_name.to_string_lossy();
+        // Create the directories if they don't exist
+        if !segments_dir.exists() {
+            fs::create_dir_all(&segments_dir)?;
+        }
 
-            // Check if the file name starts with the bucket prefix and ends with the events
-            // file suffix.
-            if file_name_str.starts_with(&prefix) && file_name_str.ends_with(&suffix) {
-                // Extract the segment id from the file name.
-                // File format: {bucket_id:05}-{segment_id:010}.evts
-                let start = prefix.len();
-                let end = file_name_str.len() - suffix.len();
-                if let Ok(segment_id) = file_name_str[start..end].parse::<u32>() {
-                    latest_segment = match latest_segment {
-                        Some((current_max, _)) if segment_id > current_max => {
-                            Some((segment_id, entry.path()))
-                        }
-                        None => Some((segment_id, entry.path())),
-                        _ => latest_segment,
-                    };
+        let mut latest_segment_id: Option<SegmentId> = None;
+
+        // Iterate through segment directories to find the latest one
+        if segments_dir.exists() {
+            for entry in fs::read_dir(&segments_dir)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+
+                let segment_dir_name = entry.file_name();
+                let segment_dir_str = segment_dir_name.to_string_lossy();
+
+                // Try to parse the segment ID from the directory name
+                if let Ok(segment_id) = segment_dir_str.parse::<u32>() {
+                    // Check if this segment has an events file
+                    let events_file = entry.path().join(SegmentKind::Events.file_name());
+                    if events_file.exists() {
+                        latest_segment_id = match latest_segment_id {
+                            Some(current_max) if segment_id > current_max => Some(segment_id),
+                            None => Some(segment_id),
+                            _ => latest_segment_id,
+                        };
+                    }
                 }
             }
         }
 
-        // If we found an existing segment, open it for writing (append mode).
-        if let Some((segment_id, path)) = latest_segment {
-            Self::open(path).map(|writer| (BucketSegmentId::new(bucket_id, segment_id), writer))
+        // If we found an existing segment, open it for writing (append mode)
+        if let Some(segment_id) = latest_segment_id {
+            let bucket_segment_id = BucketSegmentId::new(bucket_id, segment_id);
+            let events_path = segments_dir
+                .join(format!("{:010}", segment_id))
+                .join(SegmentKind::Events.file_name());
+
+            Self::open(events_path).map(|writer| (bucket_segment_id, writer))
         } else {
+            // Create a new segment with ID 0
             let bucket_segment_id = BucketSegmentId::new(bucket_id, 0);
-            let new_file_name = SegmentKind::Events.file_name(bucket_segment_id);
-            let path = dir.join(new_file_name);
-            Self::create(path, bucket_id).map(|writer| (bucket_segment_id, writer))
+
+            // Ensure the segment directory exists
+            let segment_dir = segments_dir.join(format!("{:010}", 0));
+            fs::create_dir_all(&segment_dir)?;
+
+            let events_path = segment_dir.join(SegmentKind::Events.file_name());
+            Self::create(events_path, bucket_id).map(|writer| (bucket_segment_id, writer))
         }
     }
 
