@@ -295,21 +295,21 @@ impl Worker {
             if bucket_id_to_thread_id(bucket_id, bucket_ids, num_threads) == Some(thread_id) {
                 let (bucket_segment_id, writer) = BucketSegmentWriter::latest(bucket_id, &dir)?;
                 let mut reader = BucketSegmentReader::open(
-                    dir.join(SegmentKind::Events.file_name(bucket_segment_id)),
+                    SegmentKind::Events.get_path(&dir, bucket_segment_id),
                     Some(writer.flushed_offset()),
                 )?;
 
                 let mut event_index = OpenEventIndex::open(
                     bucket_segment_id,
-                    dir.join(SegmentKind::EventIndex.file_name(bucket_segment_id)),
+                    SegmentKind::EventIndex.get_path(&dir, bucket_segment_id),
                 )?;
                 let mut partition_index = OpenPartitionIndex::open(
                     bucket_segment_id,
-                    dir.join(SegmentKind::PartitionIndex.file_name(bucket_segment_id)),
+                    SegmentKind::PartitionIndex.get_path(&dir, bucket_segment_id),
                 )?;
                 let mut stream_index = OpenStreamIndex::open(
                     bucket_segment_id,
-                    dir.join(SegmentKind::StreamIndex.file_name(bucket_segment_id)),
+                    SegmentKind::StreamIndex.get_path(&dir, bucket_segment_id),
                     segment_size,
                 )?;
 
@@ -681,34 +681,31 @@ impl WriterSet {
         let old_bucket_segment_id = self.bucket_segment_id;
         self.bucket_segment_id = self.bucket_segment_id.increment_segment_id();
 
+        SegmentKind::ensure_segment_dir(&self.dir, self.bucket_segment_id)?;
+
         self.writer = BucketSegmentWriter::create(
-            self.dir
-                .join(SegmentKind::Events.file_name(self.bucket_segment_id)),
+            SegmentKind::Events.get_path(&self.dir, self.bucket_segment_id),
             self.bucket_segment_id.bucket_id,
         )?;
         let old_reader = mem::replace(
             &mut self.reader,
             BucketSegmentReader::open(
-                self.dir
-                    .join(SegmentKind::Events.file_name(self.bucket_segment_id)),
+                SegmentKind::Events.get_path(&self.dir, self.bucket_segment_id),
                 Some(self.writer.flushed_offset()),
             )?,
         );
 
         let event_index = OpenEventIndex::create(
             self.bucket_segment_id,
-            self.dir
-                .join(SegmentKind::EventIndex.file_name(self.bucket_segment_id)),
+            SegmentKind::EventIndex.get_path(&self.dir, self.bucket_segment_id),
         )?;
         let partition_index = OpenPartitionIndex::create(
             self.bucket_segment_id,
-            self.dir
-                .join(SegmentKind::PartitionIndex.file_name(self.bucket_segment_id)),
+            SegmentKind::PartitionIndex.get_path(&self.dir, self.bucket_segment_id),
         )?;
         let stream_index = OpenStreamIndex::create(
             self.bucket_segment_id,
-            self.dir
-                .join(SegmentKind::StreamIndex.file_name(self.bucket_segment_id)),
+            SegmentKind::StreamIndex.get_path(&self.dir, self.bucket_segment_id),
             self.segment_size,
         )?;
 

@@ -43,8 +43,8 @@ pub enum CommittedEvents {
 }
 
 impl IntoIterator for CommittedEvents {
-    type Item = EventRecord;
     type IntoIter = CommittedEventsIntoIter;
+    type Item = EventRecord;
 
     fn into_iter(self) -> Self::IntoIter {
         let inner = match self {
@@ -184,6 +184,7 @@ impl BucketSegmentReader {
 
     #[cfg(all(unix, target_os = "linux"))]
     pub fn prefetch(&self, offset: u64) {
+        use std::os::fd;
         unsafe {
             libc::posix_fadvise(
                 self.file.as_raw_fd(),

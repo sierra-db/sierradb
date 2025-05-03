@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::{fmt, str};
 
 use serde::{Deserialize, Serialize};
@@ -53,41 +54,84 @@ pub enum SegmentKind {
 
 impl SegmentKind {
     pub const BUCKET_ID_LEN: usize = 5;
-    pub const EXTENSION_LEN: usize = 4;
-    pub const FILE_NAME_LEN: usize =
-        Self::BUCKET_ID_LEN + "-".len() + Self::SEGMENT_ID_LEN + ".".len() + Self::EXTENSION_LEN;
     pub const SEGMENT_ID_LEN: usize = 10;
 
-    pub fn file_name(
-        &self,
-        BucketSegmentId {
-            bucket_id,
-            segment_id,
-        }: BucketSegmentId,
-    ) -> String {
-        format!("{bucket_id:05}-{segment_id:010}.{}", self)
+    /// File names for each kind of segment file
+    pub fn file_name(&self) -> &'static str {
+        match self {
+            SegmentKind::Events => "data.evts",
+            SegmentKind::EventIndex => "index.eidx",
+            SegmentKind::PartitionIndex => "partition.pidx",
+            SegmentKind::StreamIndex => "stream.sidx",
+        }
     }
 
-    pub fn parse_file_name(s: &str) -> Option<(BucketSegmentId, SegmentKind)> {
-        if s.len() != SegmentKind::FILE_NAME_LEN {
-            return None;
-        }
+    /// Get the full path for a specific segment file
+    pub fn get_path(&self, base_dir: &Path, bucket_segment_id: BucketSegmentId) -> PathBuf {
+        let BucketSegmentId {
+            bucket_id,
+            segment_id,
+        } = bucket_segment_id;
 
-        let mut pos = 0;
+        base_dir
+            .join("buckets")
+            .join(format!("{:05}", bucket_id))
+            .join("segments")
+            .join(format!("{:010}", segment_id))
+            .join(self.file_name())
+    }
 
-        let bucket_id = s[pos..pos + SegmentKind::BUCKET_ID_LEN].parse().ok()?;
-        pos += SegmentKind::BUCKET_ID_LEN;
-        pos += "-".len();
+    /// Parse a full path back into bucket_segment_id and kind
+    pub fn parse_path(path: &Path) -> Option<(BucketSegmentId, SegmentKind)> {
+        // Get filename
+        let file_name = path.file_name()?.to_str()?;
 
-        let segment_id = s[pos..pos + SegmentKind::SEGMENT_ID_LEN].parse().ok()?;
-        pos += SegmentKind::SEGMENT_ID_LEN;
-        pos += ".".len();
+        // Determine segment kind from filename
+        let kind = match file_name {
+            "data.evts" => SegmentKind::Events,
+            "index.eidx" => SegmentKind::EventIndex,
+            "partition.pidx" => SegmentKind::PartitionIndex,
+            "stream.sidx" => SegmentKind::StreamIndex,
+            _ => return None,
+        };
 
-        let segment_kind = s[pos..pos + SegmentKind::EXTENSION_LEN].parse().ok()?;
+        // Extract segment_id from parent directory
+        let segments_dir = path.parent()?;
+        let segment_id_str = segments_dir.file_name()?.to_str()?;
+        let segment_id = segment_id_str.parse::<SegmentId>().ok()?;
+
+        // Extract bucket_id from grandparent directory path
+        let bucket_dir = segments_dir.parent()?.parent()?;
+        let bucket_id_str = bucket_dir.file_name()?.to_str()?;
+        let bucket_id = bucket_id_str.parse::<BucketId>().ok()?;
 
         let bucket_segment_id = BucketSegmentId::new(bucket_id, segment_id);
 
-        Some((bucket_segment_id, segment_kind))
+        Some((bucket_segment_id, kind))
+    }
+
+    /// Helper method to create the directory structure for a segment if it
+    /// doesn't exist
+    pub fn ensure_segment_dir(
+        base_dir: &Path,
+        bucket_segment_id: BucketSegmentId,
+    ) -> std::io::Result<PathBuf> {
+        let BucketSegmentId {
+            bucket_id,
+            segment_id,
+        } = bucket_segment_id;
+
+        let segment_dir = base_dir
+            .join("buckets")
+            .join(format!("{:05}", bucket_id))
+            .join("segments")
+            .join(format!("{:010}", segment_id));
+
+        if !segment_dir.exists() {
+            std::fs::create_dir_all(&segment_dir)?;
+        }
+
+        Ok(segment_dir)
     }
 }
 
