@@ -23,7 +23,7 @@ clap = "4.5"
 crc32fast = "1.4"
 directories = "6.0"
 futures = "0.3"
-kameo = { git = "https://github.com/tqwewe/kameo", branch = "feat/send-error-msg-err" }
+kameo = { git = "https://github.com/tqwewe/kameo", branch = "main" }
 libp2p = "0.55"
 rand = "0.9"
 serde = "1.0"

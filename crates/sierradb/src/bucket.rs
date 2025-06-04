@@ -72,9 +72,9 @@ impl SegmentKind {
 
         base_dir
             .join("buckets")
-            .join(format!("{:05}", bucket_id))
+            .join(format!("{bucket_id:05}"))
             .join("segments")
-            .join(format!("{:010}", segment_id))
+            .join(format!("{segment_id:010}"))
             .join(self.file_name())
     }
 
@@ -120,9 +120,9 @@ impl SegmentKind {
 
         let segment_dir = base_dir
             .join("buckets")
-            .join(format!("{:05}", bucket_id))
+            .join(format!("{bucket_id:05}"))
             .join("segments")
-            .join(format!("{:010}", segment_id));
+            .join(format!("{segment_id:010}"));
 
         if !segment_dir.exists() {
             std::fs::create_dir_all(&segment_dir)?;

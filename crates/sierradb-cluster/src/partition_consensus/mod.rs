@@ -1,10 +1,8 @@
 use std::cmp;
 
 use arrayvec::ArrayVec;
-use sierradb::{
-    MAX_REPLICATION_FACTOR,
-    bucket::{PartitionHash, PartitionId},
-};
+use sierradb::MAX_REPLICATION_FACTOR;
+use sierradb::bucket::{PartitionHash, PartitionId};
 
 mod behaviour;
 mod manager;
@@ -161,10 +159,7 @@ mod tests {
                     assert_eq!(
                         unique_count,
                         result.len(),
-                        "Duplicate partitions found with partition_key={}, num_partitions={}, replication={}",
-                        partition_key,
-                        num_partitions,
-                        replication
+                        "Duplicate partitions found with partition_key={partition_key}, num_partitions={num_partitions}, replication={replication}",
                     );
                 }
             }

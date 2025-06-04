@@ -114,7 +114,8 @@ impl Database {
 
                         let res = reader_set
                             .reader
-                            .read_committed_events(offset, false, header_only);
+                            .read_committed_events(offset, false, header_only)
+                            .map(|(events, _)| events);
                         let _ = reply_tx.send(res);
                     }
                     None => {
@@ -129,7 +130,8 @@ impl Database {
                                     Ok(Some(offset)) => {
                                         let res = reader_set
                                             .reader
-                                            .read_committed_events(offset, false, header_only);
+                                            .read_committed_events(offset, false, header_only)
+                                            .map(|(events, _)| events);
                                         let _ = reply_tx.send(res);
                                         return;
                                     }
@@ -1105,7 +1107,7 @@ mod tests {
             let event = create_test_event(
                 partition_key,
                 partition_id,
-                &format!("stream-{}", i),
+                &format!("stream-{i}"),
                 ExpectedVersion::Empty,
             );
 
@@ -1544,7 +1546,7 @@ mod tests {
             let event = create_test_event(
                 partition_key,
                 partition_id,
-                &format!("stream-{}", partition_id),
+                &format!("stream-{partition_id}"),
                 ExpectedVersion::Empty,
             );
 
@@ -1567,16 +1569,14 @@ mod tests {
                 .expect("Failed to get partition sequence");
             assert!(
                 seq_opt.is_some(),
-                "Expected sequence for partition {}",
-                partition_id
+                "Expected sequence for partition {partition_id}",
             );
 
             match seq_opt.unwrap() {
                 PartitionLatestSequence::LatestSequence { sequence, .. } => {
                     assert_eq!(
                         sequence, 0,
-                        "Expected sequence 0 for partition {}",
-                        partition_id
+                        "Expected sequence 0 for partition {partition_id}",
                     );
                 }
                 _ => panic!("Expected LatestSequence"),

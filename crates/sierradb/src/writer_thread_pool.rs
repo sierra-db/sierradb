@@ -461,11 +461,10 @@ impl Worker {
         }
 
         if file_size as usize + writer_set.writer.buf_len() + events_size > writer_set.segment_size
+            && let Err(err) = writer_set.rollover()
         {
-            if let Err(err) = writer_set.rollover() {
-                let _ = reply_tx.send(Err(err));
-                return;
-            }
+            let _ = reply_tx.send(Err(err));
+            return;
         }
 
         let res = writer_set.handle_write(
@@ -475,10 +474,10 @@ impl Worker {
             expected_partition_sequence,
             latest_stream_versions.len(),
         );
-        if res.is_err() {
-            if let Err(err) = writer_set.writer.set_len(file_size) {
-                error!("failed to set segment file length after write error: {err}");
-            }
+        if res.is_err()
+            && let Err(err) = writer_set.writer.set_len(file_size)
+        {
+            error!("failed to set segment file length after write error: {err}");
         }
 
         let _ = reply_tx.send(res);
@@ -615,10 +614,10 @@ impl WriterSet {
         self.pending_indexes.extend(new_pending_indexes);
 
         self.unflushed_events += event_count as u32;
-        if self.unflushed_events >= self.flush_interval_events {
-            if let Err(err) = self.flush() {
-                error!("failed to flush writer: {err}");
-            }
+        if self.unflushed_events >= self.flush_interval_events
+            && let Err(err) = self.flush()
+        {
+            error!("failed to flush writer: {err}");
         }
 
         Ok(AppendResult {
@@ -666,10 +665,10 @@ impl WriterSet {
     }
 
     fn flush_if_necessary(&mut self) {
-        if self.last_flushed.elapsed() >= self.flush_interval_duration {
-            if let Err(err) = self.flush() {
-                error!("failed to flush writer: {err}");
-            }
+        if self.last_flushed.elapsed() >= self.flush_interval_duration
+            && let Err(err) = self.flush()
+        {
+            error!("failed to flush writer: {err}");
         }
     }
 

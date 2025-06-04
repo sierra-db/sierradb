@@ -79,7 +79,7 @@ impl BucketSegmentWriter {
         dir: impl AsRef<Path>,
     ) -> Result<(BucketSegmentId, Self), WriteError> {
         let dir = dir.as_ref();
-        let bucket_dir = dir.join("buckets").join(format!("{:05}", bucket_id));
+        let bucket_dir = dir.join("buckets").join(format!("{bucket_id:05}"));
         let segments_dir = bucket_dir.join("segments");
 
         // Create the directories if they don't exist
@@ -119,7 +119,7 @@ impl BucketSegmentWriter {
         if let Some(segment_id) = latest_segment_id {
             let bucket_segment_id = BucketSegmentId::new(bucket_id, segment_id);
             let events_path = segments_dir
-                .join(format!("{:010}", segment_id))
+                .join(format!("{segment_id:010}"))
                 .join(SegmentKind::Events.file_name());
 
             Self::open(events_path).map(|writer| (bucket_segment_id, writer))
