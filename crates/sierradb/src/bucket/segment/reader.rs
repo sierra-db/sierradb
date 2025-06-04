@@ -12,6 +12,7 @@ use bincode::de::read::Reader;
 use bincode::error::DecodeError;
 use polonius_the_crab::{exit_polonius, polonius, polonius_return, polonius_try};
 use serde::{Deserialize, Serialize};
+use smallvec::{SmallVec, smallvec};
 use uuid::Uuid;
 
 use super::{
@@ -32,12 +33,9 @@ const READ_BUF_SIZE: usize = PAGE_SIZE - COMMIT_SIZE;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommittedEvents {
-    None {
-        next_offset: u64,
-    },
     Single(EventRecord),
     Transaction {
-        events: Vec<EventRecord>,
+        events: SmallVec<[EventRecord; 4]>,
         commit: CommitRecord,
     },
 }
@@ -48,7 +46,6 @@ impl IntoIterator for CommittedEvents {
 
     fn into_iter(self) -> Self::IntoIter {
         let inner = match self {
-            CommittedEvents::None { .. } => CommittedEventsIntoIterInner::Single(None),
             CommittedEvents::Single(event) => CommittedEventsIntoIterInner::Single(Some(event)),
             CommittedEvents::Transaction { events, .. } => {
                 CommittedEventsIntoIterInner::Transaction(events.into_iter())
@@ -64,7 +61,7 @@ pub struct CommittedEventsIntoIter {
 
 enum CommittedEventsIntoIterInner {
     Single(Option<EventRecord>),
-    Transaction(vec::IntoIter<EventRecord>),
+    Transaction(smallvec::IntoIter<[EventRecord; 4]>),
 }
 
 impl Iterator for CommittedEventsIntoIter {
@@ -254,13 +251,14 @@ impl BucketSegmentReader {
         &mut self,
         mut offset: u64,
         sequential: bool,
+        header_only: bool,
     ) -> Result<Option<CommittedEvents>, ReadError> {
         let mut this = self;
-        let mut events = Vec::new();
+        let mut events = SmallVec::new();
         let mut pending_transaction_id = Uuid::nil();
         loop {
             (events, offset) = polonius!(|this| -> Result<Option<CommittedEvents>, ReadError> {
-                let record = polonius_try!(this.read_record(offset, sequential));
+                let record = polonius_try!(this.read_record(offset, sequential, header_only));
                 match record {
                     Some(Record::Event(
                         event @ EventRecord {
@@ -281,7 +279,7 @@ impl BucketSegmentReader {
                             events.push(event);
                         } else if transaction_id != pending_transaction_id {
                             // Unexpected transaction, we'll start a new pending transaction
-                            events = vec![event];
+                            events = smallvec![event];
                             pending_transaction_id = transaction_id;
                         } else {
                             // Event belongs to the transaction
@@ -321,6 +319,7 @@ impl BucketSegmentReader {
         &mut self,
         start_offset: u64,
         sequential: bool,
+        header_only: bool,
     ) -> Result<Option<Record>, ReadError> {
         // This is the only check needed. We don't need to check for the event body,
         // since if the offset supports this header read, then the event body would have
@@ -348,7 +347,7 @@ impl BucketSegmentReader {
             // Backtrack the event count
             offset -= mem::size_of::<u32>() as u64;
 
-            self.read_event_body(start_offset, record_header, offset, sequential)
+            self.read_event_body(start_offset, record_header, offset, sequential, header_only)
                 .map(|event| Some(Record::Event(event)))
         } else if record_header.record_kind == 1 {
             let event_count = u32::from_le_bytes(
@@ -372,6 +371,7 @@ impl BucketSegmentReader {
         record_header: RecordHeader,
         mut offset: u64,
         sequential: bool,
+        header_only: bool,
     ) -> Result<EventRecord, ReadError> {
         let length = EVENT_HEADER_SIZE - RECORD_HEADER_SIZE;
         let header_buf = if sequential {
@@ -385,19 +385,28 @@ impl BucketSegmentReader {
 
         let (event_header, _) =
             bincode::decode_from_slice::<EventHeader, _>(header_buf, BINCODE_CONFIG)?;
-        let body_len = event_header.body_len();
-        let body = if sequential {
-            let body_buf = self.read_from_read_ahead(offset, body_len)?;
-            bincode::decode_from_slice_with_context(body_buf, BINCODE_CONFIG, &event_header)?.0
-        } else if body_len > self.body_buf.len() {
-            let mut body_buf = vec![0u8; body_len];
-            self.file.read_exact_at(&mut body_buf, offset)?;
-            bincode::decode_from_slice_with_context(&body_buf, BINCODE_CONFIG, &event_header)?.0
+
+        let body = if header_only {
+            EventBody::default()
         } else {
-            self.file
-                .read_exact_at(&mut self.body_buf[..body_len], offset)?;
-            bincode::decode_from_slice_with_context(&self.body_buf, BINCODE_CONFIG, &event_header)?
+            let body_len = event_header.body_len();
+            if sequential {
+                let body_buf = self.read_from_read_ahead(offset, body_len)?;
+                bincode::decode_from_slice_with_context(body_buf, BINCODE_CONFIG, &event_header)?.0
+            } else if body_len > self.body_buf.len() {
+                let mut body_buf = vec![0u8; body_len];
+                self.file.read_exact_at(&mut body_buf, offset)?;
+                bincode::decode_from_slice_with_context(&body_buf, BINCODE_CONFIG, &event_header)?.0
+            } else {
+                self.file
+                    .read_exact_at(&mut self.body_buf[..body_len], offset)?;
+                bincode::decode_from_slice_with_context(
+                    &self.body_buf,
+                    BINCODE_CONFIG,
+                    &event_header,
+                )?
                 .0
+            }
         };
 
         EventRecord::from_parts(start_offset, record_header, event_header, body)
@@ -474,11 +483,17 @@ pub struct BucketSegmentIter<'a> {
 }
 
 impl BucketSegmentIter<'_> {
-    pub fn next_committed_events(&mut self) -> Result<Option<CommittedEvents>, ReadError> {
+    pub fn next_committed_events(
+        &mut self,
+        header_only: bool,
+    ) -> Result<Option<CommittedEvents>, ReadError> {
         let mut this = self;
         loop {
             polonius!(|this| -> Result<Option<CommittedEvents>, ReadError> {
-                match this.reader.read_committed_events(this.offset, true) {
+                match this
+                    .reader
+                    .read_committed_events(this.offset, true, header_only)
+                {
                     Ok(Some(events)) => {
                         match &events {
                             CommittedEvents::None { next_offset } => {
@@ -501,8 +516,8 @@ impl BucketSegmentIter<'_> {
         }
     }
 
-    pub fn next_record(&mut self) -> Result<Option<Record>, ReadError> {
-        match self.reader.read_record(self.offset, true) {
+    pub fn next_record(&mut self, header_only: bool) -> Result<Option<Record>, ReadError> {
+        match self.reader.read_record(self.offset, true, header_only) {
             Ok(Some(record)) => {
                 self.offset = record.offset() + record.len();
                 Ok(Some(record))
@@ -852,7 +867,7 @@ impl EventHeader {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct EventBody {
     stream_id: StreamId,
     event_name: String,

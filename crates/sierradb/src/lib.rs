@@ -25,7 +25,7 @@ const BLOOM_SEED: [u8; 32] = [
 pub const STREAM_ID_SIZE: usize = 64;
 pub const MAX_REPLICATION_FACTOR: usize = 12;
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct StreamId {
     inner: Arc<str>,

@@ -261,7 +261,7 @@ impl OpenStreamIndex {
     /// Hydrates the index from a reader.
     pub fn hydrate(&mut self, reader: &mut BucketSegmentReader) -> Result<(), StreamIndexError> {
         let mut reader_iter = reader.iter();
-        while let Some(record) = reader_iter.next_record()? {
+        while let Some(record) = reader_iter.next_record(false)? {
             match record {
                 Record::Event(EventRecord {
                     offset,
@@ -762,7 +762,10 @@ impl EventStreamIter {
         }
     }
 
-    pub async fn next(&mut self) -> Result<Option<EventRecord>, StreamIndexError> {
+    pub async fn next(
+        &mut self,
+        header_only: bool,
+    ) -> Result<Option<EventRecord>, StreamIndexError> {
         struct ReadResult {
             events: Option<CommittedEvents>,
             new_offsets: Option<(SegmentId, VecDeque<u64>)>,
@@ -787,9 +790,11 @@ impl EventStreamIter {
                                 // We have an offset from the last batch
                                 match segments.get_mut(&segment_id) {
                                     Some(reader_set) => Ok(ReadResult {
-                                        events: reader_set
-                                            .reader
-                                            .read_committed_events(offset, false)?,
+                                        events: reader_set.reader.read_committed_events(
+                                            offset,
+                                            false,
+                                            header_only,
+                                        )?,
                                         new_offsets: None,
                                         is_live: false,
                                     }),
@@ -833,9 +838,11 @@ impl EventStreamIter {
                                     };
 
                                     return Ok(ReadResult {
-                                        events: reader_set
-                                            .reader
-                                            .read_committed_events(next_offset, false)?,
+                                        events: reader_set.reader.read_committed_events(
+                                            next_offset,
+                                            false,
+                                            header_only,
+                                        )?,
                                         new_offsets: Some((i, new_offsets)),
                                         is_live: false,
                                     });
@@ -853,9 +860,11 @@ impl EventStreamIter {
                                         };
 
                                         Ok(ReadResult {
-                                            events: reader_set
-                                                .reader
-                                                .read_committed_events(offset, false)?,
+                                            events: reader_set.reader.read_committed_events(
+                                                offset,
+                                                false,
+                                                header_only,
+                                            )?,
                                             new_offsets: None,
                                             is_live: true,
                                         })

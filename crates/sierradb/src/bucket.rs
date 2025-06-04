@@ -53,9 +53,6 @@ pub enum SegmentKind {
 }
 
 impl SegmentKind {
-    pub const BUCKET_ID_LEN: usize = 5;
-    pub const SEGMENT_ID_LEN: usize = 10;
-
     /// File names for each kind of segment file
     pub fn file_name(&self) -> &'static str {
         match self {

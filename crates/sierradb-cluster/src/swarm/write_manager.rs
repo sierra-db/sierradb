@@ -639,7 +639,7 @@ async fn confirm_transaction(
     };
 
     let offsets = match database
-        .read_transaction(partition_id, *first_event_id)
+        .read_transaction(partition_id, *first_event_id, true)
         .await?
     {
         Some(CommittedEvents::Single(event)) => {

@@ -74,9 +74,10 @@ impl Database {
         &self,
         partition_id: PartitionId,
         event_id: Uuid,
+        header_only: bool,
     ) -> Result<Option<EventRecord>, ReadError> {
         Ok(self
-            .read_transaction(partition_id, event_id)
+            .read_transaction(partition_id, event_id, header_only)
             .await?
             .and_then(|events| events.into_iter().next()))
     }
@@ -85,6 +86,7 @@ impl Database {
         &self,
         partition_id: PartitionId,
         first_event_id: Uuid,
+        header_only: bool,
     ) -> Result<Option<CommittedEvents>, ReadError> {
         let bucket_id = partition_id % self.total_buckets;
         let segment_id_offset = self
@@ -112,7 +114,7 @@ impl Database {
 
                         let res = reader_set
                             .reader
-                            .read_committed_events(offset, false);
+                            .read_committed_events(offset, false, header_only);
                         let _ = reply_tx.send(res);
                     }
                     None => {
@@ -127,7 +129,7 @@ impl Database {
                                     Ok(Some(offset)) => {
                                         let res = reader_set
                                             .reader
-                                            .read_committed_events(offset, false);
+                                            .read_committed_events(offset, false, header_only);
                                         let _ = reply_tx.send(res);
                                         return;
                                     }
@@ -154,6 +156,7 @@ impl Database {
     pub async fn read_partition(
         &self,
         partition_id: PartitionId,
+        from_sequence: u64,
     ) -> Result<PartitionEventIter, PartitionIndexError> {
         let bucket_id = partition_id % self.total_buckets;
         PartitionEventIter::new(
@@ -161,6 +164,7 @@ impl Database {
             bucket_id,
             self.reader_pool.clone(),
             self.writer_pool.indexes(),
+            from_sequence,
         )
         .await
     }
@@ -1047,7 +1051,7 @@ mod tests {
             .expect("Failed to append event");
 
         // Read the event back
-        let result = db.read_event(partition_id, event_id).await;
+        let result = db.read_event(partition_id, event_id, false).await;
         assert!(result.is_ok(), "Failed to read event: {:?}", result.err());
 
         let event_opt = result.unwrap();
@@ -1075,7 +1079,9 @@ mod tests {
         let partition_id = 1;
         let nonexistent_event_id = Uuid::new_v4();
 
-        let result = db.read_event(partition_id, nonexistent_event_id).await;
+        let result = db
+            .read_event(partition_id, nonexistent_event_id, false)
+            .await;
         assert!(
             result.is_ok(),
             "Read should succeed even for nonexistent events"
@@ -1113,13 +1119,13 @@ mod tests {
 
         // Read the partition
         let mut partition_iter = db
-            .read_partition(partition_id)
+            .read_partition(partition_id, 0)
             .await
             .expect("Failed to read partition");
 
         // Collect all events
         let mut events = Vec::new();
-        while let Some(event) = partition_iter.next().await.unwrap() {
+        while let Some(event) = partition_iter.next(false).await.unwrap() {
             events.push(event);
         }
 
@@ -1127,6 +1133,33 @@ mod tests {
 
         // Check that events are ordered by sequence
         for i in 0..2 {
+            assert!(
+                events[i].partition_sequence <= events[i + 1].partition_sequence,
+                "Events not ordered by sequence"
+            );
+        }
+
+        // Read the partition
+        let mut partition_iter = db
+            .read_partition(partition_id, 1)
+            .await
+            .expect("Failed to read partition");
+
+        // Collect all events
+        let mut events = Vec::new();
+        while let Some(event) = partition_iter.next(false).await.unwrap() {
+            events.push(event);
+        }
+
+        assert_eq!(events.len(), 2, "Expected 2 events in the partition");
+        assert_eq!(
+            events.first().unwrap().partition_sequence,
+            1,
+            "Expected first event to have partition sequence of 1"
+        );
+
+        // Check that events are ordered by sequence
+        for i in 0..1 {
             assert!(
                 events[i].partition_sequence <= events[i + 1].partition_sequence,
                 "Events not ordered by sequence"
@@ -1227,7 +1260,7 @@ mod tests {
 
         // Collect all events
         let mut events = Vec::new();
-        while let Some(event) = stream_iter.next().await.unwrap() {
+        while let Some(event) = stream_iter.next(false).await.unwrap() {
             events.push(event);
         }
 
@@ -1389,7 +1422,7 @@ mod tests {
             .read_stream(partition_id, nonexistent_stream)
             .await
             .expect("Failed to read empty stream");
-        let event = stream_iter.next().await.unwrap();
+        let event = stream_iter.next(false).await.unwrap();
         assert!(event.is_none(), "Expected no events in empty stream");
     }
 
@@ -1401,10 +1434,10 @@ mod tests {
         let unused_partition_id = 999;
 
         let mut partition_iter = db
-            .read_partition(unused_partition_id)
+            .read_partition(unused_partition_id, 0)
             .await
             .expect("Failed to read empty partition");
-        let event = partition_iter.next().await.unwrap();
+        let event = partition_iter.next(false).await.unwrap();
         assert!(event.is_none(), "Expected no events in empty partition");
     }
 

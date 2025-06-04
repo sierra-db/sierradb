@@ -245,7 +245,10 @@ mod tests {
         let mut reader = BucketSegmentReader::open(&path, Some(flushed_offset.clone())).unwrap();
 
         for (i, (kind, offset)) in offsets.into_iter().enumerate() {
-            let record = reader.read_record(offset, i % 2 == 0).unwrap().unwrap();
+            let record = reader
+                .read_record(offset, i % 2 == 0, false)
+                .unwrap()
+                .unwrap();
             match record {
                 Record::Event(EventRecord {
                     offset: _,

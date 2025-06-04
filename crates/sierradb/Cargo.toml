@@ -9,7 +9,7 @@ arc-swap = "1.7.1"
 bincode = { workspace = true, features = ["serde"] }
 bloomfilter = "3.0.1"
 boomphf = { workspace = true, features = ["serde"] }
-crc32fast = "1.4.2"
+crc32fast.workspace = true
 libc = "0.2.170"
 num_cpus = "1.16.0"
 polonius-the-crab = "0.4.1"
