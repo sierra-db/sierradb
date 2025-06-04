@@ -663,7 +663,7 @@ async fn confirm_transaction(
                 .chain(iter::once(Ok(commit.offset)))
                 .collect::<Result<_, _>>()?
         }
-        Some(CommittedEvents::None { .. }) | None => {
+        None => {
             return Err(ConfirmTransactionError::TransactionNotFound);
         }
     };

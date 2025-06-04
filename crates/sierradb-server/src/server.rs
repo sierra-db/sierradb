@@ -109,7 +109,7 @@ impl Conn {
                         "pinfo" => todo!(),
                         "sinfo" => todo!(),
                         "subscribe" => todo!(),
-                        _ => Ok(Value::Error(format!("Unknown command: {}", cmd))),
+                        _ => Ok(Value::Error(format!("Unknown command: {cmd}"))),
                     },
                     _ => Ok(Value::Error("Expected command name as bulk string".into())),
                 }

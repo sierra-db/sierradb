@@ -88,11 +88,12 @@ impl Value {
 }
 
 fn inconvertible<A>(from: &Value, target: &str) -> io::Result<A> {
-    invalid_data(format!("'{:?}' is not convertible to '{}'", from, target))
+    invalid_data(format!("'{from:?}' is not convertible to '{target}'"))
 }
 
 impl TryFrom<&Value> for String {
     type Error = io::Error;
+
     fn try_from(val: &Value) -> io::Result<Self> {
         val.as_str().map(ToOwned::to_owned)
     }
@@ -100,6 +101,7 @@ impl TryFrom<&Value> for String {
 
 impl TryFrom<Value> for String {
     type Error = io::Error;
+
     fn try_from(val: Value) -> io::Result<Self> {
         val.to_string()
     }
@@ -399,7 +401,7 @@ impl StringDecoder {
                 (false, _) => (),
                 (true, b'\n') => return self.decode(input).map(Some),
                 (true, b) => {
-                    return invalid_data(format!("Invalid last tailing line feed: '{}'", b));
+                    return invalid_data(format!("Invalid last tailing line feed: '{b}'"));
                 }
             }
         }
@@ -478,7 +480,7 @@ impl ArrayDecoder {
         if let Some(size) = self.size_decoder.as_mut().unwrap().try_decode(input)? {
             self.size_decoder = None;
             if size < 0 {
-                return invalid_data(format!("Invalid array size '{}'", size));
+                return invalid_data(format!("Invalid array size '{size}'"));
             }
             self.size = size as usize;
             self.array = Some(Vec::with_capacity(self.size));
@@ -553,8 +555,7 @@ impl IntegerDecoder {
                 (true, b'\n') => return self.decode(input).map(Some),
                 (_, b) => {
                     return invalid_data(format!(
-                        "Invalid byte '{}' when decoding integer {:?}",
-                        b, input
+                        "Invalid byte '{b}' when decoding integer {input:?}"
                     ));
                 }
             }
@@ -604,7 +605,7 @@ impl ValueDecoder {
                 RESP_TYPE_INTEGER => TypedDecoder::Integer(IntegerDecoder::default()),
                 RESP_TYPE_SIMPLE_STRING => TypedDecoder::String(StringDecoder::default()),
                 RESP_TYPE_ERROR => TypedDecoder::Error(StringDecoder::default()),
-                t => return invalid_data(format!("Invalid value type '{}'", t)),
+                t => return invalid_data(format!("Invalid value type '{t}'")),
             };
             input.advance(1);
             self.decoder = Some(decoder);

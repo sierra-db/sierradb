@@ -1,8 +1,6 @@
-use std::{
-    collections::{HashMap, HashSet},
-    fmt,
-    path::PathBuf,
-};
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::path::PathBuf;
 
 use clap::Parser;
 use config::{Config, ConfigError, Environment, File, Value, ValueKind};
@@ -173,12 +171,12 @@ impl AppConfig {
             let node_index = args
                 .node_index
                 .or_else(|| overrides.get_int("node.index").map(|n| n as u32).ok());
-            if let Some(node_index) = node_index {
-                if (node_index as usize) < nodes.len() {
-                    let overrides = nodes.remove(node_index as usize);
-                    for (key, value) in flatten_value(overrides) {
-                        builder = builder.set_override(key, value)?;
-                    }
+            if let Some(node_index) = node_index
+                && (node_index as usize) < nodes.len()
+            {
+                let overrides = nodes.remove(node_index as usize);
+                for (key, value) in flatten_value(overrides) {
+                    builder = builder.set_override(key, value)?;
                 }
             }
         }
@@ -335,7 +333,7 @@ fn flatten_value_recursive(value: Value, prefix: &str, result: &mut HashMap<Stri
                 let new_prefix = if prefix.is_empty() {
                     key
                 } else {
-                    format!("{}.{}", prefix, key)
+                    format!("{prefix}.{key}")
                 };
 
                 match val.kind {

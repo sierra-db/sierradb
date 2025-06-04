@@ -1,23 +1,21 @@
-use libp2p::{
-    Multiaddr, PeerId,
-    core::{Endpoint, transport::PortUse},
-    gossipsub::{self, IdentTopic, PublishError},
-    swarm::{
-        ConnectionDenied, ConnectionId, FromSwarm, NetworkBehaviour, THandler, THandlerInEvent,
-        THandlerOutEvent, ToSwarm,
-    },
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
+use std::task;
+use std::time::Duration;
+
+use libp2p::core::Endpoint;
+use libp2p::core::transport::PortUse;
+use libp2p::gossipsub::{self, IdentTopic, PublishError};
+use libp2p::swarm::{
+    ConnectionDenied, ConnectionId, FromSwarm, NetworkBehaviour, THandler, THandlerInEvent,
+    THandlerOutEvent, ToSwarm,
 };
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    path::PathBuf,
-    task,
-    time::Duration,
-};
+use libp2p::{Multiaddr, PeerId};
 use tokio::time::Interval;
 use tracing::{debug, error, info, trace, warn};
 
-use super::messages::Heartbeat;
-use super::{manager::PartitionManager, messages::OwnershipMessage};
+use super::manager::PartitionManager;
+use super::messages::{Heartbeat, OwnershipMessage};
 
 // Topic names
 const HEARTBEAT_TOPIC: &str = "sierra/heartbeat";
@@ -276,10 +274,9 @@ impl Behaviour {
         if let Err(err) = self
             .gossipsub
             .publish(self.heartbeat_topic.hash(), self.heartbeat_bytes.clone())
+            && !matches!(err, PublishError::InsufficientPeers)
         {
-            if !matches!(err, PublishError::InsufficientPeers) {
-                error!("error publishing heartbeat: {err}");
-            }
+            error!("error publishing heartbeat: {err}");
         }
     }
 }

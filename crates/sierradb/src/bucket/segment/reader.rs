@@ -1,6 +1,6 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -35,7 +35,7 @@ const READ_BUF_SIZE: usize = PAGE_SIZE - COMMIT_SIZE;
 pub enum CommittedEvents {
     Single(EventRecord),
     Transaction {
-        events: SmallVec<[EventRecord; 4]>,
+        events: Box<SmallVec<[EventRecord; 4]>>,
         commit: CommitRecord,
     },
 }
@@ -48,7 +48,7 @@ impl IntoIterator for CommittedEvents {
         let inner = match self {
             CommittedEvents::Single(event) => CommittedEventsIntoIterInner::Single(Some(event)),
             CommittedEvents::Transaction { events, .. } => {
-                CommittedEventsIntoIterInner::Transaction(events.into_iter())
+                CommittedEventsIntoIterInner::Transaction(Box::new(events.into_iter()))
             }
         };
         CommittedEventsIntoIter { inner }
@@ -61,7 +61,7 @@ pub struct CommittedEventsIntoIter {
 
 enum CommittedEventsIntoIterInner {
     Single(Option<EventRecord>),
-    Transaction(smallvec::IntoIter<[EventRecord; 4]>),
+    Transaction(Box<smallvec::IntoIter<[EventRecord; 4]>>),
 }
 
 impl Iterator for CommittedEventsIntoIter {
@@ -94,13 +94,18 @@ impl BucketSegmentReader {
         path: impl AsRef<Path>,
         flushed_offset: Option<FlushedOffset>,
     ) -> Result<Self, ReadError> {
-        // On OSX, gives ~5% better performance for both random and sequential reads
-        const O_DIRECT: i32 = 0o0040000;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(false)
-            .custom_flags(O_DIRECT)
-            .open(path)?;
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(false);
+
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // On OSX, gives ~5% better performance for both random and sequential reads
+            const O_DIRECT: i32 = 0o0040000;
+            opts.custom_flags(O_DIRECT);
+        }
+
+        let file = opts.open(path)?;
         let header_buf = [0u8; HEADER_BUF_SIZE];
         let body_buf = [0u8; READ_BUF_SIZE];
 
@@ -181,7 +186,7 @@ impl BucketSegmentReader {
 
     #[cfg(all(unix, target_os = "linux"))]
     pub fn prefetch(&self, offset: u64) {
-        use std::os::fd;
+        use std::os::fd::AsRawFd;
         unsafe {
             libc::posix_fadvise(
                 self.file.as_raw_fd(),
@@ -252,12 +257,15 @@ impl BucketSegmentReader {
         mut offset: u64,
         sequential: bool,
         header_only: bool,
-    ) -> Result<Option<CommittedEvents>, ReadError> {
+    ) -> Result<(Option<CommittedEvents>, Option<u64>), ReadError> {
         let mut this = self;
         let mut events = SmallVec::new();
         let mut pending_transaction_id = Uuid::nil();
         loop {
-            (events, offset) = polonius!(|this| -> Result<Option<CommittedEvents>, ReadError> {
+            (events, offset) = polonius!(|this| -> Result<
+                (Option<CommittedEvents>, Option<u64>),
+                ReadError,
+            > {
                 let record = polonius_try!(this.read_record(offset, sequential, header_only));
                 match record {
                     Some(Record::Event(
@@ -273,7 +281,10 @@ impl BucketSegmentReader {
                             // Events with a true transaction id flag are always approved
                             if events.is_empty() {
                                 // If its the first event we encountered, then return it alone
-                                polonius_return!(Ok(Some(CommittedEvents::Single(event))));
+                                polonius_return!(Ok((
+                                    Some(CommittedEvents::Single(event)),
+                                    Some(next_offset),
+                                )));
                             }
 
                             events.push(event);
@@ -289,18 +300,20 @@ impl BucketSegmentReader {
                         exit_polonius!((events, next_offset))
                     }
                     Some(Record::Commit(commit)) => {
+                        let next_offset = commit.offset + COMMIT_SIZE as u64;
                         if commit.transaction_id == pending_transaction_id && !events.is_empty() {
-                            polonius_return!(Ok(Some(CommittedEvents::Transaction {
-                                events,
-                                commit,
-                            })));
+                            polonius_return!(Ok((
+                                Some(CommittedEvents::Transaction {
+                                    events: Box::new(events),
+                                    commit
+                                }),
+                                Some(next_offset)
+                            )));
                         }
 
-                        polonius_return!(Ok(Some(CommittedEvents::None {
-                            next_offset: commit.offset + COMMIT_SIZE as u64
-                        })));
+                        polonius_return!(Ok((None, Some(next_offset))));
                     }
-                    None => polonius_return!(Ok(None)),
+                    None => polonius_return!(Ok((None, None))),
                 }
             });
         }
@@ -494,12 +507,8 @@ impl BucketSegmentIter<'_> {
                     .reader
                     .read_committed_events(this.offset, true, header_only)
                 {
-                    Ok(Some(events)) => {
+                    Ok((Some(events), _)) => {
                         match &events {
-                            CommittedEvents::None { next_offset } => {
-                                this.offset = *next_offset;
-                                exit_polonius!();
-                            }
                             CommittedEvents::Single(event) => {
                                 this.offset = event.offset + event.len();
                             }
@@ -509,7 +518,11 @@ impl BucketSegmentIter<'_> {
                         }
                         polonius_return!(Ok(Some(events)));
                     }
-                    Ok(None) => polonius_return!(Ok(None)),
+                    Ok((None, Some(next_offset))) => {
+                        this.offset = next_offset;
+                        exit_polonius!();
+                    }
+                    Ok((None, None)) => polonius_return!(Ok(None)),
                     Err(err) => polonius_return!(Err(err)),
                 }
             });

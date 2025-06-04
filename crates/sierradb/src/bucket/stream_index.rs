@@ -695,10 +695,9 @@ impl EventStreamIter {
                                                 Ok(offsets) => {
                                                     if let StreamOffsets::Offsets(offsets) =
                                                         &offsets
+                                                        && let Some(offset) = offsets.first()
                                                     {
-                                                        if let Some(offset) = offsets.first() {
-                                                            reader_set.reader.prefetch(*offset);
-                                                        }
+                                                        reader_set.reader.prefetch(*offset);
                                                     }
                                                     Some(Ok((*segment_id, offsets)))
                                                 }
@@ -789,15 +788,19 @@ impl EventStreamIter {
                             Some(NextOffset { offset, segment_id }) => {
                                 // We have an offset from the last batch
                                 match segments.get_mut(&segment_id) {
-                                    Some(reader_set) => Ok(ReadResult {
-                                        events: reader_set.reader.read_committed_events(
+                                    Some(reader_set) => {
+                                        let (events, _) = reader_set.reader.read_committed_events(
                                             offset,
                                             false,
                                             header_only,
-                                        )?,
-                                        new_offsets: None,
-                                        is_live: false,
-                                    }),
+                                        )?;
+
+                                        Ok(ReadResult {
+                                            events,
+                                            new_offsets: None,
+                                            is_live: false,
+                                        })
+                                    }
                                     None => Err(StreamIndexError::SegmentNotFound {
                                         bucket_segment_id: BucketSegmentId::new(
                                             bucket_id, segment_id,
@@ -837,12 +840,14 @@ impl EventStreamIter {
                                         continue;
                                     };
 
+                                    let (events, _) = reader_set.reader.read_committed_events(
+                                        next_offset,
+                                        false,
+                                        header_only,
+                                    )?;
+
                                     return Ok(ReadResult {
-                                        events: reader_set.reader.read_committed_events(
-                                            next_offset,
-                                            false,
-                                            header_only,
-                                        )?,
+                                        events,
                                         new_offsets: Some((i, new_offsets)),
                                         is_live: false,
                                     });
@@ -859,12 +864,14 @@ impl EventStreamIter {
                                             });
                                         };
 
+                                        let (events, _) = reader_set.reader.read_committed_events(
+                                            offset,
+                                            false,
+                                            header_only,
+                                        )?;
+
                                         Ok(ReadResult {
-                                            events: reader_set.reader.read_committed_events(
-                                                offset,
-                                                false,
-                                                header_only,
-                                            )?,
+                                            events,
                                             new_offsets: None,
                                             is_live: true,
                                         })
@@ -994,7 +1001,7 @@ mod tests {
             .as_nanos();
 
         tempfile::Builder::new()
-            .prefix(&format!("test_{}_", timestamp))
+            .prefix(&format!("test_{timestamp}_"))
             .make(|path| Ok(path.to_path_buf()))
             .unwrap()
             .path()
