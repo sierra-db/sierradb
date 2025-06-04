@@ -1,6 +1,7 @@
 use std::io;
 
-use sierradb::{StreamId, database::ExpectedVersion};
+use sierradb::StreamId;
+use sierradb::database::ExpectedVersion;
 use uuid::Uuid;
 
 use crate::value::Value;
@@ -10,7 +11,7 @@ pub struct Append {
     pub event_name: String,
     pub event_id: Option<Uuid>,
     pub partition_key: Option<Uuid>,
-    pub version: ExpectedVersion,
+    pub expected_version: ExpectedVersion,
     pub payload: Vec<u8>,
     pub metadata: Vec<u8>,
 }
@@ -83,7 +84,7 @@ macro_rules! impl_command {
 impl_command!(
     Append,
     [stream_id, event_name],
-    [event_id, partition_key, version, payload, metadata]
+    [event_id, partition_key, expected_version, payload, metadata]
 );
 
 impl_command!(SRead, [stream_id], [partition_key]);

@@ -8,6 +8,7 @@ sierradb.workspace = true
 
 arrayvec.workspace = true
 bincode.workspace = true
+crc32fast.workspace = true
 futures.workspace = true
 kameo.workspace = true
 libp2p.workspace = true
@@ -31,3 +32,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "sync"] }
 tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

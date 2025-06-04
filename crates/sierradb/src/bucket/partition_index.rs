@@ -55,14 +55,20 @@ pub struct PartitionIndexRecord<T> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PartitionOffsets {
-    Offsets(Vec<u64>), // Its cached
-    ExternalBucket,    // This partition lives in a different bucket
+    Offsets(Vec<PartitionSequenceOffset>), // Its cached
+    ExternalBucket,                        // This partition lives in a different bucket
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PartitionSequenceOffset {
+    pub sequence: u64,
+    pub offset: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClosedOffsetKind {
     Pointer(u64, u32), // Its in the file at this location (offset, length)
-    Cached(Vec<u64>),  // Its cached
+    Cached(Vec<PartitionSequenceOffset>), // Its cached
     ExternalBucket,    // This partition lives in a different bucket
 }
 
@@ -154,25 +160,28 @@ impl OpenPartitionIndex {
     pub fn insert(
         &mut self,
         partition_id: PartitionId,
-        partition_sequence: u64,
+        sequence: u64,
         offset: u64,
     ) -> Result<(), PartitionIndexError> {
         match self.index.entry(partition_id) {
             Entry::Vacant(entry) => {
                 entry.insert(PartitionIndexRecord {
-                    sequence_min: partition_sequence,
-                    sequence_max: partition_sequence,
+                    sequence_min: sequence,
+                    sequence_max: sequence,
                     sequence: 1,
-                    offsets: PartitionOffsets::Offsets(vec![offset]),
+                    offsets: PartitionOffsets::Offsets(vec![PartitionSequenceOffset {
+                        sequence,
+                        offset,
+                    }]),
                 });
             }
             Entry::Occupied(mut entry) => {
                 let entry = entry.get_mut();
-                entry.sequence_min = entry.sequence_min.min(partition_sequence);
-                entry.sequence_max = entry.sequence_max.max(partition_sequence);
+                entry.sequence_min = entry.sequence_min.min(sequence);
+                entry.sequence_max = entry.sequence_max.max(sequence);
                 match &mut entry.offsets {
                     PartitionOffsets::Offsets(offsets) => {
-                        offsets.push(offset);
+                        offsets.push(PartitionSequenceOffset { sequence, offset });
                         entry.sequence = entry
                             .sequence
                             .checked_add(1)
@@ -222,7 +231,7 @@ impl OpenPartitionIndex {
     /// Hydrates the index from a reader.
     pub fn hydrate(&mut self, reader: &mut BucketSegmentReader) -> Result<(), PartitionIndexError> {
         let mut reader_iter = reader.iter();
-        while let Some(record) = reader_iter.next_record()? {
+        while let Some(record) = reader_iter.next_record(true)? {
             match record {
                 Record::Event(EventRecord {
                     offset,
@@ -273,8 +282,18 @@ impl OpenPartitionIndex {
 
             match &record.offsets {
                 PartitionOffsets::Offsets(offsets) => {
-                    let offsets_bytes: Vec<_> =
-                        offsets.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    let mut offsets_bytes: Vec<u8> =
+                        vec![0; (SEQUENCE_SIZE + EVENTS_OFFSET_SIZE) * offsets.len()];
+                    for (i, PartitionSequenceOffset { sequence, offset }) in
+                        offsets.iter().enumerate()
+                    {
+                        let mut i = (SEQUENCE_SIZE + EVENTS_OFFSET_SIZE) * i;
+                        offsets_bytes[i..i + SEQUENCE_SIZE]
+                            .copy_from_slice(&sequence.to_le_bytes());
+                        i += SEQUENCE_SIZE;
+                        offsets_bytes[i..i + EVENTS_OFFSET_SIZE]
+                            .copy_from_slice(&offset.to_le_bytes());
+                    }
 
                     if offsets_bytes.is_empty() {
                         continue;
@@ -506,13 +525,22 @@ impl ClosedPartitionIndex {
         match key.offsets {
             ClosedOffsetKind::Pointer(offset, len) => {
                 // Read values from the file
-                let mut values_buf = vec![0u8; len as usize * 8];
+                let mut values_buf = vec![0u8; len as usize * (SEQUENCE_SIZE + EVENTS_OFFSET_SIZE)];
                 match self.file.read_exact_at(&mut values_buf, offset) {
                     Ok(_) => {
                         // Successfully read the values
                         let offsets = values_buf
-                            .chunks_exact(8)
-                            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+                            .chunks_exact(SEQUENCE_SIZE + EVENTS_OFFSET_SIZE)
+                            .map(|b| {
+                                let sequence =
+                                    u64::from_le_bytes(b[0..SEQUENCE_SIZE].try_into().unwrap());
+                                let offset = u64::from_le_bytes(
+                                    b[SEQUENCE_SIZE..SEQUENCE_SIZE + EVENTS_OFFSET_SIZE]
+                                        .try_into()
+                                        .unwrap(),
+                                );
+                                PartitionSequenceOffset { sequence, offset }
+                            })
                             .collect();
                         Ok(PartitionOffsets::Offsets(offsets))
                     }
@@ -541,10 +569,11 @@ pub struct PartitionEventIter {
     partition_id: PartitionId,
     bucket_id: BucketId,
     reader_pool: ReaderThreadPool,
+    from_sequence: u64,
     segment_id: SegmentId,
-    segment_offsets: VecDeque<u64>,
+    segment_offsets: VecDeque<PartitionSequenceOffset>,
     live_segment_id: SegmentId,
-    live_segment_offsets: VecDeque<u64>,
+    live_segment_offsets: VecDeque<PartitionSequenceOffset>,
     next_offset: Option<NextOffset>,
     next_live_offset: Option<NextOffset>,
 }
@@ -562,9 +591,10 @@ impl PartitionEventIter {
         bucket_id: BucketId,
         reader_pool: ReaderThreadPool,
         live_indexes: &HashMap<BucketId, (Arc<AtomicU32>, LiveIndexes)>,
+        from_sequence: u64,
     ) -> Result<Self, PartitionIndexError> {
         let mut live_segment_id = 0;
-        let mut live_segment_offsets: VecDeque<_> = match live_indexes.get(&bucket_id) {
+        let mut live_segment_offsets: Vec<_> = match live_indexes.get(&bucket_id) {
             Some((current_live_segment_id, live_indexes)) => {
                 let current_live_segment_id = current_live_segment_id.load(Ordering::Acquire);
                 live_segment_id = current_live_segment_id;
@@ -576,20 +606,28 @@ impl PartitionEventIter {
                     .cloned()
                 {
                     Some(PartitionIndexRecord {
-                        sequence_min: 0,
-                        offsets: PartitionOffsets::Offsets(offsets),
+                        sequence_min,
+                        offsets: PartitionOffsets::Offsets(mut offsets),
                         ..
-                    }) => {
+                    }) if sequence_min <= from_sequence => {
+                        if from_sequence > 0 {
+                            let split_point =
+                                offsets.partition_point(|x| x.sequence < from_sequence);
+                            offsets.drain(0..split_point); // Remove items before the from_sequence
+                        }
+
                         let mut live_segment_offsets: VecDeque<_> = offsets.into();
-                        let next_live_offset =
-                            live_segment_offsets.pop_front().map(|offset| NextOffset {
+                        let next_live_offset = live_segment_offsets.pop_front().map(
+                            |PartitionSequenceOffset { offset, .. }| NextOffset {
                                 offset,
                                 segment_id: current_live_segment_id,
-                            });
+                            },
+                        );
                         return Ok(PartitionEventIter {
                             partition_id,
                             bucket_id,
                             reader_pool,
+                            from_sequence,
                             segment_id: current_live_segment_id,
                             segment_offsets: VecDeque::new(),
                             live_segment_id: current_live_segment_id,
@@ -601,7 +639,7 @@ impl PartitionEventIter {
                     Some(PartitionIndexRecord {
                         offsets: PartitionOffsets::Offsets(offsets),
                         ..
-                    }) => Some(offsets.into()),
+                    }) => Some(offsets),
                     Some(PartitionIndexRecord {
                         offsets: PartitionOffsets::ExternalBucket,
                         ..
@@ -616,6 +654,14 @@ impl PartitionEventIter {
         }
         .unwrap_or_default();
 
+        if from_sequence > 0 {
+            let split_point = live_segment_offsets.partition_point(|x| x.sequence < from_sequence);
+            live_segment_offsets.drain(0..split_point); // Remove items before the from_sequence
+        }
+
+        let mut live_segment_offsets: VecDeque<_> = live_segment_offsets.into();
+
+        // Find the earlierst segment and offsets
         let (reply_tx, reply_rx) = oneshot::channel();
         reader_pool.spawn({
             move |with_readers| {
@@ -631,13 +677,26 @@ impl PartitionEventIter {
                                     };
 
                                     match partition_index.get_key(partition_id) {
-                                        Ok(Some(key)) if key.sequence_min == 0 || i == 0 => {
+                                        Ok(Some(key))
+                                            if key.sequence_min <= from_sequence || i == 0 =>
+                                        {
                                             match partition_index.get_from_key(key) {
-                                                Ok(offsets) => {
+                                                Ok(mut offsets) => {
                                                     if let PartitionOffsets::Offsets(offsets) =
-                                                        &offsets
+                                                        &mut offsets
                                                     {
-                                                        if let Some(offset) = offsets.first() {
+                                                        if from_sequence > 0 {
+                                                            let split_point = offsets
+                                                                .partition_point(|x| {
+                                                                    x.sequence < from_sequence
+                                                                });
+                                                            offsets.drain(0..split_point); // Remove items before the from_sequence
+                                                        }
+                                                        if let Some(PartitionSequenceOffset {
+                                                            offset,
+                                                            ..
+                                                        }) = offsets.first()
+                                                        {
                                                             reader_set.reader.prefetch(*offset);
                                                         }
                                                     }
@@ -661,18 +720,21 @@ impl PartitionEventIter {
         match reply_rx.await {
             Ok(Ok(Some((segment_id, PartitionOffsets::Offsets(segment_offsets))))) => {
                 let mut segment_offsets: VecDeque<_> = segment_offsets.into();
-                let next_offset = segment_offsets
-                    .pop_front()
-                    .map(|offset| NextOffset { offset, segment_id });
-                let next_live_offset = live_segment_offsets.pop_front().map(|offset| NextOffset {
-                    offset,
-                    segment_id: live_segment_id,
-                });
+                let next_offset = segment_offsets.pop_front().map(
+                    |PartitionSequenceOffset { offset, .. }| NextOffset { offset, segment_id },
+                );
+                let next_live_offset = live_segment_offsets.pop_front().map(
+                    |PartitionSequenceOffset { offset, .. }| NextOffset {
+                        offset,
+                        segment_id: live_segment_id,
+                    },
+                );
 
                 Ok(PartitionEventIter {
                     partition_id,
                     bucket_id,
                     reader_pool,
+                    from_sequence,
                     segment_id,
                     segment_offsets,
                     live_segment_id,
@@ -682,15 +744,18 @@ impl PartitionEventIter {
                 })
             }
             Ok(Ok(Some((_, PartitionOffsets::ExternalBucket)))) | Ok(Ok(None)) | Err(_) => {
-                let next_live_offset = live_segment_offsets.pop_front().map(|offset| NextOffset {
-                    offset,
-                    segment_id: live_segment_id,
-                });
+                let next_live_offset = live_segment_offsets.pop_front().map(
+                    |PartitionSequenceOffset { offset, .. }| NextOffset {
+                        offset,
+                        segment_id: live_segment_id,
+                    },
+                );
 
                 Ok(PartitionEventIter {
                     partition_id,
                     bucket_id,
                     reader_pool,
+                    from_sequence,
                     segment_id: 0,
                     segment_offsets: VecDeque::new(),
                     live_segment_id,
@@ -703,16 +768,20 @@ impl PartitionEventIter {
         }
     }
 
-    pub async fn next(&mut self) -> Result<Option<EventRecord>, PartitionIndexError> {
+    pub async fn next(
+        &mut self,
+        header_only: bool,
+    ) -> Result<Option<EventRecord>, PartitionIndexError> {
         struct ReadResult {
             events: Option<CommittedEvents>,
-            new_offsets: Option<(SegmentId, VecDeque<u64>)>,
+            new_offsets: Option<(SegmentId, VecDeque<PartitionSequenceOffset>)>,
             is_live: bool,
         }
 
         let partition_id = self.partition_id;
         let bucket_id = self.bucket_id;
         let segment_id = self.segment_id;
+        let from_sequence = self.from_sequence;
         let live_segment_id = self.live_segment_id;
         let next_offset = self.next_offset;
         let next_live_offset = self.next_live_offset;
@@ -724,13 +793,17 @@ impl PartitionEventIter {
                     .get_mut(&bucket_id)
                     .map(|segments| {
                         match next_offset {
-                            Some(NextOffset { offset, segment_id }) => {
+                            Some(NextOffset {
+                                offset, segment_id, ..
+                            }) => {
                                 // We have an offset from the last batch
                                 match segments.get_mut(&segment_id) {
                                     Some(reader_set) => Ok(ReadResult {
-                                        events: reader_set
-                                            .reader
-                                            .read_committed_events(offset, false)?,
+                                        events: reader_set.reader.read_committed_events(
+                                            offset,
+                                            false,
+                                            header_only,
+                                        )?,
                                         new_offsets: None,
                                         is_live: false,
                                     }),
@@ -759,7 +832,16 @@ impl PartitionEventIter {
                                     let mut new_offsets: VecDeque<_> = match partition_index
                                         .get(partition_id)?
                                     {
-                                        Some(PartitionOffsets::Offsets(offsets)) => offsets.into(),
+                                        Some(PartitionOffsets::Offsets(mut offsets)) => {
+                                            if from_sequence > 0 {
+                                                let split_point = offsets.partition_point(|x| {
+                                                    x.sequence < from_sequence
+                                                });
+                                                offsets.drain(0..split_point); // Remove items before the from_sequence
+                                            }
+
+                                            offsets.into()
+                                        }
                                         Some(PartitionOffsets::ExternalBucket) => {
                                             return Ok(ReadResult {
                                                 events: None,
@@ -771,14 +853,17 @@ impl PartitionEventIter {
                                             continue;
                                         }
                                     };
+
                                     let Some(next_offset) = new_offsets.pop_front() else {
                                         continue;
                                     };
 
                                     return Ok(ReadResult {
-                                        events: reader_set
-                                            .reader
-                                            .read_committed_events(next_offset, false)?,
+                                        events: reader_set.reader.read_committed_events(
+                                            next_offset.offset,
+                                            false,
+                                            header_only,
+                                        )?,
                                         new_offsets: Some((i, new_offsets)),
                                         is_live: false,
                                     });
@@ -786,7 +871,9 @@ impl PartitionEventIter {
 
                                 // No more batches found, we'll process the live offsets
                                 match next_live_offset {
-                                    Some(NextOffset { offset, segment_id }) => {
+                                    Some(NextOffset {
+                                        offset, segment_id, ..
+                                    }) => {
                                         let Some(reader_set) = segments.get_mut(&segment_id) else {
                                             return Ok(ReadResult {
                                                 events: None,
@@ -796,9 +883,11 @@ impl PartitionEventIter {
                                         };
 
                                         Ok(ReadResult {
-                                            events: reader_set
-                                                .reader
-                                                .read_committed_events(offset, false)?,
+                                            events: reader_set.reader.read_committed_events(
+                                                offset,
+                                                false,
+                                                header_only,
+                                            )?,
                                             new_offsets: None,
                                             is_live: true,
                                         })
@@ -825,28 +914,31 @@ impl PartitionEventIter {
             }))) => {
                 if is_live {
                     self.segment_id = self.live_segment_id;
-                    self.next_live_offset =
-                        self.live_segment_offsets
-                            .pop_front()
-                            .map(|offset| NextOffset {
-                                offset,
-                                segment_id: self.live_segment_id,
-                            });
+                    self.next_live_offset = self.live_segment_offsets.pop_front().map(
+                        |PartitionSequenceOffset { offset, .. }| NextOffset {
+                            offset,
+                            segment_id: self.live_segment_id,
+                        },
+                    );
                     return Ok(events.and_then(|events| events.into_iter().next()));
                 }
 
                 if let Some((new_segment, new_offsets)) = new_offsets {
                     self.segment_id = new_segment;
                     self.segment_offsets = new_offsets;
-                    self.next_offset = self.segment_offsets.pop_front().map(|offset| NextOffset {
-                        offset,
-                        segment_id: self.segment_id,
-                    });
+                    self.next_offset = self.segment_offsets.pop_front().map(
+                        |PartitionSequenceOffset { offset, .. }| NextOffset {
+                            offset,
+                            segment_id: self.segment_id,
+                        },
+                    );
                 } else {
-                    self.next_offset = self.segment_offsets.pop_front().map(|offset| NextOffset {
-                        offset,
-                        segment_id: self.segment_id,
-                    });
+                    self.next_offset = self.segment_offsets.pop_front().map(
+                        |PartitionSequenceOffset { offset, .. }| NextOffset {
+                            offset,
+                            segment_id: self.segment_id,
+                        },
+                    );
                 }
 
                 Ok(events.and_then(|events| events.into_iter().next()))
@@ -927,10 +1019,23 @@ mod tests {
         let mut index = OpenPartitionIndex::create(BucketSegmentId::new(0, 0), &path).unwrap();
 
         let partition_id = 42;
-        let offsets = vec![1000, 2000, 3000];
+        let offsets = vec![
+            PartitionSequenceOffset {
+                sequence: 0,
+                offset: 1000,
+            },
+            PartitionSequenceOffset {
+                sequence: 1,
+                offset: 2000,
+            },
+            PartitionSequenceOffset {
+                sequence: 2,
+                offset: 3000,
+            },
+        ];
 
         for (i, offset) in offsets.iter().enumerate() {
-            index.insert(partition_id, i as u64, *offset).unwrap();
+            index.insert(partition_id, i as u64, offset.offset).unwrap();
         }
 
         let record = index.get(partition_id).unwrap();
@@ -953,14 +1058,30 @@ mod tests {
 
         let partition_id1 = 1;
         let partition_id2 = 2;
-        let offsets1 = vec![100, 200];
-        let offsets2 = vec![300];
+        let offsets1 = vec![
+            PartitionSequenceOffset {
+                sequence: 0,
+                offset: 100,
+            },
+            PartitionSequenceOffset {
+                sequence: 1,
+                offset: 200,
+            },
+        ];
+        let offsets2 = vec![PartitionSequenceOffset {
+            sequence: 0,
+            offset: 300,
+        }];
 
         for (i, offset) in offsets1.iter().enumerate() {
-            index.insert(partition_id1, i as u64, *offset).unwrap();
+            index
+                .insert(partition_id1, i as u64, offset.offset)
+                .unwrap();
         }
         for (i, offset) in offsets2.iter().enumerate() {
-            index.insert(partition_id2, i as u64, *offset).unwrap();
+            index
+                .insert(partition_id2, i as u64, offset.offset)
+                .unwrap();
         }
 
         // Flush with the new MPHF format
@@ -1013,22 +1134,64 @@ mod tests {
         let partition_id3 = 3;
         let partition_id4 = 4;
 
-        let offsets1 = vec![1001, 1002];
-        let offsets2 = vec![2001, 2002, 2003];
-        let offsets3 = vec![3001, 3002];
-        let offsets4 = vec![4001];
+        let offsets1 = vec![
+            PartitionSequenceOffset {
+                sequence: 0,
+                offset: 1001,
+            },
+            PartitionSequenceOffset {
+                sequence: 1,
+                offset: 1002,
+            },
+        ];
+        let offsets2 = vec![
+            PartitionSequenceOffset {
+                sequence: 0,
+                offset: 2001,
+            },
+            PartitionSequenceOffset {
+                sequence: 1,
+                offset: 2002,
+            },
+            PartitionSequenceOffset {
+                sequence: 2,
+                offset: 2003,
+            },
+        ];
+        let offsets3 = vec![
+            PartitionSequenceOffset {
+                sequence: 0,
+                offset: 3001,
+            },
+            PartitionSequenceOffset {
+                sequence: 1,
+                offset: 3002,
+            },
+        ];
+        let offsets4 = vec![PartitionSequenceOffset {
+            sequence: 0,
+            offset: 4001,
+        }];
 
         for (i, offset) in offsets1.iter().enumerate() {
-            index.insert(partition_id1, i as u64, *offset).unwrap();
+            index
+                .insert(partition_id1, i as u64, offset.offset)
+                .unwrap();
         }
         for (i, offset) in offsets2.iter().enumerate() {
-            index.insert(partition_id2, i as u64, *offset).unwrap();
+            index
+                .insert(partition_id2, i as u64, offset.offset)
+                .unwrap();
         }
         for (i, offset) in offsets3.iter().enumerate() {
-            index.insert(partition_id3, i as u64, *offset).unwrap();
+            index
+                .insert(partition_id3, i as u64, offset.offset)
+                .unwrap();
         }
         for (i, offset) in offsets4.iter().enumerate() {
-            index.insert(partition_id4, i as u64, *offset).unwrap();
+            index
+                .insert(partition_id4, i as u64, offset.offset)
+                .unwrap();
         }
 
         // Flush with the new MPHF format

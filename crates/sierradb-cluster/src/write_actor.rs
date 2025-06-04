@@ -118,7 +118,7 @@ impl WriteActor {
     }
 
     /// Marks events as confirmed and broadcasts confirmation to replicas
-    pub async fn complete_write(mut self) {
+    pub async fn complete_write(&mut self) {
         if let Some(result) = self.append_result.take() {
             debug!(
                 transaction_id = %self.transaction_id,
@@ -261,6 +261,15 @@ impl Actor for WriteActor {
         }
 
         Ok(state)
+    }
+
+    async fn on_stop(
+        &mut self,
+        _actor_ref: WeakActorRef<Self>,
+        _reason: ActorStopReason,
+    ) -> Result<(), Self::Error> {
+        self.complete_write().await;
+        Ok(())
     }
 
     async fn next(
