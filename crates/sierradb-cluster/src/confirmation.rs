@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bincode::{Decode, Encode};
+use kameo::Reply;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::{BucketId, PartitionId};
@@ -16,11 +18,6 @@ use super::{BucketId, PartitionId};
 /// Errors that can occur during confirmation state operations
 #[derive(Error, Debug)]
 pub enum ConfirmationError {
-    #[error("encode error: {0}")]
-    Encode(#[from] bincode::error::EncodeError),
-    #[error("decode error: {0}")]
-    Decode(#[from] bincode::error::DecodeError),
-
     #[error("invalid state format: {0}")]
     InvalidFormat(String),
 
@@ -32,6 +29,12 @@ pub enum ConfirmationError {
 
     #[error("corrupted state file due to crc32c hash mismatch")]
     CorruptedState,
+
+    #[error("encode error: {0}")]
+    Encode(#[from] bincode::error::EncodeError),
+
+    #[error("decode error: {0}")]
+    Decode(#[from] bincode::error::DecodeError),
 
     #[error(transparent)]
     Io(#[from] io::Error),
@@ -239,7 +242,7 @@ impl BucketConfirmationManager {
 
     /// Get directory path for bucket confirmation files
     fn get_bucket_confirmation_dir(&self, bucket_id: BucketId) -> PathBuf {
-        let bucket_path = format!("{:05}", bucket_id);
+        let bucket_path = format!("{bucket_id:05}");
         self.data_dir
             .join("buckets")
             .join(bucket_path)
@@ -417,10 +420,10 @@ impl BucketConfirmationManager {
         let bucket_id = self.get_bucket_for_partition(partition_id);
 
         // Look up the watermark from in-memory state
-        if let Some(partition_states) = self.buckets.get(&bucket_id) {
-            if let Some(state) = partition_states.get(&partition_id) {
-                return Some(&state.confirmed_watermark);
-            }
+        if let Some(partition_states) = self.buckets.get(&bucket_id)
+            && let Some(state) = partition_states.get(&partition_id)
+        {
+            return Some(&state.confirmed_watermark);
         }
 
         // If not found, return 0 (no events confirmed)
@@ -431,10 +434,10 @@ impl BucketConfirmationManager {
     pub fn get_confirmation_gap(&self, partition_id: PartitionId) -> u64 {
         let bucket_id = self.get_bucket_for_partition(partition_id);
 
-        if let Some(partition_states) = self.buckets.get(&bucket_id) {
-            if let Some(state) = partition_states.get(&partition_id) {
-                return state.confirmation_gap();
-            }
+        if let Some(partition_states) = self.buckets.get(&bucket_id)
+            && let Some(state) = partition_states.get(&partition_id)
+        {
+            return state.confirmation_gap();
         }
 
         // If partition not found, return 0 (no gap)
@@ -450,10 +453,10 @@ impl BucketConfirmationManager {
     ) -> Vec<u64> {
         let bucket_id = self.get_bucket_for_partition(partition_id);
 
-        if let Some(partition_states) = self.buckets.get(&bucket_id) {
-            if let Some(state) = partition_states.get(&partition_id) {
-                return state.get_stuck_events(min_attempts, min_age_secs);
-            }
+        if let Some(partition_states) = self.buckets.get(&bucket_id)
+            && let Some(state) = partition_states.get(&partition_id)
+        {
+            return state.get_stuck_events(min_attempts, min_age_secs);
         }
 
         // If partition not found, return empty list
@@ -664,7 +667,7 @@ pub struct ValidationReport {
 }
 
 /// Statistics about the confirmation state
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, Reply, Serialize, Deserialize)]
 pub struct ConfirmationStats {
     pub bucket_count: usize,
     pub partition_count: usize,

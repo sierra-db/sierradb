@@ -1,5 +1,5 @@
 pub mod behaviour;
-// pub mod confirmation;
+pub mod confirmation;
 pub mod error;
 pub mod partition_consensus;
 pub mod swarm;

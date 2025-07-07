@@ -274,7 +274,7 @@ impl Behaviour {
         if let Err(err) = self
             .gossipsub
             .publish(self.heartbeat_topic.hash(), self.heartbeat_bytes.clone())
-            && !matches!(err, PublishError::InsufficientPeers)
+            && !matches!(err, PublishError::NoPeersSubscribedToTopic)
         {
             error!("error publishing heartbeat: {err}");
         }

@@ -1,58 +1,76 @@
 {
-  description = "Dev shell";
+  description = "Rust development environment";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    rust-overlay.url = "github:oxalica/rust-overlay";
-    flake-utils.url = "github:numtide/flake-utils";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
     {
       nixpkgs,
       rust-overlay,
-      flake-utils,
       ...
     }:
-    flake-utils.lib.eachDefaultSystem (
-      system:
-      let
-        overlays = [ (import rust-overlay) ];
-        rust-bin = pkgs.rust-bin.selectLatestNightlyWith (
-          toolchain:
-          toolchain.default.override {
+    let
+      supportedSystems = [
+        "x86_64-linux"
+        "aarch64-linux"
+        "x86_64-darwin"
+        "aarch64-darwin"
+      ];
+      forAllSystems = function: nixpkgs.lib.genAttrs supportedSystems function;
+    in
+    {
+      devShells = forAllSystems (
+        system:
+        let
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ rust-overlay.overlays.default ];
+          };
+
+          # Define the shell directly here, instead of importing
+          rustToolchain = pkgs.rust-bin.stable.latest.default.override {
             extensions = [
               "rust-src"
               "rustfmt"
               "rust-analyzer"
             ];
-          }
-        );
-        pkgs = import nixpkgs {
-          inherit system overlays;
-          config.allowUnfree = true;
-        };
-      in
-      with pkgs;
-      {
-        devShells.default = mkShell {
-          buildInputs =
-            [
+          };
+          # rustToolchain = pkgs.rust-bin.selectLatestNightlyWith (
+          #   toolchain:
+          #   toolchain.default.override {
+          #     extensions = [
+          #       "rust-src"
+          #       "rustfmt"
+          #       "rust-analyzer"
+          #     ];
+          #   }
+          # );
+
+          devShell = pkgs.mkShell {
+            name = "rust-dev";
+            buildInputs = with pkgs; [
               bacon
               cargo-expand
-              cargo-fuzz
-              rust-bin
-            ]
-            ++ pkgs.lib.optionals pkgs.stdenv.isDarwin (
-              with pkgs.darwin.apple_sdk.frameworks;
-              [
-                CoreServices
-                CoreFoundation
-                Security
-                SystemConfiguration
-              ]
-            );
-        };
-      }
-    );
+              cargo-generate
+              cargo-msrv
+              cargo-outdated
+              cargo-semver-checks
+              cargo-temp
+              rustToolchain
+              pkg-config
+              openssl.dev
+            ];
+          };
+        in
+        {
+          default = devShell;
+        }
+      );
+    };
 }

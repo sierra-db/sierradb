@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::{fmt, fs, process};
 
+use libc::{RLIMIT_NOFILE, getrlimit, rlimit, setrlimit};
 use rayon::{ThreadPool, ThreadPoolBuildError, ThreadPoolBuilder};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -406,6 +407,29 @@ impl DatabaseBuilder {
         let buckets_dir = dir.join("buckets");
         if !buckets_dir.exists() {
             fs::create_dir_all(&buckets_dir)?;
+        }
+
+        // Update rlimit, so we don't get an error about too many open files
+        unsafe {
+            let mut rlimit = rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+
+            if getrlimit(RLIMIT_NOFILE, &mut rlimit) == 0 {
+                let desired_rlimit = self.bucket_ids.len() as u64 * 4 + 8; // 8 added for safety
+
+                if rlimit.rlim_cur < desired_rlimit {
+                    rlimit.rlim_cur = std::cmp::min(desired_rlimit, rlimit.rlim_max);
+                    if setrlimit(RLIMIT_NOFILE, &rlimit) == 0 {
+                        debug!("successfully updated rlimit to {}", rlimit.rlim_cur);
+                    } else {
+                        error!("failed to update rlimit to {}", rlimit.rlim_cur);
+                    }
+                }
+            } else {
+                error!("failed to query rlimit");
+            }
         }
 
         let _ = fs::create_dir_all(&dir);
