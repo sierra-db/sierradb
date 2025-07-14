@@ -1,10 +1,11 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use kameo::prelude::*;
 use sierradb::{
     bucket::PartitionId,
     database::{Database, Transaction},
+    error::WriteError,
     writer_thread_pool::AppendResult,
 };
 use smallvec::SmallVec;
@@ -13,6 +14,7 @@ use uuid::Uuid;
 
 use crate::{
     ClusterActor, ClusterError, ConfirmTransaction, ReplicateWrite,
+    circuit_breaker::WriteCircuitBreaker,
     confirmation::actor::{ConfirmationActor, UpdateConfirmation},
 };
 
@@ -25,6 +27,7 @@ pub fn spawn(
     replica_partitions: Vec<(PartitionId, RemoteActorRef<ClusterActor>)>,
     replication_factor: u8,
     transaction: Transaction,
+    circuit_breaker: Arc<WriteCircuitBreaker>,
     reply_sender: Option<ReplySender<Result<AppendResult, ClusterError>>>,
 ) {
     tokio::spawn(async move {
@@ -58,81 +61,94 @@ pub fn spawn(
 
                 let mut confirmation_count = confirmed_partitions.len() as u8;
 
-                // Mark events as confirmed in the database
-                if let Err(err) = database
-                    .set_confirmations(
-                        partition_id,
-                        append.offsets.clone(),
-                        transaction_id,
-                        confirmation_count,
-                    )
-                    .await
+                // CRITICAL: Set confirmations with retry logic
+                match set_confirmations_with_retry(
+                    &database,
+                    partition_id,
+                    append.offsets.clone(),
+                    transaction_id,
+                    confirmation_count,
+                )
+                .await
                 {
-                    error!(
-                        %transaction_id,
-                        partition_id = partition_id,
-                        ?err,
-                        "failed to mark confirmations"
-                    );
-                    // Note: we continue anyway since we've already told the client
-                    // the write succeeded. We should handle this confirmation later with catchup.
-                }
+                    Ok(()) => {
+                        // Success - record in circuit breaker
+                        circuit_breaker.record_success();
 
-                let event_partition_sequences: SmallVec<[u64; 4]> =
-                    (append.first_partition_sequence..=append.last_partition_sequence).collect();
+                        // Continue with watermark update and replica confirmations
+                        let event_partition_sequences: SmallVec<[u64; 4]> =
+                            (append.first_partition_sequence..=append.last_partition_sequence)
+                                .collect();
 
-                let _ = confirmation_ref
-                    .tell(UpdateConfirmation {
-                        partition_id,
-                        versions: event_partition_sequences.clone(),
-                        confirmation_count,
-                    })
-                    .await;
-
-                // Broadcast confirmation to all confirmed replica partitions
-                for (partition_id, cluster_ref) in confirmed_partitions {
-                    let Some(cluster_ref) = cluster_ref else {
-                        continue;
-                    };
-
-                    debug!(
-                        %transaction_id,
-                        partition_id,
-                        "sending confirmation to replica"
-                    );
-
-                    cluster_ref
-                        .tell(&ConfirmTransaction {
-                            partition_id,
-                            transaction_id,
-                            event_ids: event_ids.clone(),
-                            event_versions: event_partition_sequences.clone(),
-                            confirmation_count,
-                        })
-                        .send()
-                        .expect("ConfirmTransaction serialzation should succeed");
-                }
-
-                if let Some(tx) = reply_sender {
-                    tx.send(Ok(append));
-                }
-
-                // Confirm writes for other partitions which still succeeded
-                while let Ok(Some((partition_id, cluster_ref, res))) =
-                    tokio::time::timeout(TIMEOUT, pending_replies.next()).await
-                {
-                    if res.is_ok() {
-                        confirmation_count += 1;
-                        cluster_ref
-                            .tell(&ConfirmTransaction {
+                        let _ = confirmation_ref
+                            .tell(UpdateConfirmation {
                                 partition_id,
-                                transaction_id,
-                                event_ids: event_ids.clone(),
-                                event_versions: event_partition_sequences.clone(),
+                                versions: event_partition_sequences.clone(),
                                 confirmation_count,
                             })
-                            .send()
-                            .expect("confirm write serialzation should succeed");
+                            .await;
+
+                        // Broadcast confirmation to all confirmed replica partitions
+                        for (partition_id, cluster_ref) in confirmed_partitions {
+                            let Some(cluster_ref) = cluster_ref else {
+                                continue;
+                            };
+
+                            debug!(
+                                %transaction_id,
+                                partition_id,
+                                "sending confirmation to replica"
+                            );
+
+                            cluster_ref
+                                .tell(&ConfirmTransaction {
+                                    partition_id,
+                                    transaction_id,
+                                    event_ids: event_ids.clone(),
+                                    event_versions: event_partition_sequences.clone(),
+                                    confirmation_count,
+                                })
+                                .send()
+                                .expect("ConfirmTransaction serialzation should succeed");
+                        }
+
+                        if let Some(tx) = reply_sender {
+                            tx.send(Ok(append));
+                        }
+
+                        // Confirm writes for other partitions which still succeeded
+                        while let Ok(Some((partition_id, cluster_ref, res))) =
+                            tokio::time::timeout(TIMEOUT, pending_replies.next()).await
+                        {
+                            if res.is_ok() {
+                                confirmation_count += 1;
+                                cluster_ref
+                                    .tell(&ConfirmTransaction {
+                                        partition_id,
+                                        transaction_id,
+                                        event_ids: event_ids.clone(),
+                                        event_versions: event_partition_sequences.clone(),
+                                        confirmation_count,
+                                    })
+                                    .send()
+                                    .expect("confirm write serialzation should succeed");
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        // CRITICAL FAILURE - we told replicas to write but can't confirm locally
+                        circuit_breaker.record_failure();
+
+                        error!(
+                            %transaction_id,
+                            partition_id = partition_id,
+                            ?err,
+                            "CRITICAL: Failed to set confirmations after achieving quorum"
+                        );
+
+                        if let Some(tx) = reply_sender {
+                            tx.send(Err(ClusterError::ConfirmationFailure(err.to_string())));
+                        }
                     }
                 }
             }
@@ -188,7 +204,6 @@ async fn run(
         .append_events(partition_id, transaction.clone())
         .await?;
 
-    let replica_partitions_len = replica_partitions.len();
     let mut pending_replies: FuturesUnordered<_> = replica_partitions
         .into_iter()
         .map(|(partition_id, cluster_ref)| {
@@ -234,8 +249,7 @@ async fn run(
 
                 // Check if we can still achieve quorum
                 let required_quorum = (replication_factor as usize / 2) + 1;
-                let max_possible = confirmed_partitions.len() + replica_partitions_len
-                    - confirmed_partitions.len();
+                let max_possible = confirmed_partitions.len() + pending_replies.len();
 
                 if max_possible < required_quorum {
                     error!(
@@ -259,4 +273,51 @@ async fn run(
         confirmed: confirmed_partitions.len() as u8,
         required: required_quorum as u8,
     })
+}
+
+pub async fn set_confirmations_with_retry(
+    database: &Database,
+    partition_id: PartitionId,
+    offsets: SmallVec<[u64; 4]>,
+    transaction_id: Uuid,
+    confirmation_count: u8,
+) -> Result<(), WriteError> {
+    const MAX_ATTEMPTS: u32 = 5;
+    const BASE_DELAY: Duration = Duration::from_millis(100);
+    const MAX_DELAY: Duration = Duration::from_secs(5);
+
+    let mut attempts = 0;
+    let mut delay = BASE_DELAY;
+
+    loop {
+        match database
+            .set_confirmations(
+                partition_id,
+                offsets.clone(),
+                transaction_id,
+                confirmation_count,
+            )
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                attempts += 1;
+
+                if attempts >= MAX_ATTEMPTS {
+                    return Err(err);
+                }
+
+                warn!(
+                    %transaction_id,
+                    partition_id,
+                    attempt = attempts,
+                    ?err,
+                    "retrying confirmation update"
+                );
+
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(MAX_DELAY);
+            }
+        }
+    }
 }
