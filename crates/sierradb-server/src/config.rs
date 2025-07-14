@@ -157,7 +157,7 @@ impl AppConfig {
             .set_default("heartbeat.interval_ms", 1000)?
             .set_default("heartbeat.timeout_ms", 6000)?
             .set_default("network.cluster_enabled", true)?
-            .set_default("network.cluster_address", "/ip4/0.0.0.0/udp/0/quic-v1")?
+            .set_default("network.cluster_address", "/ip4/0.0.0.0/tcp/0")?
             .set_default("network.client_address", "0.0.0.0:9090")?
             .set_default("partition.count", 1024)?
             .set_default("replication_factor", 3)?

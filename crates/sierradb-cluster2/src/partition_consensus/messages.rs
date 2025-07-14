@@ -1,15 +1,12 @@
 use bincode::{Decode, Encode};
-use kameo::actor::RemoteActorRef;
 use libp2p::PeerId;
 use std::collections::{HashMap, HashSet};
-
-use crate::ClusterActor;
 
 /// Regular heartbeat from a node to indicate it's still alive
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct Heartbeat {
     #[bincode(with_serde)]
-    pub cluster_ref: RemoteActorRef<ClusterActor>,
+    pub node_id: PeerId,
     pub owned_partitions: Vec<u16>, // Partitions owned by this node
 }
 
@@ -19,14 +16,14 @@ pub enum OwnershipMessage {
     /// Request for current ownership info (typically sent by new nodes joining)
     OwnershipRequest {
         #[bincode(with_serde)]
-        cluster_ref: RemoteActorRef<ClusterActor>,
+        node_id: PeerId,
         owned_partitions: Vec<u16>, // Partitions owned by the requesting node
     },
 
     /// Response with current ownership state
     OwnershipResponse {
         #[bincode(with_serde)]
-        partition_owners: HashMap<u16, RemoteActorRef<ClusterActor>>, // partition_id -> owner
+        partition_owners: HashMap<u16, PeerId>, // partition_id -> owner
         #[bincode(with_serde)]
         active_nodes: HashSet<PeerId>, // set of nodes considered active
     },

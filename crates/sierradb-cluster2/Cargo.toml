@@ -1,5 +1,5 @@
 [package]
-name = "sierradb-cluster"
+name = "sierradb-cluster2"
 version = "0.1.0"
 edition = "2024"
 
@@ -29,19 +29,8 @@ rand.workspace = true
 serde = { workspace = true, features = ["derive"] }
 smallvec = { workspace = true, features = ["serde"] }
 thiserror.workspace = true
-# tokio = { workspace = true, features = ["fs", "sync"] }
-tokio = { workspace = true, features = [
-  "fs",
-  "io-std",
-  "io-util",
-  "net",
-  "signal",
-  "sync",
-  "macros",
-  "rt-multi-thread",
-] }
+tokio = { workspace = true, features = ["fs", "sync"] }
 tracing.workspace = true
-tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 uuid.workspace = true
 
 [dev-dependencies]

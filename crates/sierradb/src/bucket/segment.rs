@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fs, mem};
 
 use bincode::config::{Fixint, LittleEndian, NoLimit};
+use tracing::trace;
 use uuid::Uuid;
 
 pub use self::reader::{
@@ -96,7 +97,25 @@ fn calculate_event_crc32c(
     hasher.update(event_name.as_bytes());
     hasher.update(metadata);
     hasher.update(payload);
-    hasher.finalize()
+    let hash = hasher.finalize();
+
+    trace!(
+        timestamp,
+        %transaction_id,
+        %event_id,
+        %partition_key,
+        partition_id,
+        partition_sequence,
+        stream_version,
+        %stream_id,
+        %event_name,
+        ?metadata,
+        ?payload,
+        hash,
+        "calculating event crc32c"
+    );
+
+    hash
 }
 
 #[must_use]
@@ -105,7 +124,17 @@ fn calculate_commit_crc32c(transaction_id: &Uuid, encoded_timestamp: u64, event_
     hasher.update(transaction_id.as_bytes());
     hasher.update(&encoded_timestamp.to_le_bytes());
     hasher.update(&event_count.to_le_bytes());
-    hasher.finalize()
+    let hash = hasher.finalize();
+
+    trace!(
+        %transaction_id,
+        encoded_timestamp,
+        event_count,
+        hash,
+        "calculating commit crc32c"
+    );
+
+    hash
 }
 
 #[must_use]
@@ -113,7 +142,16 @@ fn calculate_confirmation_count_crc32c(transaction_id: &Uuid, confirmation_count
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(transaction_id.as_bytes());
     hasher.update(&confirmation_count.to_le_bytes());
-    hasher.finalize()
+    let hash = hasher.finalize();
+
+    trace!(
+        %transaction_id,
+        confirmation_count,
+        hash,
+        "calculating confirmation count crc32c"
+    );
+
+    hash
 }
 
 fn set_confirmations(

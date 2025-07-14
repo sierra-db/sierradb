@@ -23,7 +23,8 @@ clap = "4.5"
 crc32fast = "1.4"
 directories = "6.0"
 futures = "0.3"
-kameo = { git = "https://github.com/tqwewe/kameo", branch = "main" }
+# kameo = { git = "https://github.com/tqwewe/kameo", branch = "main" }
+kameo = { path = "../kameo" }
 libp2p = "0.56"
 rand = "0.9"
 serde = "1.0"

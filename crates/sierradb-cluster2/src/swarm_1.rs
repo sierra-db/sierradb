@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 use self::write_manager::WriteManager;
 use crate::behaviour::{Behaviour, BehaviourEvent, Req, Resp};
+use crate::confirmation::actor::ConfirmationActor;
 use crate::error::SwarmError;
 use crate::partition_consensus::{self, PartitionManager};
 use crate::write_actor::WriteActor;
@@ -124,22 +125,21 @@ impl Swarm {
                     transaction_id,
                     origin_peer,
                 );
-            }
-            Req::ConfirmWrite {
-                partition_id,
-                transaction_id,
-                event_ids,
-                confirmation_count,
-            } => {
-                debug!(%transaction_id, partition_id, "Received confirm write request from network");
-                self.write_manager.process_network_commit(
-                    channel,
-                    partition_id,
-                    transaction_id,
-                    event_ids,
-                    confirmation_count,
-                );
-            }
+            } // Req::ConfirmWrite {
+              //     partition_id,
+              //     transaction_id,
+              //     event_ids,
+              //     confirmation_count,
+              // } => {
+              //     debug!(%transaction_id, partition_id, "Received confirm write request from network");
+              //     self.write_manager.process_network_commit(
+              //         channel,
+              //         partition_id,
+              //         transaction_id,
+              //         event_ids,
+              //         confirmation_count,
+              //     );
+              // }
         }
     }
 
@@ -261,8 +261,14 @@ impl Actor for Swarm {
             })?
             .build();
 
+        let confirmation_ref = Actor::spawn(ConfirmationActor::new(
+            database.dir().clone(),
+            database.total_buckets(),
+            replication_factor,
+        ));
+
         // Create write manager to handle distributed writes
-        let write_manager = WriteManager::new(actor_ref.clone(), database, local_peer_id);
+        let write_manager = WriteManager::new(actor_ref, confirmation_ref, database, local_peer_id);
 
         Ok(Swarm {
             swarm,

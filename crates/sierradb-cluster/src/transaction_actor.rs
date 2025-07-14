@@ -10,25 +10,23 @@ use sierradb::bucket::PartitionId;
 use sierradb::database::{Database, Transaction};
 use sierradb::writer_thread_pool::AppendResult;
 use tokio::time::Sleep;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
 
-use crate::behaviour::Resp;
-use crate::error::SwarmError;
-use crate::swarm::{ConfirmWrite, ReplicateWrite, ReplyKind, SendResponse, Swarm};
+use crate::{ClusterActor, ClusterError, ConfirmWrite, ReplicateWrite};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Handles a single write operation, coordinating the distributed consensus
 /// process.
-pub struct WriteActor {
-    swarm_ref: ActorRef<Swarm>,
+#[derive(RemoteActor)]
+pub struct TransactionActor {
     database: Database,
     partition_id: PartitionId,
     transaction_id: Uuid,
     transaction: Transaction,
-    reply: Option<ReplyKind<AppendResult>>,
-    replica_partitions: Vec<PartitionId>,
+    reply_sender: Option<ReplySender<Result<AppendResult, ClusterError>>>,
+    replica_partitions: Vec<(PartitionId, RemoteActorRef<ClusterActor>)>,
     timeout: Pin<Box<Sleep>>,
 
     // State that tracks the progress of the write operation
@@ -37,24 +35,22 @@ pub struct WriteActor {
     replication_factor: u8,
 }
 
-impl WriteActor {
+impl TransactionActor {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        swarm_ref: ActorRef<Swarm>,
         database: Database,
         partition_id: PartitionId,
         transaction: Transaction,
-        reply: ReplyKind<AppendResult>,
-        replica_partitions: Vec<PartitionId>,
+        reply_sender: Option<ReplySender<Result<AppendResult, ClusterError>>>,
+        replica_partitions: Vec<(PartitionId, RemoteActorRef<ClusterActor>)>,
         replication_factor: u8,
     ) -> Self {
         Self {
-            swarm_ref,
             database,
             partition_id,
             transaction_id: transaction.transaction_id(),
             transaction,
-            reply: Some(reply),
+            reply_sender,
             replica_partitions,
             timeout: Box::pin(tokio::time::sleep(TIMEOUT)),
             append_result: None,
@@ -71,49 +67,21 @@ impl WriteActor {
 
     /// Sends success response to client
     async fn send_success(&mut self, result: AppendResult) {
-        debug!(transaction_id = %self.transaction_id, "Sending success response");
+        debug!(transaction_id = %self.transaction_id, "sending success response");
 
         // Take ownership of the reply
-        if let Some(reply) = self.reply.take() {
-            match reply {
-                ReplyKind::Local(tx) => {
-                    // Send response to local client
-                    let _ = tx.send(Ok(result));
-                }
-                ReplyKind::Remote(channel) => {
-                    // Send response through libp2p response channel for remote clients
-                    let _ = self
-                        .swarm_ref
-                        .tell(SendResponse {
-                            channel,
-                            response: Resp::AppendEvents(Ok(result)),
-                        })
-                        .await;
-                }
-            }
+        if let Some(tx) = self.reply_sender.take() {
+            tx.send(Ok(result));
         }
     }
 
     /// Sends failure response to client
-    async fn send_failure(&mut self, err: SwarmError) {
-        error!(transaction_id = %self.transaction_id, ?err, "Sending failure response");
+    async fn send_failure(&mut self, err: ClusterError) {
+        error!(transaction_id = %self.transaction_id, ?err, "sending failure response");
 
         // Take ownership of the reply
-        if let Some(reply) = self.reply.take() {
-            match reply {
-                ReplyKind::Local(tx) => {
-                    let _ = tx.send(Err(err));
-                }
-                ReplyKind::Remote(channel) => {
-                    let _ = self
-                        .swarm_ref
-                        .tell(SendResponse {
-                            channel,
-                            response: Resp::AppendEvents(Err(err)),
-                        })
-                        .await;
-                }
-            }
+        if let Some(tx) = self.reply_sender.take() {
+            tx.send(Err(err));
         }
     }
 
@@ -123,7 +91,7 @@ impl WriteActor {
             debug!(
                 transaction_id = %self.transaction_id,
                 partition_id = %self.partition_id,
-                "Completing write operation"
+                "completing write operation"
             );
 
             // Mark events as confirmed in the database
@@ -141,24 +109,23 @@ impl WriteActor {
                     transaction_id = %self.transaction_id,
                     partition_id = %self.partition_id,
                     ?err,
-                    "Failed to mark confirmations"
+                    "failed to mark confirmations"
                 );
                 // Note: we continue anyway since we've already told the client
-                // the write succeeded
+                // the write succeeded. We should handle this confirmation later with catchup.
             }
 
             // Broadcast confirmation to all confirmed replica partitions
-            for replica_id in &self.replica_partitions {
+            for (replica_id, cluster_ref) in &self.replica_partitions {
                 if self.confirmed_partitions.contains(replica_id) {
                     debug!(
                         transaction_id = %self.transaction_id,
                         replica_id = %replica_id,
-                        "Sending confirmation to replica"
+                        "sending confirmation to replica"
                     );
 
-                    let _ = self
-                        .swarm_ref
-                        .tell(ConfirmWrite {
+                    cluster_ref
+                        .tell(&ConfirmWrite {
                             partition_id: *replica_id,
                             transaction_id: self.transaction_id,
                             event_ids: self
@@ -169,14 +136,15 @@ impl WriteActor {
                                 .collect(),
                             confirmation_count: self.confirmed_partitions.len() as u8,
                         })
-                        .await;
+                        .send()
+                        .expect("confirm write serialzation should succeed");
                 }
             }
         }
     }
 }
 
-impl Actor for WriteActor {
+impl Actor for TransactionActor {
     type Args = Self;
     type Error = Infallible;
 
@@ -184,7 +152,12 @@ impl Actor for WriteActor {
         mut state: Self::Args,
         actor_ref: ActorRef<Self>,
     ) -> Result<Self, Self::Error> {
-        debug!(transaction_id = %state.transaction_id, "Beginning write operation");
+        debug!(transaction_id = %state.transaction_id, "beginning write operation");
+
+        let has_quorum = state.has_quorum();
+        if has_quorum {
+            state.transaction = state.transaction.with_confirmation_count(1);
+        }
 
         // PHASE 1: LOCAL WRITE
         // Write events locally and assign versions
@@ -197,29 +170,37 @@ impl Actor for WriteActor {
                 debug!(
                     transaction_id = %state.transaction_id,
                     partition_id = %state.partition_id,
-                    "Local write successful"
+                    "local write successful"
                 );
+
+                // let _ = state
+                //     .confirmation_ref
+                //     .update_event_confirmation(
+                //         state.partition_id,
+                //         result.partition_sequence, // Use the sequence from the write result
+                //         1,                         // First confirmation (local write)
+                //     )
+                //     .await;
 
                 // PHASE 2: REPLICATION
                 // Begin replication to replica partitions
-                for replica_id in &state.replica_partitions {
+                for (replica_id, cluster_ref) in &state.replica_partitions {
                     debug!(
                         transaction_id = %state.transaction_id,
                         partition_id = %state.partition_id,
                         replica_id = %replica_id,
-                        "Replicating write"
+                        "replicating write"
                     );
 
-                    let _ = state
-                        .swarm_ref
-                        .tell(ReplicateWrite {
+                    let _ = cluster_ref
+                        .tell(&ReplicateWrite {
                             partition_id: *replica_id,
                             transaction: state.transaction.clone(),
                             transaction_id: state.transaction_id,
                             origin_partition: state.partition_id,
-                            write_actor_ref: actor_ref.clone(),
+                            transaction_ref: actor_ref.into_remote_ref().await,
                         })
-                        .await;
+                        .send();
                 }
 
                 // Check if we've already achieved quorum (e.g., if replication factor is 1)
@@ -227,7 +208,7 @@ impl Actor for WriteActor {
                     debug!(
                         transaction_id = %state.transaction_id,
                         partition_id = %state.partition_id,
-                        "Quorum already achieved"
+                        "quorum already achieved"
                     );
 
                     // Send success response to client with the result
@@ -247,11 +228,13 @@ impl Actor for WriteActor {
                     transaction_id = %state.transaction_id,
                     partition_id = %state.partition_id,
                     ?err,
-                    "Local write failed"
+                    "local write failed"
                 );
 
                 // Send failure response
-                state.send_failure(SwarmError::Write(err.to_string())).await;
+                state
+                    .send_failure(ClusterError::Write(err.to_string()))
+                    .await;
 
                 if actor_ref.stop_gracefully().now_or_never().is_none() {
                     warn!("write actors mailbox is full, killing");
@@ -280,7 +263,7 @@ impl Actor for WriteActor {
         tokio::select! {
             biased;
             _ = &mut self.timeout => {
-                self.send_failure(SwarmError::WriteTimeout).await;
+                self.send_failure(ClusterError::WriteTimeout).await;
                 None // Stop the actor when the timeout has been reached
             },
             msg = mailbox_rx.recv() => msg,
@@ -289,15 +272,17 @@ impl Actor for WriteActor {
 }
 
 /// Message received when a replica confirms a write
+#[derive(Debug)]
 pub struct ReplicaConfirmation {
     pub partition_id: PartitionId,
     pub transaction_id: Uuid,
-    pub result: Result<AppendResult, SwarmError>,
+    pub result: Result<AppendResult, ClusterError>,
 }
 
-impl Message<ReplicaConfirmation> for WriteActor {
+impl Message<ReplicaConfirmation> for TransactionActor {
     type Reply = ();
 
+    #[instrument(skip(self, ctx))]
     async fn handle(
         &mut self,
         msg: ReplicaConfirmation,
@@ -307,17 +292,10 @@ impl Message<ReplicaConfirmation> for WriteActor {
             warn!(
                 received_id = %msg.transaction_id,
                 expected_id = %self.transaction_id,
-                "Received confirmation for wrong request"
+                "received confirmation for wrong request"
             );
             return;
         }
-
-        debug!(
-            transaction_id = %self.transaction_id,
-            partition_id = msg.partition_id,
-            result = ?msg.result,
-            "Received replica confirmation"
-        );
 
         match msg.result {
             Ok(_) => {
@@ -326,7 +304,7 @@ impl Message<ReplicaConfirmation> for WriteActor {
                     debug!(
                         transaction_id = %self.transaction_id,
                         confirmed = self.confirmed_partitions.len(),
-                        "Quorum achieved"
+                        "quorum achieved"
                     );
 
                     // Send success response to client with the result
@@ -347,7 +325,7 @@ impl Message<ReplicaConfirmation> for WriteActor {
                 warn!(
                     transaction_id = %self.transaction_id,
                     partition_id = %msg.partition_id,
-                    "Replica failed to process write"
+                    "replica failed to process write"
                 );
 
                 // Check if we can still achieve quorum
@@ -360,11 +338,11 @@ impl Message<ReplicaConfirmation> for WriteActor {
                         transaction_id = %self.transaction_id,
                         confirmed = self.confirmed_partitions.len(),
                         required = required_quorum,
-                        "Cannot achieve quorum"
+                        "cannot achieve quorum"
                     );
 
                     // Send failure response
-                    self.send_failure(SwarmError::QuorumNotAchieved {
+                    self.send_failure(ClusterError::QuorumNotAchieved {
                         confirmed: self.confirmed_partitions.len() as u8,
                         required: required_quorum as u8,
                     })

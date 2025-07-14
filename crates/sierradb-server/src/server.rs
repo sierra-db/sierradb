@@ -4,7 +4,7 @@ use kameo::actor::ActorRef;
 use libp2p::bytes::BytesMut;
 use sierradb::database::{NewEvent, Transaction};
 use sierradb::id::{NAMESPACE_PARTITION_KEY, uuid_to_partition_hash, uuid_v7_with_partition_hash};
-use sierradb_cluster::swarm::Swarm;
+use sierradb_cluster::{ClusterActor, ExecuteTransaction};
 use smallvec::smallvec;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
@@ -15,14 +15,14 @@ use crate::request::{Append, FromArgs, SRead};
 use crate::value::{Value, ValueDecoder};
 
 pub struct Server {
-    swarm_ref: ActorRef<Swarm>,
+    cluster_ref: ActorRef<ClusterActor>,
     num_partitions: u16,
 }
 
 impl Server {
-    pub fn new(swarm_ref: ActorRef<Swarm>, num_partitions: u16) -> Self {
+    pub fn new(cluster_ref: ActorRef<ClusterActor>, num_partitions: u16) -> Self {
         Server {
-            swarm_ref,
+            cluster_ref,
             num_partitions,
         }
     }
@@ -32,10 +32,10 @@ impl Server {
         loop {
             match listener.accept().await {
                 Ok((socket, _)) => {
-                    let swarm_ref = self.swarm_ref.clone();
+                    let cluster_ref = self.cluster_ref.clone();
                     let num_partitions = self.num_partitions;
                     tokio::spawn(async move {
-                        let res = Conn::new(swarm_ref, num_partitions, socket).run().await;
+                        let res = Conn::new(cluster_ref, num_partitions, socket).run().await;
                         if let Err(err) = res {
                             warn!("connection error: {err}");
                         }
@@ -48,7 +48,7 @@ impl Server {
 }
 
 struct Conn {
-    swarm_ref: ActorRef<Swarm>,
+    cluster_ref: ActorRef<ClusterActor>,
     num_partitions: u16,
     socket: TcpStream,
     read: BytesMut,
@@ -57,13 +57,13 @@ struct Conn {
 }
 
 impl Conn {
-    fn new(swarm_ref: ActorRef<Swarm>, num_partitions: u16, socket: TcpStream) -> Self {
+    fn new(cluster_ref: ActorRef<ClusterActor>, num_partitions: u16, socket: TcpStream) -> Self {
         let read = BytesMut::new();
         let write = BytesMut::new();
         let decoder = ValueDecoder::default();
 
         Conn {
-            swarm_ref,
+            cluster_ref,
             socket,
             read,
             write,
@@ -161,12 +161,10 @@ impl Conn {
         };
 
         match self
-            .swarm_ref
-            .ask(transaction)
+            .cluster_ref
+            .ask(ExecuteTransaction::new(transaction))
             .await
-            .map_err(io::Error::other)?
-            .await
-            .map_err(io::Error::other)?
+            .map_err(io::Error::other)
         {
             Ok(result) => {
                 let mut stream_versions = result.stream_versions.into_iter();
@@ -177,7 +175,7 @@ impl Conn {
                     Value::String(event_id.to_string()),
                     Value::String(partition_key.to_string()),
                     Value::Integer(partition_id as i64),
-                    Value::Integer(result.partition_sequence as i64),
+                    Value::Integer(result.last_partition_sequence as i64),
                     Value::Integer(stream_version as i64),
                     Value::Integer(timestamp as i64),
                 ];

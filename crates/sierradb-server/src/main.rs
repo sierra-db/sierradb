@@ -4,11 +4,12 @@ use clap::Parser;
 use kameo::Actor;
 use libp2p::identity::Keypair;
 use sierradb::database::DatabaseBuilder;
-use sierradb_cluster::swarm::{ListenOn, Swarm, SwarmArgs};
+use sierradb_cluster::{ClusterActor, ClusterArgs};
 use sierradb_server::config::{AppConfig, Args};
 use sierradb_server::server::Server;
 use tracing::debug;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::format::FmtSpan;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -16,7 +17,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing_subscriber::fmt::SubscriberBuilder::default()
         .without_time()
-        .with_env_filter(EnvFilter::new(args.log.as_deref().unwrap_or("INFO")))
+        .with_env_filter(EnvFilter::new(args.log.as_deref().unwrap_or(
+            "sierradb_cluster=DEBUG,sierradb_server=DEBUG,sierradb=DEBUG,INFO",
+        )))
+        .with_span_events(FmtSpan::NEW)
         .init();
 
     let config = AppConfig::load(args)?;
@@ -40,27 +44,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         builder.writer_threads(count);
     }
 
-    let db = builder.open(config.dir)?;
+    let database = builder.open(config.dir)?;
 
-    let local_key = Keypair::generate_ed25519();
+    let keypair = Keypair::generate_ed25519();
 
-    let swarm_ref = Swarm::spawn(SwarmArgs {
-        key: local_key,
-        database: db,
+    let listen_addrs = if config.network.cluster_enabled {
+        vec![config.network.cluster_address]
+    } else {
+        vec![]
+    };
+
+    let swarm_ref = ClusterActor::spawn(ClusterArgs {
+        keypair,
+        database,
+        listen_addrs,
         partition_count: config.partition.count,
         replication_factor: config.replication_factor,
         assigned_partitions,
         heartbeat_timeout: Duration::from_millis(config.heartbeat.timeout_ms),
         heartbeat_interval: Duration::from_millis(config.heartbeat.interval_ms),
     });
-
-    if config.network.cluster_enabled {
-        swarm_ref
-            .ask(ListenOn {
-                addr: config.network.cluster_address,
-            })
-            .await?;
-    }
 
     Server::new(swarm_ref, config.partition.count)
         .listen(config.network.client_address)

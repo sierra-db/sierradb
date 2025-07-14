@@ -3,8 +3,16 @@ use std::{env, fs};
 
 use sierradb::bucket::segment::{BucketSegmentReader, Record};
 use sierradb::bucket::{BucketId, BucketSegmentId, SegmentId};
+use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::SubscriberBuilder::default()
+        .without_time()
+        .with_env_filter(EnvFilter::new(
+            "sierradb_cluster=DEBUG,sierradb_server=DEBUG,sierradb=TRACE,INFO",
+        ))
+        .init();
+
     let dir = env::args().nth(1).ok_or("missing db path argument")?;
     let buckets_dir = Path::new(&dir).join("buckets");
 
