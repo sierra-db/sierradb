@@ -7,6 +7,7 @@ use std::{
 };
 
 use arrayvec::ArrayVec;
+use circuit_breaker::WriteCircuitBreaker;
 use confirmation::{
     AtomicWatermark,
     actor::{ConfirmationActor, UpdateConfirmation},
@@ -15,13 +16,16 @@ use futures::StreamExt;
 use kameo::{mailbox::Signal, prelude::*};
 use libp2p::{
     BehaviourBuilderError, Multiaddr, PeerId, Swarm, TransportError, gossipsub, identity::Keypair,
-    mdns, noise, tcp, yamux,
+    mdns, noise, swarm::NetworkBehaviour, tcp, yamux,
 };
 use partition_consensus::PartitionManager;
 use serde::{Deserialize, Serialize};
 use sierradb::{
-    MAX_REPLICATION_FACTOR,
-    bucket::{PartitionHash, PartitionId, segment::CommittedEvents},
+    MAX_REPLICATION_FACTOR, StreamId,
+    bucket::{
+        PartitionHash, PartitionId,
+        segment::{CommittedEvents, EventRecord},
+    },
     database::{Database, Transaction},
     error::WriteError,
     id::uuid_to_partition_hash,
@@ -30,17 +34,23 @@ use sierradb::{
 use smallvec::{SmallVec, smallvec};
 use thiserror::Error;
 use tracing::{error, instrument, trace};
+use transaction::set_confirmations_with_retry;
 use uuid::Uuid;
 
-use crate::behaviour::Behaviour;
-
-pub mod behaviour;
+pub mod circuit_breaker;
 pub mod confirmation;
 pub mod partition_consensus;
 pub mod transaction;
 
 /// Maximum number of request forwards allowed to prevent loops
 const MAX_FORWARDS: u8 = 3;
+
+#[derive(NetworkBehaviour)]
+pub struct Behaviour {
+    pub kameo: remote::Behaviour,
+    pub partitions: partition_consensus::Behaviour,
+    pub mdns: mdns::tokio::Behaviour,
+}
 
 #[derive(RemoteActor)]
 pub struct ClusterActor {
@@ -49,6 +59,7 @@ pub struct ClusterActor {
     swarm: Swarm<Behaviour>,
     confirmation_ref: ActorRef<ConfirmationActor>,
     watermarks: HashMap<PartitionId, Arc<AtomicWatermark>>,
+    circuit_breaker: Arc<WriteCircuitBreaker>,
 }
 
 impl ClusterActor {
@@ -124,6 +135,16 @@ impl ClusterActor {
         metadata: WriteRequestMetadata,
         reply_sender: Option<ReplySender<Result<AppendResult, ClusterError>>>,
     ) {
+        // Check circuit breaker before proceeding
+        if !self.circuit_breaker.should_allow_request() {
+            if let Some(tx) = reply_sender {
+                tx.send(Err(ClusterError::CircuitBreakerOpen {
+                    estimated_recovery_time: self.circuit_breaker.estimated_recovery_time(),
+                }));
+            }
+            return;
+        }
+
         match destination {
             WriteDestination::Local {
                 primary_partition_id,
@@ -136,6 +157,7 @@ impl ClusterActor {
                     replica_partitions,
                     self.swarm.behaviour().partitions.manager.replication_factor,
                     transaction,
+                    self.circuit_breaker.clone(),
                     reply_sender,
                 );
             }
@@ -335,12 +357,15 @@ impl Actor for ClusterActor {
         let watermarks = confirmation_actor.manager.get_watermarks();
         let confirmation_ref = Actor::spawn_in_thread(confirmation_actor);
 
+        let circuit_breaker = Arc::new(WriteCircuitBreaker::with_defaults());
+
         Ok(ClusterActor {
             local_peer_id,
             database,
             swarm,
             confirmation_ref,
             watermarks,
+            circuit_breaker,
         })
     }
 
@@ -456,34 +481,15 @@ impl Message<ReplicateWrite> for ClusterActor {
             panic!("got a replicate write request when we dont own the partition");
         }
 
-        let (delegated_reply, reply_sender) = ctx.reply_sender();
-
         let database = self.database.clone();
 
-        tokio::spawn(async move {
-            // Replicate the write to our local database
-            let result = database
+        // Replicate the write to our local database
+        ctx.spawn(async move {
+            database
                 .append_events(msg.partition_id, msg.transaction)
-                .await;
-
-            match reply_sender {
-                Some(tx) => {
-                    tx.send(result.map_err(ClusterError::from));
-                }
-                None => {
-                    if let Err(err) = &result {
-                        error!(
-                            transaction_id = %msg.transaction_id,
-                            partition_id = msg.partition_id,
-                            ?err,
-                            "local replication failed with error"
-                        );
-                    }
-                }
-            }
-        });
-
-        delegated_reply
+                .await
+                .map_err(ClusterError::from)
+        })
     }
 }
 
@@ -512,70 +518,93 @@ pub enum ConfirmTransactionError {
 
 #[remote_message("93087af8-6b1f-4df0-8225-13fe694203c1")]
 impl Message<ConfirmTransaction> for ClusterActor {
-    type Reply = Result<(), ConfirmTransactionError>;
+    type Reply = DelegatedReply<Result<(), ConfirmTransactionError>>;
 
-    #[instrument(skip(self, _ctx))]
+    #[instrument(skip(self, ctx))]
     async fn handle(
         &mut self,
         msg: ConfirmTransaction,
-        _ctx: &mut Context<Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let Some(first_event_id) = msg.event_ids.first() else {
-            return Err(ConfirmTransactionError::EventsLengthMismatch);
-        };
+        let database = self.database.clone();
+        let confirmation_ref = self.confirmation_ref.clone();
 
-        let offsets = match self
-            .database
-            .read_transaction(msg.partition_id, *first_event_id, true)
-            .await
-            .map_err(|err| ConfirmTransactionError::Read(err.to_string()))?
-        {
-            Some(CommittedEvents::Single(event)) => {
-                smallvec![event.offset]
-            }
-            Some(CommittedEvents::Transaction { events, commit }) => {
-                if events.len() != msg.event_ids.len() {
-                    return Err(ConfirmTransactionError::EventsLengthMismatch);
+        ctx.spawn(async move {
+            let Some(first_event_id) = msg.event_ids.first() else {
+                return Err(ConfirmTransactionError::EventsLengthMismatch);
+            };
+
+            let offsets = match database
+                .read_transaction(msg.partition_id, *first_event_id, true)
+                .await
+                .map_err(|err| ConfirmTransactionError::Read(err.to_string()))?
+            {
+                Some(CommittedEvents::Single(event)) => {
+                    smallvec![event.offset]
                 }
+                Some(CommittedEvents::Transaction { events, commit }) => {
+                    if events.len() != msg.event_ids.len() {
+                        return Err(ConfirmTransactionError::EventsLengthMismatch);
+                    }
 
-                events
-                    .into_iter()
-                    .zip(msg.event_ids)
-                    .map(|(event, event_id)| {
-                        if event.event_id != event_id {
-                            return Err(ConfirmTransactionError::EventIdMismatch);
-                        }
+                    events
+                        .into_iter()
+                        .zip(msg.event_ids)
+                        .map(|(event, event_id)| {
+                            if event.event_id != event_id {
+                                return Err(ConfirmTransactionError::EventIdMismatch);
+                            }
 
-                        Ok(event.offset)
-                    })
-                    .chain(iter::once(Ok(commit.offset)))
-                    .collect::<Result<_, _>>()?
-            }
-            None => {
-                return Err(ConfirmTransactionError::TransactionNotFound);
-            }
-        };
+                            Ok(event.offset)
+                        })
+                        .chain(iter::once(Ok(commit.offset)))
+                        .collect::<Result<_, _>>()?
+                }
+                None => {
+                    return Err(ConfirmTransactionError::TransactionNotFound);
+                }
+            };
 
-        self.database
-            .set_confirmations(
+            // Retry confirmation updates for replica consistency
+            match set_confirmations_with_retry(
+                &database,
                 msg.partition_id,
                 offsets,
                 msg.transaction_id,
                 msg.confirmation_count,
             )
             .await
-            .map_err(|err| ConfirmTransactionError::Write(err.to_string()))?;
+            {
+                Ok(()) => {
+                    // Update watermark after successful confirmation
+                    let _ = confirmation_ref
+                        .tell(UpdateConfirmation {
+                            partition_id: msg.partition_id,
+                            versions: msg.event_versions,
+                            confirmation_count: msg.confirmation_count,
+                        })
+                        .await;
 
-        let _ = self
-            .confirmation_ref
-            .tell(UpdateConfirmation {
-                partition_id: msg.partition_id,
-                versions: msg.event_versions,
-                confirmation_count: msg.confirmation_count,
-            })
-            .await;
+                    Ok(())
+                }
+                Err(err) => {
+                    // Log the error but don't fail the message since primary has moved on
+                    error!(
+                        transaction_id = %msg.transaction_id,
+                        partition_id = msg.partition_id,
+                        ?err,
+                        "replica failed to update confirmations after retries"
+                    );
 
-        Ok(())
+                    // Increment replica failure metrics here for monitoring
+                    // REPLICA_CONFIRMATION_FAILURES.inc();
+
+                    // Return success to avoid unnecessary error propagation
+                    // The primary doesn't need to know about this failure
+                    Ok(())
+                }
+            }
+        })
     }
 }
 
@@ -587,6 +616,217 @@ pub struct WriteRequestMetadata {
     pub tried_peers: HashSet<PeerId>,
     /// Original partition hash
     pub partition_hash: PartitionHash,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReadEvent {
+    pub partition_id: PartitionId,
+    pub event_id: Uuid,
+}
+
+impl Message<ReadEvent> for ClusterActor {
+    type Reply = DelegatedReply<Result<Option<EventRecord>, ClusterError>>;
+
+    async fn handle(
+        &mut self,
+        msg: ReadEvent,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let database = self.database.clone();
+        let required_quorum =
+            (self.swarm.behaviour().partitions.manager.replication_factor as usize / 2) + 1;
+        let watermark = self.watermarks.get(&msg.partition_id).cloned();
+
+        ctx.spawn(async move {
+            // 1. Read the event from local storage
+            let event = database
+                .read_event(msg.partition_id, msg.event_id, false)
+                .await
+                .map_err(|err| ClusterError::Read(err.to_string()))?;
+
+            let Some(event) = event else {
+                return Ok(None); // Event doesn't exist
+            };
+
+            // 2. Check if event meets quorum requirements
+            if event.confirmation_count < required_quorum as u8 {
+                return Ok(None); // Event exists but not confirmed
+            }
+
+            // 3. Check watermark - only return if within confirmed range
+            let watermark = watermark.map(|w| w.get()).unwrap_or(0);
+            if event.partition_sequence > watermark {
+                return Ok(None); // Event exists but beyond watermark
+            }
+
+            Ok(Some(event))
+        })
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReadPartition {
+    pub partition_id: PartitionId,
+    pub from_sequence: u64,
+    pub limit: Option<u32>, // Optional limit for pagination
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PartitionEventsResponse {
+    pub events: Vec<EventRecord>,
+    pub next_sequence: Option<u64>, // For pagination
+    pub watermark: u64,             // Current watermark for this partition
+}
+
+impl Message<ReadPartition> for ClusterActor {
+    type Reply = DelegatedReply<Result<PartitionEventsResponse, ClusterError>>;
+
+    async fn handle(
+        &mut self,
+        msg: ReadPartition,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let database = self.database.clone();
+        let required_quorum =
+            ((self.swarm.behaviour().partitions.manager.replication_factor as usize / 2) + 1) as u8;
+        let watermark = self.watermarks.get(&msg.partition_id).cloned();
+
+        ctx.spawn(async move {
+            // 1. Get current watermark
+            let watermark = watermark.map(|w| w.get()).unwrap_or(0);
+
+            // 2. Don't read beyond watermark
+            if msg.from_sequence > watermark {
+                return Ok(PartitionEventsResponse {
+                    events: vec![],
+                    next_sequence: None,
+                    watermark,
+                });
+            }
+
+            // 3. Create iterator and collect events up to watermark
+            let mut iter = database
+                .read_partition(msg.partition_id, msg.from_sequence)
+                .await
+                .map_err(|err| ClusterError::Read(err.to_string()))?;
+
+            let mut events = Vec::new();
+            let limit = msg.limit.unwrap_or(100) as usize; // Default limit
+            let mut next_sequence = None;
+
+            while events.len() < limit {
+                match iter
+                    .next(false)
+                    .await
+                    .map_err(|err| ClusterError::Read(err.to_string()))?
+                {
+                    Some(event) => {
+                        // Only include events within watermark
+                        if event.partition_sequence <= watermark {
+                            assert!(
+                                event.confirmation_count >= required_quorum,
+                                "watermark should only be here if the event has been confirmed"
+                            );
+
+                            events.push(event);
+                        } else {
+                            // Hit watermark boundary
+                            break;
+                        }
+                    }
+                    None => break, // No more events
+                }
+            }
+
+            // Set next_sequence if we hit the limit
+            if events.len() == limit {
+                next_sequence = events.last().map(|e| e.partition_sequence + 1);
+            }
+
+            Ok(PartitionEventsResponse {
+                events,
+                next_sequence,
+                watermark,
+            })
+        })
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReadStream {
+    pub partition_id: PartitionId,
+    pub stream_id: StreamId,
+    pub from_version: Option<u64>, // Optional starting version
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StreamEventsResponse {
+    pub events: Vec<EventRecord>,
+    pub next_version: Option<u64>,
+    pub watermark: u64,
+}
+
+impl Message<ReadStream> for ClusterActor {
+    type Reply = DelegatedReply<Result<StreamEventsResponse, ClusterError>>;
+
+    async fn handle(
+        &mut self,
+        msg: ReadStream,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let database = self.database.clone();
+        let required_quorum =
+            ((self.swarm.behaviour().partitions.manager.replication_factor as usize / 2) + 1) as u8;
+        let watermark = self
+            .watermarks
+            .get(&msg.partition_id)
+            .map(|w| w.get())
+            .unwrap_or(0);
+
+        ctx.spawn(async move {
+            // Similar pattern to partition reads
+            let mut iter = database
+                .read_stream(msg.partition_id, msg.stream_id)
+                .await
+                .map_err(|err| ClusterError::Read(err.to_string()))?;
+
+            let mut events = Vec::new();
+            let limit = msg.limit.unwrap_or(100) as usize;
+            let from_version = msg.from_version.unwrap_or(0);
+
+            while events.len() < limit {
+                match iter
+                    .next(false)
+                    .await
+                    .map_err(|err| ClusterError::Read(err.to_string()))?
+                {
+                    Some(event) => {
+                        // Filter by version and watermark
+                        if event.stream_version >= from_version
+                            && event.partition_sequence <= watermark
+                        {
+                            assert!(
+                                event.confirmation_count >= required_quorum,
+                                "watermark should only be here if the event has been confirmed"
+                            );
+
+                            events.push(event);
+                        }
+                    }
+                    None => break,
+                }
+            }
+
+            let next_version = events.last().map(|e| e.stream_version + 1);
+
+            Ok(StreamEventsResponse {
+                events,
+                next_version,
+                watermark,
+            })
+        })
+    }
 }
 
 #[derive(Debug, Error, Serialize, Deserialize)]
@@ -608,8 +848,14 @@ pub enum ClusterError {
     WriteTimeout,
     #[error("too many forwards")]
     TooManyForwards,
-    // #[error("read error: {0}")]
-    // Read(String),
+    #[error("circuit breaker open: estimated recovery time: {estimated_recovery_time:?}")]
+    CircuitBreakerOpen {
+        estimated_recovery_time: Option<Duration>,
+    },
+    #[error("failed to write confirmation count: {0}")]
+    ConfirmationFailure(String),
+    #[error("read error: {0}")]
+    Read(String),
     #[error("write error: {0}")]
     Write(String),
     // #[error("wrong leader node for append")]
