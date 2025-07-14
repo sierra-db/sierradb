@@ -11,9 +11,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bincode::{Decode, Encode};
 use kameo::Reply;
 use serde::{Deserialize, Serialize};
-use sierradb::bucket::{BucketId, PartitionId};
 use thiserror::Error;
-use tracing::info;
+
+use super::{BucketId, PartitionId};
 
 /// Errors that can occur during confirmation state operations
 #[derive(Error, Debug)]
@@ -42,22 +42,22 @@ pub enum ConfirmationError {
 
 /// Information about an unconfirmed event
 #[derive(Debug, Clone, Encode, Decode)]
-pub struct UnconfirmedEventInfo {
-    pub version: u64,
-    pub confirmation_count: u8,
-    pub first_seen: u64,   // Unix timestamp
-    pub last_attempt: u64, // Unix timestamp
-    pub attempts: u8,
+struct UnconfirmedEventInfo {
+    version: u64,
+    confirmation_count: u8,
+    first_seen: u64,   // Unix timestamp
+    last_attempt: u64, // Unix timestamp
+    attempts: u8,
 }
 
 /// Tracks confirmation state for a partition
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct PartitionConfirmationState {
-    pub partition_id: PartitionId,
-    pub replication_factor: u8,
-    pub highest_version: u64,
-    pub confirmed_watermark: Arc<AtomicWatermark>,
-    pub unconfirmed_events: BTreeMap<u64, UnconfirmedEventInfo>,
+    partition_id: PartitionId,
+    replication_factor: u8,
+    highest_version: u64,
+    confirmed_watermark: Arc<AtomicWatermark>,
+    unconfirmed_events: BTreeMap<u64, UnconfirmedEventInfo>,
 }
 
 impl PartitionConfirmationState {
@@ -128,12 +128,7 @@ impl PartitionConfirmationState {
 
         // Update watermark if it advanced
         if watermark_advanced {
-            if self.confirmed_watermark.advance(new_watermark) {
-                info!(
-                    "partition {} advanced watermark to {new_watermark}",
-                    self.partition_id
-                );
-            }
+            self.confirmed_watermark.advance(new_watermark);
 
             // Clean up unconfirmed events that are now below the watermark
             self.unconfirmed_events
@@ -169,17 +164,17 @@ impl PartitionConfirmationState {
 
 /// Persisted bucket confirmation state format
 #[derive(Encode, Decode)]
-pub struct BucketConfirmationState {
-    pub version: u32,   // Schema version for future-proofing
-    pub timestamp: u64, // When this state was written
-    pub bucket_id: BucketId,
+struct BucketConfirmationState {
+    version: u32,   // Schema version for future-proofing
+    timestamp: u64, // When this state was written
+    bucket_id: BucketId,
     // Maps partition_id -> confirmation state
-    pub partition_states: HashMap<PartitionId, PartitionConfirmationState>,
+    partition_states: HashMap<PartitionId, PartitionConfirmationState>,
 }
 
 /// Checksum wrapper for file integrity
 #[derive(Encode, Decode)]
-pub struct ChecksummedState {
+struct ChecksummedState {
     data: Vec<u8>, // Bincode encoded BucketConfirmationState
     crc32c: u32,   // Simple checksum of the data
 }
@@ -192,11 +187,11 @@ impl ChecksummedState {
         Ok(Self { data, crc32c })
     }
 
-    pub fn validate(&self) -> bool {
+    fn validate(&self) -> bool {
         crc32fast::hash(&self.data) == self.crc32c
     }
 
-    pub fn deserialize(&self) -> Result<BucketConfirmationState, ConfirmationError> {
+    fn deserialize(&self) -> Result<BucketConfirmationState, ConfirmationError> {
         if !self.validate() {
             return Err(ConfirmationError::CorruptedState);
         }
@@ -321,15 +316,12 @@ impl BucketConfirmationManager {
         }
 
         let now = Instant::now();
+
         let should_persist = {
-            let changes = self.changes_since_persist.get(&bucket_id).copied();
-            let last_time = self.last_persist_times.get(&bucket_id);
-            match changes.zip(last_time) {
-                Some((changes, last_time)) => {
-                    changes > 100 || last_time.elapsed() > Duration::from_secs(5)
-                }
-                None => true,
-            }
+            let changes = self.changes_since_persist.get(&bucket_id).unwrap_or(&0);
+            let last_time = self.last_persist_times.get(&bucket_id).unwrap_or(&now);
+
+            *changes > 100 || now.duration_since(*last_time) > Duration::from_secs(5)
         };
 
         if should_persist {
@@ -390,8 +382,6 @@ impl BucketConfirmationManager {
         // Make temp file the current file
         fs::rename(&temp_path, &current_path)?;
 
-        info!("wrote bucket confirmations to disk");
-
         Ok(())
     }
 
@@ -438,18 +428,6 @@ impl BucketConfirmationManager {
 
         // If not found, return 0 (no events confirmed)
         None
-    }
-
-    /// Get confirmed watermarks for all partitions
-    pub fn get_watermarks(&self) -> HashMap<PartitionId, Arc<AtomicWatermark>> {
-        self.buckets
-            .values()
-            .flat_map(|partition_states| {
-                partition_states.iter().map(|(partition_id, state)| {
-                    (*partition_id, Arc::clone(&state.confirmed_watermark))
-                })
-            })
-            .collect()
     }
 
     /// Get confirmation gap (highest - watermark) for a partition

@@ -2,10 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::iter;
 
 use arrayvec::ArrayVec;
-use kameo::Actor;
-use kameo::actor::ActorRef;
+use kameo::actor::{ActorRef, RemoteActorRef};
+use kameo::{Actor, RemoteActor};
 use libp2p::PeerId;
 use libp2p::request_response::{self, OutboundFailure, OutboundRequestId, ResponseChannel};
+use serde::{Deserialize, Serialize};
 use sierradb::MAX_REPLICATION_FACTOR;
 use sierradb::bucket::PartitionId;
 use sierradb::bucket::segment::CommittedEvents;
@@ -20,10 +21,10 @@ use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use super::ReplyKind;
-use crate::behaviour::{Req, Resp, WriteRequestMetadata};
+use crate::confirmation::actor::ConfirmationActor;
 use crate::error::SwarmError;
 use crate::partition_consensus::PartitionManager;
-use crate::swarm::{SendResponse, Swarm};
+use crate::swarm::SendResponse;
 use crate::write_actor::{ReplicaConfirmation, WriteActor};
 
 /// Maximum number of request forwards allowed to prevent loops
@@ -31,7 +32,7 @@ const MAX_FORWARDS: u8 = 3;
 
 /// Manages distributed write operations across a cluster
 pub struct WriteManager {
-    swarm_ref: ActorRef<Swarm>,
+    confirmation_ref: ActorRef<ConfirmationActor>,
     database: Database,
     local_peer_id: PeerId,
     forwarded_appends:
@@ -41,9 +42,13 @@ pub struct WriteManager {
 
 impl WriteManager {
     /// Creates a new WriteManager
-    pub fn new(swarm_ref: ActorRef<Swarm>, database: Database, local_peer_id: PeerId) -> Self {
+    pub fn new(
+        confirmation_ref: ActorRef<ConfirmationActor>,
+        database: Database,
+        local_peer_id: PeerId,
+    ) -> Self {
         WriteManager {
-            swarm_ref,
+            confirmation_ref,
             database,
             local_peer_id,
             forwarded_appends: HashMap::new(),
@@ -317,44 +322,57 @@ impl WriteManager {
         });
     }
 
-    /// Handles a commit received from the network as a replica partition
-    pub fn process_network_commit(
-        &self,
-        channel: ResponseChannel<Resp>,
-        partition_id: PartitionId,
-        transaction_id: Uuid,
-        event_ids: SmallVec<[Uuid; 4]>,
-        confirmation_count: u8,
-    ) {
-        let swarm_ref = self.swarm_ref.clone();
-        let database = self.database.clone();
+    // Handles a commit received from the network as a replica partition
+    // pub fn process_network_commit(
+    //     &self,
+    //     channel: ResponseChannel<Resp>,
+    //     partition_id: PartitionId,
+    //     transaction_id: Uuid,
+    //     event_ids: SmallVec<[Uuid; 4]>,
+    //     confirmation_count: u8,
+    // ) {
+    //     let swarm_ref = self.swarm_ref.clone();
+    //     let confirmation_ref = self.confirmation_ref.clone();
+    //     let database = self.database.clone();
 
-        tokio::spawn(async move {
-            let result = confirm_transaction(
-                &database,
-                partition_id,
-                transaction_id,
-                event_ids,
-                confirmation_count,
-            )
-            .await;
+    //     tokio::spawn(async move {
+    //         let result = confirm_transaction(
+    //             &database,
+    //             partition_id,
+    //             transaction_id,
+    //             event_ids,
+    //             confirmation_count,
+    //         )
+    //         .await;
 
-            if let Err(err) = &result {
-                error!(%transaction_id, partition_id, "Failed to confirm network transaction: {err}");
-            }
+    //         match &result {
+    //             Ok(()) => {
+    //                 let _ = confirmation_ref
+    //                     .update_event_confirmation(
+    //                         partition_id,
+    //                         // Need to extract sequence from the transaction somehow
+    //                         sequence_number,
+    //                         confirmation_count, // Passed from the primary
+    //                     )
+    //                     .await;
+    //             }
+    //             Err(err) => {
+    //                 error!(%transaction_id, partition_id, "Failed to confirm network transaction: {err}");
+    //             }
+    //         }
 
-            let _ = swarm_ref
-                .tell(SendResponse {
-                    channel,
-                    response: Resp::ConfirmWrite {
-                        partition_id,
-                        transaction_id,
-                        result: result.map_err(|err| SwarmError::Write(err.to_string())),
-                    },
-                })
-                .await;
-        });
-    }
+    //         let _ = swarm_ref
+    //             .tell(SendResponse {
+    //                 channel,
+    //                 response: Resp::ConfirmWrite {
+    //                     partition_id,
+    //                     transaction_id,
+    //                     result: result.map_err(|err| SwarmError::Write(err.to_string())),
+    //                 },
+    //             })
+    //             .await;
+    //     });
+    // }
 
     /// Handles the result of a forwarded append operation
     pub fn process_append_result(
@@ -488,6 +506,7 @@ impl WriteManager {
             } => {
                 let write_actor = WriteActor::new(
                     self.swarm_ref.clone(),
+                    self.confirmation_ref.clone(),
                     self.database.clone(),
                     primary_partition_id,
                     transaction,
@@ -596,6 +615,16 @@ impl WriteManager {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteRequestMetadata {
+    /// Number of hops this request has taken
+    pub hop_count: u8,
+    /// Nodes that have already tried to process this request
+    pub tried_peers: HashSet<PeerId>,
+    /// Original partition hash
+    pub partition_hash: PartitionHash,
 }
 
 /// Represents a destination for a write request

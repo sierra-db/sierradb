@@ -41,7 +41,6 @@ use std::sync::Arc;
 
 use kameo::prelude::*;
 use serde::{Deserialize, Serialize};
-use smallvec::SmallVec;
 
 use super::{
     BucketConfirmationManager, BucketId, ConfirmationError, ConfirmationStats, PartitionId,
@@ -63,7 +62,7 @@ use super::{
 /// provides asynchronous message-based API for distributed systems.
 #[derive(Actor)]
 pub struct ConfirmationActor {
-    pub manager: BucketConfirmationManager,
+    manager: BucketConfirmationManager,
 }
 
 impl ConfirmationActor {
@@ -85,28 +84,20 @@ impl ConfirmationActor {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateConfirmation {
     pub partition_id: PartitionId,
-    pub versions: SmallVec<[u64; 4]>,
+    pub version: u64,
     pub confirmation_count: u8,
 }
 
 impl Message<UpdateConfirmation> for ConfirmationActor {
-    type Reply = Result<SmallVec<[bool; 4]>, ConfirmationError>;
+    type Reply = Result<bool, ConfirmationError>;
 
     async fn handle(
         &mut self,
         msg: UpdateConfirmation,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        msg.versions
-            .into_iter()
-            .map(|version| {
-                self.manager.update_confirmation(
-                    msg.partition_id,
-                    version + 1,
-                    msg.confirmation_count,
-                )
-            })
-            .collect()
+        self.manager
+            .update_confirmation(msg.partition_id, msg.version, msg.confirmation_count)
     }
 }
 
@@ -310,6 +301,35 @@ impl Message<PersistBucketState> for ConfirmationActor {
     }
 }
 
+/// Batch confirmation update for multiple events
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchUpdateConfirmations {
+    pub updates: Vec<UpdateConfirmation>,
+}
+
+impl Message<BatchUpdateConfirmations> for ConfirmationActor {
+    type Reply = Result<Vec<bool>, ConfirmationError>;
+
+    async fn handle(
+        &mut self,
+        msg: BatchUpdateConfirmations,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let mut results = Vec::with_capacity(msg.updates.len());
+
+        for update in msg.updates {
+            let result = self.manager.update_confirmation(
+                update.partition_id,
+                update.version,
+                update.confirmation_count,
+            )?;
+            results.push(result);
+        }
+
+        Ok(results)
+    }
+}
+
 /// Get watermarks for multiple partitions
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetMultipleWatermarks {
@@ -350,9 +370,9 @@ pub trait ConfirmationActorExt {
     async fn update_event_confirmation(
         &self,
         partition_id: PartitionId,
-        versions: SmallVec<[u64; 4]>,
+        version: u64,
         confirmation_count: u8,
-    ) -> Result<SmallVec<[bool; 4]>, SendError<UpdateConfirmation, ConfirmationError>>;
+    ) -> Result<bool, SendError<UpdateConfirmation, ConfirmationError>>;
 
     /// Get the current watermark for a partition
     async fn get_partition_watermark(
@@ -374,12 +394,12 @@ impl ConfirmationActorExt for ActorRef<ConfirmationActor> {
     async fn update_event_confirmation(
         &self,
         partition_id: PartitionId,
-        versions: SmallVec<[u64; 4]>,
+        version: u64,
         confirmation_count: u8,
-    ) -> Result<SmallVec<[bool; 4]>, SendError<UpdateConfirmation, ConfirmationError>> {
+    ) -> Result<bool, SendError<UpdateConfirmation, ConfirmationError>> {
         let msg = UpdateConfirmation {
             partition_id,
-            versions,
+            version,
             confirmation_count,
         };
         self.ask(msg).await
@@ -418,7 +438,6 @@ impl ConfirmationActorExt for ActorRef<ConfirmationActor> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smallvec::smallvec;
     use tempfile::tempdir;
     use tokio;
 
@@ -428,10 +447,8 @@ mod tests {
         let actor_ref = ConfirmationActor::spawn(temp_dir.path().to_path_buf(), 4, 3);
 
         // Test update confirmation using extension trait
-        let watermark_advanced = actor_ref
-            .update_event_confirmation(1, smallvec![1], 2)
-            .await?;
-        assert!(watermark_advanced.iter().all(|b| *b));
+        let watermark_advanced = actor_ref.update_event_confirmation(1, 1, 2).await?;
+        assert!(watermark_advanced);
 
         // Test get watermark using extension trait
         let watermark = actor_ref.get_partition_watermark(1).await?;
@@ -460,12 +477,8 @@ mod tests {
         let actor_ref = ConfirmationActor::spawn(temp_dir.path().to_path_buf(), 4, 3);
 
         // Add some confirmations
-        actor_ref
-            .update_event_confirmation(1, smallvec![1], 2)
-            .await?;
-        actor_ref
-            .update_event_confirmation(1, smallvec![2], 2)
-            .await?;
+        actor_ref.update_event_confirmation(1, 1, 2).await?;
+        actor_ref.update_event_confirmation(1, 2, 2).await?;
 
         // Test health check
         let health = actor_ref.health_check().await?;
@@ -493,16 +506,55 @@ mod tests {
         let actor_ref = ConfirmationActor::spawn(temp_dir.path().to_path_buf(), 4, 3);
 
         // Test convenience methods from extension trait
-        let watermark_advanced = actor_ref
-            .update_event_confirmation(5, smallvec![1], 2)
-            .await?;
-        assert!(watermark_advanced.iter().all(|b| *b));
+        let watermark_advanced = actor_ref.update_event_confirmation(5, 1, 2).await?;
+        assert!(watermark_advanced);
 
         let watermark = actor_ref.get_partition_watermark(5).await?;
         assert_eq!(watermark, Some(1));
 
         let has_stuck = actor_ref.has_stuck_events(5).await?;
         assert!(!has_stuck);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_batch_operations() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempdir()?;
+        let actor_ref = ConfirmationActor::spawn(temp_dir.path().to_path_buf(), 4, 3);
+
+        // Test batch update confirmations
+        let updates = vec![
+            UpdateConfirmation {
+                partition_id: 1,
+                version: 1,
+                confirmation_count: 2,
+            },
+            UpdateConfirmation {
+                partition_id: 1,
+                version: 2,
+                confirmation_count: 2,
+            },
+            UpdateConfirmation {
+                partition_id: 2,
+                version: 1,
+                confirmation_count: 3,
+            },
+        ];
+
+        let results = actor_ref.ask(BatchUpdateConfirmations { updates }).await?;
+        assert_eq!(results.len(), 3);
+
+        // Test get multiple watermarks
+        let watermarks = actor_ref
+            .ask(GetMultipleWatermarks {
+                partition_ids: vec![1, 2, 3],
+            })
+            .await?;
+        assert_eq!(watermarks.len(), 3);
+        assert_eq!(watermarks[0], (1, Some(2)));
+        assert_eq!(watermarks[1], (2, Some(1)));
+        assert_eq!(watermarks[2], (3, None));
 
         Ok(())
     }
@@ -516,7 +568,7 @@ mod tests {
         actor_ref
             .ask(UpdateConfirmation {
                 partition_id: 1,
-                versions: smallvec![1],
+                version: 1,
                 confirmation_count: 2,
             })
             .await?;
@@ -524,7 +576,7 @@ mod tests {
         actor_ref
             .ask(UpdateConfirmation {
                 partition_id: 1,
-                versions: smallvec![2],
+                version: 2,
                 confirmation_count: 2,
             })
             .await?;

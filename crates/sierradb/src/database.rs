@@ -49,6 +49,10 @@ impl Database {
         &self.dir
     }
 
+    pub fn total_buckets(&self) -> u16 {
+        self.total_buckets
+    }
+
     pub async fn append_events(
         &self,
         partition_id: PartitionId,
@@ -804,6 +808,7 @@ pub struct Transaction {
     pub(crate) transaction_id: Uuid,
     pub(crate) events: SmallVec<[NewEvent; 4]>,
     pub(crate) expected_partition_sequence: ExpectedVersion,
+    pub(crate) confirmation_count: u8,
 }
 
 impl Transaction {
@@ -838,11 +843,17 @@ impl Transaction {
             transaction_id,
             events,
             expected_partition_sequence: ExpectedVersion::Any,
+            confirmation_count: 0,
         })
     }
 
     pub fn expected_partition_sequence(mut self, sequence: ExpectedVersion) -> Self {
         self.expected_partition_sequence = sequence;
+        self
+    }
+
+    pub fn with_confirmation_count(mut self, confirmation_count: u8) -> Self {
+        self.confirmation_count = confirmation_count;
         self
     }
 

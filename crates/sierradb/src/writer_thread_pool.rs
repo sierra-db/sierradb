@@ -251,7 +251,8 @@ impl WriterThreadPool {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppendResult {
     pub offsets: SmallVec<[u64; 4]>,
-    pub partition_sequence: u64,
+    pub first_partition_sequence: u64,
+    pub last_partition_sequence: u64,
     pub stream_versions: HashMap<StreamId, u64>,
 }
 
@@ -473,6 +474,7 @@ impl Worker {
             event_versions,
             expected_partition_sequence,
             latest_stream_versions.len(),
+            batch.confirmation_count,
         );
         if res.is_err()
             && let Err(err) = writer_set.writer.set_len(file_size)
@@ -549,6 +551,7 @@ impl WriterSet {
         event_versions: Vec<CurrentVersion>,
         expected_partition_sequence: ExpectedVersion,
         unique_streams: usize,
+        confirmation_count: u8,
     ) -> Result<AppendResult, WriteError> {
         let Some(NewEvent { partition_id, .. }) = events.first() else {
             unreachable!("append event batch does not allow empty transactions");
@@ -560,6 +563,7 @@ impl WriterSet {
             expected_partition_sequence,
             next_partition_sequence,
         )?;
+        let first_partition_sequence = next_partition_sequence;
         let mut new_pending_indexes: Vec<PendingIndex> = Vec::with_capacity(events.len());
         let mut offsets = SmallVec::with_capacity(events.len());
         let mut stream_versions = HashMap::with_capacity(unique_streams);
@@ -580,9 +584,12 @@ impl WriterSet {
                 metadata: &event.metadata,
                 payload: &event.payload,
             };
-            let (offset, _) =
-                self.writer
-                    .append_event(&transaction_id, event.timestamp, 0, append)?;
+            let (offset, _) = self.writer.append_event(
+                &transaction_id,
+                event.timestamp,
+                confirmation_count,
+                append,
+            )?;
             offsets.push(offset);
             // We need to guarantee:
             // - partition key is the same as previous event partition keys in the stream
@@ -622,7 +629,8 @@ impl WriterSet {
 
         Ok(AppendResult {
             offsets,
-            partition_sequence: next_partition_sequence
+            first_partition_sequence,
+            last_partition_sequence: next_partition_sequence
                 .checked_sub(1)
                 .expect("next partition sequence should be greather than zero"),
             stream_versions,

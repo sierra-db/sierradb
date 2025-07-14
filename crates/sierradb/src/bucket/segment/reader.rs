@@ -372,6 +372,7 @@ impl BucketSegmentReader {
                 offset,
                 record_header,
                 event_count,
+                header_only,
             )?)))
         } else {
             Err(ReadError::UnknownRecordType(record_header.record_kind))
@@ -422,7 +423,7 @@ impl BucketSegmentReader {
             }
         };
 
-        EventRecord::from_parts(start_offset, record_header, event_header, body)
+        EventRecord::from_parts(start_offset, record_header, event_header, body, header_only)
     }
 
     fn fill_read_ahead(&mut self, offset: u64, mut length: usize) -> Result<(), ReadError> {
@@ -701,30 +702,33 @@ impl EventRecord {
         record_header: RecordHeader,
         event_header: EventHeader,
         body: EventBody,
+        skip_crc32c: bool,
     ) -> Result<Self, ReadError> {
-        let new_confirmation_count_crc32c = calculate_confirmation_count_crc32c(
-            &record_header.transaction_id,
-            record_header.confirmation_count,
-        );
-        if record_header.confirmation_count_crc32c != new_confirmation_count_crc32c {
-            return Err(ReadError::ConfirmationCountCrc32cMismatch { offset });
-        }
+        if !skip_crc32c {
+            let new_confirmation_count_crc32c = calculate_confirmation_count_crc32c(
+                &record_header.transaction_id,
+                record_header.confirmation_count,
+            );
+            if record_header.confirmation_count_crc32c != new_confirmation_count_crc32c {
+                return Err(ReadError::ConfirmationCountCrc32cMismatch { offset });
+            }
 
-        let new_crc32c = calculate_event_crc32c(
-            record_header.timestamp,
-            &record_header.transaction_id,
-            &event_header.event_id,
-            &event_header.partition_key,
-            event_header.partition_id,
-            event_header.partition_sequence,
-            event_header.stream_version,
-            &body.stream_id,
-            &body.event_name,
-            &body.metadata,
-            &body.payload,
-        );
-        if record_header.crc32c != new_crc32c {
-            return Err(ReadError::Crc32cMismatch { offset });
+            let new_crc32c = calculate_event_crc32c(
+                record_header.timestamp,
+                &record_header.transaction_id,
+                &event_header.event_id,
+                &event_header.partition_key,
+                event_header.partition_id,
+                event_header.partition_sequence,
+                event_header.stream_version,
+                &body.stream_id,
+                &body.event_name,
+                &body.metadata,
+                &body.payload,
+            );
+            if record_header.crc32c != new_crc32c {
+                return Err(ReadError::Crc32cMismatch { offset });
+            }
         }
 
         Ok(EventRecord {
@@ -759,22 +763,25 @@ impl CommitRecord {
         offset: u64,
         record_header: RecordHeader,
         event_count: u32,
+        skip_crc32c: bool,
     ) -> Result<Self, ReadError> {
-        let new_confirmation_count_crc32c = calculate_confirmation_count_crc32c(
-            &record_header.transaction_id,
-            record_header.confirmation_count,
-        );
-        if record_header.confirmation_count_crc32c != new_confirmation_count_crc32c {
-            return Err(ReadError::ConfirmationCountCrc32cMismatch { offset });
-        }
+        if !skip_crc32c {
+            let new_confirmation_count_crc32c = calculate_confirmation_count_crc32c(
+                &record_header.transaction_id,
+                record_header.confirmation_count,
+            );
+            if record_header.confirmation_count_crc32c != new_confirmation_count_crc32c {
+                return Err(ReadError::ConfirmationCountCrc32cMismatch { offset });
+            }
 
-        let new_crc32c = calculate_commit_crc32c(
-            &record_header.transaction_id,
-            record_header.timestamp,
-            event_count,
-        );
-        if record_header.crc32c != new_crc32c {
-            return Err(ReadError::Crc32cMismatch { offset });
+            let new_crc32c = calculate_commit_crc32c(
+                &record_header.transaction_id,
+                record_header.timestamp,
+                event_count,
+            );
+            if record_header.crc32c != new_crc32c {
+                return Err(ReadError::Crc32cMismatch { offset });
+            }
         }
 
         Ok(CommitRecord {
