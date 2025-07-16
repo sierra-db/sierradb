@@ -7,12 +7,14 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    zjstatus.url = "github:dj95/zjstatus";
   };
 
   outputs =
     {
       nixpkgs,
       rust-overlay,
+      zjstatus,
       ...
     }:
     let
@@ -41,16 +43,6 @@
               "rust-analyzer"
             ];
           };
-          # rustToolchain = pkgs.rust-bin.selectLatestNightlyWith (
-          #   toolchain:
-          #   toolchain.default.override {
-          #     extensions = [
-          #       "rust-src"
-          #       "rustfmt"
-          #       "rust-analyzer"
-          #     ];
-          #   }
-          # );
 
           devShell = pkgs.mkShell {
             name = "rust-dev";
@@ -62,10 +54,17 @@
               cargo-outdated
               cargo-semver-checks
               cargo-temp
+              redis
               rustToolchain
               pkg-config
               openssl.dev
+              zjstatus.packages.${system}.default
             ];
+
+            shellHook = ''
+              export ZJSTATUS_PATH="${zjstatus.packages.${system}.default}/bin/zjstatus.wasm"
+              ln -sf ${zjstatus.packages.${system}.default}/bin/zjstatus.wasm ./zjstatus.wasm
+            '';
           };
         in
         {
