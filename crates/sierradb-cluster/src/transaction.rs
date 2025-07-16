@@ -13,9 +13,10 @@ use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use crate::{
-    ClusterActor, ClusterError, ConfirmTransaction, ReplicateWrite,
+    ClusterActor, ClusterError,
     circuit_breaker::WriteCircuitBreaker,
     confirmation::actor::{ConfirmationActor, UpdateConfirmation},
+    write::{ConfirmTransaction, ReplicateWrite},
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);

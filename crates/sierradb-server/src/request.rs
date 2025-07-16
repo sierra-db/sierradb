@@ -16,7 +16,9 @@ pub struct Append {
     pub metadata: Vec<u8>,
 }
 
-pub struct Get {}
+pub struct Get {
+    pub event_id: Uuid,
+}
 
 pub struct PRead {}
 
@@ -60,6 +62,7 @@ macro_rules! impl_command {
                         break;
                     };
                     let name = name.as_str().map_err(|_| Value::Error("Expected field name".to_string()))?;
+                    #[allow(unused_variables)]
                     let value = iter.next().ok_or_else(|| Value::Error("Unexpected value".to_string()))?;
 
                     match name.to_lowercase().as_str() {
@@ -86,6 +89,8 @@ impl_command!(
     [stream_id, event_name],
     [event_id, partition_key, expected_version, payload, metadata]
 );
+
+impl_command!(Get, [event_id], []);
 
 impl_command!(SRead, [stream_id], [partition_key]);
 
