@@ -4,14 +4,16 @@ use kameo::actor::ActorRef;
 use libp2p::bytes::BytesMut;
 use sierradb::database::{NewEvent, Transaction};
 use sierradb::id::{NAMESPACE_PARTITION_KEY, uuid_to_partition_hash, uuid_v7_with_partition_hash};
-use sierradb_cluster::{ClusterActor, ExecuteTransaction};
+use sierradb_cluster::ClusterActor;
+use sierradb_cluster::read::ReadEvent;
+use sierradb_cluster::write::ExecuteTransaction;
 use smallvec::smallvec;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::request::{Append, FromArgs, SRead};
+use crate::request::{Append, FromArgs, Get, SRead};
 use crate::value::{Value, ValueDecoder};
 
 pub struct Server {
@@ -100,13 +102,17 @@ impl Conn {
                             Ok(append) => self.handle_append(append).await,
                             Err(err) => Ok(err),
                         },
-                        "get" => self.handle_get(&items).await,
+                        "get" => match Get::from_args(&items[1..]) {
+                            Ok(get) => self.handle_get(get).await,
+                            Err(err) => Ok(err),
+                        },
                         "pread" => self.handle_read_partition(&items).await,
                         "sread" => match SRead::from_args(&items[1..]) {
                             Ok(sread) => self.handle_read_stream(sread).await,
                             Err(err) => Ok(err),
                         },
                         "pinfo" => todo!(),
+                        "ping" => Ok(Value::String("PONG".to_string())),
                         "sinfo" => todo!(),
                         "subscribe" => todo!(),
                         _ => Ok(Value::Error(format!("Unknown command: {cmd}"))),
@@ -186,8 +192,38 @@ impl Conn {
         }
     }
 
-    async fn handle_get(&mut self, _args: &[Value]) -> io::Result<Value> {
-        Ok(Value::String("Not implemented".to_string()))
+    async fn handle_get(&mut self, Get { event_id }: Get) -> io::Result<Value> {
+        // pub event_id: Uuid,
+        // pub partition_key: Uuid,
+        // pub transaction_id: Uuid,
+        // pub partition_sequence: u64,
+        // pub stream_version: u64,
+        // pub timestamp: u64,
+        // pub stream_id: StreamId,
+        // pub event_name: String,
+        // pub metadata: Vec<u8>,
+        // pub payload: Vec<u8>,
+
+        match self.cluster_ref.ask(ReadEvent::new(event_id)).await {
+            Ok(Some(record)) => {
+                let response = vec![
+                    Value::String(record.event_id.to_string()),
+                    Value::String(record.partition_key.to_string()),
+                    Value::String(record.transaction_id.to_string()),
+                    Value::Integer(record.partition_sequence as i64),
+                    Value::Integer(record.stream_version as i64),
+                    Value::Integer(record.timestamp as i64),
+                    Value::String(record.stream_id.to_string()),
+                    Value::String(record.event_name),
+                    Value::Bulk(record.metadata),
+                    Value::Bulk(record.payload),
+                ];
+
+                Ok(Value::Array(response))
+            }
+            Ok(None) => Ok(Value::Null),
+            Err(err) => Ok(Value::Error(err.to_string())),
+        }
     }
 
     async fn handle_read_partition(&mut self, _args: &[Value]) -> io::Result<Value> {
