@@ -24,7 +24,7 @@ use super::{
 use crate::StreamId;
 use crate::bucket::{BucketId, PartitionId};
 use crate::error::{ReadError, WriteError};
-use crate::id::get_uuid_flag;
+use crate::id::{get_uuid_flag, uuid_to_partition_hash};
 
 const HEADER_BUF_SIZE: usize = EVENT_HEADER_SIZE - RECORD_HEADER_SIZE;
 const PAGE_SIZE: usize = 4096; // Usually a page is 4KB on Linux
@@ -687,6 +687,10 @@ impl EventRecord {
     //         payload: Cow::Owned(self.payload.into_owned()),
     //     }
     // }
+
+    pub fn primary_partition_id(&self, num_partitions: u16) -> PartitionId {
+        uuid_to_partition_hash(self.partition_key) % num_partitions
+    }
 
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> u64 {

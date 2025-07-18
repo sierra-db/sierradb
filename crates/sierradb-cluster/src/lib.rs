@@ -59,7 +59,7 @@ pub struct ClusterArgs {
     /// Number of replicas to maintain for each partition
     pub replication_factor: u8,
     /// Partitions assigned to this node
-    pub assigned_partitions: HashSet<u16>,
+    pub assigned_partitions: HashSet<PartitionId>,
     /// Maximum time to wait for a heartbeat before considering a peer down
     pub heartbeat_timeout: Duration,
     /// Interval between heartbeat messages
@@ -156,6 +156,7 @@ impl Actor for ClusterActor {
             database.dir().clone(),
             database.total_buckets(),
             replication_factor,
+            assigned_partitions,
         );
         let watermarks = confirmation_actor.manager.get_watermarks();
         let confirmation_ref = Actor::spawn_in_thread(confirmation_actor);

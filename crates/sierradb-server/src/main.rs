@@ -20,7 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::new(args.log.as_deref().unwrap_or(
             "sierradb_cluster=DEBUG,sierradb_server=DEBUG,sierradb=DEBUG,INFO",
         )))
-        .with_span_events(FmtSpan::NEW)
+        .with_span_events(FmtSpan::ACTIVE)
         .init();
 
     let config = AppConfig::load(args)?;

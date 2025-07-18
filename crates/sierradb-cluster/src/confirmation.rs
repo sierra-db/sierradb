@@ -1,6 +1,6 @@
 pub mod actor;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -212,16 +212,23 @@ pub struct BucketConfirmationManager {
     num_buckets: u16,
     replication_factor: u8,
     buckets: HashMap<BucketId, HashMap<PartitionId, PartitionConfirmationState>>,
+    assigned_partitions: HashSet<PartitionId>,
     last_persist_times: HashMap<BucketId, Instant>,
     changes_since_persist: HashMap<BucketId, usize>,
 }
 
 impl BucketConfirmationManager {
-    pub fn new(data_dir: PathBuf, num_buckets: u16, replication_factor: u8) -> Self {
+    pub fn new(
+        data_dir: PathBuf,
+        num_buckets: u16,
+        replication_factor: u8,
+        assigned_partitions: HashSet<PartitionId>,
+    ) -> Self {
         Self {
             data_dir,
             num_buckets,
             replication_factor,
+            assigned_partitions,
             buckets: HashMap::new(),
             last_persist_times: HashMap::new(),
             changes_since_persist: HashMap::new(),
@@ -230,17 +237,30 @@ impl BucketConfirmationManager {
 
     pub fn initialize(&mut self) {
         // Create confirmation directories if they don't exist
-        for bucket_id in 0..self.num_buckets {
+        for partition_id in self.assigned_partitions.clone() {
+            let bucket_id = partition_id % self.num_buckets;
             let bucket_dir = self.get_bucket_confirmation_dir(bucket_id);
             let _ = fs::create_dir_all(&bucket_dir);
 
             // Load existing state if available
             self.load_bucket_state(bucket_id);
         }
+
+        self.buckets = self.assigned_partitions.iter().fold(
+            HashMap::<BucketId, HashMap<PartitionId, PartitionConfirmationState>>::new(),
+            |mut acc, partition_id| {
+                let bucket_id = partition_id % self.num_buckets;
+                acc.entry(bucket_id).or_default().insert(
+                    *partition_id,
+                    PartitionConfirmationState::new(*partition_id, self.replication_factor),
+                );
+                acc
+            },
+        );
     }
 
     /// Get the appropriate bucket for a partition
-    fn get_bucket_for_partition(&self, partition_id: PartitionId) -> u16 {
+    fn get_bucket_for_partition(&self, partition_id: PartitionId) -> BucketId {
         // Simple modulo distribution
         partition_id % self.num_buckets
     }
@@ -774,7 +794,8 @@ mod tests {
     #[test]
     fn test_confirmation_persistence() -> Result<(), ConfirmationError> {
         let temp_dir = tempdir().unwrap();
-        let mut manager = BucketConfirmationManager::new(temp_dir.path().to_path_buf(), 4, 2);
+        let mut manager =
+            BucketConfirmationManager::new(temp_dir.path().to_path_buf(), 4, 2, HashSet::new());
 
         // Initialize
         manager.initialize();
@@ -789,7 +810,8 @@ mod tests {
         manager.persist_bucket_state(bucket_id)?;
 
         // Create a new manager and check if state loaded
-        let mut new_manager = BucketConfirmationManager::new(temp_dir.path().to_path_buf(), 4, 2);
+        let mut new_manager =
+            BucketConfirmationManager::new(temp_dir.path().to_path_buf(), 4, 2, HashSet::new());
         new_manager.initialize();
 
         // Check if state was loaded correctly
@@ -813,7 +835,8 @@ mod tests {
 
         // Create manager to test skip functionality
         let temp_dir = tempdir().unwrap();
-        let mut manager = BucketConfirmationManager::new(temp_dir.path().to_path_buf(), 4, 2);
+        let mut manager =
+            BucketConfirmationManager::new(temp_dir.path().to_path_buf(), 4, 2, HashSet::new());
 
         // Initialize and manually insert our test state
         manager.initialize();

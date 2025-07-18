@@ -201,23 +201,19 @@ async fn run(
         transaction = transaction.with_confirmation_count(1);
     }
 
-    let append = database
-        .append_events(partition_id, transaction.clone())
-        .await?;
+    let append = database.append_events(transaction.clone()).await?;
 
     let mut pending_replies: FuturesUnordered<_> = replica_partitions
         .into_iter()
-        .map(|(partition_id, cluster_ref)| {
+        .map(|(replica_partition_id, cluster_ref)| {
             cluster_ref
                 .ask(&ReplicateWrite {
-                    partition_id,
-                    transaction: transaction.clone(),
-                    transaction_id: transaction.transaction_id(),
+                    transaction: transaction.clone().with_partition_id(replica_partition_id),
                     origin_partition: partition_id,
                 })
                 .enqueue()
                 .expect("ReplicateWrite message serialization should succeed")
-                .map(move |res| (partition_id, cluster_ref, res))
+                .map(move |res| (replica_partition_id, cluster_ref, res))
         })
         .collect();
 

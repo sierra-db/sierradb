@@ -1,8 +1,11 @@
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::time::Duration;
 use std::{env, fs};
 
 use sierradb::bucket::segment::{BucketSegmentReader, Record};
-use sierradb::bucket::{BucketId, BucketSegmentId, SegmentId};
+use sierradb::bucket::{BucketId, BucketSegmentId, PartitionId, SegmentId};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -20,6 +23,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("No buckets directory found at {}", buckets_dir.display());
         return Ok(());
     }
+
+    let mut bucket_segments = BTreeMap::new();
 
     // Iterate through each bucket directory
     for bucket_entry in fs::read_dir(buckets_dir)? {
@@ -44,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Iterate through each segment directory
-        'segment_loop: for segment_entry in fs::read_dir(&segments_dir)? {
+        for segment_entry in fs::read_dir(&segments_dir)? {
             let segment_entry = segment_entry?;
             if !segment_entry.file_type()?.is_dir() {
                 continue;
@@ -64,30 +69,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Look for the events file in this segment directory
             let events_file = segment_entry.path().join("data.evts");
             if events_file.exists() {
-                let mut reader = BucketSegmentReader::open(events_file, None)?;
-                let mut iter = reader.iter();
+                bucket_segments.insert(bsid, events_file);
+            }
+        }
+    }
 
-                while let Some(record) = iter.next_record(false).transpose() {
-                    match record {
-                        Ok(Record::Event(event)) => {
-                            println!(
-                                "{bsid} -- {}/{} {}@{} - {} (confirmations: {})",
-                                event.partition_id,
-                                event.partition_sequence,
-                                event.stream_id,
-                                event.stream_version,
-                                event.event_name,
-                                event.confirmation_count,
-                            );
-                            println!("{event:#?}");
-                            println!();
+    let mut next_sequences: HashMap<PartitionId, u64> = HashMap::new();
+
+    'bucket_segment_loop: for (bsid, events_file) in bucket_segments {
+        let mut reader = BucketSegmentReader::open(events_file, None)?;
+        let mut iter = reader.iter();
+
+        while let Some(record) = iter.next_record(false).transpose() {
+            match record {
+                Ok(Record::Event(event)) => {
+                    let expected = match next_sequences.entry(event.partition_id) {
+                        Entry::Occupied(mut entry) => {
+                            *entry.get_mut() += 1;
+                            *entry.get()
                         }
-                        Ok(Record::Commit(_)) => {}
-                        Err(err) => {
-                            println!("ERROR: {err}");
-                            continue 'segment_loop;
+                        Entry::Vacant(entry) => {
+                            entry.insert(0);
+                            0
                         }
+                    };
+
+                    println!(
+                        "Found event for {bsid} partition id {}, expecting {expected}",
+                        event.partition_id
+                    );
+
+                    if event.partition_sequence != expected {
+                        println!("FOUND AN INCONSISTENT SEQUENCE - expected {expected}");
+                        dbg!(event);
+                        // std::process::exit(1);
+                        std::thread::sleep(Duration::from_secs(2));
                     }
+                }
+                Ok(Record::Commit(_)) => {}
+                Err(err) => {
+                    println!("ERROR: {err}");
+                    continue 'bucket_segment_loop;
                 }
             }
         }

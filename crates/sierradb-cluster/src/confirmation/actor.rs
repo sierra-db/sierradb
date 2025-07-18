@@ -36,8 +36,8 @@
 //! }
 //! ```
 
-use std::path::PathBuf;
 use std::sync::Arc;
+use std::{collections::HashSet, path::PathBuf};
 
 use kameo::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -67,8 +67,18 @@ pub struct ConfirmationActor {
 }
 
 impl ConfirmationActor {
-    pub fn new(data_dir: PathBuf, num_buckets: u16, replication_factor: u8) -> Self {
-        let mut manager = BucketConfirmationManager::new(data_dir, num_buckets, replication_factor);
+    pub fn new(
+        data_dir: PathBuf,
+        num_buckets: u16,
+        replication_factor: u8,
+        assigned_partitions: HashSet<PartitionId>,
+    ) -> Self {
+        let mut manager = BucketConfirmationManager::new(
+            data_dir,
+            num_buckets,
+            replication_factor,
+            assigned_partitions,
+        );
         manager.initialize();
 
         Self { manager }
@@ -337,8 +347,18 @@ impl Message<GetMultipleWatermarks> for ConfirmationActor {
 // Convenience methods for common operations
 impl ConfirmationActor {
     /// Spawn a new confirmation actor
-    pub fn spawn(data_dir: PathBuf, num_buckets: u16, replication_factor: u8) -> ActorRef<Self> {
-        let actor = Self::new(data_dir, num_buckets, replication_factor);
+    pub fn spawn(
+        data_dir: PathBuf,
+        num_buckets: u16,
+        replication_factor: u8,
+        assigned_partitions: HashSet<PartitionId>,
+    ) -> ActorRef<Self> {
+        let actor = Self::new(
+            data_dir,
+            num_buckets,
+            replication_factor,
+            assigned_partitions,
+        );
         Actor::spawn(actor)
     }
 }
@@ -425,7 +445,8 @@ mod tests {
     #[tokio::test]
     async fn test_confirmation_actor_basic_operations() -> Result<(), Box<dyn std::error::Error>> {
         let temp_dir = tempdir()?;
-        let actor_ref = ConfirmationActor::spawn(temp_dir.path().to_path_buf(), 4, 3);
+        let actor_ref =
+            ConfirmationActor::spawn(temp_dir.path().to_path_buf(), 4, 3, HashSet::new());
 
         // Test update confirmation using extension trait
         let watermark_advanced = actor_ref
@@ -457,7 +478,8 @@ mod tests {
     #[tokio::test]
     async fn test_health_check() -> Result<(), Box<dyn std::error::Error>> {
         let temp_dir = tempdir()?;
-        let actor_ref = ConfirmationActor::spawn(temp_dir.path().to_path_buf(), 4, 3);
+        let actor_ref =
+            ConfirmationActor::spawn(temp_dir.path().to_path_buf(), 4, 3, HashSet::new());
 
         // Add some confirmations
         actor_ref
@@ -490,7 +512,8 @@ mod tests {
     #[tokio::test]
     async fn test_extension_trait_methods() -> Result<(), Box<dyn std::error::Error>> {
         let temp_dir = tempdir()?;
-        let actor_ref = ConfirmationActor::spawn(temp_dir.path().to_path_buf(), 4, 3);
+        let actor_ref =
+            ConfirmationActor::spawn(temp_dir.path().to_path_buf(), 4, 3, HashSet::new());
 
         // Test convenience methods from extension trait
         let watermark_advanced = actor_ref
@@ -510,7 +533,8 @@ mod tests {
     #[tokio::test]
     async fn test_admin_operations() -> Result<(), Box<dyn std::error::Error>> {
         let temp_dir = tempdir()?;
-        let actor_ref = ConfirmationActor::spawn(temp_dir.path().to_path_buf(), 4, 3);
+        let actor_ref =
+            ConfirmationActor::spawn(temp_dir.path().to_path_buf(), 4, 3, HashSet::new());
 
         // Set up some initial state
         actor_ref
