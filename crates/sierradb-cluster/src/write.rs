@@ -275,9 +275,7 @@ impl Message<ExecuteTransaction> for ClusterActor {
 /// Message to replicate a write to another partition
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReplicateWrite {
-    pub partition_id: PartitionId,
     pub transaction: Transaction,
-    pub transaction_id: Uuid,
     pub origin_partition: PartitionId,
 }
 
@@ -296,7 +294,7 @@ impl Message<ReplicateWrite> for ClusterActor {
             .behaviour()
             .partitions
             .manager
-            .has_partition(msg.partition_id)
+            .has_partition(msg.transaction.partition_id())
         {
             panic!("got a replicate write request when we dont own the partition");
         }
@@ -306,7 +304,7 @@ impl Message<ReplicateWrite> for ClusterActor {
         // Replicate the write to our local database
         ctx.spawn(async move {
             database
-                .append_events(msg.partition_id, msg.transaction)
+                .append_events(msg.transaction)
                 .await
                 .map_err(ClusterError::from)
         })
@@ -415,9 +413,6 @@ impl Message<ConfirmTransaction> for ClusterActor {
                         ?err,
                         "replica failed to update confirmations after retries"
                     );
-
-                    // Increment replica failure metrics here for monitoring
-                    // REPLICA_CONFIRMATION_FAILURES.inc();
 
                     // Return success to avoid unnecessary error propagation
                     // The primary doesn't need to know about this failure

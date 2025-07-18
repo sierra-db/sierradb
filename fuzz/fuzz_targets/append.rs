@@ -58,7 +58,6 @@ fn init() -> (&'static Runtime, &'static Database) {
 
 #[derive(Clone, Debug)]
 struct AppendEvent {
-    bucket_id: u16,
     partition_id: u16,
     stream_id: StreamId,
     event_name: String,
@@ -69,7 +68,6 @@ struct AppendEvent {
 
 impl<'a> Arbitrary<'a> for AppendEvent {
     fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
-        let bucket_id = u16::arbitrary(u)?;
         let partition_id = u16::arbitrary(u)?;
 
         // Stream ID with length 1-64
@@ -124,7 +122,6 @@ impl<'a> Arbitrary<'a> for AppendEvent {
             .collect::<Result<_, _>>()?;
 
         Ok(AppendEvent {
-            bucket_id,
             partition_id,
             stream_id,
             event_name,
@@ -135,8 +132,8 @@ impl<'a> Arbitrary<'a> for AppendEvent {
     }
 
     fn size_hint(_depth: usize) -> (usize, Option<usize>) {
-        // Fixed costs: u16 + u16 + range(1..=64) + u64
-        let fixed_min = 2 + 2 + 1 + 8;
+        // Fixed costs: u16 + range(1..=64) + u64
+        let fixed_min = 2 + 1 + 8;
 
         // Minimum total: fixed costs + minimum stream_id (1 char) + event_name
         // (potentially empty)
@@ -166,17 +163,16 @@ fuzz_target!(|event: AppendEvent| {
 
     let partition_key = Uuid::new_v5(&NAMESPACE_PARTITION_KEY, event.stream_id.as_bytes());
     let partition_hash = uuid_to_partition_hash(partition_key);
+    let partition_id = event.partition_id % TOTAL_BUCKETS;
     let event_id = uuid_v7_with_partition_hash(partition_hash);
 
     runtime.block_on(async move {
         db.append_events(
-            event.bucket_id % 8,
             Transaction::new(
-                partition_hash,
+                partition_key,
+                partition_id,
                 smallvec![NewEvent {
                     event_id,
-                    partition_key,
-                    partition_id: event.partition_id % TOTAL_BUCKETS,
                     stream_id: event.stream_id,
                     stream_version: ExpectedVersion::Any,
                     event_name: event.event_name,

@@ -149,11 +149,10 @@ impl Conn {
             .as_nanos() as u64;
 
         let transaction = match Transaction::new(
-            uuid_to_partition_hash(partition_key),
+            partition_key,
+            partition_id,
             smallvec![NewEvent {
                 event_id,
-                partition_key,
-                partition_id,
                 stream_id,
                 stream_version: expected_version,
                 event_name,

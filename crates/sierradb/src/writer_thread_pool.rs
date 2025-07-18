@@ -403,6 +403,8 @@ impl Worker {
         reply_tx: oneshot::Sender<Result<AppendResult, WriteError>>,
     ) {
         let Transaction {
+            partition_key,
+            partition_id,
             transaction_id,
             events,
             expected_partition_sequence,
@@ -420,7 +422,7 @@ impl Worker {
 
         writer_set.flush_if_necessary();
 
-        let event_versions = match writer_set.validate_event_versions(&events) {
+        let event_versions = match writer_set.validate_event_versions(partition_key, &events) {
             Ok(event_versions) => event_versions,
             Err(err) => {
                 let _ = reply_tx.send(Err(err));
@@ -469,6 +471,8 @@ impl Worker {
         }
 
         let res = writer_set.handle_write(
+            partition_key,
+            partition_id,
             transaction_id,
             &events,
             event_versions,
@@ -546,6 +550,8 @@ struct WriterSet {
 impl WriterSet {
     fn handle_write(
         &mut self,
+        partition_key: Uuid,
+        partition_id: PartitionId,
         transaction_id: Uuid,
         events: &SmallVec<[NewEvent; 4]>,
         event_versions: Vec<CurrentVersion>,
@@ -553,13 +559,13 @@ impl WriterSet {
         unique_streams: usize,
         confirmation_count: u8,
     ) -> Result<AppendResult, WriteError> {
-        let Some(NewEvent { partition_id, .. }) = events.first() else {
+        if events.is_empty() {
             unreachable!("append event batch does not allow empty transactions");
-        };
+        }
 
-        let mut next_partition_sequence = self.next_partition_sequence(*partition_id)?;
+        let mut next_partition_sequence = self.next_partition_sequence(partition_id)?;
         validate_partition_sequence(
-            *partition_id,
+            partition_id,
             expected_partition_sequence,
             next_partition_sequence,
         )?;
@@ -575,8 +581,8 @@ impl WriterSet {
             stream_versions.insert(event.stream_id.clone(), stream_version);
             let append = AppendEvent {
                 event_id: &event.event_id,
-                partition_key: &event.partition_key,
-                partition_id: event.partition_id,
+                partition_key: &partition_key,
+                partition_id,
                 partition_sequence,
                 stream_version,
                 stream_id: &event.stream_id,
@@ -596,8 +602,8 @@ impl WriterSet {
             // - partition sequence doesn't reach u64::MAX
             new_pending_indexes.push(PendingIndex {
                 event_id: event.event_id,
-                partition_key: event.partition_key,
-                partition_id: event.partition_id,
+                partition_key,
+                partition_id,
                 partition_sequence,
                 stream_id: event.stream_id.clone(),
                 stream_version,
@@ -617,7 +623,7 @@ impl WriterSet {
         }
 
         self.next_partition_sequences
-            .insert(*partition_id, next_partition_sequence);
+            .insert(partition_id, next_partition_sequence);
         self.pending_indexes.extend(new_pending_indexes);
 
         self.unflushed_events += event_count as u32;
@@ -778,54 +784,42 @@ impl WriterSet {
 
     fn validate_event_versions(
         &self,
+        partition_key: Uuid,
         events: &SmallVec<[NewEvent; 4]>,
     ) -> Result<Vec<CurrentVersion>, WriteError> {
-        struct StreamVersion {
-            next: u64,
-            partition_key: Uuid,
-        }
-
-        let mut stream_versions: HashMap<StreamId, StreamVersion> = HashMap::new();
+        let mut stream_versions: HashMap<StreamId, u64> = HashMap::new();
         let mut event_versions = Vec::with_capacity(events.len());
 
         for event in events {
             match stream_versions.entry(event.stream_id.clone()) {
-                Entry::Occupied(mut entry) => {
-                    if entry.get().partition_key != event.partition_key {
-                        return Err(WriteError::Validation(
-                            EventValidationError::PartitionKeyMismatch,
-                        ));
+                Entry::Occupied(mut entry) => match event.stream_version {
+                    ExpectedVersion::Any => {
+                        event_versions.push(CurrentVersion::Current(*entry.get()));
+                        *entry.get_mut() += 1;
                     }
+                    ExpectedVersion::Exists => {
+                        event_versions.push(CurrentVersion::Current(*entry.get()));
+                        *entry.get_mut() += 1;
+                    }
+                    ExpectedVersion::Empty => {
+                        return Err(WriteError::WrongExpectedVersion {
+                            stream_id: event.stream_id.clone(),
+                            current: CurrentVersion::Current(*entry.get()),
+                            expected: event.stream_version,
+                        });
+                    }
+                    ExpectedVersion::Exact(expected_version) => {
+                        event_versions.push(CurrentVersion::Current(*entry.get()));
 
-                    match event.stream_version {
-                        ExpectedVersion::Any => {
-                            event_versions.push(CurrentVersion::Current(entry.get_mut().next));
-                            entry.get_mut().next += 1;
-                        }
-                        ExpectedVersion::Exists => {
-                            event_versions.push(CurrentVersion::Current(entry.get_mut().next));
-                            entry.get_mut().next += 1;
-                        }
-                        ExpectedVersion::Empty => {
+                        if *entry.get() != expected_version {
                             return Err(WriteError::WrongExpectedVersion {
                                 stream_id: event.stream_id.clone(),
-                                current: CurrentVersion::Current(entry.get().next),
-                                expected: event.stream_version,
+                                current: CurrentVersion::Current(*entry.get()),
+                                expected: ExpectedVersion::Exact(expected_version),
                             });
                         }
-                        ExpectedVersion::Exact(expected_version) => {
-                            event_versions.push(CurrentVersion::Current(entry.get_mut().next));
-
-                            if entry.get().next != expected_version {
-                                return Err(WriteError::WrongExpectedVersion {
-                                    stream_id: event.stream_id.clone(),
-                                    current: CurrentVersion::Current(entry.get().next),
-                                    expected: ExpectedVersion::Exact(expected_version),
-                                });
-                            }
-                        }
                     }
-                }
+                },
                 Entry::Vacant(entry) => match event.stream_version {
                     ExpectedVersion::Any => {
                         let latest_stream_version = self
@@ -850,31 +844,16 @@ impl WriterSet {
                             .transpose()?;
 
                         match latest_stream_version {
-                            Some(StreamLatestVersion::LatestVersion {
-                                partition_key,
-                                version,
-                            }) => {
-                                if partition_key != event.partition_key {
-                                    return Err(WriteError::Validation(
-                                        EventValidationError::PartitionKeyMismatch,
-                                    ));
-                                }
-
+                            Some(StreamLatestVersion::LatestVersion { version, .. }) => {
                                 event_versions.push(CurrentVersion::Current(version));
-                                entry.insert(StreamVersion {
-                                    next: version,
-                                    partition_key,
-                                });
+                                entry.insert(version);
                             }
                             Some(StreamLatestVersion::ExternalBucket { .. }) => {
                                 todo!()
                             }
                             None => {
                                 event_versions.push(CurrentVersion::Empty);
-                                entry.insert(StreamVersion {
-                                    next: 0,
-                                    partition_key: event.partition_key,
-                                });
+                                entry.insert(0);
                             }
                         }
                     }
@@ -902,21 +881,18 @@ impl WriterSet {
 
                         match latest_stream_version {
                             Some(StreamLatestVersion::LatestVersion {
-                                partition_key,
+                                partition_key: latest_partition_key,
                                 version,
                             }) => {
                                 // Stream exists, so this is fine
-                                if partition_key != event.partition_key {
+                                if partition_key != latest_partition_key {
                                     return Err(WriteError::Validation(
                                         EventValidationError::PartitionKeyMismatch,
                                     ));
                                 }
 
                                 event_versions.push(CurrentVersion::Current(version));
-                                entry.insert(StreamVersion {
-                                    next: version + 1, // Note: increment for next event
-                                    partition_key,
-                                });
+                                entry.insert(version + 1);
                             }
                             Some(StreamLatestVersion::ExternalBucket { .. }) => {
                                 todo!()
@@ -955,10 +931,10 @@ impl WriterSet {
 
                         match latest_stream_version {
                             Some(StreamLatestVersion::LatestVersion {
-                                partition_key,
+                                partition_key: latest_partition_key,
                                 version,
                             }) => {
-                                if partition_key != event.partition_key {
+                                if partition_key != latest_partition_key {
                                     return Err(WriteError::Validation(
                                         EventValidationError::PartitionKeyMismatch,
                                     ));
@@ -975,10 +951,7 @@ impl WriterSet {
                             }
                             None => {
                                 event_versions.push(CurrentVersion::Empty);
-                                entry.insert(StreamVersion {
-                                    next: 0,
-                                    partition_key: event.partition_key,
-                                });
+                                entry.insert(0);
                             }
                         }
                     }
@@ -1006,10 +979,10 @@ impl WriterSet {
 
                         match latest_stream_version {
                             Some(StreamLatestVersion::LatestVersion {
-                                partition_key,
+                                partition_key: latest_partition_key,
                                 version,
                             }) => {
-                                if partition_key != event.partition_key {
+                                if partition_key != latest_partition_key {
                                     return Err(WriteError::Validation(
                                         EventValidationError::PartitionKeyMismatch,
                                     ));
@@ -1024,10 +997,7 @@ impl WriterSet {
                                 }
 
                                 event_versions.push(CurrentVersion::Current(version));
-                                entry.insert(StreamVersion {
-                                    next: expected_version,
-                                    partition_key,
-                                });
+                                entry.insert(expected_version);
                             }
                             Some(StreamLatestVersion::ExternalBucket { .. }) => {
                                 todo!()

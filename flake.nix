@@ -35,40 +35,58 @@
             overlays = [ rust-overlay.overlays.default ];
           };
 
-          # Define the shell directly here, instead of importing
-          rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-            extensions = [
-              "rust-src"
-              "rustfmt"
-              "rust-analyzer"
-            ];
-          };
+          commonInputs = with pkgs; [
+            bacon
+            cargo-expand
+            cargo-generate
+            cargo-msrv
+            cargo-outdated
+            cargo-semver-checks
+            cargo-temp
+            redis
+            pkg-config
+            openssl.dev
+            zjstatus.packages.${system}.default
+          ];
 
-          devShell = pkgs.mkShell {
-            name = "rust-dev";
-            buildInputs = with pkgs; [
-              bacon
-              cargo-expand
-              cargo-generate
-              cargo-msrv
-              cargo-outdated
-              cargo-semver-checks
-              cargo-temp
-              redis
-              rustToolchain
-              pkg-config
-              openssl.dev
-              zjstatus.packages.${system}.default
-            ];
-
-            shellHook = ''
-              export ZJSTATUS_PATH="${zjstatus.packages.${system}.default}/bin/zjstatus.wasm"
-              ln -sf ${zjstatus.packages.${system}.default}/bin/zjstatus.wasm ./zjstatus.wasm
-            '';
-          };
+          zjHook = ''
+            export ZJSTATUS_PATH="${zjstatus.packages.${system}.default}/bin/zjstatus.wasm"
+            ln -sf ${zjstatus.packages.${system}.default}/bin/zjstatus.wasm ./zjstatus.wasm
+          '';
         in
         {
-          default = devShell;
+          default = pkgs.mkShell {
+            name = "rust-dev";
+            buildInputs =
+              commonInputs
+              ++ (with pkgs; [
+                (rust-bin.stable.latest.default.override {
+                  extensions = [
+                    "rust-src"
+                    "rustfmt"
+                    "rust-analyzer"
+                  ];
+                })
+              ]);
+            shellHook = zjHook;
+          };
+
+          fuzz = pkgs.mkShell {
+            name = "rust-fuzz-dev";
+            buildInputs =
+              commonInputs
+              ++ (with pkgs; [
+                (rust-bin.nightly.latest.default.override {
+                  extensions = [
+                    "rust-src"
+                    "rustfmt"
+                    "rust-analyzer"
+                  ];
+                })
+                cargo-fuzz
+              ]);
+            shellHook = zjHook;
+          };
         }
       );
     };

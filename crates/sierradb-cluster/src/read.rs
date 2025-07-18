@@ -154,7 +154,7 @@ impl ClusterActor {
 
             // 3. Check watermark - only return if within confirmed range
             let watermark = watermark.map(|w| w.get()).unwrap_or(0);
-            if event.partition_sequence > watermark {
+            if event.partition_sequence + 1 > watermark {
                 debug!(
                     event_partition_sequence = event.partition_sequence,
                     watermark, "event exists but is beyond watermark"
@@ -343,7 +343,7 @@ impl Message<ReadPartition> for ClusterActor {
             let watermark = watermark.map(|w| w.get()).unwrap_or(0);
 
             // 2. Don't read beyond watermark
-            if msg.from_sequence > watermark {
+            if msg.from_sequence + 1 > watermark {
                 return Ok(PartitionEventsResponse {
                     events: vec![],
                     next_sequence: None,
