@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use std::{fmt, fs, process};
+use std::{cmp, fmt, fs, process};
 
 use libc::{RLIMIT_NOFILE, getrlimit, rlimit, setrlimit};
 use rayon::{ThreadPool, ThreadPoolBuildError, ThreadPoolBuilder};
@@ -682,6 +682,40 @@ impl ExpectedVersion {
             _ => panic!("expected no stream or exact version"),
         }
     }
+
+    /// Calculate the gap between expected and current version.
+    /// Returns VersionGap::None if the expectation is satisfied.
+    pub fn gap_from(self, current: CurrentVersion) -> VersionGap {
+        match (self, current) {
+            // Any version is acceptable
+            (ExpectedVersion::Any, _) => VersionGap::None,
+
+            // Must exist - check if stream has events
+            (ExpectedVersion::Exists, CurrentVersion::Empty) => VersionGap::Incompatible,
+            (ExpectedVersion::Exists, CurrentVersion::Current(_)) => VersionGap::None,
+
+            // Must be empty - check if stream is empty
+            (ExpectedVersion::Empty, CurrentVersion::Empty) => VersionGap::None,
+            (ExpectedVersion::Empty, CurrentVersion::Current(n)) => VersionGap::Ahead(n + 1),
+
+            // Must be at exact version
+            (ExpectedVersion::Exact(expected), CurrentVersion::Empty) => {
+                VersionGap::Behind(expected + 1)
+            }
+            (ExpectedVersion::Exact(expected), CurrentVersion::Current(current)) => {
+                match expected.cmp(&current) {
+                    cmp::Ordering::Equal => VersionGap::None,
+                    cmp::Ordering::Greater => VersionGap::Behind(expected - current),
+                    cmp::Ordering::Less => VersionGap::Ahead(current - expected),
+                }
+            }
+        }
+    }
+
+    /// Check if the current version satisfies the expectation
+    pub fn is_satisfied_by(self, current: CurrentVersion) -> bool {
+        matches!(self.gap_from(current), VersionGap::None)
+    }
 }
 
 impl fmt::Display for ExpectedVersion {
@@ -740,6 +774,18 @@ impl ops::AddAssign<u64> for CurrentVersion {
             }
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VersionGap {
+    /// No gap - expectation is satisfied
+    None,
+    /// Stream is ahead by this many versions
+    Ahead(u64),
+    /// Stream is behind by this many versions  
+    Behind(u64),
+    /// Incompatible expectation (e.g., expecting exists but stream is empty)
+    Incompatible,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -845,9 +891,8 @@ impl Transaction {
         self
     }
 
-    pub fn with_partition_id(mut self, partition_id: PartitionId) -> Self {
-        self.partition_id = partition_id;
-        self
+    pub fn get_expected_partition_sequence(&self) -> ExpectedVersion {
+        self.expected_partition_sequence
     }
 
     pub fn with_confirmation_count(mut self, confirmation_count: u8) -> Self {
@@ -918,6 +963,69 @@ mod tests {
             metadata: vec![1, 2, 3], // Some test metadata
             payload: b"test payload".to_vec(),
         }
+    }
+
+    #[test]
+    fn test_version_gaps() {
+        // Any always satisfies
+        assert_eq!(
+            ExpectedVersion::Any.gap_from(CurrentVersion::Empty),
+            VersionGap::None
+        );
+        assert_eq!(
+            ExpectedVersion::Any.gap_from(CurrentVersion::Current(5)),
+            VersionGap::None
+        );
+
+        // Exists requirements
+        assert_eq!(
+            ExpectedVersion::Exists.gap_from(CurrentVersion::Empty),
+            VersionGap::Incompatible
+        );
+        assert_eq!(
+            ExpectedVersion::Exists.gap_from(CurrentVersion::Current(0)),
+            VersionGap::None
+        );
+        assert_eq!(
+            ExpectedVersion::Exists.gap_from(CurrentVersion::Current(10)),
+            VersionGap::None
+        );
+
+        // Empty requirements
+        assert_eq!(
+            ExpectedVersion::Empty.gap_from(CurrentVersion::Empty),
+            VersionGap::None
+        );
+        assert_eq!(
+            ExpectedVersion::Empty.gap_from(CurrentVersion::Current(0)),
+            VersionGap::Ahead(1)
+        );
+        assert_eq!(
+            ExpectedVersion::Empty.gap_from(CurrentVersion::Current(5)),
+            VersionGap::Ahead(6)
+        );
+
+        // Exact version requirements
+        assert_eq!(
+            ExpectedVersion::Exact(5).gap_from(CurrentVersion::Current(5)),
+            VersionGap::None
+        );
+        assert_eq!(
+            ExpectedVersion::Exact(5).gap_from(CurrentVersion::Current(3)),
+            VersionGap::Behind(2)
+        );
+        assert_eq!(
+            ExpectedVersion::Exact(5).gap_from(CurrentVersion::Current(8)),
+            VersionGap::Ahead(3)
+        );
+        assert_eq!(
+            ExpectedVersion::Exact(0).gap_from(CurrentVersion::Empty),
+            VersionGap::Behind(1)
+        );
+        assert_eq!(
+            ExpectedVersion::Exact(3).gap_from(CurrentVersion::Empty),
+            VersionGap::Behind(4)
+        );
     }
 
     // Database creation and initialization tests
@@ -1061,7 +1169,7 @@ mod tests {
         )
         .unwrap();
         let _ = db
-            .append_events(partition_id, batch)
+            .append_events(batch)
             .await
             .expect("Failed to append event");
 
@@ -1119,7 +1227,6 @@ mod tests {
         for i in 0..3 {
             let event = create_test_event(
                 partition_key,
-                partition_id,
                 &format!("stream-{i}"),
                 ExpectedVersion::Empty,
             );

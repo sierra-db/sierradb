@@ -216,9 +216,28 @@ impl AppConfig {
             Some(ids) => Ok(ids.iter().copied().collect()),
             None => {
                 let node_count = self.node_count()?;
-                Ok((0..self.bucket.count)
-                    .filter(|b| (*b as usize % node_count) == self.node.index as usize)
-                    .collect())
+                let replication_factor = self.replication_factor as usize;
+                let current_node_index = self.node.index as usize;
+
+                // Cap replication factor at node count (every node owns everything if RF >= node count)
+                let effective_replication_factor = replication_factor.min(node_count);
+
+                let mut assigned = HashSet::new();
+
+                for bucket_id in 0..self.bucket.count {
+                    let primary_node = bucket_id as usize % node_count;
+
+                    // Check if current node is one of the replica nodes for this bucket
+                    for replica_offset in 0..effective_replication_factor {
+                        let replica_node = (primary_node + replica_offset) % node_count;
+                        if replica_node == current_node_index {
+                            assigned.insert(bucket_id);
+                            break;
+                        }
+                    }
+                }
+
+                Ok(assigned)
             }
         }
     }

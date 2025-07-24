@@ -44,6 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         builder.writer_threads(count);
     }
 
+    let node_count = config.node_count()?;
     let database = builder.open(config.dir)?;
 
     let keypair = Keypair::generate_ed25519();
@@ -58,6 +59,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         keypair,
         database,
         listen_addrs,
+        node_count,
+        node_index: config.node.index as usize,
+        bucket_count: config.bucket.count,
         partition_count: config.partition.count,
         replication_factor: config.replication_factor,
         assigned_partitions,

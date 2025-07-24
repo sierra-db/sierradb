@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sierradb::{
     MAX_REPLICATION_FACTOR,
     bucket::{PartitionHash, PartitionId, segment::CommittedEvents},
-    database::Transaction,
+    database::{CurrentVersion, ExpectedVersion, Transaction, VersionGap},
     id::uuid_to_partition_hash,
     writer_thread_pool::AppendResult,
 };
@@ -17,72 +17,129 @@ use tracing::{error, instrument};
 use uuid::Uuid;
 
 use crate::{
-    ClusterActor, ClusterError, MAX_FORWARDS,
+    ClusterActor, MAX_FORWARDS,
     confirmation::actor::UpdateConfirmation,
     transaction::{self, set_confirmations_with_retry},
 };
+
+#[derive(Debug, Error, Serialize, Deserialize)]
+pub enum WriteError {
+    #[error("all replica nodes failed to process the write request")]
+    AllReplicasFailed,
+
+    #[error("circuit breaker open: estimated recovery time: {estimated_recovery_time:?}")]
+    CircuitBreakerOpen {
+        estimated_recovery_time: Option<Duration>,
+    },
+
+    #[error("failed to update coordinator confirmation count: {0}")]
+    ConfirmationFailed(String),
+
+    #[error("failed to update replication confirmation count: {0}")]
+    ReplicationConfirmationFailed(String),
+
+    #[error("database operation failed: {0}")]
+    DatabaseOperationFailed(String),
+
+    #[error(
+        "insufficient healthy replicas for write quorum ({available}/{required} replicas available)"
+    )]
+    InsufficientHealthyReplicas { available: u8, required: u8 },
+
+    #[error("coordinator is not healthy")]
+    InvalidSender,
+
+    #[error("stale write: coordinator has been alive longer than our local record of it")]
+    StaleWrite,
+
+    #[error("transaction is missing an expected partition sequence")]
+    MissingExpectedPartitionSequence,
+
+    #[error("partition {partition_id} is not owned by this node")]
+    PartitionNotOwned { partition_id: PartitionId },
+
+    #[error(
+        "write replication quorum not achieved ({confirmed}/{required} confirmations received)"
+    )]
+    ReplicationQuorumFailed { confirmed: u8, required: u8 },
+
+    #[error("write operation timed out")]
+    RequestTimeout,
+
+    #[error("write request exceeded maximum forward hops ({max} allowed)")]
+    MaximumForwardsExceeded { max: u8 },
+
+    #[error("remote operation failed: {0}")]
+    RemoteOperationFailed(Box<RemoteSendError<WriteError>>),
+
+    #[error("current partition sequence is {current} but expected {expected}")]
+    WrongExpectedSequence {
+        current: CurrentVersion,
+        expected: ExpectedVersion,
+    },
+}
+
+impl From<sierradb::error::WriteError> for WriteError {
+    fn from(err: sierradb::error::WriteError) -> Self {
+        WriteError::DatabaseOperationFailed(err.to_string())
+    }
+}
+
+impl From<RemoteSendError<WriteError>> for WriteError {
+    fn from(err: RemoteSendError<WriteError>) -> Self {
+        WriteError::RemoteOperationFailed(Box::new(err))
+    }
+}
 
 impl ClusterActor {
     /// Resolves where a write request should be directed
     fn resolve_write_destination(
         &self,
+        partition_id: PartitionId,
         metadata: &WriteRequestMetadata,
-    ) -> Result<WriteDestination, ClusterError> {
+    ) -> Result<WriteDestination, WriteError> {
         // Check for too many forwards
         if metadata.hop_count > MAX_FORWARDS {
-            return Err(ClusterError::TooManyForwards);
+            return Err(WriteError::MaximumForwardsExceeded { max: MAX_FORWARDS });
         }
 
         // Get partition distribution
-        let partitions = self
-            .swarm
-            .behaviour()
-            .partitions
-            .manager
-            .get_available_partitions_for_key(metadata.partition_hash);
+        let replicas = self
+            .topology_manager()
+            .get_available_replicas_for_key(metadata.partition_hash);
 
         // Check quorum requirements
-        let required_quorum =
-            (self.swarm.behaviour().partitions.manager.replication_factor as usize / 2) + 1;
-        if partitions.len() < required_quorum {
-            return Err(ClusterError::InsufficientPartitionsForQuorum {
-                alive: partitions.len() as u8,
+        let required_quorum = (self.replication_factor as usize / 2) + 1;
+        if replicas.len() < required_quorum {
+            return Err(WriteError::InsufficientHealthyReplicas {
+                available: replicas.len() as u8,
                 required: required_quorum as u8,
             });
         }
 
         // Get leader partition info
-        let (primary_partition_id, primary_cluster_ref) = partitions
+        let (primary_cluster_ref, _) = replicas
             .first()
             .cloned()
-            .ok_or(ClusterError::PartitionUnavailable)?;
+            .expect("there should be at least 1 replica");
 
         // Check if we are the leader
-        if self
-            .swarm
-            .behaviour()
-            .partitions
-            .manager
-            .has_partition(primary_partition_id)
+        if self.topology_manager().has_partition(partition_id)
             && primary_cluster_ref.id().peer_id().unwrap() == &self.local_peer_id
         {
-            // Extract replica partitions from the partitions list
             // Skip the first partition (primary) and only include partitions we're not the
             // leader for
-            let replica_partitions = partitions
+            let replicas = replicas
                 .iter()
                 .skip(1) // Skip the primary partition (first in the list)
                 .cloned()
-                .collect::<Vec<_>>();
+                .collect();
 
-            Ok(WriteDestination::Local {
-                primary_partition_id,
-                replica_partitions,
-            })
+            Ok(WriteDestination::Local { replicas })
         } else {
             Ok(WriteDestination::Remote {
                 primary_cluster_ref,
-                partitions: Box::new(partitions),
+                replicas,
             })
         }
     }
@@ -93,12 +150,12 @@ impl ClusterActor {
         destination: WriteDestination,
         transaction: Transaction,
         metadata: WriteRequestMetadata,
-        reply_sender: Option<ReplySender<Result<AppendResult, ClusterError>>>,
+        reply_sender: Option<ReplySender<Result<AppendResult, WriteError>>>,
     ) {
         // Check circuit breaker before proceeding
         if !self.circuit_breaker.should_allow_request() {
             if let Some(tx) = reply_sender {
-                tx.send(Err(ClusterError::CircuitBreakerOpen {
+                tx.send(Err(WriteError::CircuitBreakerOpen {
                     estimated_recovery_time: self.circuit_breaker.estimated_recovery_time(),
                 }));
             }
@@ -106,16 +163,15 @@ impl ClusterActor {
         }
 
         match destination {
-            WriteDestination::Local {
-                primary_partition_id,
-                replica_partitions,
-            } => {
+            WriteDestination::Local { replicas } => {
+                // Perform the write
                 transaction::spawn(
                     self.database.clone(),
+                    self.topology_manager().local_cluster_ref.clone(),
+                    self.topology_manager().alive_since,
                     self.confirmation_ref.clone(),
-                    primary_partition_id,
-                    replica_partitions,
-                    self.swarm.behaviour().partitions.manager.replication_factor,
+                    replicas,
+                    self.replication_factor,
                     transaction,
                     self.circuit_breaker.clone(),
                     reply_sender,
@@ -123,7 +179,7 @@ impl ClusterActor {
             }
             WriteDestination::Remote {
                 primary_cluster_ref,
-                partitions,
+                replicas,
             } => {
                 // We need to forward to the leader or an alternative peer
                 // Check if we've already tried this peer (to prevent loops)
@@ -131,8 +187,8 @@ impl ClusterActor {
                     .tried_peers
                     .contains(primary_cluster_ref.id().peer_id().unwrap())
                 {
-                    // Try the next best partition/peer if available
-                    for (_partition_id, cluster_ref) in partitions.iter().skip(1) {
+                    // Try the next best peer if available
+                    for (cluster_ref, _) in replicas.iter().skip(1) {
                         if !metadata
                             .tried_peers
                             .contains(cluster_ref.id().peer_id().unwrap())
@@ -150,7 +206,7 @@ impl ClusterActor {
 
                     // No untried peers left
                     if let Some(tx) = reply_sender {
-                        tx.send(Err(ClusterError::NoAvailableLeaders));
+                        tx.send(Err(WriteError::AllReplicasFailed));
                     }
 
                     return;
@@ -168,7 +224,7 @@ impl ClusterActor {
         cluster_ref: RemoteActorRef<ClusterActor>,
         transaction: Transaction,
         mut metadata: WriteRequestMetadata,
-        reply_sender: Option<ReplySender<Result<AppendResult, ClusterError>>>,
+        reply_sender: Option<ReplySender<Result<AppendResult, WriteError>>>,
     ) {
         // Add this peer to the tried list
         metadata
@@ -187,7 +243,7 @@ impl ClusterActor {
                         .reply_timeout(Duration::from_secs(10))
                         .await;
 
-                    tx.send(res.map_err(ClusterError::from));
+                    tx.send(res.map_err(WriteError::from));
                 });
             }
             None => {
@@ -207,14 +263,12 @@ impl ClusterActor {
 enum WriteDestination {
     /// Process locally as the leader
     Local {
-        primary_partition_id: PartitionId,
-        replica_partitions: Vec<(PartitionId, RemoteActorRef<ClusterActor>)>,
+        replicas: ArrayVec<(RemoteActorRef<ClusterActor>, u64), MAX_REPLICATION_FACTOR>,
     },
     /// Forward to a remote leader
     Remote {
         primary_cluster_ref: RemoteActorRef<ClusterActor>,
-        partitions:
-            Box<ArrayVec<(PartitionId, RemoteActorRef<ClusterActor>), MAX_REPLICATION_FACTOR>>,
+        replicas: ArrayVec<(RemoteActorRef<ClusterActor>, u64), MAX_REPLICATION_FACTOR>,
     },
 }
 
@@ -244,7 +298,7 @@ impl ExecuteTransaction {
 
 #[remote_message("e0e82b26-9528-4afb-a819-c5914c08b218")]
 impl Message<ExecuteTransaction> for ClusterActor {
-    type Reply = DelegatedReply<Result<AppendResult, ClusterError>>;
+    type Reply = DelegatedReply<Result<AppendResult, WriteError>>;
 
     #[instrument(skip(self, ctx))]
     async fn handle(
@@ -254,7 +308,8 @@ impl Message<ExecuteTransaction> for ClusterActor {
     ) -> Self::Reply {
         let (delegated_reply, reply_sender) = ctx.reply_sender();
 
-        match self.resolve_write_destination(&msg.metadata) {
+        // Phase 1: Write Request Routing
+        match self.resolve_write_destination(msg.transaction.partition_id(), &msg.metadata) {
             Ok(destination) => {
                 self.route_write_request(destination, msg.transaction, msg.metadata, reply_sender)
             }
@@ -275,13 +330,14 @@ impl Message<ExecuteTransaction> for ClusterActor {
 /// Message to replicate a write to another partition
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReplicateWrite {
+    pub coordinator_ref: RemoteActorRef<ClusterActor>,
+    pub coordinator_alive_since: u64,
     pub transaction: Transaction,
-    pub origin_partition: PartitionId,
 }
 
 #[remote_message("ae8dc4cc-e382-4a68-9451-d10c5347d3c9")]
 impl Message<ReplicateWrite> for ClusterActor {
-    type Reply = DelegatedReply<Result<AppendResult, ClusterError>>;
+    type Reply = DelegatedReply<Result<AppendResult, WriteError>>;
 
     #[instrument(skip(self, ctx))]
     async fn handle(
@@ -289,24 +345,66 @@ impl Message<ReplicateWrite> for ClusterActor {
         msg: ReplicateWrite,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        // Ensure the transaction has the expected partition sequence set
+        match msg.transaction.get_expected_partition_sequence() {
+            ExpectedVersion::Any | ExpectedVersion::Exists => {
+                return ctx.reply(Err(WriteError::MissingExpectedPartitionSequence));
+            }
+            ExpectedVersion::Empty | ExpectedVersion::Exact(_) => {}
+        }
+
+        // Check if we even own this partition
         if !self
-            .swarm
-            .behaviour()
-            .partitions
-            .manager
+            .topology_manager()
             .has_partition(msg.transaction.partition_id())
         {
-            panic!("got a replicate write request when we dont own the partition");
+            return ctx.reply(Err(WriteError::PartitionNotOwned {
+                partition_id: msg.transaction.partition_id(),
+            }));
+        }
+
+        // Ensure the coordinator is available from our perspective
+        let Some((_, alive_since)) = self
+            .topology_manager()
+            .get_available_replicas(msg.transaction.partition_id())
+            .into_iter()
+            .find(|(cluster_ref, _)| cluster_ref == &msg.coordinator_ref)
+        else {
+            return ctx.reply(Err(WriteError::InvalidSender));
+        };
+
+        // Ensure the write is not stale
+        if msg.coordinator_alive_since < alive_since {
+            return ctx.reply(Err(WriteError::StaleWrite));
         }
 
         let database = self.database.clone();
 
         // Replicate the write to our local database
         ctx.spawn(async move {
-            database
-                .append_events(msg.transaction)
-                .await
-                .map_err(ClusterError::from)
+            let res = database.append_events(msg.transaction).await;
+            match res {
+                Ok(append) => Ok(append),
+                Err(sierradb::error::WriteError::WrongExpectedSequence {
+                    current,
+                    expected,
+                    ..
+                }) => {
+                    match expected.gap_from(current) {
+                        VersionGap::None => {}
+                        VersionGap::Ahead(_) => {
+                            // Duplicate/already processed
+                        }
+                        VersionGap::Behind(_) => {
+                            // Gap detected, need catchup
+                        }
+                        VersionGap::Incompatible => {}
+                    }
+
+                    Err(WriteError::WrongExpectedSequence { current, expected })
+                }
+                Err(err) => Err(WriteError::DatabaseOperationFailed(err.to_string())),
+            }
         })
     }
 }
@@ -316,7 +414,7 @@ pub struct ConfirmTransaction {
     pub partition_id: PartitionId,
     pub transaction_id: Uuid,
     pub event_ids: SmallVec<[Uuid; 4]>,
-    pub event_versions: SmallVec<[u64; 4]>,
+    pub event_partition_sequences: SmallVec<[u64; 4]>,
     pub confirmation_count: u8,
 }
 
@@ -326,6 +424,8 @@ pub enum ConfirmTransactionError {
     EventsLengthMismatch,
     #[error("event id mismatch")]
     EventIdMismatch,
+    #[error("partition sequence mismatch (expected {expected}, got {actual})")]
+    PartitionSequenceMismatch { expected: u64, actual: u64 },
     #[error("transaction not found")]
     TransactionNotFound,
     #[error("read error: {0}")]
@@ -365,6 +465,18 @@ impl Message<ConfirmTransaction> for ClusterActor {
                         return Err(ConfirmTransactionError::EventsLengthMismatch);
                     }
 
+                    // Validate partition sequences match expected
+                    for (event, expected_version) in
+                        events.iter().zip(msg.event_partition_sequences.iter())
+                    {
+                        if event.partition_sequence != *expected_version {
+                            return Err(ConfirmTransactionError::PartitionSequenceMismatch {
+                                expected: *expected_version,
+                                actual: event.partition_sequence,
+                            });
+                        }
+                    }
+
                     events
                         .into_iter()
                         .zip(msg.event_ids)
@@ -398,7 +510,7 @@ impl Message<ConfirmTransaction> for ClusterActor {
                     let _ = confirmation_ref
                         .tell(UpdateConfirmation {
                             partition_id: msg.partition_id,
-                            versions: msg.event_versions,
+                            versions: msg.event_partition_sequences,
                             confirmation_count: msg.confirmation_count,
                         })
                         .await;
@@ -406,7 +518,6 @@ impl Message<ConfirmTransaction> for ClusterActor {
                     Ok(())
                 }
                 Err(err) => {
-                    // Log the error but don't fail the message since primary has moved on
                     error!(
                         transaction_id = %msg.transaction_id,
                         partition_id = msg.partition_id,
@@ -414,9 +525,15 @@ impl Message<ConfirmTransaction> for ClusterActor {
                         "replica failed to update confirmations after retries"
                     );
 
-                    // Return success to avoid unnecessary error propagation
-                    // The primary doesn't need to know about this failure
-                    Ok(())
+                    // TODO:
+                    //
+                    // // Mark this replica as degraded for this partition
+                    // self.mark_replica_degraded(msg.partition_id, &err);
+                    //
+                    // // Trigger background recovery process
+                    // self.schedule_replica_recovery(msg.partition_id);
+
+                    Err(ConfirmTransactionError::Write(err.to_string()))
                 }
             }
         })
@@ -429,6 +546,6 @@ pub struct WriteRequestMetadata {
     pub hop_count: u8,
     /// Nodes that have already tried to process this request
     pub tried_peers: HashSet<PeerId>,
-    /// Original partition hash
+    /// Partition hash
     pub partition_hash: PartitionHash,
 }

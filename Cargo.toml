@@ -5,6 +5,7 @@ members = ["crates/*", "fuzz"]
 [workspace.dependencies]
 sierradb = { path = "crates/sierradb" }
 sierradb-cluster = { path = "crates/sierradb-cluster" }
+sierradb-topology = { path = "crates/sierradb-topology" }
 
 arrayvec = "0.7"
 bincode = "2.0"

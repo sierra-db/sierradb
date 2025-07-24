@@ -5,8 +5,9 @@ edition = "2024"
 
 [dependencies]
 sierradb.workspace = true
+sierradb-topology.workspace = true
 
-arrayvec.workspace = true
+arrayvec = { workspace = true, features = ["serde"] }
 bincode.workspace = true
 crc32fast.workspace = true
 futures.workspace = true
