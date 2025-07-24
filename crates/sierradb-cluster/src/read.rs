@@ -31,8 +31,8 @@ pub enum ReadDestination {
     },
     Remote {
         cluster_ref: RemoteActorRef<ClusterActor>,
-        available_partitions:
-            Box<ArrayVec<(PartitionId, RemoteActorRef<ClusterActor>), MAX_REPLICATION_FACTOR>>,
+        available_replicas:
+            Box<ArrayVec<(RemoteActorRef<ClusterActor>, u64), MAX_REPLICATION_FACTOR>>,
     },
 }
 
@@ -48,44 +48,33 @@ impl ClusterActor {
         }
 
         // Get all partitions that could contain this event (all replicas)
-        let partitions = self
-            .swarm
-            .behaviour()
-            .partitions
-            .manager
-            .get_available_partitions_for_key(metadata.partition_hash);
+        let partition_id = metadata.partition_hash % self.topology_manager().num_partitions;
+        let replicas = self.topology_manager().get_available_replicas(partition_id);
 
-        if partitions.is_empty() {
+        if replicas.is_empty() {
             return Err(ClusterError::PartitionUnavailable);
         }
 
         // Check if we have any of the partitions locally
         // We can read from any replica, not just the leader
-        for (partition_id, cluster_ref) in &partitions {
-            if self
-                .swarm
-                .behaviour()
-                .partitions
-                .manager
-                .has_partition(*partition_id)
+        for (cluster_ref, _) in &replicas {
+            if self.topology_manager().has_partition(partition_id)
                 && cluster_ref.id().peer_id().unwrap() == &self.local_peer_id
             {
-                return Ok(ReadDestination::Local {
-                    partition_id: *partition_id,
-                });
+                return Ok(ReadDestination::Local { partition_id });
             }
         }
 
         // We don't have the partition locally, need to read from remote
         // Find the best available remote partition (prefer ones we haven't tried)
-        for (_partition_id, cluster_ref) in &partitions {
+        for (cluster_ref, _) in &replicas {
             if !metadata
                 .tried_peers
                 .contains(cluster_ref.id().peer_id().unwrap())
             {
                 return Ok(ReadDestination::Remote {
                     cluster_ref: cluster_ref.clone(),
-                    available_partitions: Box::new(partitions),
+                    available_replicas: Box::new(replicas),
                 });
             }
         }
@@ -108,14 +97,14 @@ impl ClusterActor {
             }
             ReadDestination::Remote {
                 cluster_ref,
-                available_partitions,
+                available_replicas,
             } => {
                 // Forward to remote node
                 self.send_read_forward_request(
                     cluster_ref,
                     event_id,
                     metadata,
-                    available_partitions,
+                    *available_replicas,
                     reply_sender,
                 );
             }
@@ -130,8 +119,7 @@ impl ClusterActor {
         reply_sender: Option<ReplySender<Result<Option<EventRecord>, ClusterError>>>,
     ) {
         let database = self.database.clone();
-        let required_quorum =
-            (self.swarm.behaviour().partitions.manager.replication_factor as usize / 2) + 1;
+        let required_quorum = (self.replication_factor as usize / 2) + 1;
         let watermark = self.watermarks.get(&partition_id).cloned();
 
         let task = async move {
@@ -181,9 +169,7 @@ impl ClusterActor {
         cluster_ref: RemoteActorRef<ClusterActor>,
         event_id: Uuid,
         mut metadata: ReadRequestMetadata,
-        available_partitions: Box<
-            ArrayVec<(PartitionId, RemoteActorRef<ClusterActor>), MAX_REPLICATION_FACTOR>,
-        >,
+        available_replicas: ArrayVec<(RemoteActorRef<ClusterActor>, u64), MAX_REPLICATION_FACTOR>,
         reply_sender: Option<ReplySender<Result<Option<EventRecord>, ClusterError>>>,
     ) {
         // Increment hop count and add this peer to tried list
@@ -209,7 +195,7 @@ impl ClusterActor {
                         Err(_) => {
                             // If this peer failed, try the next available partition
                             // This provides fault tolerance when some replicas are down
-                            Self::try_next_partition(available_partitions, event_id, metadata, tx)
+                            Self::try_next_replica(available_replicas, event_id, metadata, tx)
                                 .await;
                         }
                     }
@@ -224,16 +210,14 @@ impl ClusterActor {
         }
     }
 
-    async fn try_next_partition(
-        available_partitions: Box<
-            ArrayVec<(PartitionId, RemoteActorRef<ClusterActor>), MAX_REPLICATION_FACTOR>,
-        >,
+    async fn try_next_replica(
+        available_replicas: ArrayVec<(RemoteActorRef<ClusterActor>, u64), MAX_REPLICATION_FACTOR>,
         event_id: Uuid,
         mut metadata: ReadRequestMetadata,
         reply_sender: ReplySender<Result<Option<EventRecord>, ClusterError>>,
     ) {
         // Find the next untried partition
-        for (_part_id, cluster_ref) in available_partitions.iter() {
+        for (cluster_ref, _) in available_replicas.iter() {
             if !metadata
                 .tried_peers
                 .contains(cluster_ref.id().peer_id().unwrap())
@@ -334,8 +318,7 @@ impl Message<ReadPartition> for ClusterActor {
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let database = self.database.clone();
-        let required_quorum =
-            ((self.swarm.behaviour().partitions.manager.replication_factor as usize / 2) + 1) as u8;
+        let required_quorum = ((self.replication_factor as usize / 2) + 1) as u8;
         let watermark = self.watermarks.get(&msg.partition_id).cloned();
 
         ctx.spawn(async move {
@@ -424,8 +407,7 @@ impl Message<ReadStream> for ClusterActor {
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let database = self.database.clone();
-        let required_quorum =
-            ((self.swarm.behaviour().partitions.manager.replication_factor as usize / 2) + 1) as u8;
+        let required_quorum = ((self.replication_factor as usize / 2) + 1) as u8;
         let watermark = self
             .watermarks
             .get(&msg.partition_id)

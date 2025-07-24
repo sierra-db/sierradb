@@ -1,0 +1,19 @@
+[package]
+name = "sierradb-topology"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sierradb.workspace = true
+
+arrayvec = { workspace = true, features = ["serde"] }
+bincode.workspace = true
+kameo = { workspace = true, features = ["remote"] }
+libp2p.workspace = true
+libp2p.features = [
+  "gossipsub",
+  "serde",
+]
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["time"] }
+tracing.workspace = true

@@ -5,3 +5,5 @@ Cargo.lock
 log
 .direnv
 zjstatus.wasm
+**/.obsidian
+**/.trash

@@ -13,15 +13,14 @@ use libp2p::{
     BehaviourBuilderError, Multiaddr, PeerId, Swarm, TransportError, gossipsub, identity::Keypair,
     mdns, noise, swarm::NetworkBehaviour, tcp, yamux,
 };
-use partition_consensus::PartitionManager;
 use serde::{Deserialize, Serialize};
 use sierradb::{bucket::PartitionId, database::Database, error::WriteError};
+use sierradb_topology::TopologyManager;
 use thiserror::Error;
 use tracing::{error, trace};
 
 pub mod circuit_breaker;
 pub mod confirmation;
-pub mod partition_consensus;
 pub mod read;
 pub mod transaction;
 pub mod write;
@@ -32,7 +31,7 @@ const MAX_FORWARDS: u8 = 3;
 #[derive(NetworkBehaviour)]
 pub struct Behaviour {
     pub kameo: remote::Behaviour,
-    pub partitions: partition_consensus::Behaviour,
+    pub topology: sierradb_topology::Behaviour<RemoteActorRef<ClusterActor>>,
     pub mdns: mdns::tokio::Behaviour,
 }
 
@@ -41,9 +40,16 @@ pub struct ClusterActor {
     local_peer_id: PeerId,
     database: Database,
     swarm: Swarm<Behaviour>,
+    replication_factor: u8,
     confirmation_ref: ActorRef<ConfirmationActor>,
     watermarks: HashMap<PartitionId, Arc<AtomicWatermark>>,
     circuit_breaker: Arc<WriteCircuitBreaker>,
+}
+
+impl ClusterActor {
+    fn topology_manager(&self) -> &TopologyManager<RemoteActorRef<Self>> {
+        &self.swarm.behaviour().topology.manager
+    }
 }
 
 /// Configuration parameters for creating a new Swarm actor
@@ -54,6 +60,9 @@ pub struct ClusterArgs {
     pub database: Database,
     /// List of addresses to listen on
     pub listen_addrs: Vec<Multiaddr>,
+    pub node_count: usize,
+    pub node_index: usize,
+    pub bucket_count: u16,
     /// Total number of partitions in the system
     pub partition_count: u16,
     /// Number of replicas to maintain for each partition
@@ -75,7 +84,10 @@ impl Actor for ClusterActor {
             keypair: key,
             database,
             listen_addrs,
-            partition_count: num_partitions,
+            node_index,
+            node_count,
+            bucket_count,
+            partition_count,
             replication_factor,
             assigned_partitions,
             heartbeat_timeout,
@@ -122,27 +134,23 @@ impl Actor for ClusterActor {
                 let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?;
 
                 // Create partition manager to track partition ownership
-                let partition_manager = PartitionManager::new(
-                    cluster_ref.clone(),
-                    vec![cluster_ref],
-                    num_partitions,
+                let manager = TopologyManager::new(
+                    cluster_ref,
+                    node_index,
+                    node_count,
+                    partition_count,
+                    bucket_count,
                     replication_factor,
-                    assigned_partitions.iter().copied().collect(),
-                    None,
                     heartbeat_timeout,
                 );
 
                 // Create partition ownership behavior
-                let partitions = partition_consensus::Behaviour::new(
-                    gossipsub,
-                    partition_manager,
-                    None,
-                    heartbeat_interval,
-                );
+                let topology =
+                    sierradb_topology::Behaviour::new(gossipsub, manager, heartbeat_interval);
 
                 Ok(Behaviour {
                     kameo,
-                    partitions,
+                    topology,
                     mdns,
                 })
             })?
@@ -167,6 +175,7 @@ impl Actor for ClusterActor {
             local_peer_id,
             database,
             swarm,
+            replication_factor,
             confirmation_ref,
             watermarks,
             circuit_breaker,

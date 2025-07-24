@@ -1,9 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
 use std::task;
 use std::time::Duration;
 
-use kameo::actor::RemoteActorRef;
+use arrayvec::ArrayVec;
 use libp2p::core::Endpoint;
 use libp2p::core::transport::PortUse;
 use libp2p::gossipsub::{self, IdentTopic, PublishError};
@@ -12,35 +11,35 @@ use libp2p::swarm::{
     THandlerOutEvent, ToSwarm,
 };
 use libp2p::{Multiaddr, PeerId};
+use sierradb::MAX_REPLICATION_FACTOR;
+use sierradb::bucket::PartitionId;
 use tokio::time::Interval;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::ClusterActor;
+use crate::ClusterKey;
 
-use super::manager::PartitionManager;
+use super::manager::TopologyManager;
 use super::messages::{Heartbeat, OwnershipMessage};
 
 // Topic names
 const HEARTBEAT_TOPIC: &str = "sierra/heartbeat";
 const OWNERSHIP_TOPIC: &str = "sierra/ownership";
 
-pub struct Behaviour {
+pub struct Behaviour<T: ClusterKey> {
     pub gossipsub: gossipsub::Behaviour,
-    pub manager: PartitionManager,
+    pub manager: TopologyManager<T>,
     pub heartbeat_interval: Interval,
     pub timeout_check_interval: Interval,
     pub heartbeat_topic: gossipsub::IdentTopic,
     pub ownership_topic: gossipsub::IdentTopic,
-    pub store_path: Option<PathBuf>,
-    pub pending_events: VecDeque<PartitionBehaviourEvent>,
+    pub pending_events: VecDeque<PartitionBehaviourEvent<T>>,
     pub heartbeat_bytes: Box<[u8]>,
 }
 
-impl Behaviour {
+impl<T: ClusterKey> Behaviour<T> {
     pub fn new(
         mut gossipsub: gossipsub::Behaviour,
-        partition_manager: PartitionManager,
-        store_path: Option<PathBuf>,
+        manager: TopologyManager<T>,
         heartbeat_interval_duration: Duration,
     ) -> Self {
         // Set up intervals for periodic tasks
@@ -55,10 +54,14 @@ impl Behaviour {
         let _ = gossipsub.subscribe(&heartbeat_topic);
         let _ = gossipsub.subscribe(&ownership_topic);
 
+        // Pre-encode heartbeat message
         let heartbeat_bytes = bincode::encode_to_vec(
             Heartbeat {
-                cluster_ref: partition_manager.local_cluster_ref.clone(),
-                owned_partitions: partition_manager.assigned_partitions.to_vec(),
+                cluster_ref: bincode::serde::Compat(manager.local_cluster_ref.clone()),
+                owned_partitions: manager.assigned_partitions.clone(),
+                alive_since: manager.alive_since,
+                node_index: manager.local_node_index,
+                total_node_count: manager.total_node_count,
             },
             bincode::config::standard(),
         )
@@ -66,23 +69,23 @@ impl Behaviour {
         .into();
 
         info!(
-            "node owns {}/{} partitions",
-            partition_manager.assigned_partitions.len(),
-            partition_manager.num_partitions,
+            "node {} owns {}/{} partitions as replicas",
+            manager.local_node_index,
+            manager.assigned_partitions.len(),
+            manager.num_partitions,
         );
         trace!(
-            "node owns partitions: {:?}",
-            partition_manager.assigned_partitions,
+            "node {} is replica for partitions: {:?}",
+            manager.local_node_index, manager.assigned_partitions,
         );
 
         Self {
             gossipsub,
-            manager: partition_manager,
+            manager,
             heartbeat_interval,
             timeout_check_interval,
             heartbeat_topic,
             ownership_topic,
-            store_path,
             pending_events: VecDeque::new(),
             heartbeat_bytes,
         }
@@ -95,114 +98,145 @@ impl Behaviour {
         // Send an ownership request to the new peer
         let request = OwnershipMessage::OwnershipRequest {
             cluster_ref: self.manager.local_cluster_ref.clone(),
-            owned_partitions: self.manager.assigned_partitions.to_vec(),
+            owned_partitions: self.manager.assigned_partitions.clone(),
+            alive_since: self.manager.alive_since,
+            node_index: self.manager.local_node_index,
+            total_node_count: self.manager.total_node_count,
         };
 
-        self.send_ownership_message(&request);
+        self.send_ownership_message(request);
     }
 
     fn handle_gossipsub_event(&mut self, event: &gossipsub::Event) {
         if let gossipsub::Event::Message { message, .. } = event {
             match message.topic.as_str() {
                 HEARTBEAT_TOPIC => {
-                    // Decode the heartbeat message
-                    match bincode::decode_from_slice(&message.data, bincode::config::standard()) {
-                        Ok((
-                            Heartbeat {
-                                cluster_ref,
-                                owned_partitions,
-                            },
-                            _,
-                        )) => {
-                            let cluster_id = cluster_ref.id();
-                            trace!("received heartbeat from {cluster_id}");
-
-                            // Check if the node was previously inactive
-                            let was_inactive = !self
-                                .manager
-                                .active_nodes
-                                .contains(cluster_ref.id().peer_id().unwrap());
-
-                            // Update heartbeat and ownership
-                            let status_changed = self
-                                .manager
-                                .on_heartbeat(cluster_ref.clone(), &owned_partitions);
-
-                            // Make sure our own partitions are still registered
-                            self.manager.ensure_local_partitions();
-
-                            // If this is a new node, or it was inactive
-                            if status_changed || was_inactive {
-                                info!(
-                                    "node {cluster_id} is now active with {} partitions",
-                                    owned_partitions.len()
-                                );
-
-                                self.pending_events.push_back(
-                                    PartitionBehaviourEvent::NodeStatusChanged {
-                                        peer_id: *cluster_ref.id().peer_id().unwrap(),
-                                        is_active: true,
-                                        owned_partitions: owned_partitions.clone(),
-                                    },
-                                );
-
-                                self.pending_events.push_back(
-                                    PartitionBehaviourEvent::OwnershipUpdated {
-                                        partition_owners: self.manager.partition_owners.clone(),
-                                        active_nodes: self.manager.active_nodes.clone(),
-                                    },
-                                );
-
-                                // Save the updated ownership info
-                                // if let Some(path) = &self.store_path {
-                                // self.partition_manager.save_store_spawn(path.clone());
-                                // }
-                            }
-                        }
-                        Err(err) => {
-                            error!("failed to decode heartbeat message: {}", err);
-                        }
-                    }
+                    self.handle_heartbeat_message(&message.data);
                 }
                 OWNERSHIP_TOPIC => {
-                    match bincode::decode_from_slice::<OwnershipMessage, _>(
-                        &message.data,
-                        bincode::config::standard(),
-                    ) {
-                        Ok((msg, _)) => {
-                            self.handle_partition_message(&msg);
-                        }
-                        Err(err) => {
-                            error!("failed to decode partition message: {err}");
-                        }
-                    }
+                    self.handle_ownership_message(&message.data);
                 }
                 topic => {
-                    warn!("unknown topic: {topic}")
+                    warn!("received message on unknown topic: {topic}")
                 }
             }
         }
     }
 
-    fn handle_partition_message(&mut self, message: &OwnershipMessage) {
+    fn handle_heartbeat_message(&mut self, data: &[u8]) {
+        match bincode::decode_from_slice::<Heartbeat<bincode::serde::Compat<T>>, _>(
+            data,
+            bincode::config::standard(),
+        ) {
+            Ok((
+                Heartbeat {
+                    cluster_ref: bincode::serde::Compat(cluster_ref),
+                    owned_partitions,
+                    alive_since,
+                    node_index,
+                    total_node_count,
+                },
+                _,
+            )) => {
+                let cluster_id = cluster_ref.id();
+                trace!("received heartbeat from {cluster_id} (index: {node_index})");
+
+                // Skip our own heartbeats
+                if cluster_ref.id() == self.manager.local_cluster_ref.id() {
+                    return;
+                }
+
+                // Check if the node was previously inactive
+                let was_inactive = !self
+                    .manager
+                    .active_nodes
+                    .contains_key(cluster_ref.id().peer_id().unwrap());
+
+                // Update heartbeat and ownership
+                let status_changed = self.manager.on_heartbeat(
+                    cluster_ref.clone(),
+                    &owned_partitions,
+                    alive_since,
+                    node_index,
+                    total_node_count,
+                );
+
+                // Make sure our own partitions are still registered
+                self.manager.ensure_local_partitions();
+
+                // If this is a new node, or it was inactive
+                if status_changed || was_inactive {
+                    info!(
+                        "node {cluster_id} (index: {node_index}) is now active with {} replica partitions",
+                        owned_partitions.len()
+                    );
+
+                    self.pending_events
+                        .push_back(PartitionBehaviourEvent::NodeStatusChanged {
+                            peer_id: *cluster_ref.id().peer_id().unwrap(),
+                            is_active: true,
+                            owned_partitions: owned_partitions.clone(),
+                        });
+
+                    self.pending_events.push_back(
+                        PartitionBehaviourEvent::ReplicaAssignmentUpdated {
+                            partition_replicas: self.manager.partition_replicas.clone(),
+                            active_nodes: self.manager.active_nodes.clone(),
+                        },
+                    );
+                }
+            }
+            Err(err) => {
+                error!("failed to decode heartbeat message: {}", err);
+            }
+        }
+    }
+
+    fn handle_ownership_message(&mut self, data: &[u8]) {
+        match bincode::decode_from_slice::<OwnershipMessage<bincode::serde::Compat<T>>, _>(
+            data,
+            bincode::config::standard(),
+        ) {
+            Ok((msg, _)) => {
+                self.handle_partition_message(msg.map(|bincode::serde::Compat(key)| key));
+            }
+            Err(err) => {
+                error!("failed to decode ownership message: {err}");
+            }
+        }
+    }
+
+    fn handle_partition_message(&mut self, message: OwnershipMessage<T>) {
         match message {
             OwnershipMessage::OwnershipRequest {
                 cluster_ref,
                 owned_partitions,
+                alive_since,
+                node_index,
+                total_node_count,
             } => {
+                // Skip our own requests
+                if cluster_ref.id() == self.manager.local_cluster_ref.id() {
+                    return;
+                }
+
                 info!(
-                    "received ownership request from {} with {} partitions",
+                    "received ownership request from {} (index: {}) with {} replica partitions",
                     cluster_ref.id(),
+                    node_index,
                     owned_partitions.len()
                 );
 
                 // Process the node connection
-                if let Some(response) = self
-                    .manager
-                    .on_node_connected(cluster_ref.clone(), owned_partitions)
-                {
-                    // Send a response with our full ownership information
-                    self.send_ownership_message(&response);
+                if let Some(response) = self.manager.on_node_connected(
+                    cluster_ref.clone(),
+                    &owned_partitions,
+                    alive_since,
+                    node_index,
+                    total_node_count,
+                ) {
+                    // Send a response with our full replica assignment information
+                    self.send_ownership_message(response);
 
                     // Notify application
                     self.pending_events
@@ -212,55 +246,71 @@ impl Behaviour {
                             owned_partitions: owned_partitions.clone(),
                         });
 
-                    self.pending_events
-                        .push_back(PartitionBehaviourEvent::OwnershipUpdated {
-                            partition_owners: self.manager.partition_owners.clone(),
+                    self.pending_events.push_back(
+                        PartitionBehaviourEvent::ReplicaAssignmentUpdated {
+                            partition_replicas: self.manager.partition_replicas.clone(),
                             active_nodes: self.manager.active_nodes.clone(),
-                        });
+                        },
+                    );
                 }
             }
             OwnershipMessage::OwnershipResponse {
-                partition_owners,
+                partition_replicas,
                 active_nodes,
             } => {
                 info!(
-                    "received ownership response with {} partitions and {} active nodes",
-                    partition_owners.len(),
+                    "received ownership response with {} partition replica assignments and {} active nodes",
+                    partition_replicas.len(),
                     active_nodes.len()
                 );
 
-                // Update our ownership info from the response
+                // Convert the response format back to our internal format
+                let partition_replicas = partition_replicas
+                    .into_iter()
+                    .flat_map(|(cluster_ref, partition_ids)| {
+                        partition_ids
+                            .into_iter()
+                            .map(move |partition_id| (partition_id, cluster_ref.clone()))
+                    })
+                    .fold(
+                        HashMap::<PartitionId, ArrayVec<T, MAX_REPLICATION_FACTOR>>::new(),
+                        |mut acc, (partition_id, cluster_ref)| {
+                            acc.entry(partition_id).or_default().push(cluster_ref);
+                            acc
+                        },
+                    );
+
+                // Update our replica assignments from the response
                 self.manager
-                    .handle_ownership_response(partition_owners, active_nodes.clone());
+                    .handle_ownership_response(&partition_replicas, active_nodes.clone());
 
                 // Make sure our partitions are still registered correctly
                 self.manager.ensure_local_partitions();
 
-                // Save store
-                // if let Some(path) = &self.store_path {
-                //     self.partition_manager.save_store_spawn(path.clone());
-                // }
-
                 // Notify application
                 self.pending_events
-                    .push_back(PartitionBehaviourEvent::OwnershipUpdated {
-                        partition_owners: self.manager.partition_owners.clone(),
+                    .push_back(PartitionBehaviourEvent::ReplicaAssignmentUpdated {
+                        partition_replicas: self.manager.partition_replicas.clone(),
                         active_nodes: self.manager.active_nodes.clone(),
                     });
             }
         }
     }
 
-    fn send_ownership_message(&mut self, message: &OwnershipMessage) {
-        // Encode and send
-        match bincode::encode_to_vec(message, bincode::config::standard()) {
+    fn send_ownership_message(&mut self, message: OwnershipMessage<T>) {
+        match bincode::encode_to_vec(
+            message.map(bincode::serde::Compat),
+            bincode::config::standard(),
+        ) {
             Ok(encoded) => {
                 if let Err(err) = self.gossipsub.publish(self.ownership_topic.hash(), encoded) {
-                    error!("error publishing message: {err}");
+                    if !matches!(err, PublishError::NoPeersSubscribedToTopic) {
+                        error!("error publishing ownership message: {err}");
+                    }
                 }
             }
             Err(err) => {
-                error!("failed to encode message: {err}");
+                error!("failed to encode ownership message: {err}");
             }
         }
     }
@@ -270,36 +320,38 @@ impl Behaviour {
         self.manager.ensure_local_partitions();
 
         trace!(
-            "sending heartbeat with {} partitions",
+            "sending heartbeat with {} replica partitions",
             self.manager.assigned_partitions.len()
         );
+
         if let Err(err) = self
             .gossipsub
             .publish(self.heartbeat_topic.hash(), self.heartbeat_bytes.clone())
-            && !matches!(err, PublishError::NoPeersSubscribedToTopic)
         {
-            error!("error publishing heartbeat: {err}");
+            if !matches!(err, PublishError::NoPeersSubscribedToTopic) {
+                error!("error publishing heartbeat: {err}");
+            }
         }
     }
 }
 
 #[derive(Debug)]
-pub enum PartitionBehaviourEvent {
+pub enum PartitionBehaviourEvent<T> {
     Gossipsub(<gossipsub::Behaviour as NetworkBehaviour>::ToSwarm),
     NodeStatusChanged {
         peer_id: PeerId,
         is_active: bool,
-        owned_partitions: Vec<u16>,
+        owned_partitions: HashSet<PartitionId>, // Partitions this node is a replica for
     },
-    OwnershipUpdated {
-        partition_owners: HashMap<u16, RemoteActorRef<ClusterActor>>,
-        active_nodes: HashSet<PeerId>,
+    ReplicaAssignmentUpdated {
+        partition_replicas: HashMap<PartitionId, ArrayVec<T, MAX_REPLICATION_FACTOR>>,
+        active_nodes: HashMap<PeerId, (u64, usize)>, // PeerId -> (alive_since, node_index)
     },
 }
 
-impl NetworkBehaviour for Behaviour {
+impl<T: ClusterKey> NetworkBehaviour for Behaviour<T> {
     type ConnectionHandler = THandler<gossipsub::Behaviour>;
-    type ToSwarm = PartitionBehaviourEvent;
+    type ToSwarm = PartitionBehaviourEvent<T>;
 
     fn handle_pending_inbound_connection(
         &mut self,
@@ -312,8 +364,7 @@ impl NetworkBehaviour for Behaviour {
             connection_id,
             local_addr,
             remote_addr,
-        )?;
-        Ok(())
+        )
     }
 
     fn handle_established_inbound_connection(
@@ -386,7 +437,13 @@ impl NetworkBehaviour for Behaviour {
                     .push_back(PartitionBehaviourEvent::NodeStatusChanged {
                         peer_id: ev.peer_id,
                         is_active: false,
-                        owned_partitions: Vec::new(), // No partitions when inactive
+                        owned_partitions: HashSet::new(), // No partitions when inactive
+                    });
+
+                self.pending_events
+                    .push_back(PartitionBehaviourEvent::ReplicaAssignmentUpdated {
+                        partition_replicas: self.manager.partition_replicas.clone(),
+                        active_nodes: self.manager.active_nodes.clone(),
                     });
             }
             _ => {}
@@ -437,8 +494,8 @@ impl NetworkBehaviour for Behaviour {
             if status_changed {
                 // Notify application
                 self.pending_events
-                    .push_back(PartitionBehaviourEvent::OwnershipUpdated {
-                        partition_owners: self.manager.partition_owners.clone(),
+                    .push_back(PartitionBehaviourEvent::ReplicaAssignmentUpdated {
+                        partition_replicas: self.manager.partition_replicas.clone(),
                         active_nodes: self.manager.active_nodes.clone(),
                     });
             }

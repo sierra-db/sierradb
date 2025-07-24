@@ -1,16 +1,39 @@
 use std::cmp;
+use std::hash::Hash;
 
 use arrayvec::ArrayVec;
+use kameo::prelude::*;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use sierradb::MAX_REPLICATION_FACTOR;
 use sierradb::bucket::{PartitionHash, PartitionId};
 
 mod behaviour;
 mod manager;
 mod messages;
-mod store;
+pub mod test_helpers;
 
 pub use behaviour::{Behaviour, PartitionBehaviourEvent};
-pub use manager::PartitionManager;
+pub use manager::TopologyManager;
+
+pub trait ClusterKey: Clone + Ord + Hash + Send + Serialize + DeserializeOwned + 'static {
+    fn id(&self) -> ActorId;
+}
+
+impl ClusterKey for ActorId {
+    fn id(&self) -> ActorId {
+        *self
+    }
+}
+
+impl<A> ClusterKey for RemoteActorRef<A>
+where
+    A: Actor + RemoteActor,
+{
+    fn id(&self) -> ActorId {
+        self.id()
+    }
+}
 
 /// Distributes a partition across the cluster for replication
 ///
@@ -18,13 +41,17 @@ pub use manager::PartitionManager;
 /// store replicas of that data according to the configured replication factor.
 ///
 /// # Arguments
-/// * `partition_key` - The primary partition identifier (without moduloing yet,
-///   just the raw value from uuid_to_partition_id)
+/// * `partition_hash` - The primary partition identifier (from uuid_to_partition_id)
 /// * `num_partitions` - The total number of partitions in the system
 /// * `replication_factor` - How many copies of the data should be stored
 ///
 /// # Returns
 /// An array of partition IDs where the data should be stored
+///
+/// # Example
+/// For replication_factor=3 and partition_hash=42:
+/// - Event stored in partitions [5, 17, 31] with 3 nodes each
+///   (each partition ID is replicated across multiple nodes)
 pub fn distribute_partition(
     partition_hash: PartitionHash,
     num_partitions: u16,
@@ -263,5 +290,33 @@ mod tests {
         // Should still have 6 unique partitions, avoiding the cycle
         assert_eq!(result.len(), 6);
         assert_eq!(result.iter().collect::<HashSet<_>>().len(), 6);
+    }
+
+    // New test to demonstrate the design change
+    #[test]
+    fn test_new_replication_design_explanation() {
+        // In the new design, events are still distributed across multiple partitions
+        // but each partition is replicated across multiple nodes
+
+        let partition_hash = 42;
+        let num_partitions = 16;
+        let replication_factor = 3;
+
+        let partitions = distribute_partition(partition_hash, num_partitions, replication_factor);
+
+        // This event will be stored in 3 different logical partitions
+        assert_eq!(partitions.len(), 3);
+
+        // But unlike the old design where each partition had 1 owner,
+        // in the new design each of these partitions has multiple replica nodes
+        // This is handled in PartitionManager.partition_replicas
+
+        // Example:
+        // - Partition 10 replicated on nodes [A, B, C]
+        // - Partition 5 replicated on nodes [B, C, D]
+        // - Partition 15 replicated on nodes [C, D, A]
+        //
+        // So the event is stored 9 times total (3 partitions × 3 replicas each)
+        // instead of 3 times in different partitions with single owners
     }
 }

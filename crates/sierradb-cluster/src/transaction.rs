@@ -1,11 +1,12 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
+use arrayvec::ArrayVec;
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use kameo::prelude::*;
 use sierradb::{
+    MAX_REPLICATION_FACTOR,
     bucket::PartitionId,
-    database::{Database, Transaction},
-    error::WriteError,
+    database::{Database, ExpectedVersion, Transaction},
     writer_thread_pool::AppendResult,
 };
 use smallvec::SmallVec;
@@ -13,27 +14,29 @@ use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use crate::{
-    ClusterActor, ClusterError,
+    ClusterActor,
     circuit_breaker::WriteCircuitBreaker,
     confirmation::actor::{ConfirmationActor, UpdateConfirmation},
-    write::{ConfirmTransaction, ReplicateWrite},
+    write::{ConfirmTransaction, ReplicateWrite, WriteError},
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn spawn(
     database: Database,
+    local_cluster_ref: RemoteActorRef<ClusterActor>,
+    local_alive_since: u64,
     confirmation_ref: ActorRef<ConfirmationActor>,
-    partition_id: PartitionId,
-    replica_partitions: Vec<(PartitionId, RemoteActorRef<ClusterActor>)>,
+    replicas: ArrayVec<(RemoteActorRef<ClusterActor>, u64), MAX_REPLICATION_FACTOR>,
     replication_factor: u8,
     transaction: Transaction,
     circuit_breaker: Arc<WriteCircuitBreaker>,
-    reply_sender: Option<ReplySender<Result<AppendResult, ClusterError>>>,
+    reply_sender: Option<ReplySender<Result<AppendResult, WriteError>>>,
 ) {
     tokio::spawn(async move {
         let transaction_id = transaction.transaction_id();
-        debug!(%transaction_id, "beginning distributed write");
+        let partition_id = transaction.partition_id();
+        debug!(%transaction_id, partition_id, "beginning distributed write");
 
         let event_ids: SmallVec<[Uuid; 4]> = transaction
             .events()
@@ -45,22 +48,23 @@ pub fn spawn(
             TIMEOUT,
             run(
                 &database,
-                partition_id,
-                replica_partitions.clone(),
+                &local_cluster_ref,
+                local_alive_since,
+                replicas,
                 replication_factor,
                 transaction,
             ),
         )
         .await
         {
-            Ok(Ok((append, confirmed_partitions, mut pending_replies))) => {
+            Ok(Ok((append, confirmed_replicas, mut pending_replies))) => {
                 debug!(
                     %transaction_id,
-                    partition_id = partition_id,
                     "completing write operation"
                 );
 
-                let mut confirmation_count = confirmed_partitions.len() as u8;
+                // Phase 5: Write Confirmation
+                let mut confirmation_count = confirmed_replicas.len() as u8;
 
                 // CRITICAL: Set confirmations with retry logic
                 match set_confirmations_with_retry(
@@ -90,14 +94,14 @@ pub fn spawn(
                             .await;
 
                         // Broadcast confirmation to all confirmed replica partitions
-                        for (partition_id, cluster_ref) in confirmed_partitions {
+                        for cluster_ref in confirmed_replicas {
                             let Some(cluster_ref) = cluster_ref else {
                                 continue;
                             };
 
                             debug!(
                                 %transaction_id,
-                                partition_id,
+                                partition_id = partition_id,
                                 "sending confirmation to replica"
                             );
 
@@ -106,7 +110,7 @@ pub fn spawn(
                                     partition_id,
                                     transaction_id,
                                     event_ids: event_ids.clone(),
-                                    event_versions: event_partition_sequences.clone(),
+                                    event_partition_sequences: event_partition_sequences.clone(),
                                     confirmation_count,
                                 })
                                 .send()
@@ -118,7 +122,7 @@ pub fn spawn(
                         }
 
                         // Confirm writes for other partitions which still succeeded
-                        while let Ok(Some((partition_id, cluster_ref, res))) =
+                        while let Ok(Some((cluster_ref, res))) =
                             tokio::time::timeout(TIMEOUT, pending_replies.next()).await
                         {
                             if res.is_ok() {
@@ -128,7 +132,8 @@ pub fn spawn(
                                         partition_id,
                                         transaction_id,
                                         event_ids: event_ids.clone(),
-                                        event_versions: event_partition_sequences.clone(),
+                                        event_partition_sequences: event_partition_sequences
+                                            .clone(),
                                         confirmation_count,
                                     })
                                     .send()
@@ -142,13 +147,13 @@ pub fn spawn(
 
                         error!(
                             %transaction_id,
-                            partition_id = partition_id,
+                            partition_id,
                             ?err,
                             "CRITICAL: Failed to set confirmations after achieving quorum"
                         );
 
                         if let Some(tx) = reply_sender {
-                            tx.send(Err(ClusterError::ConfirmationFailure(err.to_string())));
+                            tx.send(Err(WriteError::ConfirmationFailed(err.to_string())));
                         }
                     }
                 }
@@ -163,7 +168,7 @@ pub fn spawn(
             },
             Err(elapsed) => match reply_sender {
                 Some(tx) => {
-                    tx.send(Err(ClusterError::WriteTimeout));
+                    tx.send(Err(WriteError::RequestTimeout));
                 }
                 None => {
                     error!("distributed write timed out after {elapsed}");
@@ -175,26 +180,27 @@ pub fn spawn(
 
 async fn run(
     database: &Database,
-    partition_id: PartitionId,
-    replica_partitions: Vec<(PartitionId, RemoteActorRef<ClusterActor>)>,
+    local_cluster_ref: &RemoteActorRef<ClusterActor>,
+    local_alive_since: u64,
+    replicas: ArrayVec<(RemoteActorRef<ClusterActor>, u64), MAX_REPLICATION_FACTOR>,
     replication_factor: u8,
     mut transaction: Transaction,
 ) -> Result<
     (
         AppendResult,
-        HashMap<PartitionId, Option<RemoteActorRef<ClusterActor>>>,
+        ArrayVec<Option<RemoteActorRef<ClusterActor>>, MAX_REPLICATION_FACTOR>,
         FuturesUnordered<
             impl Future<
                 Output = (
-                    PartitionId,
                     RemoteActorRef<ClusterActor>,
-                    Result<AppendResult, RemoteSendError<ClusterError>>,
+                    Result<AppendResult, RemoteSendError<WriteError>>,
                 ),
             > + 'static,
         >,
     ),
-    ClusterError,
+    WriteError,
 > {
+    // Phase 2: Coordinator Write Preparation
     let required_quorum = (replication_factor as usize / 2) + 1;
     let has_quorum = required_quorum <= 1;
     if has_quorum {
@@ -203,35 +209,60 @@ async fn run(
 
     let append = database.append_events(transaction.clone()).await?;
 
-    let mut pending_replies: FuturesUnordered<_> = replica_partitions
+    // Phase 3: Replica Write Replication
+    let expected_partition_sequence =
+        ExpectedVersion::from_next_version(append.first_partition_sequence);
+
+    // Check our new expected sequence doesn't mismatch the original expected sequence
+    #[cfg(debug_assertions)]
+    {
+        match transaction.get_expected_partition_sequence() {
+            ExpectedVersion::Any => {}
+            ExpectedVersion::Exists => {
+                debug_assert_ne!(expected_partition_sequence, ExpectedVersion::Empty);
+            }
+            ExpectedVersion::Empty => {
+                debug_assert_eq!(expected_partition_sequence, ExpectedVersion::Empty);
+            }
+            ExpectedVersion::Exact(exact) => {
+                debug_assert_eq!(expected_partition_sequence, ExpectedVersion::Exact(exact));
+            }
+        }
+    }
+
+    transaction = transaction.expected_partition_sequence(expected_partition_sequence);
+
+    let mut pending_replies: FuturesUnordered<_> = replicas
         .into_iter()
-        .map(|(replica_partition_id, cluster_ref)| {
+        .map(|(cluster_ref, _)| {
             cluster_ref
                 .ask(&ReplicateWrite {
-                    transaction: transaction.clone().with_partition_id(replica_partition_id),
-                    origin_partition: partition_id,
+                    coordinator_ref: local_cluster_ref.clone(),
+                    coordinator_alive_since: local_alive_since,
+                    transaction: transaction.clone(),
                 })
                 .enqueue()
                 .expect("ReplicateWrite message serialization should succeed")
-                .map(move |res| (replica_partition_id, cluster_ref, res))
+                .map(move |res| (cluster_ref, res))
         })
         .collect();
 
-    let mut confirmed_partitions = HashMap::from_iter([(partition_id, None)]);
-    while let Some((partition_id, cluster_ref, res)) = pending_replies.next().await {
+    // Phase 4: Quorum Confirmation
+    let mut confirmed_replicas = ArrayVec::from_iter([None]);
+    while let Some((cluster_ref, res)) = pending_replies.next().await {
         match res {
             Ok(_) => {
-                confirmed_partitions.insert(partition_id, Some(cluster_ref));
+                confirmed_replicas.push(Some(cluster_ref));
 
-                let has_quorum = confirmed_partitions.len() >= required_quorum;
+                let has_quorum = confirmed_replicas.len() >= required_quorum;
                 if has_quorum {
                     debug!(
                         transaction_id = %transaction.transaction_id(),
-                        confirmed = confirmed_partitions.len(),
+                        confirmed = confirmed_replicas.len(),
                         "quorum achieved"
                     );
 
-                    return Ok((append, confirmed_partitions, pending_replies));
+                    return Ok((append, confirmed_replicas, pending_replies));
                 }
             }
             Err(err) => {
@@ -240,25 +271,25 @@ async fn run(
                 // In a more advanced implementation, we might adjust the quorum calculation
                 warn!(
                     transaction_id = %transaction.transaction_id(),
-                    partition_id,
+                    cluster_ref_id = %cluster_ref.id(),
                     "replica failed to process write: {err}"
                 );
 
                 // Check if we can still achieve quorum
                 let required_quorum = (replication_factor as usize / 2) + 1;
-                let max_possible = confirmed_partitions.len() + pending_replies.len();
+                let max_possible = confirmed_replicas.len() + pending_replies.len();
 
                 if max_possible < required_quorum {
                     error!(
                         transaction_id = %transaction.transaction_id(),
-                        confirmed = confirmed_partitions.len(),
+                        confirmed = confirmed_replicas.len(),
                         required = required_quorum,
                         "cannot achieve quorum"
                     );
 
                     // Send failure response
-                    return Err(ClusterError::QuorumNotAchieved {
-                        confirmed: confirmed_partitions.len() as u8,
+                    return Err(WriteError::ReplicationQuorumFailed {
+                        confirmed: confirmed_replicas.len() as u8,
                         required: required_quorum as u8,
                     });
                 }
@@ -266,8 +297,8 @@ async fn run(
         }
     }
 
-    Err(ClusterError::QuorumNotAchieved {
-        confirmed: confirmed_partitions.len() as u8,
+    Err(WriteError::ReplicationQuorumFailed {
+        confirmed: confirmed_replicas.len() as u8,
         required: required_quorum as u8,
     })
 }
@@ -278,7 +309,7 @@ pub async fn set_confirmations_with_retry(
     offsets: SmallVec<[u64; 4]>,
     transaction_id: Uuid,
     confirmation_count: u8,
-) -> Result<(), WriteError> {
+) -> Result<(), sierradb::error::WriteError> {
     const MAX_ATTEMPTS: u32 = 5;
     const BASE_DELAY: Duration = Duration::from_millis(100);
     const MAX_DELAY: Duration = Duration::from_secs(5);
