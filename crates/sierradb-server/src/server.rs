@@ -6,7 +6,7 @@ use sierradb::database::{NewEvent, Transaction};
 use sierradb::id::{NAMESPACE_PARTITION_KEY, uuid_to_partition_hash, uuid_v7_with_partition_hash};
 use sierradb_cluster::ClusterActor;
 use sierradb_cluster::read::ReadEvent;
-use sierradb_cluster::write::ExecuteTransaction;
+use sierradb_cluster::write::execute::ExecuteTransaction;
 use smallvec::smallvec;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};

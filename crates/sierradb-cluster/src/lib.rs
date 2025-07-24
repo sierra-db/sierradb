@@ -22,7 +22,6 @@ use tracing::{error, trace};
 pub mod circuit_breaker;
 pub mod confirmation;
 pub mod read;
-pub mod transaction;
 pub mod write;
 
 /// Maximum number of request forwards allowed to prevent loops
