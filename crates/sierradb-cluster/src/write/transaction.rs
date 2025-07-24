@@ -17,8 +17,10 @@ use crate::{
     ClusterActor,
     circuit_breaker::WriteCircuitBreaker,
     confirmation::actor::{ConfirmationActor, UpdateConfirmation},
-    write::{ConfirmTransaction, ReplicateWrite, WriteError},
+    write::confirm::ConfirmTransaction,
 };
+
+use super::{error::WriteError, replicate::ReplicateWrite};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
