@@ -65,7 +65,8 @@ impl<T: ClusterKey> TopologyManager<T> {
         // Initialize cluster nodes tracking
         let cluster_nodes = HashMap::from_iter([(local_peer_id, local_cluster_ref.clone())]);
 
-        // Initialize partition replicas - we'll populate this as we discover other nodes
+        // Initialize partition replicas - we'll populate this as we discover other
+        // nodes
         let partition_replicas = HashMap::new();
 
         let mut manager = Self {
@@ -96,7 +97,8 @@ impl<T: ClusterKey> TopologyManager<T> {
     }
 
     /// Calculate which partitions a node should own based on bucket assignment
-    /// This uses the exact same logic as the original assigned_buckets/assigned_partitions code
+    /// This uses the exact same logic as the original
+    /// assigned_buckets/assigned_partitions code
     fn calculate_assigned_partitions(
         node_index: usize,
         total_node_count: usize,
@@ -158,12 +160,17 @@ impl<T: ClusterKey> TopologyManager<T> {
         replicas
     }
 
+    pub fn get_assigned_partitions(&self) -> &HashSet<PartitionId> {
+        &self.assigned_partitions
+    }
+
     /// Determine whether this node has the specified partition
     pub fn has_partition(&self, partition_id: PartitionId) -> bool {
         self.assigned_partitions.contains(&partition_id)
     }
 
-    /// Get the availability status of a partition (true if any replica is active)
+    /// Get the availability status of a partition (true if any replica is
+    /// active)
     pub fn is_partition_available(&self, partition_id: PartitionId) -> bool {
         self.partition_replicas
             .get(&partition_id)
@@ -176,7 +183,8 @@ impl<T: ClusterKey> TopologyManager<T> {
             .unwrap_or(false)
     }
 
-    /// Get all available replica nodes for a partition, sorted by alive_since for consistency
+    /// Get all available replica nodes for a partition, sorted by alive_since
+    /// for consistency
     pub fn get_available_replicas(
         &self,
         partition_id: PartitionId,
@@ -817,8 +825,8 @@ mod replica_manager_tests {
         let manager =
             TopologyManager::new(local_cluster_ref, 0, 3, 100, 10, 3, Duration::from_secs(30));
 
-        // Initially, partitions should not be available (only local node, need 3 replicas)
-        // Actually, let's test a partition this node owns
+        // Initially, partitions should not be available (only local node, need 3
+        // replicas) Actually, let's test a partition this node owns
         let owned_partition = *manager.assigned_partitions.iter().next().unwrap();
 
         // Should be available because we have at least one replica
