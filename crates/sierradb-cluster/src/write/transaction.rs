@@ -195,7 +195,7 @@ async fn run(
             impl Future<
                 Output = (
                     RemoteActorRef<ClusterActor>,
-                    Result<AppendResult, RemoteSendError<WriteError>>,
+                    Result<AppendResult, RemoteSendError<SendError<ReplicateWrite, WriteError>>>,
                 ),
             > + 'static,
         >,
@@ -215,7 +215,8 @@ async fn run(
     let expected_partition_sequence =
         ExpectedVersion::from_next_version(append.first_partition_sequence);
 
-    // Check our new expected sequence doesn't mismatch the original expected sequence
+    // Check our new expected sequence doesn't mismatch the original expected
+    // sequence
     #[cfg(debug_assertions)]
     {
         match transaction.get_expected_partition_sequence() {

@@ -9,10 +9,16 @@ use sierradb::{
 use thiserror::Error;
 use tracing::error;
 
-#[derive(Debug, Error, Serialize, Deserialize)]
+#[derive(Clone, Debug, Error, Serialize, Deserialize)]
 pub enum WriteError {
     #[error("all replica nodes failed to process the write request")]
     AllReplicasFailed,
+
+    #[error("replicate write buffer evicted to make room for lower write")]
+    BufferEvicted,
+
+    #[error("replicate write buffer is full")]
+    BufferFull,
 
     #[error("circuit breaker open: estimated recovery time: {estimated_recovery_time:?}")]
     CircuitBreakerOpen {
@@ -57,7 +63,10 @@ pub enum WriteError {
     MaximumForwardsExceeded { max: u8 },
 
     #[error("remote operation failed: {0}")]
-    RemoteOperationFailed(Box<RemoteSendError<WriteError>>),
+    RemoteOperationFailed(String),
+
+    #[error("sequence is already being processed")]
+    SequenceConflict,
 
     #[error("current partition sequence is {current} but expected {expected}")]
     WrongExpectedSequence {
@@ -74,7 +83,7 @@ impl From<sierradb::error::WriteError> for WriteError {
 
 impl From<RemoteSendError<WriteError>> for WriteError {
     fn from(err: RemoteSendError<WriteError>) -> Self {
-        WriteError::RemoteOperationFailed(Box::new(err))
+        WriteError::RemoteOperationFailed(err.to_string())
     }
 }
 

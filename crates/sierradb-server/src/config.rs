@@ -51,7 +51,7 @@ pub struct AppConfig {
     pub network: NetworkConfig,
     pub node: NodeConfig,
     pub partition: PartitionConfig,
-    pub replication_factor: u8,
+    pub replication: ReplicationConfig,
     pub segment: SegmentConfig,
     #[serde(default)]
     pub threads: Threads,
@@ -94,6 +94,14 @@ pub struct NodeConfig {
 pub struct PartitionConfig {
     pub count: u16,
     pub ids: Option<Vec<PartitionId>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReplicationConfig {
+    pub buffer_size: usize,
+    pub buffer_timeout_ms: u64,
+    // pub catch_up_threshold: u64,
+    pub factor: u8,
 }
 
 #[derive(Debug, Deserialize)]
@@ -160,7 +168,10 @@ impl AppConfig {
             .set_default("network.cluster_address", "/ip4/0.0.0.0/tcp/0")?
             .set_default("network.client_address", "0.0.0.0:9090")?
             .set_default("partition.count", 1024)?
-            .set_default("replication_factor", 3)?
+            .set_default("replication.buffer_size", 1000)?
+            .set_default("replication.buffer_timeout_ms", 5000)?
+            // .set_default("replication.catch_up_threshold", 100)?
+            .set_default("replication.factor", 3)?
             .set_default("segment.size_bytes", 256_000_000)?;
 
         // Apply any overrides from the node config
@@ -216,10 +227,11 @@ impl AppConfig {
             Some(ids) => Ok(ids.iter().copied().collect()),
             None => {
                 let node_count = self.node_count()?;
-                let replication_factor = self.replication_factor as usize;
+                let replication_factor = self.replication.factor as usize;
                 let current_node_index = self.node.index as usize;
 
-                // Cap replication factor at node count (every node owns everything if RF >= node count)
+                // Cap replication factor at node count (every node owns everything if RF >=
+                // node count)
                 let effective_replication_factor = replication_factor.min(node_count);
 
                 let mut assigned = HashSet::new();
@@ -322,7 +334,22 @@ impl fmt::Display for AppConfig {
             None => writeln!(f, "partition.ids = <none>")?,
         }
 
-        writeln!(f, "replication_factor = {}", self.replication_factor)?;
+        writeln!(
+            f,
+            "replication.buffer_size = {}",
+            self.replication.buffer_size
+        )?;
+        writeln!(
+            f,
+            "replication.buffer_timeout_ms = {}",
+            self.replication.buffer_timeout_ms
+        )?;
+        // writeln!(
+        //     f,
+        //     "replication.catch_up_threshold = {}",
+        //     self.replication.catch_up_threshold
+        // )?;
+        writeln!(f, "replication.factor = {}", self.replication.factor)?;
 
         writeln!(f, "segment.size_bytes = {}", self.segment.size_bytes)?;
 

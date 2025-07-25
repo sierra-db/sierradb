@@ -19,6 +19,8 @@ use sierradb_topology::TopologyManager;
 use thiserror::Error;
 use tracing::{error, trace};
 
+use crate::write::replicate::{PartitionReplicatorActor, PartitionReplicatorActorArgs};
+
 pub mod circuit_breaker;
 pub mod confirmation;
 pub mod read;
@@ -43,6 +45,7 @@ pub struct ClusterActor {
     confirmation_ref: ActorRef<ConfirmationActor>,
     watermarks: HashMap<PartitionId, Arc<AtomicWatermark>>,
     circuit_breaker: Arc<WriteCircuitBreaker>,
+    replicator_refs: HashMap<PartitionId, ActorRef<PartitionReplicatorActor>>,
 }
 
 impl ClusterActor {
@@ -59,8 +62,11 @@ pub struct ClusterArgs {
     pub database: Database,
     /// List of addresses to listen on
     pub listen_addrs: Vec<Multiaddr>,
+    /// Total number of nodes in the cluster
     pub node_count: usize,
+    /// Zero-based index of this node in the cluster
     pub node_index: usize,
+    /// Total number of buckets in the system
     pub bucket_count: u16,
     /// Total number of partitions in the system
     pub partition_count: u16,
@@ -72,6 +78,12 @@ pub struct ClusterArgs {
     pub heartbeat_timeout: Duration,
     /// Interval between heartbeat messages
     pub heartbeat_interval: Duration,
+    /// Maximum number of out-of-order writes to buffer per partition
+    pub replication_buffer_size: usize,
+    /// Maximum time to keep buffered writes before timing out
+    pub replication_buffer_timeout: Duration,
+    // / Number of sequences behind before triggering catch-up
+    // pub replication_catch_up_threshold: u64,
 }
 
 impl Actor for ClusterActor {
@@ -80,21 +92,24 @@ impl Actor for ClusterActor {
 
     async fn on_start(
         ClusterArgs {
-            keypair: key,
+            keypair,
             database,
             listen_addrs,
-            node_index,
             node_count,
+            node_index,
             bucket_count,
             partition_count,
             replication_factor,
             assigned_partitions,
             heartbeat_timeout,
             heartbeat_interval,
+            replication_buffer_size,
+            replication_buffer_timeout,
+            // replication_catch_up_threshold,
         }: Self::Args,
         actor_ref: ActorRef<Self>,
     ) -> Result<Self, Self::Error> {
-        let local_peer_id = key.public().to_peer_id();
+        let local_peer_id = keypair.public().to_peer_id();
         trace!(
             %local_peer_id,
             partitions = %assigned_partitions.len(),
@@ -102,7 +117,7 @@ impl Actor for ClusterActor {
         );
 
         let kameo = remote::Behaviour::new(
-            key.public().to_peer_id(),
+            keypair.public().to_peer_id(),
             remote::messaging::Config::default(),
         );
 
@@ -111,7 +126,7 @@ impl Actor for ClusterActor {
         let cluster_ref = actor_ref.into_remote_ref().await;
 
         // Build the libp2p swarm with all required behaviors
-        let mut swarm = libp2p::SwarmBuilder::with_existing_identity(key)
+        let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_tcp(
                 tcp::Config::default(),
@@ -159,6 +174,24 @@ impl Actor for ClusterActor {
             swarm.listen_on(addr)?;
         }
 
+        let replicator_refs = assigned_partitions
+            .iter()
+            .map(|partition_id| {
+                (
+                    *partition_id,
+                    PartitionReplicatorActor::spawn_with_mailbox(
+                        PartitionReplicatorActorArgs {
+                            partition_id: *partition_id,
+                            database: database.clone(),
+                            buffer_size: replication_buffer_size,
+                            buffer_timeout: replication_buffer_timeout,
+                        },
+                        mailbox::bounded(1_000),
+                    ),
+                )
+            })
+            .collect();
+
         let confirmation_actor = ConfirmationActor::new(
             database.dir().clone(),
             database.total_buckets(),
@@ -178,6 +211,7 @@ impl Actor for ClusterActor {
             confirmation_ref,
             watermarks,
             circuit_breaker,
+            replicator_refs,
         })
     }
 

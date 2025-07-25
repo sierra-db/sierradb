@@ -20,7 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::new(args.log.as_deref().unwrap_or(
             "sierradb_cluster=DEBUG,sierradb_server=DEBUG,sierradb=DEBUG,INFO",
         )))
-        .with_span_events(FmtSpan::ACTIVE)
+        .with_span_events(FmtSpan::ENTER)
         .init();
 
     let config = AppConfig::load(args)?;
@@ -63,10 +63,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         node_index: config.node.index as usize,
         bucket_count: config.bucket.count,
         partition_count: config.partition.count,
-        replication_factor: config.replication_factor,
+        replication_factor: config.replication.factor,
         assigned_partitions,
         heartbeat_timeout: Duration::from_millis(config.heartbeat.timeout_ms),
         heartbeat_interval: Duration::from_millis(config.heartbeat.interval_ms),
+        replication_buffer_size: config.replication.buffer_size,
+        replication_buffer_timeout: Duration::from_millis(config.replication.buffer_timeout_ms),
     });
 
     Server::new(swarm_ref, config.partition.count)
