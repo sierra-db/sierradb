@@ -16,7 +16,7 @@ use tokio::{
     select,
     time::{Interval, MissedTickBehavior},
 };
-use tracing::{debug, error, instrument};
+use tracing::{debug, error, instrument, warn};
 
 use crate::ClusterActor;
 
@@ -29,6 +29,8 @@ pub struct PartitionReplicatorActor {
     buffered_writes: BTreeMap<u64, BufferedWrite>,
     buffer_size: usize,
     buffer_timeout: Duration,
+    gap_detection_timeout: Duration,
+    catch_up_ranges: BTreeMap<u64, u64>, // start_seq -> end_seq (inclusive)
     gc_interval: Interval,
 }
 
@@ -41,6 +43,7 @@ pub struct PartitionReplicatorActorArgs {
     pub buffer_timeout: Duration,
     // /// Number of sequences behind before triggering catch-up
     // pub catch_up_threshold: u64,
+    pub gap_detection_timeout: Duration,
 }
 
 impl Actor for PartitionReplicatorActor {
@@ -53,6 +56,7 @@ impl Actor for PartitionReplicatorActor {
             database,
             buffer_size,
             buffer_timeout,
+            gap_detection_timeout,
         }: Self::Args,
         _actor_ref: ActorRef<Self>,
     ) -> Result<Self, Self::Error> {
@@ -69,7 +73,7 @@ impl Actor for PartitionReplicatorActor {
         };
 
         let mut gc_interval =
-            tokio::time::interval((buffer_timeout / 5).max(Duration::from_secs(2)));
+            tokio::time::interval((buffer_timeout / 5).max(gap_detection_timeout / 3));
         gc_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         Ok(PartitionReplicatorActor {
@@ -79,6 +83,8 @@ impl Actor for PartitionReplicatorActor {
             buffered_writes: BTreeMap::new(),
             buffer_size,
             buffer_timeout,
+            gap_detection_timeout,
+            catch_up_ranges: BTreeMap::new(),
             gc_interval,
         })
     }
@@ -92,6 +98,7 @@ impl Actor for PartitionReplicatorActor {
             select! {
                 msg = mailbox_rx.recv() => return msg,
                 _ = self.gc_interval.tick() => {
+                    self.detect_and_handle_gaps();
                     self.garbage_collect();
                 }
             }
@@ -100,15 +107,122 @@ impl Actor for PartitionReplicatorActor {
 }
 
 impl PartitionReplicatorActor {
+    fn detect_and_handle_gaps(&mut self) {
+        // Look for the oldest buffered write to detect gaps
+        if let Some((&oldest_buffered_seq, oldest_write)) = self.buffered_writes.first_key_value() {
+            let expected_seq = self.next_expected_seq;
+            let gap_size = oldest_buffered_seq - expected_seq;
+            let wait_time = oldest_write.received_at.elapsed();
+
+            // Gap detected if:
+            // 1. We have buffered writes waiting for missing sequences (gap_size > 0)
+            // 2. They've been waiting longer than our gap detection threshold
+            // 3. We're not already catching up this range
+            if gap_size > 0
+                && wait_time > self.gap_detection_timeout
+                && !self.is_range_in_catch_up(expected_seq, oldest_buffered_seq - 1)
+            {
+                warn!(
+                    partition_id = self.partition_id,
+                    expected_seq,
+                    oldest_buffered_seq,
+                    gap_size,
+                    wait_time_ms = wait_time.as_millis(),
+                    "sequence gap detected, triggering catch-up"
+                );
+
+                // Mark this range as being caught up and trigger the catch-up process
+                self.trigger_catch_up(expected_seq, oldest_buffered_seq - 1);
+            }
+        }
+    }
+
+    fn trigger_catch_up(&mut self, from_seq: u64, to_seq: u64) {
+        // Mark the range as being caught up
+        self.catch_up_ranges.insert(from_seq, to_seq);
+
+        debug!(
+            partition_id = self.partition_id,
+            from_seq, to_seq, "Starting catch-up for sequence range"
+        );
+
+        // TODO: Actually trigger the catch-up process
+        // This would involve:
+        // 1. Getting the coordinator for this partition
+        // 2. Sending a PartitionSyncRequest
+        // 3. Applying the returned events
+        // 4. Calling mark_catch_up_complete when done
+
+        // For now, we'll just spawn a placeholder task
+        let partition_id = self.partition_id;
+        tokio::spawn(async move {
+            // Placeholder: In real implementation, this would perform catch-up
+            warn!(
+                partition_id,
+                from_seq, to_seq, "TODO: Implement actual catch-up logic"
+            );
+        });
+    }
+
+    fn is_sequence_in_catch_up_range(&self, seq: u64) -> bool {
+        is_sequence_in_catch_up_range(&self.catch_up_ranges, seq)
+    }
+
+    fn is_range_in_catch_up(&self, from_seq: u64, to_seq: u64) -> bool {
+        for (&start, &end) in &self.catch_up_ranges {
+            // Check if the requested range overlaps with any existing catch-up range
+            if !(to_seq < start || from_seq > end) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn mark_catch_up_complete(&mut self, from_seq: u64, to_seq: u64) {
+        if let Some(&existing_end) = self.catch_up_ranges.get(&from_seq) {
+            if existing_end == to_seq {
+                self.catch_up_ranges.remove(&from_seq);
+                debug!(
+                    partition_id = self.partition_id,
+                    from_seq, to_seq, "catch-up completed for sequence range"
+                );
+            } else {
+                warn!(
+                    partition_id = self.partition_id,
+                    from_seq,
+                    to_seq,
+                    existing_end,
+                    "catch-up completion mismatch - expected end sequence doesn't match"
+                );
+            }
+        } else {
+            warn!(
+                partition_id = self.partition_id,
+                from_seq, to_seq, "attempted to mark catch-up complete for unknown range"
+            );
+        }
+    }
+
     fn garbage_collect(&mut self) {
-        self.buffered_writes.retain(|partition_sequence, write| {
+        self.buffered_writes.retain(|&partition_sequence, write| {
+            // Don't garbage collect writes that are part of active catch-up ranges
+            if is_sequence_in_catch_up_range(&self.catch_up_ranges, partition_sequence) {
+                debug!(
+                    partition_id = self.partition_id,
+                    partition_sequence, "preserving buffered write - part of active catch-up range"
+                );
+                return true;
+            }
+
             if write.received_at.elapsed() <= self.buffer_timeout {
                 return true;
             }
 
             debug!(
                 partition_id = self.partition_id,
-                partition_sequence, "buffered replicate write timed out"
+                partition_sequence,
+                elapsed_ms = write.received_at.elapsed().as_millis(),
+                "buffered replicate write timed out"
             );
 
             for tx in write.reply_senders.drain(..) {
@@ -205,6 +319,15 @@ impl PartitionReplicatorActor {
     fn pop_next_buffered_write(&mut self) -> Option<BufferedWrite> {
         self.buffered_writes.remove(&self.next_expected_seq)
     }
+}
+
+fn is_sequence_in_catch_up_range(catch_up_ranges: &BTreeMap<u64, u64>, seq: u64) -> bool {
+    for (start, end) in catch_up_ranges {
+        if &seq >= start && &seq <= end {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Debug)]
@@ -502,6 +625,7 @@ mod tests {
             buffered_writes: BTreeMap::new(),
             buffer_size: 100,
             buffer_timeout: Duration::from_secs(10),
+            gap_detection_timeout: Duration::from_secs(10),
             gc_interval: tokio::time::interval(Duration::from_secs(10)),
         }
     }
