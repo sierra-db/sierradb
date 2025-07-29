@@ -344,24 +344,26 @@ impl Message<ReadPartition> for ClusterActor {
             let limit = msg.limit.unwrap_or(100) as usize; // Default limit
             let mut next_sequence = None;
 
-            while events.len() < limit {
+            'outer: while events.len() < limit {
                 match iter
                     .next(false)
                     .await
                     .map_err(|err| ClusterError::Read(err.to_string()))?
                 {
-                    Some(event) => {
-                        // Only include events within watermark
-                        if event.partition_sequence <= watermark {
-                            assert!(
-                                event.confirmation_count >= required_quorum,
-                                "watermark should only be here if the event has been confirmed"
-                            );
+                    Some(commit) => {
+                        for event in commit {
+                            // Only include events within watermark
+                            if event.partition_sequence <= watermark {
+                                assert!(
+                                    event.confirmation_count >= required_quorum,
+                                    "watermark should only be here if the event has been confirmed"
+                                );
 
-                            events.push(event);
-                        } else {
-                            // Hit watermark boundary
-                            break;
+                                events.push(event);
+                            } else {
+                                // Hit watermark boundary
+                                break 'outer;
+                            }
                         }
                     }
                     None => break, // No more events
@@ -431,17 +433,19 @@ impl Message<ReadStream> for ClusterActor {
                     .await
                     .map_err(|err| ClusterError::Read(err.to_string()))?
                 {
-                    Some(event) => {
-                        // Filter by version and watermark
-                        if event.stream_version >= from_version
-                            && event.partition_sequence <= watermark
-                        {
-                            assert!(
-                                event.confirmation_count >= required_quorum,
-                                "watermark should only be here if the event has been confirmed"
-                            );
+                    Some(commit) => {
+                        for event in commit {
+                            // Filter by version and watermark
+                            if event.stream_version >= from_version
+                                && event.partition_sequence <= watermark
+                            {
+                                assert!(
+                                    event.confirmation_count >= required_quorum,
+                                    "watermark should only be here if the event has been confirmed"
+                                );
 
-                            events.push(event);
+                                events.push(event);
+                            }
                         }
                     }
                     None => break,

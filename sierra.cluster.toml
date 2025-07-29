@@ -4,6 +4,9 @@
 [bucket]
 count = 64
 
+[replication]
+factor = 3
+
 [[nodes]]
 dir = "target/db-0"
 network.client_address = "0.0.0.0:9090"

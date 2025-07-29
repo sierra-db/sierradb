@@ -1,7 +1,8 @@
 //! Actor module for managing confirmation state in Eventus
 //!
-//! This module provides a Kameo actor wrapper around `BucketConfirmationManager`
-//! to enable concurrent, fault-tolerant confirmation state management.
+//! This module provides a Kameo actor wrapper around
+//! `BucketConfirmationManager` to enable concurrent, fault-tolerant
+//! confirmation state management.
 //!
 //! ## Usage
 //!
@@ -36,11 +37,12 @@
 //! }
 //! ```
 
+use std::collections::HashSet;
 use std::sync::Arc;
-use std::{collections::HashSet, path::PathBuf};
 
 use kameo::prelude::*;
 use serde::{Deserialize, Serialize};
+use sierradb::database::Database;
 use smallvec::SmallVec;
 
 use super::{
@@ -67,21 +69,20 @@ pub struct ConfirmationActor {
 }
 
 impl ConfirmationActor {
-    pub fn new(
-        data_dir: PathBuf,
-        num_buckets: u16,
+    pub async fn new(
+        database: &Database,
         replication_factor: u8,
         assigned_partitions: HashSet<PartitionId>,
-    ) -> Self {
+    ) -> Result<Self, ConfirmationError> {
         let mut manager = BucketConfirmationManager::new(
-            data_dir,
-            num_buckets,
+            database.dir().clone(),
+            database.total_buckets(),
             replication_factor,
             assigned_partitions,
         );
-        manager.initialize();
+        manager.initialize(database).await?;
 
-        Self { manager }
+        Ok(Self { manager })
     }
 }
 
@@ -347,19 +348,13 @@ impl Message<GetMultipleWatermarks> for ConfirmationActor {
 // Convenience methods for common operations
 impl ConfirmationActor {
     /// Spawn a new confirmation actor
-    pub fn spawn(
-        data_dir: PathBuf,
-        num_buckets: u16,
+    pub async fn spawn(
+        database: &Database,
         replication_factor: u8,
         assigned_partitions: HashSet<PartitionId>,
-    ) -> ActorRef<Self> {
-        let actor = Self::new(
-            data_dir,
-            num_buckets,
-            replication_factor,
-            assigned_partitions,
-        );
-        Actor::spawn(actor)
+    ) -> Result<ActorRef<Self>, ConfirmationError> {
+        let actor = Self::new(database, replication_factor, assigned_partitions).await?;
+        Ok(Actor::spawn(actor))
     }
 }
 

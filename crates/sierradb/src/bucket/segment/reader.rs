@@ -31,13 +31,54 @@ const PAGE_SIZE: usize = 4096; // Usually a page is 4KB on Linux
 const READ_AHEAD_SIZE: usize = 64 * 1024; // 64 KB read ahead buffer
 const READ_BUF_SIZE: usize = PAGE_SIZE - COMMIT_SIZE;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommittedEvents {
     Single(EventRecord),
     Transaction {
         events: Box<SmallVec<[EventRecord; 4]>>,
         commit: CommitRecord,
     },
+}
+
+impl CommittedEvents {
+    pub fn confirmation_count(&self) -> u8 {
+        match self {
+            CommittedEvents::Single(event) => event.confirmation_count,
+            CommittedEvents::Transaction { commit, .. } => commit.confirmation_count,
+        }
+    }
+
+    pub fn transaction_id(&self) -> &Uuid {
+        match self {
+            CommittedEvents::Single(event) => &event.transaction_id,
+            CommittedEvents::Transaction { commit, .. } => &commit.transaction_id,
+        }
+    }
+
+    pub fn first_partition_sequence(&self) -> Option<u64> {
+        match self {
+            CommittedEvents::Single(event) => Some(event.partition_sequence),
+            CommittedEvents::Transaction { events, .. } => {
+                events.first().map(|event| event.partition_sequence)
+            }
+        }
+    }
+
+    pub fn last_partition_sequence(&self) -> Option<u64> {
+        match self {
+            CommittedEvents::Single(event) => Some(event.partition_sequence),
+            CommittedEvents::Transaction { events, .. } => {
+                events.last().map(|event| event.partition_sequence)
+            }
+        }
+    }
+
+    pub fn first(&self) -> Option<&EventRecord> {
+        match self {
+            CommittedEvents::Single(event) => Some(event),
+            CommittedEvents::Transaction { events, .. } => events.first(),
+        }
+    }
 }
 
 impl IntoIterator for CommittedEvents {
@@ -275,7 +316,7 @@ impl BucketSegmentReader {
                             ..
                         },
                     )) => {
-                        let next_offset = offset + event.len();
+                        let next_offset = offset + event.size;
 
                         if get_uuid_flag(&transaction_id) {
                             // Events with a true transaction id flag are always approved
@@ -511,7 +552,7 @@ impl BucketSegmentIter<'_> {
                     Ok((Some(events), _)) => {
                         match &events {
                             CommittedEvents::Single(event) => {
-                                this.offset = event.offset + event.len();
+                                this.offset = event.offset + event.size;
                             }
                             CommittedEvents::Transaction { commit, .. } => {
                                 this.offset = commit.offset + COMMIT_SIZE as u64;
@@ -573,7 +614,7 @@ impl Record {
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> u64 {
         match self {
-            Record::Event(event) => event.len(),
+            Record::Event(event) => event.size,
             Record::Commit(_) => COMMIT_SIZE as u64,
         }
     }
@@ -667,6 +708,9 @@ pub struct EventRecord {
     /// Contains the domain-specific information that constitutes the event.
     /// Must be deserializable based on the event_name.
     pub payload: Vec<u8>,
+
+    /// Size in bytes the event takes on disk.
+    pub size: u64,
 }
 
 impl EventRecord {
@@ -692,14 +736,15 @@ impl EventRecord {
         uuid_to_partition_hash(self.partition_key) % num_partitions
     }
 
-    #[allow(clippy::len_without_is_empty)]
-    pub fn len(&self) -> u64 {
-        EVENT_HEADER_SIZE as u64
-            + self.stream_id.len() as u64
-            + self.event_name.len() as u64
-            + self.metadata.len() as u64
-            + self.payload.len() as u64
-    }
+    // This method no longer is valid when reading just the header!
+    // #[allow(clippy::len_without_is_empty)]
+    // pub fn len(&self) -> u64 {
+    //     EVENT_HEADER_SIZE as u64
+    //         + self.stream_id.len() as u64
+    //         + self.event_name.len() as u64
+    //         + self.metadata.len() as u64
+    //         + self.payload.len() as u64
+    // }
 
     fn from_parts(
         offset: u64,
@@ -735,6 +780,12 @@ impl EventRecord {
             }
         }
 
+        let size = EVENT_HEADER_SIZE as u64
+            + event_header.stream_id_len as u64
+            + event_header.event_name_len as u64
+            + event_header.metadata_len as u64
+            + event_header.payload_len as u64;
+
         Ok(EventRecord {
             offset,
             event_id: event_header.event_id,
@@ -749,11 +800,12 @@ impl EventRecord {
             event_name: body.event_name,
             metadata: body.metadata,
             payload: body.payload,
+            size,
         })
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitRecord {
     pub offset: u64,
     pub transaction_id: Uuid,

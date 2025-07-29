@@ -12,6 +12,8 @@ use bincode::{Decode, Encode};
 use kameo::Reply;
 use serde::{Deserialize, Serialize};
 use sierradb::bucket::{BucketId, PartitionId};
+use sierradb::database::Database;
+use sierradb::error::PartitionIndexError;
 use thiserror::Error;
 use tracing::info;
 
@@ -35,6 +37,9 @@ pub enum ConfirmationError {
 
     #[error("decode error: {0}")]
     Decode(#[from] bincode::error::DecodeError),
+
+    #[error(transparent)]
+    PartitionIndex(#[from] PartitionIndexError),
 
     #[error(transparent)]
     Io(#[from] io::Error),
@@ -235,7 +240,7 @@ impl BucketConfirmationManager {
         }
     }
 
-    pub fn initialize(&mut self) {
+    pub async fn initialize(&mut self, database: &Database) -> Result<(), ConfirmationError> {
         // Create confirmation directories if they don't exist
         for partition_id in self.assigned_partitions.clone() {
             let bucket_id = partition_id % self.num_buckets;
@@ -246,17 +251,45 @@ impl BucketConfirmationManager {
             self.load_bucket_state(bucket_id);
         }
 
+        // Insert partitions if they dont exist
         self.buckets = self.assigned_partitions.iter().fold(
             HashMap::<BucketId, HashMap<PartitionId, PartitionConfirmationState>>::new(),
             |mut acc, partition_id| {
                 let bucket_id = partition_id % self.num_buckets;
-                acc.entry(bucket_id).or_default().insert(
-                    *partition_id,
-                    PartitionConfirmationState::new(*partition_id, self.replication_factor),
-                );
+                acc.entry(bucket_id)
+                    .or_default()
+                    .entry(*partition_id)
+                    .or_insert_with(|| {
+                        PartitionConfirmationState::new(*partition_id, self.replication_factor)
+                    });
                 acc
             },
         );
+
+        // Update confirmations for events on disk already but beyond the watermark
+        let watermarks: Vec<_> = self
+            .buckets
+            .values()
+            .flat_map(|partitions| {
+                partitions
+                    .iter()
+                    .map(|(partition_id, state)| (*partition_id, state.confirmed_watermark.get()))
+            })
+            .collect();
+        for (partition_id, watermark) in watermarks {
+            let mut iter = database.read_partition(partition_id, watermark).await?;
+            while let Some(commit) = iter.next(true).await? {
+                for event in commit {
+                    self.update_confirmation(
+                        partition_id,
+                        event.partition_sequence + 1,
+                        event.confirmation_count,
+                    )?;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Get the appropriate bucket for a partition

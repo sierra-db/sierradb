@@ -900,6 +900,11 @@ impl Transaction {
         self
     }
 
+    pub fn with_transaction_id(mut self, transaction_id: Uuid) -> Self {
+        self.transaction_id = transaction_id;
+        self
+    }
+
     pub fn partition_key(&self) -> Uuid {
         self.partition_key
     }
