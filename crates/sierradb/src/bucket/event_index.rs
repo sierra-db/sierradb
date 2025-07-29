@@ -28,6 +28,7 @@ const RECORD_SIZE: usize = mem::size_of::<Uuid>() + mem::size_of::<u64>();
 
 const MPHF_GAMMA: f64 = 1.4;
 
+#[derive(Debug)]
 pub struct OpenEventIndex {
     id: BucketSegmentId,
     file: File,

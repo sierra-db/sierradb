@@ -23,6 +23,7 @@ config = { version = "0.15", default-features = false, features = [
 clap = "4.5"
 crc32fast = "1.4"
 directories = "6.0"
+failsafe = "1.3.0"
 futures = "0.3"
 # kameo = { git = "https://github.com/tqwewe/kameo", branch = "main" }
 kameo = { path = "../kameo" }

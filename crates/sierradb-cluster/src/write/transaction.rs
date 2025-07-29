@@ -244,6 +244,8 @@ async fn run(
                     coordinator_alive_since: local_alive_since,
                     transaction: transaction.clone(),
                 })
+                .mailbox_timeout(TIMEOUT)
+                .reply_timeout(TIMEOUT)
                 .enqueue()
                 .expect("ReplicateWrite message serialization should succeed")
                 .map(move |res| (cluster_ref, res))

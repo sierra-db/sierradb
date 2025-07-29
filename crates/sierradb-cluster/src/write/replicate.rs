@@ -1,37 +1,40 @@
-use std::{
-    collections::{BTreeMap, btree_map::Entry},
-    iter,
-    time::{Duration, Instant},
-};
+use std::time::Duration;
 
+use failsafe::{
+    StateMachine,
+    backoff::{self, EqualJittered},
+    failure_policy::{self, ConsecutiveFailures},
+    futures::CircuitBreaker,
+};
+use futures::future::Either;
 use kameo::{mailbox::Signal, prelude::*};
 use serde::{Deserialize, Serialize};
 use sierradb::{
-    bucket::PartitionId,
-    database::{Database, ExpectedVersion, PartitionLatestSequence, Transaction, VersionGap},
+    bucket::{PartitionId, segment::CommittedEvents},
+    database::{Database, ExpectedVersion, NewEvent, PartitionLatestSequence, Transaction},
     writer_thread_pool::AppendResult,
 };
 use smallvec::{SmallVec, smallvec};
-use tokio::{
-    select,
-    time::{Interval, MissedTickBehavior},
-};
+use tokio::{select, time::Instant};
 use tracing::{debug, error, instrument, warn};
 
-use crate::ClusterActor;
+use crate::{
+    ClusterActor, ClusterError,
+    write::{
+        ordered_queue::{self, OrderedValue},
+        timeout_ordered_queue::{TimedOrderedValue, TimeoutOrderedQueue},
+    },
+};
 
 use super::error::WriteError;
 
 pub struct PartitionReplicatorActor {
     partition_id: PartitionId,
     database: Database,
-    next_expected_seq: u64,
-    buffered_writes: BTreeMap<u64, BufferedWrite>,
-    buffer_size: usize,
+    buffered_writes: TimeoutOrderedQueue<u64, BufferedWrite>,
     buffer_timeout: Duration,
-    gap_detection_timeout: Duration,
-    catch_up_ranges: BTreeMap<u64, u64>, // start_seq -> end_seq (inclusive)
-    gc_interval: Interval,
+    catching_up: bool,
+    breaker: StateMachine<ConsecutiveFailures<EqualJittered>, ()>,
 }
 
 pub struct PartitionReplicatorActorArgs {
@@ -41,9 +44,8 @@ pub struct PartitionReplicatorActorArgs {
     pub buffer_size: usize,
     /// Maximum time to keep buffered writes before timing out
     pub buffer_timeout: Duration,
-    // /// Number of sequences behind before triggering catch-up
-    // pub catch_up_threshold: u64,
-    pub gap_detection_timeout: Duration,
+    /// Maximum time before requesting a catchup
+    pub catchup_timeout: Duration,
 }
 
 impl Actor for PartitionReplicatorActor {
@@ -56,7 +58,7 @@ impl Actor for PartitionReplicatorActor {
             database,
             buffer_size,
             buffer_timeout,
-            gap_detection_timeout,
+            catchup_timeout,
         }: Self::Args,
         _actor_ref: ActorRef<Self>,
     ) -> Result<Self, Self::Error> {
@@ -72,34 +74,46 @@ impl Actor for PartitionReplicatorActor {
             None => 0,
         };
 
-        let mut gc_interval =
-            tokio::time::interval((buffer_timeout / 5).max(gap_detection_timeout / 3));
-        gc_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let breaker = failsafe::Config::new()
+            .failure_policy(failure_policy::consecutive_failures(
+                5,
+                backoff::equal_jittered(Duration::from_secs(1), Duration::from_secs(30)),
+            ))
+            .build();
 
         Ok(PartitionReplicatorActor {
             partition_id,
             database,
-            next_expected_seq,
-            buffered_writes: BTreeMap::new(),
-            buffer_size,
+            buffered_writes: TimeoutOrderedQueue::new(
+                next_expected_seq,
+                buffer_size,
+                catchup_timeout,
+            ),
             buffer_timeout,
-            gap_detection_timeout,
-            catch_up_ranges: BTreeMap::new(),
-            gc_interval,
+            catching_up: false,
+            breaker,
         })
     }
 
     async fn next(
         &mut self,
-        _actor_ref: WeakActorRef<Self>,
+        actor_ref: WeakActorRef<Self>,
         mailbox_rx: &mut MailboxReceiver<Self>,
     ) -> Option<Signal<Self>> {
         loop {
+            let catchup_fut = if !self.catching_up {
+                self.buffered_writes
+                    .timeout_future()
+                    .map(Either::Left)
+                    .unwrap_or_else(|| Either::Right(futures::future::pending()))
+            } else {
+                Either::Right(futures::future::pending())
+            };
             select! {
                 msg = mailbox_rx.recv() => return msg,
-                _ = self.gc_interval.tick() => {
-                    self.detect_and_handle_gaps();
-                    self.garbage_collect();
+                _ = catchup_fut => {
+                    println!("detecting and handling gaps");
+                    self.detect_and_handle_gaps(&actor_ref);
                 }
             }
         }
@@ -107,130 +121,94 @@ impl Actor for PartitionReplicatorActor {
 }
 
 impl PartitionReplicatorActor {
-    fn detect_and_handle_gaps(&mut self) {
-        // Look for the oldest buffered write to detect gaps
-        if let Some((&oldest_buffered_seq, oldest_write)) = self.buffered_writes.first_key_value() {
-            let expected_seq = self.next_expected_seq;
-            let gap_size = oldest_buffered_seq - expected_seq;
-            let wait_time = oldest_write.received_at.elapsed();
+    fn detect_and_handle_gaps(&mut self, partition_ref: &WeakActorRef<Self>) {
+        // Delete records which have expired
+        let mut records_deleted = false;
+        while let Some(mut entry) = self.buffered_writes.queue.map.first_entry() {
+            if entry.get_mut().garbage_collect(self.buffer_timeout) {
+                break;
+            } else {
+                entry.remove();
+                records_deleted = true;
+            }
+        }
+        if records_deleted {
+            self.buffered_writes.update_timeout();
+        }
 
-            // Gap detected if:
-            // 1. We have buffered writes waiting for missing sequences (gap_size > 0)
-            // 2. They've been waiting longer than our gap detection threshold
-            // 3. We're not already catching up this range
-            if gap_size > 0
-                && wait_time > self.gap_detection_timeout
-                && !self.is_range_in_catch_up(expected_seq, oldest_buffered_seq - 1)
-            {
+        if !self.breaker.is_call_permitted() {
+            return;
+        }
+
+        // Look for the oldest buffered write to detect gaps
+        if let Some((&oldest_buffered_seq, oldest_write)) =
+            self.buffered_writes.queue.map.first_key_value()
+        {
+            let from_seq = *self.buffered_writes.next();
+            let to_seq = oldest_buffered_seq - 1;
+            let gap_size = oldest_buffered_seq - from_seq;
+            let wait_time = oldest_write
+                .reply_senders
+                .first()
+                .map(|reply| reply.received_at.elapsed());
+
+            if gap_size > 0 && !self.catching_up {
                 warn!(
                     partition_id = self.partition_id,
-                    expected_seq,
+                    expected_seq = from_seq,
                     oldest_buffered_seq,
                     gap_size,
-                    wait_time_ms = wait_time.as_millis(),
+                    wait_time_ms = wait_time
+                        .map(|wait_time| wait_time.as_millis())
+                        .unwrap_or_default(),
                     "sequence gap detected, triggering catch-up"
                 );
 
-                // Mark this range as being caught up and trigger the catch-up process
-                self.trigger_catch_up(expected_seq, oldest_buffered_seq - 1);
-            }
-        }
-    }
-
-    fn trigger_catch_up(&mut self, from_seq: u64, to_seq: u64) {
-        // Mark the range as being caught up
-        self.catch_up_ranges.insert(from_seq, to_seq);
-
-        debug!(
-            partition_id = self.partition_id,
-            from_seq, to_seq, "Starting catch-up for sequence range"
-        );
-
-        // TODO: Actually trigger the catch-up process
-        // This would involve:
-        // 1. Getting the coordinator for this partition
-        // 2. Sending a PartitionSyncRequest
-        // 3. Applying the returned events
-        // 4. Calling mark_catch_up_complete when done
-
-        // For now, we'll just spawn a placeholder task
-        let partition_id = self.partition_id;
-        tokio::spawn(async move {
-            // Placeholder: In real implementation, this would perform catch-up
-            warn!(
-                partition_id,
-                from_seq, to_seq, "TODO: Implement actual catch-up logic"
-            );
-        });
-    }
-
-    fn is_sequence_in_catch_up_range(&self, seq: u64) -> bool {
-        is_sequence_in_catch_up_range(&self.catch_up_ranges, seq)
-    }
-
-    fn is_range_in_catch_up(&self, from_seq: u64, to_seq: u64) -> bool {
-        for (&start, &end) in &self.catch_up_ranges {
-            // Check if the requested range overlaps with any existing catch-up range
-            if !(to_seq < start || from_seq > end) {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn mark_catch_up_complete(&mut self, from_seq: u64, to_seq: u64) {
-        if let Some(&existing_end) = self.catch_up_ranges.get(&from_seq) {
-            if existing_end == to_seq {
-                self.catch_up_ranges.remove(&from_seq);
-                debug!(
-                    partition_id = self.partition_id,
-                    from_seq, to_seq, "catch-up completed for sequence range"
-                );
-            } else {
-                warn!(
-                    partition_id = self.partition_id,
+                self.trigger_catch_up(
+                    partition_ref,
+                    oldest_write.coordinator_ref.clone(),
                     from_seq,
                     to_seq,
-                    existing_end,
-                    "catch-up completion mismatch - expected end sequence doesn't match"
                 );
             }
-        } else {
-            warn!(
-                partition_id = self.partition_id,
-                from_seq, to_seq, "attempted to mark catch-up complete for unknown range"
-            );
         }
     }
 
-    fn garbage_collect(&mut self) {
-        self.buffered_writes.retain(|&partition_sequence, write| {
-            // Don't garbage collect writes that are part of active catch-up ranges
-            if is_sequence_in_catch_up_range(&self.catch_up_ranges, partition_sequence) {
-                debug!(
-                    partition_id = self.partition_id,
-                    partition_sequence, "preserving buffered write - part of active catch-up range"
-                );
-                return true;
-            }
+    fn trigger_catch_up(
+        &mut self,
+        partition_ref: &WeakActorRef<PartitionReplicatorActor>,
+        coordinator_ref: RemoteActorRef<ClusterActor>,
+        from_seq: u64,
+        to_seq: u64,
+    ) {
+        // Mark the range as being caught up
+        self.catching_up = true;
 
-            if write.received_at.elapsed() <= self.buffer_timeout {
-                return true;
-            }
+        let partition_id = self.partition_id;
+        debug!(
+            partition_id,
+            from_seq, to_seq, "starting catch-up for sequence range"
+        );
 
-            debug!(
-                partition_id = self.partition_id,
-                partition_sequence,
-                elapsed_ms = write.received_at.elapsed().as_millis(),
-                "buffered replicate write timed out"
-            );
+        let breaker = self.breaker.clone();
 
-            for tx in write.reply_senders.drain(..) {
-                tx.send(Err(WriteError::RequestTimeout));
-            }
+        if let Some(partition_ref) = partition_ref.upgrade() {
+            tokio::spawn(async move {
+                let result = breaker
+                    .call(
+                        coordinator_ref
+                            .ask(&PartitionSyncRequest {
+                                partition_id,
+                                from_seq,
+                                to_seq,
+                            })
+                            .into_future(),
+                    )
+                    .await;
 
-            false
-        });
+                let _ = partition_ref.tell(PartitionSyncResponse { result }).await;
+            });
+        }
     }
 
     /// Handles incoming write requests by either processing them immediately if
@@ -238,6 +216,7 @@ impl PartitionReplicatorActor {
     /// sequential processing, with duplicate detection and conflict resolution.
     fn buffer_write(
         &mut self,
+        coordinator_ref: RemoteActorRef<ClusterActor>,
         tx: Transaction,
         reply_sender: Option<ReplySender<Result<AppendResult, WriteError>>>,
     ) -> Result<Option<BufferedWrite>, BufferWriteError> {
@@ -245,89 +224,95 @@ impl PartitionReplicatorActor {
             .get_expected_partition_sequence()
             .into_next_version()
             .expect("partition sequence should not reach max");
-        if expected_next_sequence == self.next_expected_seq {
-            match self.buffered_writes.entry(self.next_expected_seq) {
-                Entry::Vacant(_) => {
-                    return Ok(Some(BufferedWrite::new(tx, reply_sender)));
-                }
-                Entry::Occupied(entry) => {
-                    if entry.get().tx.transaction_id() == tx.transaction_id() {
-                        debug_assert_eq!(entry.get().tx, tx);
-                        let existing = entry.remove();
-                        let buffered_write = BufferedWrite::new_with_merged_reply_senders(
-                            tx,
-                            existing.reply_senders,
-                            reply_sender,
-                        );
-                        return Ok(Some(buffered_write));
-                    } else {
-                        return Err(BufferWriteError::new(
-                            WriteError::SequenceConflict,
-                            reply_sender,
-                        ));
-                    }
-                }
-            }
-        } else if expected_next_sequence < self.next_expected_seq {
-            return Err(BufferWriteError::new(WriteError::StaleWrite, reply_sender));
-        }
-
-        if self.buffered_writes.len() >= self.buffer_size
-            && let Some(last_entry) = self.buffered_writes.last_entry()
-        {
-            if last_entry.key() > &expected_next_sequence {
-                debug!(
-                    "evicting buffered write seq {} to make room for seq {}",
-                    last_entry.key(),
-                    expected_next_sequence
-                );
-                for tx in last_entry.remove().reply_senders {
-                    tx.send(Err(WriteError::BufferEvicted));
-                }
-            } else {
-                return Err(BufferWriteError::new(WriteError::BufferFull, reply_sender));
-            }
-        }
-
-        match self.buffered_writes.entry(expected_next_sequence) {
-            Entry::Vacant(entry) => {
-                entry.insert(BufferedWrite::new(tx, reply_sender));
-                Ok(None)
-            }
-            Entry::Occupied(mut entry) => {
-                if entry.get().tx.transaction_id() == tx.transaction_id() {
-                    debug_assert_eq!(entry.get().tx, tx);
+        match self.buffered_writes.insert(
+            expected_next_sequence,
+            BufferedWrite::new(coordinator_ref, tx, reply_sender),
+        ) {
+            Ok(insert) => {
+                if let Some((evicted_seq, evicted_write)) = insert.evicted {
                     debug!(
-                        "received duplicate write for partition {} sequence {expected_next_sequence}",
-                        self.partition_id
+                        "evicting buffered write seq {evicted_seq} to make room for seq {expected_next_sequence}",
                     );
-                    if let Some(tx) = reply_sender {
-                        entry.get_mut().reply_senders.push(tx);
+                    for reply in evicted_write
+                        .garbage_collected(self.buffer_timeout)
+                        .map(|buffered_write| buffered_write.reply_senders)
+                        .unwrap_or_default()
+                    {
+                        reply.tx.send(Err(WriteError::BufferEvicted));
                     }
-                    Ok(None) // Already buffered, treat as successful no-op
-                } else {
-                    // CONFLICT: Different transaction with same sequence
-                    Err(BufferWriteError::new(
-                        WriteError::SequenceConflict,
-                        reply_sender,
-                    ))
                 }
+
+                Ok(insert
+                    .next
+                    .and_then(|write| write.garbage_collected(self.buffer_timeout)))
             }
+            Err(err) => match err {
+                ordered_queue::Error::Conflict { value } => Err(BufferWriteError::new(
+                    WriteError::SequenceConflict,
+                    value.reply_senders.into_iter().next().map(|reply| reply.tx),
+                )),
+                ordered_queue::Error::Full { key: _, value } => Err(BufferWriteError::new(
+                    WriteError::BufferFull,
+                    value.reply_senders.into_iter().next().map(|reply| reply.tx),
+                )),
+                ordered_queue::Error::Stale { key: _, value } => Err(BufferWriteError::new(
+                    WriteError::StaleWrite,
+                    value.reply_senders.into_iter().next().map(|reply| reply.tx),
+                )),
+            },
         }
     }
 
     fn pop_next_buffered_write(&mut self) -> Option<BufferedWrite> {
-        self.buffered_writes.remove(&self.next_expected_seq)
-    }
-}
-
-fn is_sequence_in_catch_up_range(catch_up_ranges: &BTreeMap<u64, u64>, seq: u64) -> bool {
-    for (start, end) in catch_up_ranges {
-        if &seq >= start && &seq <= end {
-            return true;
+        while let Some(mut write) = self.buffered_writes.pop() {
+            if write.garbage_collect(self.buffer_timeout) {
+                return Some(write);
+            }
         }
+
+        None
     }
-    false
+
+    async fn write_buffered(&mut self, write: BufferedWrite) -> Result<AppendResult, WriteError> {
+        let res = self.write_transaction(write.tx).await;
+
+        for reply in write.reply_senders {
+            reply.tx.send(res.clone());
+        }
+
+        res
+    }
+
+    async fn write_transaction(&mut self, tx: Transaction) -> Result<AppendResult, WriteError> {
+        let res = self
+            .database
+            .append_events(tx)
+            .await
+            .map_err(|err| match err {
+                sierradb::error::WriteError::WrongExpectedSequence {
+                    current, expected, ..
+                } => WriteError::WrongExpectedSequence { current, expected },
+                err => WriteError::DatabaseOperationFailed(err.to_string()),
+            });
+
+        match &res {
+            Ok(append) => {
+                debug!(
+                    "successfully wrote partition {} sequences {}-{}",
+                    append.first_partition_sequence,
+                    append.last_partition_sequence,
+                    self.partition_id
+                );
+                self.buffered_writes
+                    .progress_to(append.last_partition_sequence + 1);
+            }
+            Err(err) => {
+                error!("failed to replicate write: {err}");
+            }
+        }
+
+        res
+    }
 }
 
 #[derive(Debug)]
@@ -348,40 +333,67 @@ impl BufferWriteError {
     }
 }
 
+#[derive(Debug)]
 struct BufferedWrite {
+    coordinator_ref: RemoteActorRef<ClusterActor>,
     tx: Transaction,
-    reply_senders: SmallVec<[ReplySender<Result<AppendResult, WriteError>>; 4]>,
+    reply_senders: SmallVec<[ReplySenderTimed; 4]>,
+}
+
+#[derive(Debug)]
+struct ReplySenderTimed {
+    tx: ReplySender<Result<AppendResult, WriteError>>,
     received_at: Instant,
+}
+
+impl ReplySenderTimed {
+    pub fn new(tx: ReplySender<Result<AppendResult, WriteError>>) -> Self {
+        ReplySenderTimed {
+            tx,
+            received_at: Instant::now(),
+        }
+    }
 }
 
 impl BufferedWrite {
     fn new(
+        coordinator_ref: RemoteActorRef<ClusterActor>,
         tx: Transaction,
         reply_sender: Option<ReplySender<Result<AppendResult, WriteError>>>,
     ) -> Self {
         BufferedWrite {
+            coordinator_ref,
             tx,
-            reply_senders: reply_sender.map(|tx| smallvec![tx]).unwrap_or_default(),
-            received_at: Instant::now(),
+            reply_senders: reply_sender
+                .map(|tx| smallvec![ReplySenderTimed::new(tx)])
+                .unwrap_or_default(),
         }
     }
 
-    fn new_with_merged_reply_senders(
-        tx: Transaction,
-        mut reply_senders: SmallVec<[ReplySender<Result<AppendResult, WriteError>>; 4]>,
-        reply_sender: Option<ReplySender<Result<AppendResult, WriteError>>>,
-    ) -> Self {
-        BufferedWrite {
-            tx,
-            reply_senders: match reply_sender {
-                Some(tx) => {
-                    reply_senders.push(tx);
-                    reply_senders
-                }
-                None => reply_senders,
-            },
-            received_at: Instant::now(),
-        }
+    fn garbage_collect(&mut self, buffer_timeout: Duration) -> bool {
+        self.reply_senders
+            .retain(|reply| reply.received_at.elapsed() <= buffer_timeout);
+        !self.reply_senders.is_empty()
+    }
+
+    fn garbage_collected(mut self, buffer_timeout: Duration) -> Option<Self> {
+        self.garbage_collect(buffer_timeout).then_some(self)
+    }
+}
+
+impl OrderedValue for BufferedWrite {
+    fn key_eq(&self, other: &Self) -> bool {
+        self.tx.transaction_id() == other.tx.transaction_id()
+    }
+
+    fn merge(&mut self, new: Self) {
+        self.reply_senders.extend(new.reply_senders);
+    }
+}
+
+impl TimedOrderedValue for BufferedWrite {
+    fn received_at(&self) -> Instant {
+        self.reply_senders.first().unwrap().received_at
     }
 }
 
@@ -397,7 +409,7 @@ pub struct ReplicateWrite {
 impl Message<ReplicateWrite> for ClusterActor {
     type Reply = ForwardedReply<ReplicateWrite, DelegatedReply<Result<AppendResult, WriteError>>>;
 
-    #[instrument(skip(self, ctx))]
+    #[instrument(skip_all, fields(coordinator_ref_id = %msg.coordinator_ref.id(), transaction_id = %msg.transaction.transaction_id(), events = msg.transaction.events().len()))]
     async fn handle(
         &mut self,
         msg: ReplicateWrite,
@@ -438,7 +450,7 @@ impl Message<ReplicateWrite> for ClusterActor {
 impl Message<ReplicateWrite> for PartitionReplicatorActor {
     type Reply = DelegatedReply<Result<AppendResult, WriteError>>;
 
-    #[instrument(skip(self, ctx))]
+    #[instrument(skip_all, fields(coordinator_ref_id = %msg.coordinator_ref.id(), transaction_id = %msg.transaction.transaction_id(), events = msg.transaction.events().len()))]
     async fn handle(
         &mut self,
         msg: ReplicateWrite,
@@ -446,79 +458,30 @@ impl Message<ReplicateWrite> for PartitionReplicatorActor {
     ) -> Self::Reply {
         let (delegated_reply, reply_sender) = ctx.reply_sender();
 
-        let mut next_write = match self.buffer_write(msg.transaction, reply_sender) {
-            Ok(Some(write)) => Some(write),
-            Ok(None) => self.pop_next_buffered_write(),
-            Err(BufferWriteError {
-                error,
-                reply_sender,
-            }) => {
-                if let Some(tx) = reply_sender {
-                    tx.send(Err(error));
-                } else {
-                    error!("{error}");
-                }
+        let mut next_write =
+            match self.buffer_write(msg.coordinator_ref, msg.transaction, reply_sender) {
+                Ok(Some(write)) => Some(write),
+                Ok(None) => self.pop_next_buffered_write(),
+                Err(BufferWriteError {
+                    error,
+                    reply_sender,
+                }) => {
+                    if let Some(tx) = reply_sender {
+                        tx.send(Err(error));
+                    } else {
+                        error!("{error}");
+                    }
 
-                return delegated_reply;
-            }
-        };
+                    return delegated_reply;
+                }
+            };
 
         while let Some(write) = next_write {
-            let res = self.database.append_events(write.tx).await.map_err(|err| {
-                match err {
-                    sierradb::error::WriteError::WrongExpectedSequence {
-                        current,
-                        expected,
-                        ..
-                    } => {
-                        match expected.gap_from(current) {
-                            VersionGap::None => {}
-                            VersionGap::Ahead(_) => {
-                                // Duplicate/already processed
-                            }
-                            VersionGap::Behind(_) => {
-                                // Gap detected, need catchup
-                            }
-                            VersionGap::Incompatible => {
-                                unreachable!(
-                                    "we verified the transaction has a valid expected sequence"
-                                )
-                            }
-                        }
-
-                        WriteError::WrongExpectedSequence { current, expected }
-                    }
-                    err => WriteError::DatabaseOperationFailed(err.to_string()),
-                }
-            });
-
-            let seq_range = res
-                .as_ref()
-                .map(|append| {
-                    (
-                        append.first_partition_sequence,
-                        append.last_partition_sequence,
-                    )
-                })
-                .ok();
-
-            for (res, tx) in iter::repeat_n(res, write.reply_senders.len()).zip(write.reply_senders)
-            {
-                tx.send(res);
-            }
-
-            match seq_range {
-                Some((first, last)) => {
-                    debug!(
-                        "successfully wrote partition {} sequences {first}-{last}",
-                        self.partition_id
-                    );
-
-                    assert_eq!(self.next_expected_seq, first);
-                    self.next_expected_seq = last + 1;
+            match self.write_buffered(write).await {
+                Ok(_) => {
                     next_write = self.pop_next_buffered_write();
                 }
-                None => break,
+                Err(_) => break,
             }
         }
 
@@ -526,500 +489,683 @@ impl Message<ReplicateWrite> for PartitionReplicatorActor {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::{
-        collections::{BTreeMap, HashSet},
-        time::Duration,
-    };
+#[derive(Clone, Serialize, Deserialize)]
+struct PartitionSyncRequest {
+    partition_id: PartitionId,
+    from_seq: u64,
+    to_seq: u64,
+}
 
-    use kameo::{
-        Actor,
-        prelude::{Context, Message},
-        reply::{DelegatedReply, ReplySender},
-    };
-    use sierradb::{
-        StreamId,
-        bucket::PartitionId,
-        database::{
-            Database, DatabaseBuilder, ExpectedVersion, NewEvent, PartitionLatestSequence,
-            Transaction,
-        },
-        id::{uuid_to_partition_hash, uuid_v7_with_partition_hash},
-        writer_thread_pool::AppendResult,
-    };
-    use smallvec::smallvec;
-    use tempfile::tempdir;
-    use tokio::sync::oneshot;
-    use uuid::Uuid;
+#[remote_message("9b26d88a-4467-432b-a308-c1279b317b73")]
+impl Message<PartitionSyncRequest> for ClusterActor {
+    type Reply = DelegatedReply<Result<Vec<CommittedEvents>, ClusterError>>;
 
-    use crate::write::{
-        error::WriteError,
-        replicate::{BufferWriteError, PartitionReplicatorActor},
-    };
-
-    async fn create_temp_db() -> (tempfile::TempDir, Database) {
-        let temp_dir = tempdir().expect("Failed to create temp directory");
-        let db = DatabaseBuilder::new()
-            .flush_interval_events(1)
-            .writer_threads(2)
-            .reader_threads(2)
-            .total_buckets(4)
-            .bucket_ids_from_range(0..4)
-            .open(temp_dir.path())
-            .expect("Failed to open database");
-        (temp_dir, db)
-    }
-
-    fn create_test_event(
-        partition_key: Uuid,
-        stream_id_str: &str,
-        version: ExpectedVersion,
-    ) -> NewEvent {
-        NewEvent {
-            event_id: uuid_v7_with_partition_hash(uuid_to_partition_hash(partition_key)),
-            stream_id: StreamId::new(stream_id_str).expect("Invalid stream ID"),
-            stream_version: version,
-            event_name: "test_event".to_string(),
-            timestamp: 12345678,     // Fixed timestamp for testing
-            metadata: vec![1, 2, 3], // Some test metadata
-            payload: b"test payload".to_vec(),
-        }
-    }
-
-    fn create_test_transaction(expected_sequence: ExpectedVersion) -> Transaction {
-        let partition_key = Uuid::new_v4();
-        Transaction::new(
-            partition_key,
-            1,
-            smallvec![create_test_event(
-                partition_key,
-                "hii",
-                ExpectedVersion::Any
-            )],
-        )
-        .unwrap()
-        .expected_partition_sequence(expected_sequence)
-    }
-
-    async fn setup_partition_replicator(
-        partition_id: PartitionId,
-        database: Database,
-        next_expected_seq: Option<u64>,
-    ) -> PartitionReplicatorActor {
-        let next_expected_seq = match next_expected_seq {
-            Some(n) => n,
-            None => match database.get_partition_sequence(partition_id).await.unwrap() {
-                Some(PartitionLatestSequence::LatestSequence { sequence, .. }) => sequence + 1,
-                Some(PartitionLatestSequence::ExternalBucket { .. }) => {
-                    todo!()
-                }
-                None => 0,
-            },
+    async fn handle(
+        &mut self,
+        msg: PartitionSyncRequest,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let db = self.database.clone();
+        let Some(watermark) = self.watermarks.get(&msg.partition_id).map(|w| w.get()) else {
+            return ctx.reply(Ok(vec![]));
         };
 
-        PartitionReplicatorActor {
-            partition_id,
-            database,
-            next_expected_seq,
-            buffered_writes: BTreeMap::new(),
-            buffer_size: 100,
-            buffer_timeout: Duration::from_secs(10),
-            gap_detection_timeout: Duration::from_secs(10),
-            gc_interval: tokio::time::interval(Duration::from_secs(10)),
-        }
-    }
+        ctx.spawn(async move {
+            let mut iter = db
+                .read_partition(msg.partition_id, msg.from_seq)
+                .await
+                .map_err(|err| ClusterError::Read(err.to_string()))?;
+            let mut commits = Vec::new();
+            while let Some(commit) = iter
+                .next(false)
+                .await
+                .map_err(|err| ClusterError::Read(err.to_string()))?
+            {
+                let Some(first_seq) = commit.first_partition_sequence() else {
+                    error!("found commit with zero events - this should not happen");
+                    continue;
+                };
+                if first_seq > watermark {
+                    break;
+                }
 
-    async fn new_reply_sender() -> ReplySender<Result<AppendResult, WriteError>> {
-        #[derive(Actor)]
-        struct ReplySenderObtainer;
+                debug_assert!(
+                    commit.last_partition_sequence().unwrap() <= watermark,
+                    "if the first events partition sequence is valid, then so should the last"
+                );
 
-        struct ObtainReplySender(oneshot::Sender<ReplySender<Result<AppendResult, WriteError>>>);
-
-        impl Message<ObtainReplySender> for ReplySenderObtainer {
-            type Reply = DelegatedReply<Result<AppendResult, WriteError>>;
-
-            async fn handle(
-                &mut self,
-                msg: ObtainReplySender,
-                ctx: &mut Context<Self, Self::Reply>,
-            ) -> Self::Reply {
-                let (delegated_reply, reply_sender) = ctx.reply_sender();
-                let _ = msg.0.send(reply_sender.unwrap());
-                delegated_reply
+                match commit {
+                    CommittedEvents::Single(ref event) => {
+                        if event.partition_sequence <= msg.to_seq {
+                            commits.push(commit);
+                        } else {
+                            break;
+                        }
+                    }
+                    CommittedEvents::Transaction { ref events, .. } => {
+                        if let Some(first_event) = events.first() {
+                            if first_event.partition_sequence <= msg.to_seq {
+                                commits.push(commit);
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
             }
-        }
 
-        let obtainer_ref = ReplySenderObtainer::spawn(ReplySenderObtainer);
-        let (reply_tx, reply_rx) = oneshot::channel();
-        #[allow(clippy::let_underscore_future)]
-        let _ = obtainer_ref
-            .ask(ObtainReplySender(reply_tx))
-            .enqueue()
-            .await
-            .unwrap();
-        reply_rx.await.unwrap()
-    }
-
-    #[tokio::test]
-    async fn test_sequential_write_immediate_processing() {
-        let (_temp_dir, db) = create_temp_db().await;
-        let mut replicator = setup_partition_replicator(1, db, None).await;
-
-        let reply_sender = new_reply_sender().await;
-        let tx = create_test_transaction(ExpectedVersion::Empty);
-        let result = replicator.buffer_write(tx, Some(reply_sender));
-
-        assert!(matches!(result, Ok(Some(_))));
-        assert_eq!(replicator.buffered_writes.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_out_of_order_write_buffering() {
-        let (_temp_dir, db) = create_temp_db().await;
-        let mut replicator = setup_partition_replicator(1, db, Some(5)).await;
-
-        let reply_sender = new_reply_sender().await;
-        let tx = create_test_transaction(ExpectedVersion::Exact(7));
-        let result = replicator.buffer_write(tx, Some(reply_sender));
-
-        assert!(matches!(result, Ok(None)));
-        assert_eq!(replicator.buffered_writes.len(), 1);
-        assert!(replicator.buffered_writes.contains_key(&8));
-    }
-
-    #[tokio::test]
-    async fn test_stale_write_rejection() {
-        let (_temp_dir, db) = create_temp_db().await;
-        let mut replicator = setup_partition_replicator(1, db, Some(10)).await;
-
-        let reply_sender = new_reply_sender().await;
-        let tx = create_test_transaction(ExpectedVersion::Exact(5));
-        let result = replicator.buffer_write(tx, Some(reply_sender));
-
-        assert!(matches!(
-            result,
-            Err(BufferWriteError {
-                error: WriteError::StaleWrite,
-                reply_sender: Some(_)
-            })
-        ));
-        assert_eq!(replicator.buffered_writes.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_duplicate_write_handling() {
-        let (_temp_dir, db) = create_temp_db().await;
-        let mut replicator = setup_partition_replicator(1, db, Some(5)).await;
-
-        let tx = create_test_transaction(ExpectedVersion::Exact(7));
-
-        // First write
-        let reply_sender = new_reply_sender().await;
-        let result1 = replicator.buffer_write(tx.clone(), Some(reply_sender));
-        assert!(matches!(result1, Ok(None)));
-
-        // Duplicate write
-        let reply_sender = new_reply_sender().await;
-        let result2 = replicator.buffer_write(tx, Some(reply_sender));
-        assert!(matches!(result2, Ok(None)));
-
-        assert_eq!(replicator.buffered_writes.len(), 1);
-        assert_eq!(
-            replicator
-                .buffered_writes
-                .get(&8)
-                .unwrap()
-                .reply_senders
-                .len(),
-            2
-        );
-    }
-
-    #[tokio::test]
-    async fn test_sequence_conflict() {
-        let (_temp_dir, db) = create_temp_db().await;
-        let mut replicator = setup_partition_replicator(1, db, Some(5)).await;
-
-        let tx1 = create_test_transaction(ExpectedVersion::Exact(7));
-        let tx2 = create_test_transaction(ExpectedVersion::Exact(7));
-
-        // First write
-        let reply_sender = new_reply_sender().await;
-        let result1 = replicator.buffer_write(tx1, Some(reply_sender));
-        assert!(matches!(result1, Ok(None)));
-
-        // Conflicting write
-        let reply_sender = new_reply_sender().await;
-        let result2 = replicator.buffer_write(tx2, Some(reply_sender));
-        assert!(matches!(
-            result2,
-            Err(BufferWriteError {
-                error: WriteError::SequenceConflict,
-                reply_sender: Some(_)
-            })
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_buffer_size_limit_with_eviction() {
-        let (_temp_dir, db) = create_temp_db().await;
-        let mut replicator = setup_partition_replicator(1, db, Some(5)).await;
-        replicator.buffer_size = 2;
-
-        // Fill buffer to capacity
-        let reply_sender = new_reply_sender().await;
-        let tx = create_test_transaction(ExpectedVersion::Exact(7));
-        replicator.buffer_write(tx, Some(reply_sender)).unwrap();
-
-        let reply_sender = new_reply_sender().await;
-        let tx = create_test_transaction(ExpectedVersion::Exact(8));
-        replicator.buffer_write(tx, Some(reply_sender)).unwrap();
-
-        assert_eq!(replicator.buffered_writes.len(), 2);
-
-        // Add lower sequence - should evict highest
-        let reply_sender = new_reply_sender().await;
-        let tx = create_test_transaction(ExpectedVersion::Exact(6));
-        let result = replicator.buffer_write(tx, Some(reply_sender));
-        assert!(matches!(result, Ok(None)));
-
-        // Should have evicted sequence 8
-        assert_eq!(replicator.buffered_writes.len(), 2);
-        assert!(replicator.buffered_writes.contains_key(&7));
-        assert!(replicator.buffered_writes.contains_key(&8));
-        assert!(!replicator.buffered_writes.contains_key(&9));
-    }
-
-    #[tokio::test]
-    async fn test_buffer_size_limit_rejection() {
-        let (_temp_dir, db) = create_temp_db().await;
-        let mut replicator = setup_partition_replicator(1, db, Some(5)).await;
-        replicator.buffer_size = 2;
-
-        // Fill buffer with lower sequences
-        let reply_sender = new_reply_sender().await;
-        let tx = create_test_transaction(ExpectedVersion::Exact(7));
-        replicator.buffer_write(tx, Some(reply_sender)).unwrap();
-
-        let reply_sender = new_reply_sender().await;
-        let tx = create_test_transaction(ExpectedVersion::Exact(8));
-        replicator.buffer_write(tx, Some(reply_sender)).unwrap();
-
-        // Try to add higher sequence - should be rejected
-        let reply_sender = new_reply_sender().await;
-        let tx = create_test_transaction(ExpectedVersion::Exact(10));
-        let result = replicator.buffer_write(tx, Some(reply_sender));
-
-        assert!(matches!(
-            result,
-            Err(BufferWriteError {
-                error: WriteError::BufferFull,
-                reply_sender: Some(_)
-            })
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_pop_next_buffered_write() {
-        let (_temp_dir, db) = create_temp_db().await;
-        let mut replicator = setup_partition_replicator(1, db, Some(5)).await;
-
-        // Buffer some writes
-        let reply_sender = new_reply_sender().await;
-        let tx = create_test_transaction(ExpectedVersion::Exact(6));
-        replicator.buffer_write(tx, Some(reply_sender)).unwrap();
-
-        let reply_sender = new_reply_sender().await;
-        let tx = create_test_transaction(ExpectedVersion::Exact(5));
-        replicator.buffer_write(tx, Some(reply_sender)).unwrap();
-
-        let reply_sender = new_reply_sender().await;
-        let tx = create_test_transaction(ExpectedVersion::Exact(4));
-        replicator.buffer_write(tx, Some(reply_sender)).unwrap();
-
-        // Advance to 6
-        replicator.next_expected_seq += 1;
-        let popped = replicator.pop_next_buffered_write();
-        assert!(popped.is_some());
-        assert_eq!(
-            popped.unwrap().tx.get_expected_partition_sequence(),
-            ExpectedVersion::Exact(5)
-        );
-
-        // Advance to 7
-        replicator.next_expected_seq += 1;
-        let popped = replicator.pop_next_buffered_write();
-        assert!(popped.is_some());
-        assert_eq!(
-            popped.unwrap().tx.get_expected_partition_sequence(),
-            ExpectedVersion::Exact(6)
-        );
-
-        // No more writes
-        replicator.next_expected_seq += 1;
-        let popped = replicator.pop_next_buffered_write();
-        assert!(popped.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_immediate_processing_with_duplicate() {
-        let (_temp_dir, db) = create_temp_db().await;
-        let mut replicator = setup_partition_replicator(1, db, Some(5)).await;
-
-        let tx = create_test_transaction(ExpectedVersion::Exact(5));
-
-        // First write at next expected sequence
-        let reply_sender = new_reply_sender().await;
-        let result1 = replicator.buffer_write(tx.clone(), Some(reply_sender));
-
-        // Should be buffered
-        assert!(matches!(result1, Ok(None)));
-
-        // Duplicate of same transaction
-        replicator.next_expected_seq += 1;
-        let reply_sender = new_reply_sender().await;
-        let result2 = replicator.buffer_write(tx, Some(reply_sender));
-
-        // Should merge reply senders and return merged write
-        assert!(matches!(result2, Ok(Some(_))));
-        if let Ok(Some(merged_write)) = result2 {
-            assert_eq!(merged_write.reply_senders.len(), 2);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_complex_buffering_scenario() {
-        let (_temp_dir, db) = create_temp_db().await;
-        let mut replicator = setup_partition_replicator(1, db, Some(11)).await;
-
-        // Add writes: 12, 15, 11, 13, 10 (10 should be immediate)
-        let sequences = vec![12, 15, 11, 13, 10];
-        let mut immediate_count = 0;
-
-        for seq in sequences {
-            let tx = create_test_transaction(ExpectedVersion::Exact(seq));
-            let reply_sender = new_reply_sender().await;
-            match replicator.buffer_write(tx, Some(reply_sender)) {
-                Ok(Some(_)) => immediate_count += 1,
-                Ok(None) => {}
-                Err(err) => panic!("Unexpected error: {err:?}"),
-            }
-        }
-
-        assert_eq!(immediate_count, 1); // Only sequence 10
-        assert_eq!(replicator.buffered_writes.len(), 4); // 11, 12, 13, 15
-
-        // Process in order
-        replicator.next_expected_seq += 1; // Now expecting 11
-        let next = replicator.pop_next_buffered_write();
-        assert!(next.is_some());
-        assert_eq!(
-            next.unwrap().tx.get_expected_partition_sequence(),
-            ExpectedVersion::Exact(11)
-        );
-
-        replicator.next_expected_seq += 1; // Now expecting 12
-        let next = replicator.pop_next_buffered_write();
-        assert_eq!(
-            next.unwrap().tx.get_expected_partition_sequence(),
-            ExpectedVersion::Exact(12)
-        );
-
-        replicator.next_expected_seq += 1; // Now expecting 13
-        let next = replicator.pop_next_buffered_write();
-        assert_eq!(
-            next.unwrap().tx.get_expected_partition_sequence(),
-            ExpectedVersion::Exact(13)
-        );
-
-        replicator.next_expected_seq += 1; // Now expecting 14
-        let next = replicator.pop_next_buffered_write();
-        assert!(next.is_none()); // Gap at 14
-
-        // Add 14
-        let tx = create_test_transaction(ExpectedVersion::Exact(14));
-        let reply_sender = new_reply_sender().await;
-        replicator.buffer_write(tx, Some(reply_sender)).unwrap();
-
-        replicator.next_expected_seq += 1; // Now expecting 15
-        let next = replicator.pop_next_buffered_write();
-        assert!(next.is_some());
-
-        assert_eq!(replicator.buffered_writes.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_garbage_collection() {
-        let (_temp_dir, db) = create_temp_db().await;
-        let mut replicator = setup_partition_replicator(1, db, Some(5)).await;
-        replicator.buffer_timeout = Duration::from_millis(1); // Very short timeout
-
-        // Add a write
-        let reply_sender = new_reply_sender().await;
-        let tx = create_test_transaction(ExpectedVersion::Exact(7));
-        replicator.buffer_write(tx, Some(reply_sender)).unwrap();
-        assert_eq!(replicator.buffered_writes.len(), 1);
-
-        // Wait for timeout
-        std::thread::sleep(Duration::from_millis(2));
-
-        // Garbage collect
-        replicator.garbage_collect();
-        assert_eq!(replicator.buffered_writes.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_reply_sender_merging() {
-        let (_temp_dir, db) = create_temp_db().await;
-        let mut replicator = setup_partition_replicator(1, db, Some(5)).await;
-
-        let tx = create_test_transaction(ExpectedVersion::Exact(6));
-
-        // First write
-        let reply_sender = new_reply_sender().await;
-        replicator
-            .buffer_write(tx.clone(), Some(reply_sender))
-            .unwrap();
-
-        // Duplicate with different reply sender
-        let reply_sender = new_reply_sender().await;
-        replicator.buffer_write(tx, Some(reply_sender)).unwrap();
-
-        // Check that reply senders were merged
-        let buffered = replicator.buffered_writes.get(&7).unwrap();
-        dbg!(&buffered.reply_senders);
-        assert_eq!(buffered.reply_senders.len(), 2);
-    }
-
-    // // ==========================================
-    // // Property-Based Tests
-    // // ==========================================
-
-    #[tokio::test]
-    async fn test_buffer_invariants() {
-        let (_temp_dir, db) = create_temp_db().await;
-        let mut replicator = setup_partition_replicator(1, db, Some(0)).await;
-        replicator.buffer_size = 100;
-
-        // Add 1000 random writes
-        for i in 0..1000 {
-            let seq = (i * 17 + 7) % 200; // Generate pseudo-random but deterministic sequences
-            let tx = create_test_transaction(ExpectedVersion::Exact(seq));
-            let reply_sender = new_reply_sender().await;
-            let _ = replicator.buffer_write(tx.clone(), Some(reply_sender));
-        }
-
-        // Verify buffer size constraint
-        assert!(replicator.buffered_writes.len() <= 100);
-
-        // Verify all buffered sequences are >= next_expected_seq
-        for &seq in replicator.buffered_writes.keys() {
-            assert!(seq >= replicator.next_expected_seq);
-        }
-
-        // Verify no duplicates (BTreeMap guarantees this, but good to verify)
-        let unique_sequences: HashSet<_> = replicator.buffered_writes.keys().collect();
-        assert_eq!(unique_sequences.len(), replicator.buffered_writes.len());
+            Ok(commits)
+        })
     }
 }
+
+struct PartitionSyncResponse {
+    result: Result<Vec<CommittedEvents>, failsafe::Error<RemoteSendError<ClusterError>>>,
+}
+
+impl Message<PartitionSyncResponse> for PartitionReplicatorActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        PartitionSyncResponse { result }: PartitionSyncResponse,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.catching_up = false;
+
+        match result {
+            Ok(commits) => {
+                for commit in commits {
+                    let Some(first) = commit.first() else {
+                        warn!("partition sync response returned commit with no events");
+                        continue;
+                    };
+
+                    let tx_id = *commit.transaction_id();
+                    let confirmation_count = commit.confirmation_count();
+                    let tx = Transaction::new(
+                        first.partition_key,
+                        first.partition_id,
+                        commit
+                            .into_iter()
+                            .map(|event| NewEvent {
+                                event_id: event.event_id,
+                                stream_id: event.stream_id,
+                                stream_version: ExpectedVersion::from_next_version(
+                                    event.stream_version,
+                                ),
+                                event_name: event.event_name,
+                                timestamp: event.timestamp,
+                                metadata: event.metadata,
+                                payload: event.payload,
+                            })
+                            .collect(),
+                    )
+                    .unwrap()
+                    .with_transaction_id(tx_id)
+                    .with_confirmation_count(confirmation_count);
+                    match self.write_transaction(tx).await {
+                        Ok(append) => {
+                            debug!(
+                                "appended {} events for partition {} from sequence {} to {}",
+                                append.offsets.len(),
+                                self.partition_id,
+                                append.first_partition_sequence,
+                                append.last_partition_sequence
+                            );
+                        }
+                        Err(err) => {
+                            error!("partition sync append events failed: {err}");
+                            self.buffered_writes.update_timeout();
+                            return;
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                error!("partition sync failed: {err}");
+                self.buffered_writes.update_timeout();
+                return;
+            }
+        }
+
+        while let Some(write) = self.pop_next_buffered_write() {
+            match self.write_buffered(write).await {
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+
+        self.buffered_writes.update_timeout();
+    }
+}
+
+// #[cfg(test)]
+// mod tests {
+//     use std::{
+//         collections::{BTreeMap, HashSet},
+//         time::Duration,
+//     };
+
+//     use kameo::{
+//         Actor,
+//         actor::RemoteActorRef,
+//         prelude::{Context, Message},
+//         reply::{DelegatedReply, ReplySender},
+//     };
+//     use sierradb::{
+//         StreamId,
+//         bucket::PartitionId,
+//         database::{
+//             Database, DatabaseBuilder, ExpectedVersion, NewEvent,
+// PartitionLatestSequence,             Transaction,
+//         },
+//         id::{uuid_to_partition_hash, uuid_v7_with_partition_hash},
+//         writer_thread_pool::AppendResult,
+//     };
+//     use smallvec::smallvec;
+//     use tempfile::tempdir;
+//     use tokio::sync::oneshot;
+//     use uuid::Uuid;
+
+//     use crate::{
+//         ClusterActor,
+//         write::{
+//             error::WriteError,
+//             replicate::{BufferWriteError, PartitionReplicatorActor},
+//         },
+//     };
+
+//     async fn create_temp_db() -> (tempfile::TempDir, Database) {
+//         let temp_dir = tempdir().expect("failed to create temp directory");
+//         let db = DatabaseBuilder::new()
+//             .flush_interval_events(1)
+//             .writer_threads(2)
+//             .reader_threads(2)
+//             .total_buckets(4)
+//             .bucket_ids_from_range(0..4)
+//             .open(temp_dir.path())
+//             .expect("failed to open database");
+//         (temp_dir, db)
+//     }
+
+//     fn create_test_event(
+//         partition_key: Uuid,
+//         stream_id_str: &str,
+//         version: ExpectedVersion,
+//     ) -> NewEvent {
+//         NewEvent {
+//             event_id:
+// uuid_v7_with_partition_hash(uuid_to_partition_hash(partition_key)),
+//             stream_id: StreamId::new(stream_id_str).expect("invalid stream
+// ID"),             stream_version: version,
+//             event_name: "test_event".to_string(),
+//             timestamp: 12345678,     // Fixed timestamp for testing
+//             metadata: vec![1, 2, 3], // Some test metadata
+//             payload: b"test payload".to_vec(),
+//         }
+//     }
+
+//     fn create_test_transaction(expected_sequence: ExpectedVersion) ->
+// Transaction {         let partition_key = Uuid::new_v4();
+//         Transaction::new(
+//             partition_key,
+//             1,
+//             smallvec![create_test_event(
+//                 partition_key,
+//                 "hii",
+//                 ExpectedVersion::Any
+//             )],
+//         )
+//         .unwrap()
+//         .expected_partition_sequence(expected_sequence)
+//     }
+
+//     async fn setup_partition_replicator(
+//         partition_id: PartitionId,
+//         database: Database,
+//         next_expected_seq: Option<u64>,
+//     ) -> PartitionReplicatorActor {
+//         let next_expected_seq = match next_expected_seq {
+//             Some(n) => n,
+//             None => match
+// database.get_partition_sequence(partition_id).await.unwrap() {
+// Some(PartitionLatestSequence::LatestSequence { sequence, .. }) => sequence +
+// 1,                 Some(PartitionLatestSequence::ExternalBucket { .. }) => {
+//                     todo!()
+//                 }
+//                 None => 0,
+//             },
+//         };
+
+//         PartitionReplicatorActor {
+//             partition_id,
+//             database,
+//             next_expected_seq,
+//             buffered_writes: BTreeMap::new(),
+//             buffer_timeout: Duration::from_secs(10),
+//             catchup_timeout: Duration::from_secs(10),
+//             catchup_ranges: BTreeMap::new(),
+//             next_catchup_seq: u64::MAX,
+//             next_catchup_timeout:
+// Box::pin(tokio::time::sleep(Duration::MAX)),         }
+//     }
+
+//     async fn setup_coordinator_ref() -> RemoteActorRef<ClusterActor> {
+//         ClusterActor::prepare().actor_ref().into_remote_ref().await
+//     }
+
+//     async fn new_reply_sender() -> ReplySender<Result<AppendResult,
+// WriteError>> {         #[derive(Actor)]
+//         struct ReplySenderObtainer;
+
+//         struct
+// ObtainReplySender(oneshot::Sender<ReplySender<Result<AppendResult,
+// WriteError>>>);
+
+//         impl Message<ObtainReplySender> for ReplySenderObtainer {
+//             type Reply = DelegatedReply<Result<AppendResult, WriteError>>;
+
+//             async fn handle(
+//                 &mut self,
+//                 msg: ObtainReplySender,
+//                 ctx: &mut Context<Self, Self::Reply>,
+//             ) -> Self::Reply {
+//                 let (delegated_reply, reply_sender) = ctx.reply_sender();
+//                 let _ = msg.0.send(reply_sender.unwrap());
+//                 delegated_reply
+//             }
+//         }
+
+//         let obtainer_ref = ReplySenderObtainer::spawn(ReplySenderObtainer);
+//         let (reply_tx, reply_rx) = oneshot::channel();
+//         #[allow(clippy::let_underscore_future)]
+//         let _ = obtainer_ref
+//             .ask(ObtainReplySender(reply_tx))
+//             .enqueue()
+//             .await
+//             .unwrap();
+//         reply_rx.await.unwrap()
+//     }
+
+//     #[tokio::test]
+//     async fn test_sequential_write_immediate_processing() {
+//         let (_temp_dir, db) = create_temp_db().await;
+//         let mut replicator = setup_partition_replicator(1, db, None).await;
+//         let coordinator_ref = setup_coordinator_ref().await;
+
+//         let reply_sender = new_reply_sender().await;
+//         let tx = create_test_transaction(ExpectedVersion::Empty);
+//         let result = replicator.buffer_write(coordinator_ref, tx,
+// Some(reply_sender));
+
+//         assert!(matches!(result, Ok(Some(_))));
+//         assert_eq!(replicator.buffered_writes.len(), 0);
+//     }
+
+//     #[tokio::test]
+//     async fn test_out_of_order_write_buffering() {
+//         let (_temp_dir, db) = create_temp_db().await;
+//         let mut replicator = setup_partition_replicator(1, db,
+// Some(5)).await;         let coordinator_ref = setup_coordinator_ref().await;
+
+//         let reply_sender = new_reply_sender().await;
+//         let tx = create_test_transaction(ExpectedVersion::Exact(7));
+//         let result = replicator.buffer_write(coordinator_ref, tx,
+// Some(reply_sender));
+
+//         assert!(matches!(result, Ok(None)));
+//         assert_eq!(replicator.buffered_writes.len(), 1);
+//         assert!(replicator.buffered_writes.contains_key(&8));
+//     }
+
+//     #[tokio::test]
+//     async fn test_stale_write_rejection() {
+//         let (_temp_dir, db) = create_temp_db().await;
+//         let mut replicator = setup_partition_replicator(1, db,
+// Some(10)).await;         let coordinator_ref = setup_coordinator_ref().await;
+
+//         let reply_sender = new_reply_sender().await;
+//         let tx = create_test_transaction(ExpectedVersion::Exact(5));
+//         let result = replicator.buffer_write(coordinator_ref, tx,
+// Some(reply_sender));
+
+//         assert!(matches!(
+//             result,
+//             Err(BufferWriteError {
+//                 error: WriteError::StaleWrite,
+//                 reply_sender: Some(_)
+//             })
+//         ));
+//         assert_eq!(replicator.buffered_writes.len(), 0);
+//     }
+
+//     #[tokio::test]
+//     async fn test_duplicate_write_handling() {
+//         let (_temp_dir, db) = create_temp_db().await;
+//         let mut replicator = setup_partition_replicator(1, db,
+// Some(5)).await;         let coordinator_ref = setup_coordinator_ref().await;
+
+//         let tx = create_test_transaction(ExpectedVersion::Exact(7));
+
+//         // First write
+//         let reply_sender = new_reply_sender().await;
+//         let result1 =
+//             replicator.buffer_write(coordinator_ref.clone(), tx.clone(),
+// Some(reply_sender));         assert!(matches!(result1, Ok(None)));
+
+//         // Duplicate write
+//         let reply_sender = new_reply_sender().await;
+//         let result2 = replicator.buffer_write(coordinator_ref, tx,
+// Some(reply_sender));         assert!(matches!(result2, Ok(None)));
+
+//         assert_eq!(replicator.buffered_writes.len(), 1);
+//         assert_eq!(
+//             replicator
+//                 .buffered_writes
+//                 .get(&8)
+//                 .unwrap()
+//                 .reply_senders
+//                 .len(),
+//             2
+//         );
+//     }
+
+//     #[tokio::test]
+//     async fn test_sequence_conflict() {
+//         let (_temp_dir, db) = create_temp_db().await;
+//         let mut replicator = setup_partition_replicator(1, db,
+// Some(5)).await;         let coordinator_ref = setup_coordinator_ref().await;
+
+//         let tx1 = create_test_transaction(ExpectedVersion::Exact(7));
+//         let tx2 = create_test_transaction(ExpectedVersion::Exact(7));
+
+//         // First write
+//         let reply_sender = new_reply_sender().await;
+//         let result1 = replicator.buffer_write(coordinator_ref.clone(), tx1,
+// Some(reply_sender));         assert!(matches!(result1, Ok(None)));
+
+//         // Conflicting write
+//         let reply_sender = new_reply_sender().await;
+//         let result2 = replicator.buffer_write(coordinator_ref, tx2,
+// Some(reply_sender));         assert!(matches!(
+//             result2,
+//             Err(BufferWriteError {
+//                 error: WriteError::SequenceConflict,
+//                 reply_sender: Some(_)
+//             })
+//         ));
+//     }
+
+//     #[tokio::test]
+//     async fn test_buffer_size_limit_with_eviction() {
+//         let (_temp_dir, db) = create_temp_db().await;
+//         let mut replicator = setup_partition_replicator(1, db,
+// Some(5)).await;         replicator.buffer_size = 2;
+//         let coordinator_ref = setup_coordinator_ref().await;
+
+//         // Fill buffer to capacity
+//         let reply_sender = new_reply_sender().await;
+//         let tx = create_test_transaction(ExpectedVersion::Exact(7));
+//         replicator
+//             .buffer_write(coordinator_ref.clone(), tx, Some(reply_sender))
+//             .unwrap();
+
+//         let reply_sender = new_reply_sender().await;
+//         let tx = create_test_transaction(ExpectedVersion::Exact(8));
+//         replicator
+//             .buffer_write(coordinator_ref.clone(), tx, Some(reply_sender))
+//             .unwrap();
+
+//         assert_eq!(replicator.buffered_writes.len(), 2);
+
+//         // Add lower sequence - should evict highest
+//         let reply_sender = new_reply_sender().await;
+//         let tx = create_test_transaction(ExpectedVersion::Exact(6));
+//         let result = replicator.buffer_write(coordinator_ref, tx,
+// Some(reply_sender));         assert!(matches!(result, Ok(None)));
+
+//         // Should have evicted sequence 8
+//         assert_eq!(replicator.buffered_writes.len(), 2);
+//         assert!(replicator.buffered_writes.contains_key(&7));
+//         assert!(replicator.buffered_writes.contains_key(&8));
+//         assert!(!replicator.buffered_writes.contains_key(&9));
+//     }
+
+//     #[tokio::test]
+//     async fn test_buffer_size_limit_rejection() {
+//         let (_temp_dir, db) = create_temp_db().await;
+//         let mut replicator = setup_partition_replicator(1, db,
+// Some(5)).await;         replicator.buffer_size = 2;
+//         let coordinator_ref = setup_coordinator_ref().await;
+
+//         // Fill buffer with lower sequences
+//         let reply_sender = new_reply_sender().await;
+//         let tx = create_test_transaction(ExpectedVersion::Exact(7));
+//         replicator
+//             .buffer_write(coordinator_ref.clone(), tx, Some(reply_sender))
+//             .unwrap();
+
+//         let reply_sender = new_reply_sender().await;
+//         let tx = create_test_transaction(ExpectedVersion::Exact(8));
+//         replicator
+//             .buffer_write(coordinator_ref.clone(), tx, Some(reply_sender))
+//             .unwrap();
+
+//         // Try to add higher sequence - should be rejected
+//         let reply_sender = new_reply_sender().await;
+//         let tx = create_test_transaction(ExpectedVersion::Exact(10));
+//         let result = replicator.buffer_write(coordinator_ref, tx,
+// Some(reply_sender));
+
+//         assert!(matches!(
+//             result,
+//             Err(BufferWriteError {
+//                 error: WriteError::BufferFull,
+//                 reply_sender: Some(_)
+//             })
+//         ));
+//     }
+
+//     #[tokio::test]
+//     async fn test_pop_next_buffered_write() {
+//         let (_temp_dir, db) = create_temp_db().await;
+//         let mut replicator = setup_partition_replicator(1, db,
+// Some(5)).await;         let coordinator_ref = setup_coordinator_ref().await;
+
+//         // Buffer some writes
+//         let reply_sender = new_reply_sender().await;
+//         let tx = create_test_transaction(ExpectedVersion::Exact(6));
+//         replicator
+//             .buffer_write(coordinator_ref.clone(), tx, Some(reply_sender))
+//             .unwrap();
+
+//         let reply_sender = new_reply_sender().await;
+//         let tx = create_test_transaction(ExpectedVersion::Exact(5));
+//         replicator
+//             .buffer_write(coordinator_ref.clone(), tx, Some(reply_sender))
+//             .unwrap();
+
+//         let reply_sender = new_reply_sender().await;
+//         let tx = create_test_transaction(ExpectedVersion::Exact(4));
+//         replicator
+//             .buffer_write(coordinator_ref, tx, Some(reply_sender))
+//             .unwrap();
+
+//         // Advance to 6
+//         replicator.next_expected_seq += 1;
+//         let popped = replicator.pop_next_buffered_write();
+//         assert!(popped.is_some());
+//         assert_eq!(
+//             popped.unwrap().tx.get_expected_partition_sequence(),
+//             ExpectedVersion::Exact(5)
+//         );
+
+//         // Advance to 7
+//         replicator.next_expected_seq += 1;
+//         let popped = replicator.pop_next_buffered_write();
+//         assert!(popped.is_some());
+//         assert_eq!(
+//             popped.unwrap().tx.get_expected_partition_sequence(),
+//             ExpectedVersion::Exact(6)
+//         );
+
+//         // No more writes
+//         replicator.next_expected_seq += 1;
+//         let popped = replicator.pop_next_buffered_write();
+//         assert!(popped.is_none());
+//     }
+
+//     #[tokio::test]
+//     async fn test_immediate_processing_with_duplicate() {
+//         let (_temp_dir, db) = create_temp_db().await;
+//         let mut replicator = setup_partition_replicator(1, db,
+// Some(5)).await;         let coordinator_ref = setup_coordinator_ref().await;
+
+//         let tx = create_test_transaction(ExpectedVersion::Exact(5));
+
+//         // First write at next expected sequence
+//         let reply_sender = new_reply_sender().await;
+//         let result1 =
+//             replicator.buffer_write(coordinator_ref.clone(), tx.clone(),
+// Some(reply_sender));
+
+//         // Should be buffered
+//         assert!(matches!(result1, Ok(None)));
+
+//         // Duplicate of same transaction
+//         replicator.next_expected_seq += 1;
+//         let reply_sender = new_reply_sender().await;
+//         let result2 = replicator.buffer_write(coordinator_ref, tx,
+// Some(reply_sender));
+
+//         // Should merge reply senders and return merged write
+//         assert!(matches!(result2, Ok(Some(_))));
+//         if let Ok(Some(merged_write)) = result2 {
+//             assert_eq!(merged_write.reply_senders.len(), 2);
+//         }
+//     }
+
+//     #[tokio::test]
+//     async fn test_complex_buffering_scenario() {
+//         let (_temp_dir, db) = create_temp_db().await;
+//         let mut replicator = setup_partition_replicator(1, db,
+// Some(11)).await;         let coordinator_ref = setup_coordinator_ref().await;
+
+//         // Add writes: 12, 15, 11, 13, 10 (10 should be immediate)
+//         let sequences = vec![12, 15, 11, 13, 10];
+//         let mut immediate_count = 0;
+
+//         for seq in sequences {
+//             let tx = create_test_transaction(ExpectedVersion::Exact(seq));
+//             let reply_sender = new_reply_sender().await;
+//             match replicator.buffer_write(coordinator_ref.clone(), tx,
+// Some(reply_sender)) {                 Ok(Some(_)) => immediate_count += 1,
+//                 Ok(None) => {}
+//                 Err(err) => panic!("unexpected error: {err:?}"),
+//             }
+//         }
+
+//         assert_eq!(immediate_count, 1); // Only sequence 10
+//         assert_eq!(replicator.buffered_writes.len(), 4); // 11, 12, 13, 15
+
+//         // Process in order
+//         replicator.next_expected_seq += 1; // Now expecting 11
+//         let next = replicator.pop_next_buffered_write();
+//         assert!(next.is_some());
+//         assert_eq!(
+//             next.unwrap().tx.get_expected_partition_sequence(),
+//             ExpectedVersion::Exact(11)
+//         );
+
+//         replicator.next_expected_seq += 1; // Now expecting 12
+//         let next = replicator.pop_next_buffered_write();
+//         assert_eq!(
+//             next.unwrap().tx.get_expected_partition_sequence(),
+//             ExpectedVersion::Exact(12)
+//         );
+
+//         replicator.next_expected_seq += 1; // Now expecting 13
+//         let next = replicator.pop_next_buffered_write();
+//         assert_eq!(
+//             next.unwrap().tx.get_expected_partition_sequence(),
+//             ExpectedVersion::Exact(13)
+//         );
+
+//         replicator.next_expected_seq += 1; // Now expecting 14
+//         let next = replicator.pop_next_buffered_write();
+//         assert!(next.is_none()); // Gap at 14
+
+//         // Add 14
+//         let tx = create_test_transaction(ExpectedVersion::Exact(14));
+//         let reply_sender = new_reply_sender().await;
+//         replicator
+//             .buffer_write(coordinator_ref, tx, Some(reply_sender))
+//             .unwrap();
+
+//         replicator.next_expected_seq += 1; // Now expecting 15
+//         let next = replicator.pop_next_buffered_write();
+//         assert!(next.is_some());
+
+//         assert_eq!(replicator.buffered_writes.len(), 0);
+//     }
+
+//     #[tokio::test]
+//     async fn test_reply_sender_merging() {
+//         let (_temp_dir, db) = create_temp_db().await;
+//         let mut replicator = setup_partition_replicator(1, db,
+// Some(5)).await;         let coordinator_ref = setup_coordinator_ref().await;
+
+//         let tx = create_test_transaction(ExpectedVersion::Exact(6));
+
+//         // First write
+//         let reply_sender = new_reply_sender().await;
+//         replicator
+//             .buffer_write(coordinator_ref.clone(), tx.clone(),
+// Some(reply_sender))             .unwrap();
+
+//         // Duplicate with different reply sender
+//         let reply_sender = new_reply_sender().await;
+//         replicator
+//             .buffer_write(coordinator_ref, tx, Some(reply_sender))
+//             .unwrap();
+
+//         // Check that reply senders were merged
+//         let buffered = replicator.buffered_writes.get(&7).unwrap();
+//         dbg!(&buffered.reply_senders);
+//         assert_eq!(buffered.reply_senders.len(), 2);
+//     }
+
+//     // // ==========================================
+//     // // Property-Based Tests
+//     // // ==========================================
+
+//     #[tokio::test]
+//     async fn test_buffer_invariants() {
+//         let (_temp_dir, db) = create_temp_db().await;
+//         let mut replicator = setup_partition_replicator(1, db,
+// Some(0)).await;         replicator.buffer_size = 100;
+//         let coordinator_ref = setup_coordinator_ref().await;
+
+//         // Add 1000 random writes
+//         for i in 0..1000 {
+//             let seq = (i * 17 + 7) % 200; // Generate pseudo-random but
+// deterministic sequences             let tx =
+// create_test_transaction(ExpectedVersion::Exact(seq));             let
+// reply_sender = new_reply_sender().await;             let _ =
+//                 replicator.buffer_write(coordinator_ref.clone(), tx.clone(),
+// Some(reply_sender));         }
+
+//         // Verify buffer size constraint
+//         assert!(replicator.buffered_writes.len() <= 100);
+
+//         // Verify all buffered sequences are >= next_expected_seq
+//         for &seq in replicator.buffered_writes.keys() {
+//             assert!(seq >= replicator.next_expected_seq);
+//         }
+
+//         // Verify no duplicates (BTreeMap guarantees this, but good to
+// verify)         let unique_sequences: HashSet<_> =
+// replicator.buffered_writes.keys().collect();         assert_eq!
+// (unique_sequences.len(), replicator.buffered_writes.len());     }
+// }

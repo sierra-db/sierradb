@@ -36,6 +36,7 @@ use crate::reader_thread_pool::ReaderThreadPool;
 
 pub type LiveIndexes = Arc<RwLock<LiveIndexSet>>;
 
+#[derive(Debug)]
 pub struct LiveIndexSet {
     pub event_index: OpenEventIndex,
     pub partition_index: OpenPartitionIndex,
