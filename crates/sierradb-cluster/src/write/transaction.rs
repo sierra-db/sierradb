@@ -24,15 +24,20 @@ use super::{error::WriteError, replicate::ReplicateWrite};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Configuration for distributed write operations
+pub struct WriteConfig {
+    pub database: Database,
+    pub local_cluster_ref: RemoteActorRef<ClusterActor>,
+    pub local_alive_since: u64,
+    pub confirmation_ref: ActorRef<ConfirmationActor>,
+    pub replicas: ArrayVec<(RemoteActorRef<ClusterActor>, u64), MAX_REPLICATION_FACTOR>,
+    pub replication_factor: u8,
+    pub circuit_breaker: Arc<WriteCircuitBreaker>,
+}
+
 pub fn spawn(
-    database: Database,
-    local_cluster_ref: RemoteActorRef<ClusterActor>,
-    local_alive_since: u64,
-    confirmation_ref: ActorRef<ConfirmationActor>,
-    replicas: ArrayVec<(RemoteActorRef<ClusterActor>, u64), MAX_REPLICATION_FACTOR>,
-    replication_factor: u8,
+    config: WriteConfig,
     transaction: Transaction,
-    circuit_breaker: Arc<WriteCircuitBreaker>,
     reply_sender: Option<ReplySender<Result<AppendResult, WriteError>>>,
 ) {
     tokio::spawn(async move {
@@ -49,11 +54,11 @@ pub fn spawn(
         match tokio::time::timeout(
             TIMEOUT,
             run(
-                &database,
-                &local_cluster_ref,
-                local_alive_since,
-                replicas,
-                replication_factor,
+                &config.database,
+                &config.local_cluster_ref,
+                config.local_alive_since,
+                config.replicas,
+                config.replication_factor,
                 transaction,
             ),
         )
@@ -70,7 +75,7 @@ pub fn spawn(
 
                 // CRITICAL: Set confirmations with retry logic
                 match set_confirmations_with_retry(
-                    &database,
+                    &config.database,
                     partition_id,
                     append.offsets.clone(),
                     transaction_id,
@@ -80,14 +85,15 @@ pub fn spawn(
                 {
                     Ok(()) => {
                         // Success - record in circuit breaker
-                        circuit_breaker.record_success();
+                        config.circuit_breaker.record_success();
 
                         // Continue with watermark update and replica confirmations
                         let event_partition_sequences: SmallVec<[u64; 4]> =
                             (append.first_partition_sequence..=append.last_partition_sequence)
                                 .collect();
 
-                        let _ = confirmation_ref
+                        let _ = config
+                            .confirmation_ref
                             .tell(UpdateConfirmation {
                                 partition_id,
                                 versions: event_partition_sequences.clone(),
@@ -145,7 +151,7 @@ pub fn spawn(
                     }
                     Err(err) => {
                         // CRITICAL FAILURE - we told replicas to write but can't confirm locally
-                        circuit_breaker.record_failure();
+                        config.circuit_breaker.record_failure();
 
                         error!(
                             %transaction_id,
