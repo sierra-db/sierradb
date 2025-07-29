@@ -471,16 +471,16 @@ impl Worker {
             return;
         }
 
-        let res = writer_set.handle_write(
+        let res = writer_set.handle_write(WriteOperation {
             partition_key,
             partition_id,
             transaction_id,
-            &events,
+            events: &events,
             event_versions,
             expected_partition_sequence,
-            latest_stream_versions.len(),
-            batch.confirmation_count,
-        );
+            unique_streams: latest_stream_versions.len(),
+            confirmation_count: batch.confirmation_count,
+        });
         if res.is_err()
             && let Err(err) = writer_set.writer.set_len(file_size)
         {
@@ -530,6 +530,17 @@ impl Worker {
     }
 }
 
+/// Parameters for a write operation
+pub struct WriteOperation<'a> {
+    pub partition_key: Uuid,
+    pub partition_id: PartitionId,
+    pub transaction_id: Uuid,
+    pub events: &'a SmallVec<[NewEvent; 4]>,
+    pub event_versions: Vec<CurrentVersion>,
+    pub expected_partition_sequence: ExpectedVersion,
+    pub unique_streams: usize,
+    pub confirmation_count: u8,
+}
 struct WriterSet {
     dir: PathBuf,
     reader: BucketSegmentReader,
@@ -549,41 +560,31 @@ struct WriterSet {
 }
 
 impl WriterSet {
-    fn handle_write(
-        &mut self,
-        partition_key: Uuid,
-        partition_id: PartitionId,
-        transaction_id: Uuid,
-        events: &SmallVec<[NewEvent; 4]>,
-        event_versions: Vec<CurrentVersion>,
-        expected_partition_sequence: ExpectedVersion,
-        unique_streams: usize,
-        confirmation_count: u8,
-    ) -> Result<AppendResult, WriteError> {
-        if events.is_empty() {
+    fn handle_write(&mut self, req: WriteOperation<'_>) -> Result<AppendResult, WriteError> {
+        if req.events.is_empty() {
             unreachable!("append event batch does not allow empty transactions");
         }
 
-        let mut next_partition_sequence = self.next_partition_sequence(partition_id)?;
+        let mut next_partition_sequence = self.next_partition_sequence(req.partition_id)?;
         validate_partition_sequence(
-            partition_id,
-            expected_partition_sequence,
+            req.partition_id,
+            req.expected_partition_sequence,
             next_partition_sequence,
         )?;
         let first_partition_sequence = next_partition_sequence;
-        let mut new_pending_indexes: Vec<PendingIndex> = Vec::with_capacity(events.len());
-        let mut offsets = SmallVec::with_capacity(events.len());
-        let mut stream_versions = HashMap::with_capacity(unique_streams);
+        let mut new_pending_indexes: Vec<PendingIndex> = Vec::with_capacity(req.events.len());
+        let mut offsets = SmallVec::with_capacity(req.events.len());
+        let mut stream_versions = HashMap::with_capacity(req.unique_streams);
 
-        let event_count = events.len();
-        for (event, stream_version) in events.into_iter().zip(event_versions) {
+        let event_count = req.events.len();
+        for (event, stream_version) in req.events.into_iter().zip(req.event_versions) {
             let partition_sequence = next_partition_sequence;
             let stream_version = stream_version.next();
             stream_versions.insert(event.stream_id.clone(), stream_version);
             let append = AppendEvent {
                 event_id: &event.event_id,
-                partition_key: &partition_key,
-                partition_id,
+                partition_key: &req.partition_key,
+                partition_id: req.partition_id,
                 partition_sequence,
                 stream_version,
                 stream_id: &event.stream_id,
@@ -592,9 +593,9 @@ impl WriterSet {
                 payload: &event.payload,
             };
             let (offset, _) = self.writer.append_event(
-                &transaction_id,
+                &req.transaction_id,
                 event.timestamp,
-                confirmation_count,
+                req.confirmation_count,
                 append,
             )?;
             offsets.push(offset);
@@ -603,8 +604,8 @@ impl WriterSet {
             // - partition sequence doesn't reach u64::MAX
             new_pending_indexes.push(PendingIndex {
                 event_id: event.event_id,
-                partition_key,
-                partition_id,
+                partition_key: req.partition_key,
+                partition_id: req.partition_id,
                 partition_sequence,
                 stream_id: event.stream_id.clone(),
                 stream_version,
@@ -614,17 +615,17 @@ impl WriterSet {
             next_partition_sequence = next_partition_sequence.checked_add(1).unwrap();
         }
 
-        if !get_uuid_flag(&transaction_id) {
+        if !get_uuid_flag(&req.transaction_id) {
             let timestamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|_| WriteError::BadSystemTime)?
                 .as_nanos() as u64;
             self.writer
-                .append_commit(&transaction_id, timestamp, event_count as u32, 0)?;
+                .append_commit(&req.transaction_id, timestamp, event_count as u32, 0)?;
         }
 
         self.next_partition_sequences
-            .insert(partition_id, next_partition_sequence);
+            .insert(req.partition_id, next_partition_sequence);
         self.pending_indexes.extend(new_pending_indexes);
 
         self.unflushed_events += event_count as u32;
