@@ -303,10 +303,10 @@ impl<T: ClusterKey> Behaviour<T> {
             bincode::config::standard(),
         ) {
             Ok(encoded) => {
-                if let Err(err) = self.gossipsub.publish(self.ownership_topic.hash(), encoded) {
-                    if !matches!(err, PublishError::NoPeersSubscribedToTopic) {
-                        error!("error publishing ownership message: {err}");
-                    }
+                if let Err(err) = self.gossipsub.publish(self.ownership_topic.hash(), encoded)
+                    && !matches!(err, PublishError::NoPeersSubscribedToTopic)
+                {
+                    error!("error publishing ownership message: {err}");
                 }
             }
             Err(err) => {
@@ -327,10 +327,9 @@ impl<T: ClusterKey> Behaviour<T> {
         if let Err(err) = self
             .gossipsub
             .publish(self.heartbeat_topic.hash(), self.heartbeat_bytes.clone())
+            && !matches!(err, PublishError::NoPeersSubscribedToTopic)
         {
-            if !matches!(err, PublishError::NoPeersSubscribedToTopic) {
-                error!("error publishing heartbeat: {err}");
-            }
+            error!("error publishing heartbeat: {err}");
         }
     }
 }

@@ -108,16 +108,16 @@ impl Message<UpdateConfirmation> for ConfirmationActor {
         msg: UpdateConfirmation,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        msg.versions
-            .into_iter()
-            .map(|version| {
-                self.manager.update_confirmation(
-                    msg.partition_id,
-                    version + 1,
-                    msg.confirmation_count,
-                )
-            })
-            .collect()
+        let mut results = SmallVec::new();
+        for version in msg.versions {
+            let advanced = self
+                .manager
+                .update_confirmation(msg.partition_id, version + 1, msg.confirmation_count)
+                .await?;
+            results.push(advanced);
+        }
+
+        Ok(results)
     }
 }
 
@@ -197,6 +197,7 @@ impl Message<AdminForceWatermark> for ConfirmationActor {
     ) -> Self::Reply {
         self.manager
             .admin_force_watermark(msg.partition_id, msg.new_watermark)
+            .await
     }
 }
 
@@ -215,7 +216,9 @@ impl Message<AdminSkipEvent> for ConfirmationActor {
         msg: AdminSkipEvent,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.manager.admin_skip_event(msg.partition_id, msg.version)
+        self.manager
+            .admin_skip_event(msg.partition_id, msg.version)
+            .await
     }
 }
 
@@ -235,6 +238,7 @@ impl Message<ValidateAgainstEvents> for ConfirmationActor {
     ) -> Self::Reply {
         self.manager
             .validate_against_events(msg.bucket_id, msg.event_validator.as_ref())
+            .await
     }
 }
 
@@ -317,7 +321,7 @@ impl Message<PersistBucketState> for ConfirmationActor {
         msg: PersistBucketState,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.manager.persist_bucket_state(msg.bucket_id)
+        self.manager.persist_bucket_state(msg.bucket_id).await
     }
 }
 
@@ -432,20 +436,31 @@ impl ConfirmationActorExt for ActorRef<ConfirmationActor> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use sierradb::database::DatabaseBuilder;
     use smallvec::smallvec;
-    use tempfile::tempdir;
-    use tokio;
+    use tempfile::{TempDir, tempdir};
+
+    use super::*;
+
+    async fn create_temp_db() -> (TempDir, Database) {
+        let temp_dir = tempdir().expect("Failed to create temp directory");
+        let db = DatabaseBuilder::new()
+            .flush_interval_events(1)
+            .total_buckets(4)
+            .bucket_ids_from_range(0..4)
+            .open(temp_dir.path())
+            .expect("Failed to open database");
+        (temp_dir, db)
+    }
 
     #[tokio::test]
     async fn test_confirmation_actor_basic_operations() -> Result<(), Box<dyn std::error::Error>> {
-        let temp_dir = tempdir()?;
-        let actor_ref =
-            ConfirmationActor::spawn(temp_dir.path().to_path_buf(), 4, 3, HashSet::new());
+        let (_temp_dir, db) = create_temp_db().await;
+        let actor_ref = ConfirmationActor::spawn(&db, 3, HashSet::from_iter([0, 1, 2, 3])).await?;
 
         // Test update confirmation using extension trait
         let watermark_advanced = actor_ref
-            .update_event_confirmation(1, smallvec![1], 2)
+            .update_event_confirmation(1, smallvec![0], 2)
             .await?;
         assert!(watermark_advanced.iter().all(|b| *b));
 
@@ -472,16 +487,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_check() -> Result<(), Box<dyn std::error::Error>> {
-        let temp_dir = tempdir()?;
-        let actor_ref =
-            ConfirmationActor::spawn(temp_dir.path().to_path_buf(), 4, 3, HashSet::new());
+        let (_temp_dir, db) = create_temp_db().await;
+        let actor_ref = ConfirmationActor::spawn(&db, 3, HashSet::from_iter([0, 1, 2, 3])).await?;
 
         // Add some confirmations
         actor_ref
-            .update_event_confirmation(1, smallvec![1], 2)
+            .update_event_confirmation(1, smallvec![0], 2)
             .await?;
         actor_ref
-            .update_event_confirmation(1, smallvec![2], 2)
+            .update_event_confirmation(1, smallvec![1], 2)
             .await?;
 
         // Test health check
@@ -506,13 +520,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_extension_trait_methods() -> Result<(), Box<dyn std::error::Error>> {
-        let temp_dir = tempdir()?;
-        let actor_ref =
-            ConfirmationActor::spawn(temp_dir.path().to_path_buf(), 4, 3, HashSet::new());
+        let (_temp_dir, db) = create_temp_db().await;
+        let actor_ref = ConfirmationActor::spawn(&db, 3, HashSet::from_iter([0, 1, 2, 3])).await?;
 
         // Test convenience methods from extension trait
         let watermark_advanced = actor_ref
-            .update_event_confirmation(5, smallvec![1], 2)
+            .update_event_confirmation(5, smallvec![0], 2)
             .await?;
         assert!(watermark_advanced.iter().all(|b| *b));
 
@@ -527,9 +540,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_admin_operations() -> Result<(), Box<dyn std::error::Error>> {
-        let temp_dir = tempdir()?;
-        let actor_ref =
-            ConfirmationActor::spawn(temp_dir.path().to_path_buf(), 4, 3, HashSet::new());
+        let (_temp_dir, db) = create_temp_db().await;
+        let actor_ref = ConfirmationActor::spawn(&db, 3, HashSet::from_iter([0, 1, 2, 3])).await?;
 
         // Set up some initial state
         actor_ref

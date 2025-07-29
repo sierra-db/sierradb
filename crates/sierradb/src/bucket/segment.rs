@@ -284,7 +284,7 @@ mod tests {
 
         for (i, (kind, offset)) in offsets.into_iter().enumerate() {
             let record = reader
-                .read_record(offset, i % 2 == 0, false)
+                .read_record(offset, i.is_multiple_of(2), false)
                 .unwrap()
                 .unwrap();
             match record {
@@ -302,6 +302,7 @@ mod tests {
                     event_name: ren,
                     metadata: rm,
                     payload: rp,
+                    size,
                 }) => {
                     assert_eq!(kind, 0);
                     assert_eq!(rid, event_id);
@@ -315,6 +316,14 @@ mod tests {
                     assert_eq!(ren, event_name);
                     assert_eq!(rm, metadata);
                     assert_eq!(rp, payload);
+                    assert_eq!(
+                        size,
+                        EVENT_HEADER_SIZE as u64
+                            + stream_id.len() as u64
+                            + event_name.len() as u64
+                            + metadata.len() as u64
+                            + payload.len() as u64
+                    );
                 }
                 Record::Commit(CommitRecord {
                     offset: _,

@@ -41,7 +41,8 @@ where
 /// store replicas of that data according to the configured replication factor.
 ///
 /// # Arguments
-/// * `partition_hash` - The primary partition identifier (from uuid_to_partition_id)
+/// * `partition_hash` - The primary partition identifier (from
+///   uuid_to_partition_id)
 /// * `num_partitions` - The total number of partitions in the system
 /// * `replication_factor` - How many copies of the data should be stored
 ///
@@ -50,8 +51,8 @@ where
 ///
 /// # Example
 /// For replication_factor=3 and partition_hash=42:
-/// - Event stored in partitions [5, 17, 31] with 3 nodes each
-///   (each partition ID is replicated across multiple nodes)
+/// - Event stored in partitions [5, 17, 31] with 3 nodes each (each partition
+///   ID is replicated across multiple nodes)
 pub fn distribute_partition(
     partition_hash: PartitionHash,
     num_partitions: u16,
@@ -88,7 +89,7 @@ pub fn distribute_partition(
             let candidate = num_partitions / 2 + 1;
 
             // If num_partitions is even and candidate is even, add 1 to make it odd
-            if num_partitions % 2 == 0 && candidate % 2 == 0 {
+            if num_partitions.is_multiple_of(2) && candidate.is_multiple_of(2) {
                 candidate + 1
             } else {
                 candidate

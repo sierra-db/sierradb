@@ -200,7 +200,7 @@ impl Actor for ClusterActor {
                 .await
                 .map_err(|err| ClusterError::ConfirmationFailure(err.to_string()))?;
         let watermarks = confirmation_actor.manager.get_watermarks();
-        let confirmation_ref = Actor::spawn_in_thread(confirmation_actor);
+        let confirmation_ref = Actor::spawn(confirmation_actor);
 
         let circuit_breaker = Arc::new(WriteCircuitBreaker::with_defaults());
 

@@ -52,6 +52,7 @@
           zjHook = ''
             export ZJSTATUS_PATH="${zjstatus.packages.${system}.default}/bin/zjstatus.wasm"
             ln -sf ${zjstatus.packages.${system}.default}/bin/zjstatus.wasm ./zjstatus.wasm
+            ulimit -n 4096
           '';
         in
         {
