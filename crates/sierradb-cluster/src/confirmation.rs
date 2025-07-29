@@ -1,8 +1,7 @@
 pub mod actor;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,6 +14,8 @@ use sierradb::bucket::{BucketId, PartitionId};
 use sierradb::database::Database;
 use sierradb::error::PartitionIndexError;
 use thiserror::Error;
+use tokio::fs::{self, File};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::info;
 
 /// Errors that can occur during confirmation state operations
@@ -245,26 +246,23 @@ impl BucketConfirmationManager {
         for partition_id in self.assigned_partitions.clone() {
             let bucket_id = partition_id % self.num_buckets;
             let bucket_dir = self.get_bucket_confirmation_dir(bucket_id);
-            let _ = fs::create_dir_all(&bucket_dir);
+            let _ = fs::create_dir_all(&bucket_dir).await;
 
             // Load existing state if available
-            self.load_bucket_state(bucket_id);
+            self.load_bucket_state(bucket_id).await;
         }
 
         // Insert partitions if they dont exist
-        self.buckets = self.assigned_partitions.iter().fold(
-            HashMap::<BucketId, HashMap<PartitionId, PartitionConfirmationState>>::new(),
-            |mut acc, partition_id| {
-                let bucket_id = partition_id % self.num_buckets;
-                acc.entry(bucket_id)
-                    .or_default()
-                    .entry(*partition_id)
-                    .or_insert_with(|| {
-                        PartitionConfirmationState::new(*partition_id, self.replication_factor)
-                    });
-                acc
-            },
-        );
+        for partition_id in &self.assigned_partitions {
+            let bucket_id = partition_id % self.num_buckets;
+            self.buckets
+                .entry(bucket_id)
+                .or_default()
+                .entry(*partition_id)
+                .or_insert_with(|| {
+                    PartitionConfirmationState::new(*partition_id, self.replication_factor)
+                });
+        }
 
         // Update confirmations for events on disk already but beyond the watermark
         let watermarks: Vec<_> = self
@@ -284,7 +282,8 @@ impl BucketConfirmationManager {
                         partition_id,
                         event.partition_sequence + 1,
                         event.confirmation_count,
-                    )?;
+                    )
+                    .await?;
                 }
             }
         }
@@ -326,18 +325,18 @@ impl BucketConfirmationManager {
     }
 
     /// Load bucket state from disk
-    fn load_bucket_state(&mut self, bucket_id: BucketId) {
+    async fn load_bucket_state(&mut self, bucket_id: BucketId) {
         let current_path = self.get_current_state_path(bucket_id);
         let previous_path = self.get_previous_state_path(bucket_id);
 
         // Try loading from current file first
-        if let Ok(state) = self.load_state_file(&current_path) {
+        if let Ok(state) = self.load_state_file(&current_path).await {
             self.buckets.insert(bucket_id, state.partition_states);
             return;
         }
 
         // Fall back to previous file if current is corrupted/missing
-        if let Ok(state) = self.load_state_file(&previous_path) {
+        if let Ok(state) = self.load_state_file(&previous_path).await {
             self.buckets.insert(bucket_id, state.partition_states);
             return;
         }
@@ -347,7 +346,10 @@ impl BucketConfirmationManager {
     }
 
     /// Load a state file and deserialize it
-    fn load_state_file(&self, path: &Path) -> Result<BucketConfirmationState, ConfirmationError> {
+    async fn load_state_file(
+        &self,
+        path: &Path,
+    ) -> Result<BucketConfirmationState, ConfirmationError> {
         if !path.exists() {
             return Err(ConfirmationError::Io(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -355,9 +357,9 @@ impl BucketConfirmationManager {
             )));
         }
 
-        let mut file = File::open(path)?;
+        let mut file = File::open(path).await?;
         let mut contents = Vec::new();
-        file.read_to_end(&mut contents)?;
+        file.read_to_end(&mut contents).await?;
 
         let (checksummed, _): (ChecksummedState, _) =
             bincode::decode_from_slice(&contents, bincode::config::standard())?;
@@ -365,7 +367,7 @@ impl BucketConfirmationManager {
     }
 
     /// Persist bucket state if enough changes or time has passed
-    pub fn persist_bucket_if_needed(
+    pub async fn persist_bucket_if_needed(
         &mut self,
         bucket_id: BucketId,
     ) -> Result<bool, ConfirmationError> {
@@ -386,7 +388,7 @@ impl BucketConfirmationManager {
         };
 
         if should_persist {
-            self.persist_bucket_state(bucket_id)?;
+            self.persist_bucket_state(bucket_id).await?;
 
             // Update tracking values
             self.last_persist_times.insert(bucket_id, now);
@@ -399,7 +401,10 @@ impl BucketConfirmationManager {
     }
 
     /// Force persist state regardless of timing
-    pub fn persist_bucket_state(&mut self, bucket_id: BucketId) -> Result<(), ConfirmationError> {
+    pub async fn persist_bucket_state(
+        &mut self,
+        bucket_id: BucketId,
+    ) -> Result<(), ConfirmationError> {
         if !self.buckets.contains_key(&bucket_id) {
             return Err(ConfirmationError::BucketNotFound(bucket_id));
         }
@@ -427,21 +432,21 @@ impl BucketConfirmationManager {
         let previous_path = self.get_previous_state_path(bucket_id);
 
         {
-            let mut file = File::create(&temp_path)?;
-            file.write_all(&state_bincode)?;
-            file.sync_all()?;
+            let mut file = File::create(&temp_path).await?;
+            file.write_all(&state_bincode).await?;
+            file.sync_all().await?;
         }
 
         // If current file exists, make it the previous backup
         if current_path.exists() {
             if previous_path.exists() {
-                fs::remove_file(&previous_path)?;
+                fs::remove_file(&previous_path).await?;
             }
-            fs::rename(&current_path, &previous_path)?;
+            fs::rename(&current_path, &previous_path).await?;
         }
 
         // Make temp file the current file
-        fs::rename(&temp_path, &current_path)?;
+        fs::rename(&temp_path, &current_path).await?;
 
         info!("wrote bucket confirmations to disk");
 
@@ -449,7 +454,7 @@ impl BucketConfirmationManager {
     }
 
     /// Update confirmation count for an event
-    pub fn update_confirmation(
+    pub async fn update_confirmation(
         &mut self,
         partition_id: PartitionId,
         version: u64,
@@ -473,7 +478,7 @@ impl BucketConfirmationManager {
         *changes += 1;
 
         // Try to persist if needed
-        self.persist_bucket_if_needed(bucket_id)?;
+        self.persist_bucket_if_needed(bucket_id).await?;
 
         Ok(watermark_advanced)
     }
@@ -539,7 +544,7 @@ impl BucketConfirmationManager {
     }
 
     /// Force a watermark update - used for admin recovery of stuck partitions
-    pub fn admin_force_watermark(
+    pub async fn admin_force_watermark(
         &mut self,
         partition_id: PartitionId,
         new_watermark: u64,
@@ -564,7 +569,7 @@ impl BucketConfirmationManager {
                 .retain(|&ver, _| ver > new_watermark);
 
             // Force persistence
-            self.persist_bucket_state(bucket_id)?;
+            self.persist_bucket_state(bucket_id).await?;
         }
 
         // No change needed
@@ -573,7 +578,7 @@ impl BucketConfirmationManager {
 
     /// Skip a specific event version - used for admin recovery of corrupted
     /// events
-    pub fn admin_skip_event(
+    pub async fn admin_skip_event(
         &mut self,
         partition_id: PartitionId,
         version: u64,
@@ -636,17 +641,17 @@ impl BucketConfirmationManager {
                 .retain(|&ver, _| ver > new_watermark);
 
             // Force persistence
-            self.persist_bucket_state(bucket_id)?;
+            self.persist_bucket_state(bucket_id).await?;
         }
 
         Ok(watermark_advanced)
     }
 
     /// Validate state against event data
-    pub fn validate_against_events(
+    pub async fn validate_against_events(
         &mut self,
         bucket_id: BucketId,
-        event_validator: &dyn Fn(PartitionId, u64) -> bool,
+        event_validator: &(dyn Fn(PartitionId, u64) -> bool + Send + Sync),
     ) -> Result<ValidationReport, ConfirmationError> {
         if !self.buckets.contains_key(&bucket_id) {
             return Err(ConfirmationError::BucketNotFound(bucket_id));
@@ -697,7 +702,7 @@ impl BucketConfirmationManager {
 
         // Force persistence if we made any adjustments
         if report.watermarks_adjusted > 0 {
-            self.persist_bucket_state(bucket_id)?;
+            self.persist_bucket_state(bucket_id).await?;
         }
 
         Ok(report)
@@ -789,9 +794,21 @@ impl AtomicWatermark {
 
 #[cfg(test)]
 mod tests {
-    use tempfile::tempdir;
+    use sierradb::database::DatabaseBuilder;
+    use tempfile::{TempDir, tempdir};
 
     use super::*;
+
+    async fn create_temp_db() -> (TempDir, Database) {
+        let temp_dir = tempdir().expect("Failed to create temp directory");
+        let db = DatabaseBuilder::new()
+            .flush_interval_events(1)
+            .total_buckets(4)
+            .bucket_ids_from_range(0..4)
+            .open(temp_dir.path())
+            .expect("Failed to open database");
+        (temp_dir, db)
+    }
 
     #[test]
     fn test_partition_confirmation_basic() {
@@ -824,28 +841,38 @@ mod tests {
         assert_eq!(state.confirmed_watermark.get(), 5); // Now advances to 5
     }
 
-    #[test]
-    fn test_confirmation_persistence() -> Result<(), ConfirmationError> {
-        let temp_dir = tempdir().unwrap();
-        let mut manager =
-            BucketConfirmationManager::new(temp_dir.path().to_path_buf(), 4, 2, HashSet::new());
+    #[tokio::test]
+    async fn test_confirmation_persistence() -> Result<(), ConfirmationError> {
+        let (_temp_dir, db) = create_temp_db().await;
+        let mut manager = BucketConfirmationManager::new(
+            db.dir().clone(),
+            4,
+            2,
+            HashSet::from_iter([0, 1, 2, 3]),
+        );
 
         // Initialize
-        manager.initialize();
+        manager.initialize(&db).await?;
 
         // Add some confirmations
-        manager.update_confirmation(1, 1, 2)?;
-        manager.update_confirmation(1, 2, 2)?;
-        manager.update_confirmation(1, 3, 2)?;
+        manager.update_confirmation(1, 1, 2).await?;
+        manager.update_confirmation(1, 2, 2).await?;
+        manager.update_confirmation(1, 3, 2).await?;
+
+        assert_eq!(manager.get_watermark(1).unwrap().get(), 3);
 
         // Force persist
         let bucket_id = manager.get_bucket_for_partition(1);
-        manager.persist_bucket_state(bucket_id)?;
+        manager.persist_bucket_state(bucket_id).await?;
 
         // Create a new manager and check if state loaded
-        let mut new_manager =
-            BucketConfirmationManager::new(temp_dir.path().to_path_buf(), 4, 2, HashSet::new());
-        new_manager.initialize();
+        let mut new_manager = BucketConfirmationManager::new(
+            db.dir().clone(),
+            4,
+            2,
+            HashSet::from_iter([0, 1, 2, 3]),
+        );
+        new_manager.initialize(&db).await?;
 
         // Check if state was loaded correctly
         assert_eq!(new_manager.get_watermark(1).unwrap().get(), 3);
@@ -853,8 +880,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_skip_event() -> Result<(), ConfirmationError> {
+    #[tokio::test]
+    async fn test_skip_event() -> Result<(), ConfirmationError> {
         let mut state = PartitionConfirmationState::new(42, 2);
 
         // Add event confirmations
@@ -867,12 +894,16 @@ mod tests {
         assert_eq!(state.confirmed_watermark.get(), 2);
 
         // Create manager to test skip functionality
-        let temp_dir = tempdir().unwrap();
-        let mut manager =
-            BucketConfirmationManager::new(temp_dir.path().to_path_buf(), 4, 2, HashSet::new());
+        let (_temp_dir, db) = create_temp_db().await;
+        let mut manager = BucketConfirmationManager::new(
+            db.dir().clone(),
+            4,
+            2,
+            HashSet::from_iter([0, 1, 2, 3]),
+        );
 
         // Initialize and manually insert our test state
-        manager.initialize();
+        manager.initialize(&db).await?;
         let bucket_id = manager.get_bucket_for_partition(42);
         manager
             .buckets
@@ -881,7 +912,7 @@ mod tests {
             .insert(42, state);
 
         // Skip the unconfirmed event
-        assert!(manager.admin_skip_event(42, 3)?);
+        assert!(manager.admin_skip_event(42, 3).await?);
 
         // Watermark should now be 4
         assert_eq!(manager.get_watermark(42).unwrap().get(), 4);

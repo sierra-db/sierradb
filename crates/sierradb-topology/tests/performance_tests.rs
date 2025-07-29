@@ -122,9 +122,9 @@ async fn test_memory_usage_stability() {
     let mut managers = create_connected_cluster(10);
 
     // Simulate long-running operation with many state changes
-    for iteration in 0..100 {
+    for iteration in 0_usize..100_usize {
         // Add some churn
-        if iteration % 10 == 0 {
+        if iteration.is_multiple_of(10) {
             // Disconnect random node
             let disconnect_idx = iteration % 10;
             let disconnect_peer = managers[disconnect_idx].1;
