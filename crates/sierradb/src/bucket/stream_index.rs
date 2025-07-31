@@ -76,6 +76,7 @@ impl From<StreamOffsets> for ClosedOffsetKind {
     }
 }
 
+#[derive(Debug)]
 pub struct OpenStreamIndex {
     id: BucketSegmentId,
     file: File,
@@ -764,7 +765,7 @@ impl EventStreamIter {
     pub async fn next(
         &mut self,
         header_only: bool,
-    ) -> Result<Option<EventRecord>, StreamIndexError> {
+    ) -> Result<Option<CommittedEvents>, StreamIndexError> {
         struct ReadResult {
             events: Option<CommittedEvents>,
             new_offsets: Option<(SegmentId, VecDeque<u64>)>,
@@ -905,7 +906,7 @@ impl EventStreamIter {
                                 offset,
                                 segment_id: self.live_segment_id,
                             });
-                    return Ok(events.and_then(|events| events.into_iter().next()));
+                    return Ok(events);
                 }
 
                 if let Some((new_segment, new_offsets)) = new_offsets {
@@ -922,7 +923,7 @@ impl EventStreamIter {
                     });
                 }
 
-                Ok(events.and_then(|events| events.into_iter().next()))
+                Ok(events)
             }
             Ok(Ok(None)) => Ok(None),
             Ok(Err(err)) => Err(err),

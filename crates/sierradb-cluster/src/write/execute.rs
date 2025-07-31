@@ -11,6 +11,7 @@ use sierradb::{
 };
 use tracing::instrument;
 
+use crate::write::transaction::WriteConfig;
 use crate::{ClusterActor, MAX_FORWARDS};
 
 use super::{error::WriteError, transaction};
@@ -90,14 +91,16 @@ impl ClusterActor {
             WriteDestination::Local { replicas } => {
                 // Perform the write
                 transaction::spawn(
-                    self.database.clone(),
-                    self.topology_manager().local_cluster_ref.clone(),
-                    self.topology_manager().alive_since,
-                    self.confirmation_ref.clone(),
-                    replicas,
-                    self.replication_factor,
+                    WriteConfig {
+                        database: self.database.clone(),
+                        local_cluster_ref: self.topology_manager().local_cluster_ref.clone(),
+                        local_alive_since: self.topology_manager().alive_since,
+                        confirmation_ref: self.confirmation_ref.clone(),
+                        replicas,
+                        replication_factor: self.replication_factor,
+                        circuit_breaker: self.circuit_breaker.clone(),
+                    },
                     transaction,
-                    self.circuit_breaker.clone(),
                     reply_sender,
                 );
             }

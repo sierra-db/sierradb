@@ -31,8 +31,8 @@ layout {
     }
     
     swap_tiled_layout name="vertical" {
-    tab max_panes=5 {
-    pane split_direction="vertical" {
+        tab max_panes=5 {
+            pane split_direction="vertical" {
                 pane
                 pane { children; }
             }

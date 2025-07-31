@@ -1,3 +1,5 @@
+#![feature(btree_extract_if)]
+
 use std::{
     collections::{HashMap, HashSet},
     io,
@@ -82,8 +84,8 @@ pub struct ClusterArgs {
     pub replication_buffer_size: usize,
     /// Maximum time to keep buffered writes before timing out
     pub replication_buffer_timeout: Duration,
-    // / Number of sequences behind before triggering catch-up
-    // pub replication_catch_up_threshold: u64,
+    /// Maximum time before requesting a catchup
+    pub replication_catchup_timeout: Duration,
 }
 
 impl Actor for ClusterActor {
@@ -105,7 +107,7 @@ impl Actor for ClusterActor {
             heartbeat_interval,
             replication_buffer_size,
             replication_buffer_timeout,
-            // replication_catch_up_threshold,
+            replication_catchup_timeout,
         }: Self::Args,
         actor_ref: ActorRef<Self>,
     ) -> Result<Self, Self::Error> {
@@ -185,6 +187,7 @@ impl Actor for ClusterActor {
                             database: database.clone(),
                             buffer_size: replication_buffer_size,
                             buffer_timeout: replication_buffer_timeout,
+                            catchup_timeout: replication_catchup_timeout,
                         },
                         mailbox::bounded(1_000),
                     ),
@@ -192,14 +195,12 @@ impl Actor for ClusterActor {
             })
             .collect();
 
-        let confirmation_actor = ConfirmationActor::new(
-            database.dir().clone(),
-            database.total_buckets(),
-            replication_factor,
-            assigned_partitions,
-        );
+        let confirmation_actor =
+            ConfirmationActor::new(&database, replication_factor, assigned_partitions)
+                .await
+                .map_err(|err| ClusterError::ConfirmationFailure(err.to_string()))?;
         let watermarks = confirmation_actor.manager.get_watermarks();
-        let confirmation_ref = Actor::spawn_in_thread(confirmation_actor);
+        let confirmation_ref = Actor::spawn(confirmation_actor);
 
         let circuit_breaker = Arc::new(WriteCircuitBreaker::with_defaults());
 

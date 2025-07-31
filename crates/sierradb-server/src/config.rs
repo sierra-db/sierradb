@@ -100,7 +100,7 @@ pub struct PartitionConfig {
 pub struct ReplicationConfig {
     pub buffer_size: usize,
     pub buffer_timeout_ms: u64,
-    // pub catch_up_threshold: u64,
+    pub catchup_timeout_ms: u64,
     pub factor: u8,
 }
 
@@ -169,8 +169,8 @@ impl AppConfig {
             .set_default("network.client_address", "0.0.0.0:9090")?
             .set_default("partition.count", 1024)?
             .set_default("replication.buffer_size", 1000)?
-            .set_default("replication.buffer_timeout_ms", 5000)?
-            // .set_default("replication.catch_up_threshold", 100)?
+            .set_default("replication.buffer_timeout_ms", 8000)?
+            .set_default("replication.catchup_timeout_ms", 2000)?
             .set_default("replication.factor", 3)?
             .set_default("segment.size_bytes", 256_000_000)?;
 

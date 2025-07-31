@@ -81,6 +81,7 @@ impl From<PartitionOffsets> for ClosedOffsetKind {
     }
 }
 
+#[derive(Debug)]
 pub struct OpenPartitionIndex {
     id: BucketSegmentId,
     file: File,
@@ -771,7 +772,7 @@ impl PartitionEventIter {
     pub async fn next(
         &mut self,
         header_only: bool,
-    ) -> Result<Option<EventRecord>, PartitionIndexError> {
+    ) -> Result<Option<CommittedEvents>, PartitionIndexError> {
         struct ReadResult {
             events: Option<CommittedEvents>,
             new_offsets: Option<(SegmentId, VecDeque<PartitionSequenceOffset>)>,
@@ -928,7 +929,7 @@ impl PartitionEventIter {
                             segment_id: self.live_segment_id,
                         },
                     );
-                    return Ok(events.and_then(|events| events.into_iter().next()));
+                    return Ok(events);
                 }
 
                 if let Some((new_segment, new_offsets)) = new_offsets {
@@ -949,7 +950,7 @@ impl PartitionEventIter {
                     );
                 }
 
-                Ok(events.and_then(|events| events.into_iter().next()))
+                Ok(events)
             }
             Ok(Ok(None)) => Ok(None),
             Ok(Err(err)) => Err(err),
