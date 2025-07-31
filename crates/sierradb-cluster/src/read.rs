@@ -297,7 +297,8 @@ impl Message<ReadEvent> for ClusterActor {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReadPartition {
     pub partition_id: PartitionId,
-    pub from_sequence: u64,
+    pub start_sequence: u64,
+    pub end_sequence: u64,
     pub limit: Option<u32>, // Optional limit for pagination
 }
 
@@ -319,24 +320,25 @@ impl Message<ReadPartition> for ClusterActor {
     ) -> Self::Reply {
         let database = self.database.clone();
         let required_quorum = ((self.replication_factor as usize / 2) + 1) as u8;
-        let watermark = self.watermarks.get(&msg.partition_id).cloned();
+        let watermark = self
+            .watermarks
+            .get(&msg.partition_id)
+            .map(|w| w.get())
+            .unwrap_or(0);
+
+        // Don't read beyond watermark
+        if msg.start_sequence + 1 > watermark {
+            return ctx.reply(Ok(PartitionEventsResponse {
+                events: vec![],
+                next_sequence: None,
+                watermark,
+            }));
+        }
 
         ctx.spawn(async move {
-            // 1. Get current watermark
-            let watermark = watermark.map(|w| w.get()).unwrap_or(0);
-
-            // 2. Don't read beyond watermark
-            if msg.from_sequence + 1 > watermark {
-                return Ok(PartitionEventsResponse {
-                    events: vec![],
-                    next_sequence: None,
-                    watermark,
-                });
-            }
-
-            // 3. Create iterator and collect events up to watermark
+            // Create iterator and collect events up to watermark
             let mut iter = database
-                .read_partition(msg.partition_id, msg.from_sequence)
+                .read_partition(msg.partition_id, msg.start_sequence)
                 .await
                 .map_err(|err| ClusterError::Read(err.to_string()))?;
 

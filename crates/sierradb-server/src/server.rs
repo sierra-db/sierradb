@@ -7,13 +7,13 @@ use sierradb::id::{NAMESPACE_PARTITION_KEY, uuid_to_partition_hash, uuid_v7_with
 use sierradb_cluster::ClusterActor;
 use sierradb_cluster::read::ReadEvent;
 use sierradb_cluster::write::execute::ExecuteTransaction;
-use smallvec::smallvec;
+use smallvec::{SmallVec, smallvec};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::request::{Append, FromArgs, Get, SRead};
+use crate::request::{EAppend, EGet, EMAppend, EPScan, EPSeq, ESVer, EScan, ESub, FromArgs};
 use crate::value::{Value, ValueDecoder};
 
 pub struct Server {
@@ -96,25 +96,26 @@ impl Conn {
                     return Ok(Value::Error("Empty command".into()));
                 }
 
+                macro_rules! handle_req {
+                    ($cmd:ty, $handle:ident) => {
+                        match <$cmd>::from_args(&items[1..]) {
+                            Ok(cmd) => self.$handle(cmd).await,
+                            Err(err) => Ok(err),
+                        }
+                    };
+                }
+
                 match &items[0].as_str() {
-                    Ok(cmd) => match cmd.to_lowercase().as_str() {
-                        "append" => match Append::from_args(&items[1..]) {
-                            Ok(append) => self.handle_append(append).await,
-                            Err(err) => Ok(err),
-                        },
-                        "get" => match Get::from_args(&items[1..]) {
-                            Ok(get) => self.handle_get(get).await,
-                            Err(err) => Ok(err),
-                        },
-                        "pread" => self.handle_read_partition(&items).await,
-                        "sread" => match SRead::from_args(&items[1..]) {
-                            Ok(sread) => self.handle_read_stream(sread).await,
-                            Err(err) => Ok(err),
-                        },
-                        "pinfo" => todo!(),
-                        "ping" => Ok(Value::String("PONG".to_string())),
-                        "sinfo" => todo!(),
-                        "subscribe" => todo!(),
+                    Ok(cmd) => match cmd.to_uppercase().as_str() {
+                        "EAPPEND" => handle_req!(EAppend, handle_eappend),
+                        "EMAPPEND" => handle_req!(EMAppend, handle_emappend),
+                        "EGET" => handle_req!(EGet, handle_eget),
+                        "EPSCAN" => handle_req!(EPScan, handle_epscan),
+                        "ESCAN" => handle_req!(EScan, handle_escan),
+                        "EPSEQ" => handle_req!(EPSeq, handle_epseq),
+                        "ESVER" => handle_req!(ESVer, handle_esver),
+                        "ESUB" => handle_req!(ESub, handle_esub),
+                        "PING" => Ok(Value::String("PONG".to_string())),
                         _ => Ok(Value::Error(format!("Unknown command: {cmd}"))),
                     },
                     _ => Ok(Value::Error("Expected command name as bulk string".into())),
@@ -124,9 +125,9 @@ impl Conn {
         }
     }
 
-    async fn handle_append(
+    async fn handle_eappend(
         &mut self,
-        Append {
+        EAppend {
             stream_id,
             event_name,
             event_id,
@@ -134,14 +135,13 @@ impl Conn {
             expected_version,
             payload,
             metadata,
-        }: Append,
+        }: EAppend,
     ) -> io::Result<Value> {
         let partition_key = partition_key
             .unwrap_or_else(|| Uuid::new_v5(&NAMESPACE_PARTITION_KEY, stream_id.as_bytes()));
-        let event_id = event_id
-            .unwrap_or_else(|| uuid_v7_with_partition_hash(uuid_to_partition_hash(partition_key)));
-
         let partition_hash = uuid_to_partition_hash(partition_key);
+        let event_id = event_id.unwrap_or_else(|| uuid_v7_with_partition_hash(partition_hash));
+
         let partition_id = partition_hash % self.num_partitions;
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -175,12 +175,16 @@ impl Conn {
                 let mut stream_versions = result.stream_versions.into_iter();
                 let (_, stream_version) = stream_versions.next().unwrap();
                 debug_assert_eq!(stream_versions.next(), None);
+                debug_assert_eq!(
+                    result.first_partition_sequence,
+                    result.last_partition_sequence
+                );
 
                 let response = vec![
                     Value::String(event_id.to_string()),
                     Value::String(partition_key.to_string()),
                     Value::Integer(partition_id as i64),
-                    Value::Integer(result.last_partition_sequence as i64),
+                    Value::Integer(result.first_partition_sequence as i64),
                     Value::Integer(stream_version as i64),
                     Value::Integer(timestamp as i64),
                 ];
@@ -191,23 +195,86 @@ impl Conn {
         }
     }
 
-    async fn handle_get(&mut self, Get { event_id }: Get) -> io::Result<Value> {
-        // pub event_id: Uuid,
-        // pub partition_key: Uuid,
-        // pub transaction_id: Uuid,
-        // pub partition_sequence: u64,
-        // pub stream_version: u64,
-        // pub timestamp: u64,
-        // pub stream_id: StreamId,
-        // pub event_name: String,
-        // pub metadata: Vec<u8>,
-        // pub payload: Vec<u8>,
+    async fn handle_emappend(
+        &mut self,
+        EMAppend {
+            partition_key,
+            events,
+        }: EMAppend,
+    ) -> io::Result<Value> {
+        let partition_hash = uuid_to_partition_hash(partition_key);
+        let partition_id = partition_hash % self.num_partitions;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| io::Error::other("system time error"))?
+            .as_nanos() as u64;
 
+        let events: SmallVec<[_; 4]> = events
+            .into_iter()
+            .map(|event| {
+                let event_id = event
+                    .event_id
+                    .unwrap_or_else(|| uuid_v7_with_partition_hash(partition_hash));
+                NewEvent {
+                    event_id,
+                    stream_id: event.stream_id,
+                    stream_version: event.expected_version,
+                    event_name: event.event_name,
+                    timestamp,
+                    metadata: event.metadata,
+                    payload: event.payload,
+                }
+            })
+            .collect();
+        let event_ids: SmallVec<[_; 4]> = events.iter().map(|event| event.event_id).collect();
+
+        let transaction = match Transaction::new(partition_key, partition_id, events) {
+            Ok(transaction) => transaction,
+            Err(err) => return Ok(Value::Error(err.to_string())),
+        };
+
+        match self
+            .cluster_ref
+            .ask(ExecuteTransaction::new(transaction))
+            .await
+            .map_err(io::Error::other)
+        {
+            Ok(result) => {
+                let stream_versions = result.stream_versions.into_iter();
+                let event_infos = event_ids
+                    .into_iter()
+                    .zip(stream_versions)
+                    .map(|(event_id, (stream_id, stream_version))| {
+                        Value::Array(vec![
+                            Value::String(event_id.to_string()),
+                            Value::String(stream_id.to_string()),
+                            Value::Integer(stream_version as i64),
+                        ])
+                    })
+                    .collect();
+
+                let response = vec![
+                    Value::String(partition_key.to_string()),
+                    Value::Integer(partition_id as i64),
+                    Value::Integer(result.first_partition_sequence as i64),
+                    Value::Integer(result.last_partition_sequence as i64),
+                    Value::Integer(timestamp as i64),
+                    Value::Array(event_infos),
+                ];
+
+                Ok(Value::Array(response))
+            }
+            Err(err) => Ok(Value::Error(err.to_string())),
+        }
+    }
+
+    async fn handle_eget(&mut self, EGet { event_id }: EGet) -> io::Result<Value> {
         match self.cluster_ref.ask(ReadEvent::new(event_id)).await {
             Ok(Some(record)) => {
                 let response = vec![
                     Value::String(record.event_id.to_string()),
                     Value::String(record.partition_key.to_string()),
+                    Value::Integer(record.partition_id as i64),
                     Value::String(record.transaction_id.to_string()),
                     Value::Integer(record.partition_sequence as i64),
                     Value::Integer(record.stream_version as i64),
@@ -225,20 +292,23 @@ impl Conn {
         }
     }
 
-    async fn handle_read_partition(&mut self, _args: &[Value]) -> io::Result<Value> {
+    async fn handle_epscan(&mut self, EPScan { .. }: EPScan) -> io::Result<Value> {
         Ok(Value::String("Not implemented".to_string()))
     }
 
-    async fn handle_read_stream(
-        &mut self,
-        SRead {
-            stream_id,
-            partition_key,
-        }: SRead,
-    ) -> io::Result<Value> {
-        let partition_key = partition_key
-            .unwrap_or_else(|| Uuid::new_v5(&NAMESPACE_PARTITION_KEY, stream_id.as_bytes()));
+    async fn handle_escan(&mut self, EScan { .. }: EScan) -> io::Result<Value> {
+        Ok(Value::String("Not implemented".to_string()))
+    }
 
-        Ok(Value::String(format!("Not implemented: {partition_key}")))
+    async fn handle_epseq(&mut self, EPSeq { .. }: EPSeq) -> io::Result<Value> {
+        Ok(Value::String("Not implemented".to_string()))
+    }
+
+    async fn handle_esver(&mut self, ESVer { .. }: ESVer) -> io::Result<Value> {
+        Ok(Value::String("Not implemented".to_string()))
+    }
+
+    async fn handle_esub(&mut self, ESub {}: ESub) -> io::Result<Value> {
+        Ok(Value::String("Not implemented".to_string()))
     }
 }

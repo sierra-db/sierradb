@@ -1,0 +1,15 @@
+[package]
+name = "sierradb-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+redis = "0.32.4"
+serde = { workspace = true, features = ["derive"] }
+uuid = { workspace = true, features = ["serde", "v5"] }
+
+[features]
+aio = ["redis/aio"]
+cluster = ["redis/cluster"]
+tokio-comp = ["aio", "redis/tokio-comp"]
