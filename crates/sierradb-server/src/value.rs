@@ -87,7 +87,7 @@ impl Value {
     }
 }
 
-fn inconvertible<A>(from: &Value, target: &str) -> io::Result<A> {
+pub fn inconvertible<A>(from: &Value, target: &str) -> io::Result<A> {
     invalid_data(format!("'{from:?}' is not convertible to '{target}'"))
 }
 
@@ -196,6 +196,52 @@ impl TryFrom<&Value> for f64 {
 
     fn try_from(val: &Value) -> io::Result<Self> {
         val.as_float()
+    }
+}
+
+impl TryFrom<Value> for u64 {
+    type Error = io::Error;
+
+    fn try_from(val: Value) -> io::Result<Self> {
+        Ok(val.as_integer()? as u64)
+    }
+}
+
+impl TryFrom<&Value> for u64 {
+    type Error = io::Error;
+
+    fn try_from(val: &Value) -> io::Result<Self> {
+        Ok(val.as_integer()? as u64)
+    }
+}
+
+impl TryFrom<&Value> for Option<u64> {
+    type Error = io::Error;
+
+    fn try_from(val: &Value) -> io::Result<Self> {
+        match val.as_integer() {
+            Ok(n) => Ok(Some(n as u64)),
+            Err(err) => match val {
+                Value::Null => Ok(None),
+                _ => Err(err),
+            },
+        }
+    }
+}
+
+impl TryFrom<Value> for u16 {
+    type Error = io::Error;
+
+    fn try_from(val: Value) -> io::Result<Self> {
+        Ok(val.as_integer()? as u16)
+    }
+}
+
+impl TryFrom<&Value> for u16 {
+    type Error = io::Error;
+
+    fn try_from(val: &Value) -> io::Result<Self> {
+        Ok(val.as_integer()? as u16)
     }
 }
 

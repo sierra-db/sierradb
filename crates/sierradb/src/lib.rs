@@ -56,6 +56,10 @@ impl StreamId {
     pub unsafe fn new_unchecked(s: impl Into<Arc<str>>) -> Self {
         StreamId { inner: s.into() }
     }
+
+    pub fn into_inner(self) -> Arc<str> {
+        self.inner
+    }
 }
 
 impl fmt::Display for StreamId {

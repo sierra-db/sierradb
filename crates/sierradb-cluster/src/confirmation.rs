@@ -60,17 +60,15 @@ pub struct UnconfirmedEventInfo {
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct PartitionConfirmationState {
     pub partition_id: PartitionId,
-    pub replication_factor: u8,
     pub highest_version: u64,
     pub confirmed_watermark: Arc<AtomicWatermark>,
     pub unconfirmed_events: BTreeMap<u64, UnconfirmedEventInfo>,
 }
 
 impl PartitionConfirmationState {
-    pub fn new(partition_id: PartitionId, replication_factor: u8) -> Self {
+    pub fn new(partition_id: PartitionId) -> Self {
         Self {
             partition_id,
-            replication_factor,
             highest_version: 0,
             confirmed_watermark: Arc::new(AtomicWatermark::new(0)),
             unconfirmed_events: BTreeMap::new(),
@@ -79,7 +77,12 @@ impl PartitionConfirmationState {
 
     /// Updates the confirmation count for an event and advances the watermark
     /// if possible
-    pub fn update_confirmation(&mut self, version: u64, confirmation_count: u8) -> bool {
+    pub fn update_confirmation(
+        &mut self,
+        version: u64,
+        confirmation_count: u8,
+        replication_factor: u8,
+    ) -> bool {
         // Track highest version we've seen
         if version > self.highest_version {
             self.highest_version = version;
@@ -114,7 +117,7 @@ impl PartitionConfirmationState {
         event.attempts += 1;
 
         // Check if we can advance the watermark
-        let required_quorum = (self.replication_factor / 2) + 1;
+        let required_quorum = (replication_factor / 2) + 1;
 
         // Find the highest contiguous confirmed version
         let mut next_expected = confirmed_watermark + 1;
@@ -259,9 +262,7 @@ impl BucketConfirmationManager {
                 .entry(bucket_id)
                 .or_default()
                 .entry(*partition_id)
-                .or_insert_with(|| {
-                    PartitionConfirmationState::new(*partition_id, self.replication_factor)
-                });
+                .or_insert_with(|| PartitionConfirmationState::new(*partition_id));
         }
 
         // Update confirmations for events on disk already but beyond the watermark
@@ -466,12 +467,13 @@ impl BucketConfirmationManager {
         let partition_states = self.buckets.entry(bucket_id).or_default();
 
         // Ensure partition exists
-        let state = partition_states.entry(partition_id).or_insert_with(|| {
-            PartitionConfirmationState::new(partition_id, self.replication_factor)
-        });
+        let state = partition_states
+            .entry(partition_id)
+            .or_insert_with(|| PartitionConfirmationState::new(partition_id));
 
         // Update confirmation state
-        let watermark_advanced = state.update_confirmation(version, confirmation_count);
+        let watermark_advanced =
+            state.update_confirmation(version, confirmation_count, self.replication_factor);
 
         // Track changes for persistence
         let changes = self.changes_since_persist.entry(bucket_id).or_insert(0);
@@ -555,9 +557,9 @@ impl BucketConfirmationManager {
         let partition_states = self.buckets.entry(bucket_id).or_default();
 
         // Ensure partition exists
-        let state = partition_states.entry(partition_id).or_insert_with(|| {
-            PartitionConfirmationState::new(partition_id, self.replication_factor)
-        });
+        let state = partition_states
+            .entry(partition_id)
+            .or_insert_with(|| PartitionConfirmationState::new(partition_id));
 
         // Only allow advancing the watermark, not moving it backwards
         if new_watermark > state.confirmed_watermark.get() {
@@ -589,9 +591,9 @@ impl BucketConfirmationManager {
         let partition_states = self.buckets.entry(bucket_id).or_default();
 
         // Ensure partition exists
-        let state = partition_states.entry(partition_id).or_insert_with(|| {
-            PartitionConfirmationState::new(partition_id, self.replication_factor)
-        });
+        let state = partition_states
+            .entry(partition_id)
+            .or_insert_with(|| PartitionConfirmationState::new(partition_id));
 
         // Only allow skipping events above the current watermark
         let confirmed_watermark = state.confirmed_watermark.get();
@@ -812,32 +814,32 @@ mod tests {
 
     #[test]
     fn test_partition_confirmation_basic() {
-        let mut state = PartitionConfirmationState::new(42, 2);
+        let mut state = PartitionConfirmationState::new(42);
 
         // Add event confirmations
         assert_eq!(state.confirmed_watermark.get(), 0);
 
         // First event (v1) - watermark doesn't advance yet because count < quorum
-        assert!(!state.update_confirmation(1, 1));
+        assert!(!state.update_confirmation(1, 1, 2));
         assert_eq!(state.confirmed_watermark.get(), 0); // Not enough confirmations yet
 
         // Confirm event (v1) with quorum - watermark should advance
-        assert!(state.update_confirmation(1, 2));
+        assert!(state.update_confirmation(1, 2, 2));
         assert_eq!(state.confirmed_watermark.get(), 1); // Now confirmed
 
         // Add multiple events, all with quorum
-        assert!(state.update_confirmation(2, 2));
+        assert!(state.update_confirmation(2, 2, 2));
         assert_eq!(state.confirmed_watermark.get(), 2);
 
-        assert!(state.update_confirmation(3, 2));
+        assert!(state.update_confirmation(3, 2, 2));
         assert_eq!(state.confirmed_watermark.get(), 3);
 
         // Ensure gaps prevent watermark advancement
-        assert!(!state.update_confirmation(5, 2));
+        assert!(!state.update_confirmation(5, 2, 2));
         assert_eq!(state.confirmed_watermark.get(), 3); // Still 3 due to gap at v4
 
         // Fill the gap
-        assert!(state.update_confirmation(4, 2));
+        assert!(state.update_confirmation(4, 2, 2));
         assert_eq!(state.confirmed_watermark.get(), 5); // Now advances to 5
     }
 
@@ -882,13 +884,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_skip_event() -> Result<(), ConfirmationError> {
-        let mut state = PartitionConfirmationState::new(42, 2);
+        let mut state = PartitionConfirmationState::new(42);
 
         // Add event confirmations
-        state.update_confirmation(1, 2);
-        state.update_confirmation(2, 2);
-        state.update_confirmation(3, 1); // Not enough confirmations
-        state.update_confirmation(4, 2);
+        state.update_confirmation(1, 2, 2);
+        state.update_confirmation(2, 2, 2);
+        state.update_confirmation(3, 1, 2); // Not enough confirmations
+        state.update_confirmation(4, 2, 2);
 
         // Current watermark should be 2
         assert_eq!(state.confirmed_watermark.get(), 2);

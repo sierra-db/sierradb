@@ -28,7 +28,7 @@ use crate::error::{
     DatabaseError, EventValidationError, PartitionIndexError, ReadError, StreamIndexError,
     ThreadPoolError, WriteError,
 };
-use crate::id::{set_uuid_flag, validate_event_id};
+use crate::id::{set_uuid_flag, uuid_to_partition_hash, validate_event_id};
 use crate::reader_thread_pool::ReaderThreadPool;
 use crate::writer_thread_pool::{AppendResult, WriterThreadPool};
 
@@ -868,7 +868,7 @@ impl Transaction {
             return Err(EventValidationError::EmptyTransaction);
         }
 
-        let partition_hash = partition_id;
+        let partition_hash = uuid_to_partition_hash(partition_key);
 
         events.iter().try_fold((), |_, event| {
             if !validate_event_id(event.event_id, partition_hash) {

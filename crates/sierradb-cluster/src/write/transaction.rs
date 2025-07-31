@@ -260,6 +260,20 @@ async fn run(
 
     // Phase 4: Quorum Confirmation
     let mut confirmed_replicas = ArrayVec::from_iter([None]);
+
+    // Early return for single node case - if no replicas, we already have quorum
+    if pending_replies.is_empty() {
+        let has_quorum = confirmed_replicas.len() >= required_quorum;
+        if has_quorum {
+            debug!(
+                transaction_id = %transaction.transaction_id(),
+                confirmed = confirmed_replicas.len(),
+                "quorum achieved (single node)"
+            );
+            return Ok((append, confirmed_replicas, pending_replies));
+        }
+    }
+
     while let Some((cluster_ref, res)) = pending_replies.next().await {
         match res {
             Ok(_) => {
