@@ -410,7 +410,7 @@ impl BucketSegmentReader {
                     .unwrap(),
             );
             Ok(Some(Record::Commit(CommitRecord::from_parts(
-                offset,
+                start_offset,
                 record_header,
                 event_count,
                 header_only,
