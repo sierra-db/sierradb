@@ -227,7 +227,12 @@ impl ExecuteTransaction {
 impl Message<ExecuteTransaction> for ClusterActor {
     type Reply = DelegatedReply<Result<AppendResult, WriteError>>;
 
-    #[instrument(skip(self, ctx))]
+    #[instrument(skip_all, fields(
+        partition_key = %msg.transaction.partition_key(),
+        partition_id = msg.transaction.partition_id(),
+        event_count = msg.transaction.events().len(),
+        stream_events = msg.transaction.events().iter().map(|event| format!("{}: {}", event.stream_id, event.event_name)).collect::<smallvec::SmallVec<[_; 4]> >().join(", "),
+    ))]
     async fn handle(
         &mut self,
         msg: ExecuteTransaction,
