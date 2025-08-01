@@ -157,7 +157,7 @@ impl_command!(EGet, [event_id], []);
 // EPSCAN
 pub struct EPScan {
     pub partition: PartitionSelector,
-    pub start_sequence: RangeValue,
+    pub start_sequence: u64,
     pub end_sequence: RangeValue,
     pub count: Option<u64>,
 }
@@ -168,9 +168,16 @@ impl_command!(EPScan, [partition, start_sequence, end_sequence], [count]);
 pub struct EScan {
     pub stream_id: StreamId,
     pub partition_key: Option<Uuid>,
+    pub start_version: u64,
+    pub end_version: RangeValue,
+    pub count: Option<u64>,
 }
 
-impl_command!(EScan, [stream_id], [partition_key]);
+impl_command!(
+    EScan,
+    [stream_id, start_version, end_version],
+    [partition_key, count]
+);
 
 // EPSEQ
 pub struct EPSeq {

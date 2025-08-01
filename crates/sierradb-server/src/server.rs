@@ -5,7 +5,7 @@ use libp2p::bytes::BytesMut;
 use sierradb::database::{NewEvent, Transaction};
 use sierradb::id::{NAMESPACE_PARTITION_KEY, uuid_to_partition_hash, uuid_v7_with_partition_hash};
 use sierradb_cluster::ClusterActor;
-use sierradb_cluster::read::ReadEvent;
+use sierradb_cluster::read::{ReadEvent, ReadPartition, ReadStream};
 use sierradb_cluster::write::execute::ExecuteTransaction;
 use smallvec::{SmallVec, smallvec};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
@@ -13,7 +13,9 @@ use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::request::{EAppend, EGet, EMAppend, EPScan, EPSeq, ESVer, EScan, ESub, FromArgs};
+use crate::request::{
+    EAppend, EGet, EMAppend, EPScan, EPSeq, ESVer, EScan, ESub, FromArgs, RangeValue,
+};
 use crate::value::{Value, ValueDecoder};
 
 pub struct Server {
@@ -292,12 +294,116 @@ impl Conn {
         }
     }
 
-    async fn handle_epscan(&mut self, EPScan { .. }: EPScan) -> io::Result<Value> {
-        Ok(Value::String("Not implemented".to_string()))
+    async fn handle_epscan(
+        &mut self,
+        EPScan {
+            partition,
+            start_sequence,
+            end_sequence,
+            count,
+        }: EPScan,
+    ) -> io::Result<Value> {
+        let res = self
+            .cluster_ref
+            .ask(ReadPartition {
+                partition_id: partition.into_partition_id(self.num_partitions),
+                start_sequence,
+                end_sequence: match end_sequence {
+                    RangeValue::Start => {
+                        return Err(io::Error::other("end_sequence cannot be '-'"));
+                    }
+                    RangeValue::End => None,
+                    RangeValue::Value(n) => Some(n),
+                },
+                count: count.unwrap_or(100),
+            })
+            .await;
+        match res {
+            Ok(records) => {
+                let events = records
+                    .events
+                    .into_iter()
+                    .map(|event| {
+                        Value::Array(vec![
+                            Value::String(event.event_id.to_string()),
+                            Value::String(event.partition_key.to_string()),
+                            Value::Integer(event.partition_id as i64),
+                            Value::String(event.transaction_id.to_string()),
+                            Value::Integer(event.partition_sequence as i64),
+                            Value::Integer(event.stream_version as i64),
+                            Value::Integer(event.timestamp as i64),
+                            Value::String(event.stream_id.to_string()),
+                            Value::String(event.event_name),
+                            Value::Bulk(event.metadata),
+                            Value::Bulk(event.payload),
+                        ])
+                    })
+                    .collect();
+                let response = vec![Value::Boolean(records.has_more), Value::Array(events)];
+
+                Ok(Value::Array(response))
+            }
+            Err(err) => Ok(Value::Error(err.to_string())),
+        }
     }
 
-    async fn handle_escan(&mut self, EScan { .. }: EScan) -> io::Result<Value> {
-        Ok(Value::String("Not implemented".to_string()))
+    async fn handle_escan(
+        &mut self,
+        EScan {
+            stream_id,
+            partition_key,
+            start_version,
+            end_version,
+            count,
+        }: EScan,
+    ) -> io::Result<Value> {
+        let partition_key = partition_key
+            .unwrap_or_else(|| Uuid::new_v5(&NAMESPACE_PARTITION_KEY, stream_id.as_bytes()));
+        let partition_hash = uuid_to_partition_hash(partition_key);
+        let partition_id = partition_hash % self.num_partitions;
+        let res = self
+            .cluster_ref
+            .ask(ReadStream {
+                stream_id,
+                partition_id,
+                start_version,
+                end_version: match end_version {
+                    RangeValue::Start => {
+                        return Err(io::Error::other("end_version cannot be '-'"));
+                    }
+                    RangeValue::End => None,
+                    RangeValue::Value(n) => Some(n),
+                },
+                count: count.unwrap_or(100),
+            })
+            .await;
+        match res {
+            Ok(records) => {
+                let events = records
+                    .events
+                    .into_iter()
+                    .map(|event| {
+                        Value::Array(vec![
+                            Value::String(event.event_id.to_string()),
+                            Value::String(event.partition_key.to_string()),
+                            Value::Integer(event.partition_id as i64),
+                            Value::String(event.transaction_id.to_string()),
+                            Value::Integer(event.partition_sequence as i64),
+                            Value::Integer(event.stream_version as i64),
+                            Value::Integer(event.timestamp as i64),
+                            Value::String(event.stream_id.to_string()),
+                            Value::String(event.event_name),
+                            Value::Bulk(event.metadata),
+                            Value::Bulk(event.payload),
+                        ])
+                    })
+                    .collect();
+                let response = vec![Value::Boolean(records.has_more), Value::Array(events)];
+
+                Ok(Value::Array(response))
+            }
+            Err(err) => Ok(Value::Error(err.to_string())),
+        }
     }
 
     async fn handle_epseq(&mut self, EPSeq { .. }: EPSeq) -> io::Result<Value> {
