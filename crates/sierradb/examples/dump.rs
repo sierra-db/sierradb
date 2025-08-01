@@ -14,6 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let dir = env::args().nth(1).ok_or("missing db path argument")?;
+    let filter_bucket: Option<BucketId> = env::args().nth(2).map(|b| b.parse()).transpose()?;
     let buckets_dir = Path::new(&dir).join("buckets");
 
     if !buckets_dir.exists() {
@@ -36,6 +37,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let Ok(bucket_id) = bucket_name_str.parse::<BucketId>() else {
             continue;
         };
+
+        if let Some(filter_bucket_id) = filter_bucket
+            && filter_bucket_id != bucket_id
+        {
+            continue;
+        }
 
         // Access the 'segments' subdirectory within this bucket
         let segments_dir = bucket_entry.path().join("segments");
