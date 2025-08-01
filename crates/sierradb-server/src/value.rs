@@ -13,6 +13,7 @@ pub enum Value {
     Array(Vec<Value>),
     StaticError(&'static str),
     StaticString(&'static str),
+    Boolean(bool),
 }
 
 impl Value {
@@ -389,6 +390,13 @@ impl ValueEncoder {
         Self::write_crlf(buf);
     }
 
+    fn write_boolean(buf: &mut BytesMut, value: bool) {
+        Self::ensure_capacity(buf, 4);
+        buf.put_u8(b'#');
+        buf.put_u8(if value { b't' } else { b'f' });
+        Self::write_crlf(buf);
+    }
+
     pub fn encode(buf: &mut BytesMut, value: &Value) {
         match value {
             Value::Null => Self::write_header(buf, b'$', -1),
@@ -404,6 +412,7 @@ impl ValueEncoder {
             Value::Error(e) => Self::write_string(buf, b'-', e),
             Value::StaticError(e) => Self::write_string(buf, b'-', e),
             Value::StaticString(e) => Self::write_string(buf, b'+', e),
+            Value::Boolean(b) => Self::write_boolean(buf, *b),
         }
     }
 }
