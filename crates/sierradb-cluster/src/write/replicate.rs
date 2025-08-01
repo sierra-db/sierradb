@@ -112,7 +112,6 @@ impl Actor for PartitionReplicatorActor {
             select! {
                 msg = mailbox_rx.recv() => return msg,
                 _ = catchup_fut => {
-                    println!("detecting and handling gaps");
                     self.detect_and_handle_gaps(&actor_ref);
                 }
             }
