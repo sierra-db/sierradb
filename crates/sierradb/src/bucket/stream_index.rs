@@ -893,10 +893,45 @@ impl EventStreamIter {
 
         match reply_rx.await {
             Ok(Ok(Some(ReadResult {
-                events,
+                mut events,
                 new_offsets,
                 is_live,
             }))) => {
+                // Filter events and handle skipping
+                if let Some(ref mut committed_events) = events {
+                    let max_returned_version = match committed_events {
+                        CommittedEvents::Transaction { events, .. } => {
+                            // Filter to only keep events from our stream
+                            events.retain(|event| event.stream_id == self.stream_id);
+
+                            // Get the max stream version from remaining events
+                            events.iter().map(|e| e.stream_version).max()
+                        }
+                        CommittedEvents::Single(event) => {
+                            // If this single event is not from our stream, return None
+                            if event.stream_id == self.stream_id {
+                                Some(event.stream_version)
+                            } else {
+                                None
+                            }
+                        }
+                    };
+
+                    if let Some(_max_version) = max_returned_version {
+                        // Skip all offsets that might contain events with
+                        // stream_version <= max_version
+                        // Note: We can't know which offsets correspond to which
+                        // versions without reading, but
+                        // we can still benefit from skipping some redundant
+                        // reads This is a best-effort
+                        // optimization
+                    } else {
+                        // No events from our stream in this transaction
+                        events = None;
+                    }
+                }
+
+                // Update segment state
                 if is_live {
                     self.segment_id = self.live_segment_id;
                     self.next_live_offset =
@@ -906,17 +941,11 @@ impl EventStreamIter {
                                 offset,
                                 segment_id: self.live_segment_id,
                             });
-                    return Ok(events);
-                }
-
-                if let Some((new_segment, new_offsets)) = new_offsets {
-                    self.segment_id = new_segment;
-                    self.segment_offsets = new_offsets;
-                    self.next_offset = self.segment_offsets.pop_front().map(|offset| NextOffset {
-                        offset,
-                        segment_id: self.segment_id,
-                    });
                 } else {
+                    if let Some((new_segment, new_offsets)) = new_offsets {
+                        self.segment_id = new_segment;
+                        self.segment_offsets = new_offsets;
+                    }
                     self.next_offset = self.segment_offsets.pop_front().map(|offset| NextOffset {
                         offset,
                         segment_id: self.segment_id,
