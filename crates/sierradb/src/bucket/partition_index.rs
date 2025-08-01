@@ -662,7 +662,7 @@ impl PartitionEventIter {
 
         let mut live_segment_offsets: VecDeque<_> = live_segment_offsets.into();
 
-        // Find the earlierst segment and offsets
+        // Find the earliest segment and offsets
         let (reply_tx, reply_rx) = oneshot::channel();
         reader_pool.spawn({
             move |with_readers| {
@@ -918,9 +918,26 @@ impl PartitionEventIter {
         match reply_rx.await {
             Ok(Ok(Some(ReadResult {
                 events,
-                new_offsets,
+                mut new_offsets,
                 is_live,
             }))) => {
+                // Handle skipping past all events in the transaction
+                if let Some(ref committed_events) = events
+                    && let Some(max_seq) = committed_events.last_partition_sequence()
+                {
+                    // Skip all offsets with sequences <= max_seq we just returned
+                    if is_live {
+                        self.live_segment_offsets
+                            .retain(|offset| offset.sequence > max_seq);
+                    } else if let Some((_, ref mut new_offsets)) = new_offsets {
+                        new_offsets.retain(|offset| offset.sequence > max_seq);
+                    } else {
+                        self.segment_offsets
+                            .retain(|offset| offset.sequence > max_seq);
+                    }
+                }
+
+                // Now update segment state
                 if is_live {
                     self.segment_id = self.live_segment_id;
                     self.next_live_offset = self.live_segment_offsets.pop_front().map(
@@ -929,19 +946,11 @@ impl PartitionEventIter {
                             segment_id: self.live_segment_id,
                         },
                     );
-                    return Ok(events);
-                }
-
-                if let Some((new_segment, new_offsets)) = new_offsets {
-                    self.segment_id = new_segment;
-                    self.segment_offsets = new_offsets;
-                    self.next_offset = self.segment_offsets.pop_front().map(
-                        |PartitionSequenceOffset { offset, .. }| NextOffset {
-                            offset,
-                            segment_id: self.segment_id,
-                        },
-                    );
                 } else {
+                    if let Some((new_segment, new_offsets)) = new_offsets {
+                        self.segment_id = new_segment;
+                        self.segment_offsets = new_offsets;
+                    }
                     self.next_offset = self.segment_offsets.pop_front().map(
                         |PartitionSequenceOffset { offset, .. }| NextOffset {
                             offset,
