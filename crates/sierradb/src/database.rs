@@ -946,6 +946,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::bucket::PartitionHash;
     use crate::id::uuid_v7_with_partition_hash;
 
     // Helper functions for test setup
@@ -961,12 +962,12 @@ mod tests {
     }
 
     fn create_test_event(
-        partition_id: PartitionId,
+        partition_hash: PartitionHash,
         stream_id_str: &str,
         version: ExpectedVersion,
     ) -> NewEvent {
         NewEvent {
-            event_id: uuid_v7_with_partition_hash(partition_id),
+            event_id: uuid_v7_with_partition_hash(partition_hash),
             stream_id: StreamId::new(stream_id_str).expect("Invalid stream ID"),
             stream_version: version,
             event_name: "test_event".to_string(),
@@ -1078,9 +1079,10 @@ mod tests {
 
         let partition_id = 1;
         let partition_key = Uuid::new_v4();
+        let partition_hash = uuid_to_partition_hash(partition_key);
         let stream_id_str = "test-stream";
 
-        let event = create_test_event(partition_id, stream_id_str, ExpectedVersion::Empty);
+        let event = create_test_event(partition_hash, stream_id_str, ExpectedVersion::Empty);
 
         let batch = Transaction::new(partition_key, partition_id, smallvec![event])
             .expect("Failed to create batch");
@@ -1100,12 +1102,13 @@ mod tests {
 
         let partition_id = 1;
         let partition_key = Uuid::new_v4();
+        let partition_hash = uuid_to_partition_hash(partition_key);
         let stream_id_str = "test-stream";
 
         // Append 3 events to the same stream with sequential versions
         for i in 0..3 {
             let event = create_test_event(
-                partition_id,
+                partition_hash,
                 stream_id_str,
                 if i == 0 {
                     ExpectedVersion::Empty
@@ -1135,10 +1138,11 @@ mod tests {
 
         let partition_id = 1;
         let partition_key = Uuid::new_v4();
+        let partition_hash = uuid_to_partition_hash(partition_key);
 
         // Create events for two different streams in the same transaction
-        let event1 = create_test_event(partition_id, "stream-1", ExpectedVersion::Empty);
-        let event2 = create_test_event(partition_id, "stream-2", ExpectedVersion::Empty);
+        let event1 = create_test_event(partition_hash, "stream-1", ExpectedVersion::Empty);
+        let event2 = create_test_event(partition_hash, "stream-2", ExpectedVersion::Empty);
 
         let events = smallvec![event1, event2];
         let batch = Transaction::new(partition_key, partition_id, events).unwrap();
@@ -1168,9 +1172,10 @@ mod tests {
         // Append an event first
         let partition_id = 1;
         let partition_key = Uuid::new_v4();
+        let partition_hash = uuid_to_partition_hash(partition_key);
         let stream_id_str = "test-stream";
 
-        let event = create_test_event(partition_id, stream_id_str, ExpectedVersion::Empty);
+        let event = create_test_event(partition_hash, stream_id_str, ExpectedVersion::Empty);
         let event_id = event.event_id;
 
         let batch = Transaction::new(partition_key, partition_id, smallvec![event]).unwrap();
@@ -1228,11 +1233,15 @@ mod tests {
         // Append multiple events to the same partition
         let partition_id = 1;
         let partition_key = Uuid::new_v4();
+        let partition_hash = uuid_to_partition_hash(partition_key);
 
         // Create and append 3 events
         for i in 0..3 {
-            let event =
-                create_test_event(partition_id, &format!("stream-{i}"), ExpectedVersion::Empty);
+            let event = create_test_event(
+                partition_hash,
+                &format!("stream-{i}"),
+                ExpectedVersion::Empty,
+            );
 
             let batch = Transaction::new(partition_key, partition_id, smallvec![event]).unwrap();
             let _ = db
@@ -1291,11 +1300,12 @@ mod tests {
         // Append events to get a sequence
         let partition_id = 1;
         let partition_key = Uuid::new_v4();
+        let partition_hash = uuid_to_partition_hash(partition_key);
 
         // Create and append 3 events
         for i in 0..3 {
             let event = create_test_event(
-                partition_id,
+                partition_hash,
                 "test-stream",
                 if i == 0 {
                     ExpectedVersion::Empty
@@ -1343,12 +1353,13 @@ mod tests {
         // Append multiple events to the same stream
         let partition_id = 1;
         let partition_key = Uuid::new_v4();
+        let partition_hash = uuid_to_partition_hash(partition_key);
         let stream_id_str = "test-stream";
 
         // Create and append 3 events
         for i in 0..3 {
             let event = create_test_event(
-                partition_id,
+                partition_hash,
                 stream_id_str,
                 if i == 0 {
                     ExpectedVersion::Empty
@@ -1401,12 +1412,13 @@ mod tests {
         // Append events to get a version
         let partition_id = 1;
         let partition_key = Uuid::new_v4();
+        let partition_hash = uuid_to_partition_hash(partition_key);
         let stream_id_str = "test-stream";
 
         // Create and append 3 events
         for i in 0..3 {
             let event = create_test_event(
-                partition_id,
+                partition_hash,
                 stream_id_str,
                 if i == 0 {
                     ExpectedVersion::Empty
@@ -1454,10 +1466,11 @@ mod tests {
 
         let partition_id = 1;
         let partition_key = Uuid::new_v4();
+        let partition_hash = uuid_to_partition_hash(partition_key);
         let stream_id_str = "test-stream";
 
         // First event - create stream
-        let event1 = create_test_event(partition_id, stream_id_str, ExpectedVersion::Empty);
+        let event1 = create_test_event(partition_hash, stream_id_str, ExpectedVersion::Empty);
 
         let batch1 = Transaction::new(partition_key, partition_id, smallvec![event1]).unwrap();
         let _ = db
@@ -1467,7 +1480,7 @@ mod tests {
 
         // Second event - tries to create stream again (should fail)
         let event2 = create_test_event(
-            partition_id,
+            partition_hash,
             stream_id_str,
             ExpectedVersion::Empty, // This should fail as stream now exists
         );
@@ -1485,10 +1498,11 @@ mod tests {
 
         let partition_id = 1;
         let partition_key = Uuid::new_v4();
+        let partition_hash = uuid_to_partition_hash(partition_key);
         let stream_id_str = "test-stream";
 
         // Create stream
-        let event1 = create_test_event(partition_id, stream_id_str, ExpectedVersion::Empty);
+        let event1 = create_test_event(partition_hash, stream_id_str, ExpectedVersion::Empty);
 
         let batch1 = Transaction::new(partition_key, partition_id, smallvec![event1]).unwrap();
         let _ = db
@@ -1498,7 +1512,7 @@ mod tests {
 
         // Try to append with wrong version
         let event2 = create_test_event(
-            partition_id,
+            partition_hash,
             stream_id_str,
             ExpectedVersion::Exact(1), // Wrong, should be 0
         );
@@ -1547,10 +1561,11 @@ mod tests {
 
         let partition_id = 1;
         let partition_key = Uuid::new_v4();
+        let partition_hash = uuid_to_partition_hash(partition_key);
         let stream_id_str = "test-stream";
 
         // First create the stream
-        let event1 = create_test_event(partition_id, stream_id_str, ExpectedVersion::Empty);
+        let event1 = create_test_event(partition_hash, stream_id_str, ExpectedVersion::Empty);
 
         let batch1 = Transaction::new(partition_key, partition_id, smallvec![event1]).unwrap();
         let _ = db
@@ -1559,7 +1574,7 @@ mod tests {
             .expect("Failed to append first event");
 
         // Append with StreamExists expectation (should succeed)
-        let event2 = create_test_event(partition_id, stream_id_str, ExpectedVersion::Exists);
+        let event2 = create_test_event(partition_hash, stream_id_str, ExpectedVersion::Exists);
 
         let batch2 = Transaction::new(partition_key, partition_id, smallvec![event2]).unwrap();
         let result = db.append_events(batch2).await;
@@ -1576,10 +1591,11 @@ mod tests {
 
         let partition_id = 1;
         let partition_key = Uuid::new_v4();
+        let partition_hash = uuid_to_partition_hash(partition_key);
         let stream_id_str = "test-stream";
 
         // For a new stream, Any should work
-        let event1 = create_test_event(partition_id, stream_id_str, ExpectedVersion::Any);
+        let event1 = create_test_event(partition_hash, stream_id_str, ExpectedVersion::Any);
 
         let batch1 = Transaction::new(partition_key, partition_id, smallvec![event1]).unwrap();
         let result1 = db.append_events(batch1).await;
@@ -1589,7 +1605,7 @@ mod tests {
         );
 
         // For an existing stream, Any should also work
-        let event2 = create_test_event(partition_id, stream_id_str, ExpectedVersion::Any);
+        let event2 = create_test_event(partition_hash, stream_id_str, ExpectedVersion::Any);
 
         let batch2 = Transaction::new(partition_key, partition_id, smallvec![event2]).unwrap();
         let result2 = db.append_events(batch2).await;
@@ -1617,8 +1633,9 @@ mod tests {
 
         for &partition_id in &partition_ids {
             let partition_key = Uuid::new_v4();
+            let partition_hash = uuid_to_partition_hash(partition_key);
             let event = create_test_event(
-                partition_id,
+                partition_hash,
                 &format!("stream-{partition_id}"),
                 ExpectedVersion::Empty,
             );

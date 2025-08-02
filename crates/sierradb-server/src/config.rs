@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use clap::Parser;
 use config::{Config, ConfigError, Environment, File, Value, ValueKind};
@@ -8,6 +10,7 @@ use directories::ProjectDirs;
 use libp2p::Multiaddr;
 use serde::Deserialize;
 use sierradb::bucket::{BucketId, PartitionId};
+use thiserror::Error;
 
 /// A distributed, partitioned event store with configurable replication
 #[derive(Parser, Debug)]
@@ -222,6 +225,172 @@ impl AppConfig {
         Ok(config)
     }
 
+    pub fn validate(&self) -> Result<Vec<ValidationError>, ConfigError> {
+        let mut errs = Vec::new();
+
+        // Bucket validation
+        if self.bucket.count == 0 {
+            errs.push(ValidationError::BucketCountZero);
+        }
+        if let Some(ids) = &self.bucket.ids {
+            if ids.len() != self.bucket.count as usize {
+                errs.push(ValidationError::BucketIdCountMismatch {
+                    expected: self.bucket.count,
+                    actual: ids.len(),
+                });
+            }
+            let unique_ids: HashSet<_> = ids.iter().collect();
+            if unique_ids.len() != ids.len() {
+                errs.push(ValidationError::DuplicateBucketIds);
+            }
+        }
+
+        // Heartbeat validation
+        if self.heartbeat.interval_ms == 0 {
+            errs.push(ValidationError::HeartbeatIntervalZero);
+        }
+        if self.heartbeat.timeout_ms == 0 {
+            errs.push(ValidationError::HeartbeatTimeoutZero);
+        }
+        if self.heartbeat.timeout_ms <= self.heartbeat.interval_ms {
+            errs.push(ValidationError::HeartbeatTimeoutTooShort {
+                interval: self.heartbeat.interval_ms,
+                timeout: self.heartbeat.timeout_ms,
+            });
+        }
+
+        // Network validation
+        if SocketAddr::from_str(&self.network.client_address).is_err() {
+            errs.push(ValidationError::InvalidClientAddress {
+                address: self.network.client_address.clone(),
+            });
+        }
+
+        // Node validation
+        if let Some(count) = self.node.count {
+            if count == 0 {
+                errs.push(ValidationError::NodeCountZero);
+            }
+            if self.node.index >= count {
+                errs.push(ValidationError::NodeIndexOutOfBounds {
+                    index: self.node.index,
+                    count,
+                });
+            }
+        }
+
+        // Cluster mode validation
+        if !self.network.cluster_enabled {
+            // Non-cluster mode
+            if let Some(count) = self.node.count
+                && count > 1
+            {
+                errs.push(ValidationError::MultipleNodesWithoutCluster { count });
+            }
+        }
+
+        // Partition validation
+        if self.partition.count == 0 {
+            errs.push(ValidationError::PartitionCountZero);
+        }
+        if let Some(ids) = &self.partition.ids {
+            if ids.len() != self.partition.count as usize {
+                errs.push(ValidationError::PartitionIdCountMismatch {
+                    expected: self.partition.count,
+                    actual: ids.len(),
+                });
+            }
+            let unique_ids: HashSet<_> = ids.iter().collect();
+            if unique_ids.len() != ids.len() {
+                errs.push(ValidationError::DuplicatePartitionIds);
+            }
+        }
+
+        // Replication validation
+        if self.replication.factor == 0 {
+            errs.push(ValidationError::ReplicationFactorZero);
+        }
+        if self.replication.buffer_size == 0 {
+            errs.push(ValidationError::ReplicationBufferSizeZero);
+        }
+        if self.replication.buffer_timeout_ms == 0 {
+            errs.push(ValidationError::ReplicationBufferTimeoutZero);
+        }
+        if self.replication.catchup_timeout_ms == 0 {
+            errs.push(ValidationError::ReplicationCatchupTimeoutZero);
+        }
+
+        // Replication factor vs node count
+        let node_count = self.node_count()?;
+        if self.replication.factor as usize > node_count {
+            errs.push(ValidationError::ReplicationFactorExceedsNodeCount {
+                factor: self.replication.factor,
+                node_count,
+            });
+        }
+
+        // Segment validation
+        if self.segment.size_bytes == 0 {
+            errs.push(ValidationError::SegmentSizeZero);
+        }
+        const MIN_SEGMENT_SIZE: usize = 1024; // 1KB
+        const MAX_SEGMENT_SIZE: usize = 1024 * 1024 * 1024 * 10; // 10GB
+        if self.segment.size_bytes < MIN_SEGMENT_SIZE {
+            errs.push(ValidationError::SegmentSizeTooSmall {
+                size: self.segment.size_bytes,
+                min: MIN_SEGMENT_SIZE,
+            });
+        }
+        if self.segment.size_bytes > MAX_SEGMENT_SIZE {
+            errs.push(ValidationError::SegmentSizeTooLarge {
+                size: self.segment.size_bytes,
+                max: MAX_SEGMENT_SIZE,
+            });
+        }
+
+        // Thread validation
+        if let Some(read_threads) = self.threads.read {
+            if read_threads == 0 {
+                errs.push(ValidationError::ReadThreadsZero);
+            }
+            const MAX_THREADS: u16 = 1024;
+            if read_threads > MAX_THREADS {
+                errs.push(ValidationError::TooManyReadThreads {
+                    count: read_threads,
+                    max: MAX_THREADS,
+                });
+            }
+        }
+        if let Some(write_threads) = self.threads.write {
+            if write_threads == 0 {
+                errs.push(ValidationError::WriteThreadsZero);
+            }
+            const MAX_THREADS: u16 = 1024;
+            if write_threads > MAX_THREADS {
+                errs.push(ValidationError::TooManyWriteThreads {
+                    count: write_threads,
+                    max: MAX_THREADS,
+                });
+            }
+        }
+
+        // Cross-field validations for distribution
+        if (self.partition.count as usize) < node_count {
+            errs.push(ValidationError::TooFewPartitionsForNodes {
+                partitions: self.partition.count,
+                nodes: node_count,
+            });
+        }
+        if self.partition.count < self.bucket.count {
+            errs.push(ValidationError::TooFewPartitionsForBuckets {
+                buckets: self.bucket.count,
+                partitions: self.partition.count,
+            });
+        }
+
+        Ok(errs)
+    }
+
     pub fn assigned_buckets(&self) -> Result<HashSet<BucketId>, ConfigError> {
         match &self.bucket.ids {
             Some(ids) => Ok(ids.iter().copied().collect()),
@@ -398,4 +567,79 @@ fn flatten_value_recursive(value: Value, prefix: &str, result: &mut HashMap<Stri
             }
         }
     }
+}
+
+#[derive(Clone, Debug, Error)]
+pub enum ValidationError {
+    // Bucket errors
+    #[error("bucket count cannot be zero")]
+    BucketCountZero,
+    #[error("bucket ID count mismatch: expected {expected}, got {actual}")]
+    BucketIdCountMismatch { expected: u16, actual: usize },
+    #[error("duplicate bucket IDs found")]
+    DuplicateBucketIds,
+
+    // Heartbeat errors
+    #[error("heartbeat interval cannot be zero")]
+    HeartbeatIntervalZero,
+    #[error("heartbeat timeout cannot be zero")]
+    HeartbeatTimeoutZero,
+    #[error("heartbeat timeout ({timeout}ms) must be greater than interval ({interval}ms)")]
+    HeartbeatTimeoutTooShort { interval: u64, timeout: u64 },
+
+    // Network errors
+    #[error("invalid client address: {address}")]
+    InvalidClientAddress { address: String },
+
+    // Node errors
+    #[error("node count cannot be zero")]
+    NodeCountZero,
+    #[error("node index {index} is out of bounds for count {count}")]
+    NodeIndexOutOfBounds { index: u32, count: u32 },
+    #[error("multiple nodes ({count}) configured but cluster is disabled")]
+    MultipleNodesWithoutCluster { count: u32 },
+
+    // Partition errors
+    #[error("partition count cannot be zero")]
+    PartitionCountZero,
+    #[error("partition ID count mismatch: expected {expected}, got {actual}")]
+    PartitionIdCountMismatch { expected: u16, actual: usize },
+    #[error("duplicate partition IDs found")]
+    DuplicatePartitionIds,
+
+    // Replication errors
+    #[error("replication factor cannot be zero")]
+    ReplicationFactorZero,
+    #[error("replication factor {factor} exceeds node count {node_count}")]
+    ReplicationFactorExceedsNodeCount { factor: u8, node_count: usize },
+    #[error("replication buffer size cannot be zero")]
+    ReplicationBufferSizeZero,
+    #[error("replication buffer timeout cannot be zero")]
+    ReplicationBufferTimeoutZero,
+    #[error("replication catchup timeout cannot be zero")]
+    ReplicationCatchupTimeoutZero,
+
+    // Segment errors
+    #[error("segment size cannot be zero")]
+    SegmentSizeZero,
+    #[error("segment size {size} is too small (minimum: {min} bytes)")]
+    SegmentSizeTooSmall { size: usize, min: usize },
+    #[error("segment size {size} is too large (maximum: {max} bytes)")]
+    SegmentSizeTooLarge { size: usize, max: usize },
+
+    // Thread errors
+    #[error("read thread count cannot be zero")]
+    ReadThreadsZero,
+    #[error("write thread count cannot be zero")]
+    WriteThreadsZero,
+    #[error("too many read threads: {count} (maximum: {max})")]
+    TooManyReadThreads { count: u16, max: u16 },
+    #[error("too many write threads: {count} (maximum: {max})")]
+    TooManyWriteThreads { count: u16, max: u16 },
+
+    // Cross-field errors
+    #[error("too few partitions ({partitions}) for {nodes} nodes")]
+    TooFewPartitionsForNodes { partitions: u16, nodes: usize },
+    #[error("too few partitions ({partitions}) for {buckets} buckets")]
+    TooFewPartitionsForBuckets { buckets: u16, partitions: u16 },
 }

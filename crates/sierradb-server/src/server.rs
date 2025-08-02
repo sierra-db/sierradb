@@ -14,7 +14,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::request::{
-    EAppend, EGet, EMAppend, EPScan, EPSeq, ESVer, EScan, ESub, FromArgs, RangeValue,
+    EAppend, EGet, EMAppend, EPScan, EPSeq, ESVer, EScan, ESub, FromArgs, Hello, RangeValue,
 };
 use crate::value::{Value, ValueDecoder};
 
@@ -109,6 +109,8 @@ impl Conn {
 
                 match &items[0].as_str() {
                     Ok(cmd) => match cmd.to_uppercase().as_str() {
+                        "HELLO" => handle_req!(Hello, handle_hello),
+                        "PING" => self.handle_ping(),
                         "EAPPEND" => handle_req!(EAppend, handle_eappend),
                         "EMAPPEND" => handle_req!(EMAppend, handle_emappend),
                         "EGET" => handle_req!(EGet, handle_eget),
@@ -117,7 +119,6 @@ impl Conn {
                         "EPSEQ" => handle_req!(EPSeq, handle_epseq),
                         "ESVER" => handle_req!(ESVer, handle_esver),
                         "ESUB" => handle_req!(ESub, handle_esub),
-                        "PING" => Ok(Value::String("PONG".to_string())),
                         _ => Ok(Value::Error(format!("Unknown command: {cmd}"))),
                     },
                     _ => Ok(Value::Error("Expected command name as bulk string".into())),
@@ -125,6 +126,18 @@ impl Conn {
             }
             _ => Ok(Value::Error("Expected array".into())),
         }
+    }
+
+    async fn handle_hello(&mut self, Hello { version: _ }: Hello) -> io::Result<Value> {
+        Ok(Value::Array(vec![
+            Value::Integer(3),                     // protocol version
+            Value::String("SIERRADB".to_string()), // server name
+            Value::Integer(self.num_partitions as i64),
+        ]))
+    }
+
+    fn handle_ping(&mut self) -> io::Result<Value> {
+        Ok(Value::String("PONG".to_string()))
     }
 
     async fn handle_eappend(

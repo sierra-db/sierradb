@@ -7,9 +7,8 @@ use sierradb::database::DatabaseBuilder;
 use sierradb_cluster::{ClusterActor, ClusterArgs};
 use sierradb_server::config::{AppConfig, Args};
 use sierradb_server::server::Server;
-use tracing::debug;
+use tracing::{debug, error};
 use tracing_subscriber::EnvFilter;
-use tracing_subscriber::fmt::format::FmtSpan;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -17,14 +16,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing_subscriber::fmt::SubscriberBuilder::default()
         .without_time()
+        .with_target(false)
         .with_env_filter(EnvFilter::new(args.log.as_deref().unwrap_or(
             "sierradb_cluster=DEBUG,sierradb_server=DEBUG,sierradb=DEBUG,INFO",
         )))
-        .with_span_events(FmtSpan::ENTER)
+        // .with_span_events(FmtSpan::ENTER)
         .init();
 
     let config = AppConfig::load(args)?;
     debug!("Configuration:\n{config}");
+    let errs = config.validate()?;
+    let has_errs = !errs.is_empty();
+    for err in errs {
+        error!("config error: {err}");
+    }
+    if has_errs {
+        std::process::exit(1);
+    }
 
     let assigned_buckets = config.assigned_buckets()?;
     let assigned_partitions = config.assigned_partitions(&assigned_buckets);

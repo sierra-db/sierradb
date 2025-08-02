@@ -9,6 +9,9 @@ redis = "0.32.4"
 serde = { workspace = true, features = ["derive"] }
 uuid = { workspace = true, features = ["serde", "v5"] }
 
+[dev-dependencies]
+ciborium = "0.2.2"
+
 [features]
 aio = ["redis/aio"]
 cluster = ["redis/cluster"]
