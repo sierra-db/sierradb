@@ -1,18 +1,15 @@
 use std::time::Duration;
 
-use redis::Value;
 use sierradb_client::{Commands, EAppendOptions, EMAppendEvent, stream_partition_key};
-use uuid::Uuid;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", stream_partition_key("mypartition"));
+    return Ok(());
+
     let client = redis::Client::open("redis://127.0.0.1:9090/")?;
     let mut con = client.get_connection()?;
 
-    let info = con.eappend(
-        "foo",
-        "bar",
-        EAppendOptions::default().payload(b"hola".to_vec()),
-    )?;
+    let info = con.eappend("foo", "bar", EAppendOptions::new().payload(b"hola"))?;
     println!("Appended event!");
     dbg!(&info);
 
@@ -31,6 +28,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     println!("Appended events!");
     dbg!(&info);
+
+    let batch = con.epscan_by_id(665, 0, None, None)?;
+    dbg!(batch);
+
+    let batch = con.escan_with_partition_key(
+        "mypartition",
+        stream_partition_key("mypartition"),
+        0,
+        None,
+        None,
+    )?;
+    dbg!(batch);
 
     Ok(())
 }

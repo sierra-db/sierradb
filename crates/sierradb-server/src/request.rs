@@ -9,7 +9,46 @@ use uuid::Uuid;
 use crate::impl_command;
 use crate::value::Value;
 
-// EAPPEND
+pub struct Hello {
+    pub version: Option<i64>,
+}
+
+impl FromArgs for Hello {
+    fn from_args(args: &[Value]) -> Result<Self, Value> {
+        let version = if args.len() > 1 {
+            match args[1].as_integer() {
+                Ok(v) => Some(v),
+                Err(_) => return Err(Value::Error("Invalid protocol version".into())),
+            }
+        } else {
+            None
+        };
+
+        Ok(Hello { version })
+    }
+}
+
+/// Append an event to a stream.
+///
+/// # Syntax
+/// ```text
+/// EAPPEND <stream_id> <event_name> [EVENT_ID <event_id>] [PARTITION_KEY <partition_key>] [EXPECTED_VERSION <version>] [PAYLOAD <payload>] [METADATA <metadata>]
+/// ```
+///
+/// # Parameters
+/// - `stream_id`: Stream identifier to append the event to
+/// - `event_name`: Name/type of the event
+/// - `event_id` (optional): UUID for the event (auto-generated if not provided)
+/// - `partition_key` (optional): UUID to determine event partitioning
+/// - `expected_version` (optional): Expected stream version (number, "any",
+///   "exists", "empty")
+/// - `payload` (optional): Event payload data
+/// - `metadata` (optional): Event metadata
+///
+/// # Example
+/// ```text
+/// EAPPEND my-stream UserCreated PAYLOAD '{"name":"john"}' METADATA '{"source":"api"}'
+/// ```
 pub struct EAppend {
     pub stream_id: StreamId,
     pub event_name: String,
@@ -35,6 +74,32 @@ pub struct Event {
     pub metadata: Vec<u8>,
 }
 
+/// Append multiple events to streams in a single transaction.
+///
+/// # Syntax
+/// ```text
+/// EMAPPEND <partition_key> <stream_id1> <event_name1> [EVENT_ID <event_id1>] [EXPECTED_VERSION <version1>] [PAYLOAD <payload1>] [METADATA <metadata1>] [<stream_id2> <event_name2> ...]
+/// ```
+///
+/// # Parameters
+/// - `partition_key`: UUID that determines which partition all events will be
+///   written to
+/// - For each event:
+///   - `stream_id`: Stream identifier to append the event to
+///   - `event_name`: Name/type of the event
+///   - `event_id` (optional): UUID for the event (auto-generated if not
+///     provided)
+///   - `expected_version` (optional): Expected stream version (number, "any",
+///     "exists", "empty")
+///   - `payload` (optional): Event payload data
+///   - `metadata` (optional): Event metadata
+///
+/// # Example
+/// ```text
+/// EMAPPEND 550e8400-e29b-41d4-a716-446655440000 stream1 EventA PAYLOAD '{"data":"value1"}' stream2 EventB PAYLOAD '{"data":"value2"}'
+/// ```
+///
+/// **Note:** All events are appended atomically in a single transaction.
 pub struct EMAppend {
     pub partition_key: Uuid,
     pub events: Vec<Event>,
@@ -147,14 +212,45 @@ impl FromArgs for EMAppend {
     }
 }
 
-// EGET
+/// Get an event by its unique identifier.
+///
+/// # Syntax
+/// ```text
+/// EGET <event_id>
+/// ```
+///
+/// # Parameters
+/// - `event_id`: UUID of the event to retrieve
+///
+/// # Example
+/// ```text
+/// EGET 550e8400-e29b-41d4-a716-446655440000
+/// ```
 pub struct EGet {
     pub event_id: Uuid,
 }
 
 impl_command!(EGet, [event_id], []);
 
-// EPSCAN
+/// Scan events in a partition by sequence number range.
+///
+/// # Syntax
+/// ```text
+/// EPSCAN <partition> <start_sequence> <end_sequence> [COUNT <count>]
+/// ```
+///
+/// # Parameters
+/// - `partition`: Partition selector (partition ID 0-65535 or UUID key)
+/// - `start_sequence`: Starting sequence number (use "-" for beginning)
+/// - `end_sequence`: Ending sequence number (use "+" for end, or specific
+///   number)
+/// - `count` (optional): Maximum number of events to return
+///
+/// # Examples
+/// ```text
+/// EPSCAN 42 100 200 COUNT 50
+/// EPSCAN 550e8400-e29b-41d4-a716-446655440000 - + COUNT 100
+/// ```
 pub struct EPScan {
     pub partition: PartitionSelector,
     pub start_sequence: u64,
@@ -164,12 +260,30 @@ pub struct EPScan {
 
 impl_command!(EPScan, [partition, start_sequence, end_sequence], [count]);
 
-// ESCAN
+/// Scan events in a stream by version range.
+///
+/// # Syntax
+/// ```text
+/// ESCAN <stream_id> <start_version> <end_version> [PARTITION_KEY <partition_key>] [COUNT <count>]
+/// ```
+///
+/// # Parameters
+/// - `stream_id`: Stream identifier to scan
+/// - `start_version`: Starting version number (use "-" for beginning)
+/// - `end_version`: Ending version number (use "+" for end, or specific number)
+/// - `partition_key` (optional): UUID to scan specific partition
+/// - `count` (optional): Maximum number of events to return
+///
+/// # Examples
+/// ```text
+/// ESCAN my-stream 0 100 COUNT 50
+/// ESCAN my-stream - + PARTITION_KEY 550e8400-e29b-41d4-a716-446655440000
+/// ```
 pub struct EScan {
     pub stream_id: StreamId,
-    pub partition_key: Option<Uuid>,
     pub start_version: u64,
     pub end_version: RangeValue,
+    pub partition_key: Option<Uuid>,
     pub count: Option<u64>,
 }
 
@@ -179,14 +293,43 @@ impl_command!(
     [partition_key, count]
 );
 
-// EPSEQ
+/// Get the current sequence number for a partition.
+///
+/// # Syntax
+/// ```text
+/// EPSEQ <partition>
+/// ```
+///
+/// # Parameters
+/// - `partition`: Partition selector (partition ID 0-65535 or UUID key)
+///
+/// # Examples
+/// ```text
+/// EPSEQ 42
+/// EPSEQ 550e8400-e29b-41d4-a716-446655440000
+/// ```
 pub struct EPSeq {
     pub partition: PartitionSelector,
 }
 
 impl_command!(EPSeq, [partition], []);
 
-// ESVER
+/// Get the current version number for a stream.
+///
+/// # Syntax
+/// ```text
+/// ESVER <stream_id> [PARTITION_KEY <partition_key>]
+/// ```
+///
+/// # Parameters
+/// - `stream_id`: Stream identifier to get version for
+/// - `partition_key` (optional): UUID to check specific partition
+///
+/// # Examples
+/// ```text
+/// ESVER my-stream
+/// ESVER my-stream PARTITION_KEY 550e8400-e29b-41d4-a716-446655440000
+/// ```
 pub struct ESVer {
     pub stream_id: StreamId,
     pub partition_key: Option<Uuid>,
@@ -194,7 +337,22 @@ pub struct ESVer {
 
 impl_command!(ESVer, [stream_id], [partition_key]);
 
-// ESUB
+/// Subscribe to receive events from the event store.
+///
+/// # Syntax
+/// ```text
+/// ESUB
+/// ```
+///
+/// # Parameters
+/// None
+///
+/// # Example
+/// ```text
+/// ESUB
+/// ```
+///
+/// **Note:** Establishes a persistent connection to receive real-time events.
 pub struct ESub {}
 
 impl_command!(ESub, [], []);

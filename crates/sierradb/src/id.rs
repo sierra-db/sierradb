@@ -6,7 +6,8 @@ use uuid::{Uuid, uuid};
 use crate::RANDOM_STATE;
 use crate::bucket::{BucketId, PartitionHash, PartitionId};
 
-pub const NAMESPACE_PARTITION_KEY: Uuid = uuid!("bd804425-2e2e-499f-b61d-e045d035ca86");
+// Uuid::new_v5(&Uuid::NAMESPACE_DNS, b"sierradb.tqwewe.com")
+pub const NAMESPACE_PARTITION_KEY: Uuid = uuid!("219bd637-e279-53e9-9e2b-eabe5d9120cc");
 
 /// Hashes the stream id, and performs a modulo on the lowest 16 bits of the
 /// hash.

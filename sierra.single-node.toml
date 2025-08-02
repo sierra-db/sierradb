@@ -1,6 +1,6 @@
 # A single node config
 
-dir = "target/db"
+dir = "target/db-single-node"
 
 [network]
 cluster_enabled = false

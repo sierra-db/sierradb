@@ -27,6 +27,19 @@
       forAllSystems = function: nixpkgs.lib.genAttrs supportedSystems function;
     in
     {
+      packages = forAllSystems (
+        system:
+        let
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ rust-overlay.overlays.default ];
+          };
+        in
+        {
+          default = pkgs.callPackage ./default.nix { };
+        }
+      );
+
       devShells = forAllSystems (
         system:
         let

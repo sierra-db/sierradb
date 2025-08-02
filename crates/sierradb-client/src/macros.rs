@@ -76,10 +76,10 @@ macro_rules! implement_command_sync {
 		fn $name<$lifetime, $($tyargs: $ty + Send + Sync + $lifetime,)*>(
 			& $lifetime mut self
 			$(, $argname: $argty)*
-		) -> RedisResult<$rettype>
+		) -> redis::RedisResult<$rettype>
 
 		{
-			Cmd::$name($($argname),*).query(self)
+			redis::Cmd::$name($($argname),*).query(self)
 		}
 	};
 }
@@ -123,14 +123,14 @@ macro_rules! implement_commands {
         /// assert_eq!(con.get("my_key"), Ok(42));
         /// # Ok(()) }
         /// ```
-        pub trait Commands : ConnectionLike+Sized {
+        pub trait Commands : redis::ConnectionLike + Sized {
             $(
                 $(#[$attr])*
                 #[inline]
                 #[allow(clippy::extra_unused_lifetimes, clippy::needless_lifetimes)]
                 fn $name<$lifetime, $($tyargs: $ty, )*>(
-                    &mut self $(, $argname: $argty)*) -> RedisResult<$rettype>
-                    { Cmd::$name($($argname),*).query(self) }
+                    &mut self $(, $argname: $argty)*) -> redis::RedisResult<$rettype>
+                    { redis::Cmd::$name($($argname),*).query(self) }
             )*
         }
 
@@ -142,7 +142,7 @@ macro_rules! implement_commands {
             )*
         }
 
-        impl CmdExt for Cmd {
+        impl CmdExt for redis::Cmd {
             $(
                 $(#[$attr])*
                 #[allow(clippy::extra_unused_lifetimes, clippy::needless_lifetimes)]
@@ -192,7 +192,7 @@ macro_rules! implement_commands {
                     $(, $argname: $argty)*
                 ) -> redis::RedisFuture<$lifetime, RV>
                 where
-                    RV: FromRedisValue,
+                    RV: redis::FromRedisValue,
                 {
                     Box::pin(async move { ($body).query_async(self).await })
                 }
@@ -201,7 +201,7 @@ macro_rules! implement_commands {
 
         /// Implements common redis commands.
         /// The return types are concrete and opinionated. If you want to choose the return type you should use the `Commands` trait.
-        pub trait TypedCommands : ConnectionLike+Sized {
+        pub trait TypedCommands: redis::ConnectionLike + Sized {
             $(
 				implement_command_sync! {
 					$lifetime
@@ -220,7 +220,7 @@ macro_rules! implement_commands {
 		/// Implements common redis commands over asynchronous connections.
         /// The return types are concrete and opinionated. If you want to choose the return type you should use the `AsyncCommands` trait.
 		#[cfg(feature = "aio")]
-        pub trait AsyncTypedCommands : redis::aio::ConnectionLike + Send + Sized {
+        pub trait AsyncTypedCommands: redis::aio::ConnectionLike + Send + Sized {
             $(
 				implement_command_async! {
 					$lifetime
@@ -249,7 +249,7 @@ macro_rules! implement_commands {
             )*
         }
 
-        impl PipelineExt for Pipeline {
+        impl PipelineExt for redis::Pipeline {
             $(
                 $(#[$attr])*
                 #[inline]
@@ -266,12 +266,24 @@ macro_rules! implement_commands {
         // commands trait, this returns the cluster pipeline rather than a result
         // directly.  Other than that it works the same however.
         #[cfg(feature = "cluster")]
-        impl ClusterPipeline {
+        pub trait ClusterPipeline {
+            $(
+                $(#[$attr])*
+                #[allow(clippy::extra_unused_lifetimes, clippy::needless_lifetimes)]
+                fn $name<$lifetime, $($tyargs: $ty),*>(
+                    &mut self $(, $argname: $argty)*
+                ) -> &mut Self;
+            )*
+
+        }
+
+        #[cfg(feature = "cluster")]
+        impl ClusterPipeline for redis::cluster::ClusterPipeline {
             $(
                 $(#[$attr])*
                 #[inline]
                 #[allow(clippy::extra_unused_lifetimes, clippy::needless_lifetimes)]
-                pub fn $name<$lifetime, $($tyargs: $ty),*>(
+                fn $name<$lifetime, $($tyargs: $ty),*>(
                     &mut self $(, $argname: $argty)*
                 ) -> &mut Self {
                     self.add_command(::std::mem::take($body))

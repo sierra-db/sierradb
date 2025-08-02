@@ -19,6 +19,7 @@ kameo.workspace = true
 libp2p.workspace = true
 serde = { workspace = true, features = ["derive"] }
 smallvec.workspace = true
+thiserror.workspace = true
 tokio = { workspace = true, features = [
   "fs",
   "io-std",
