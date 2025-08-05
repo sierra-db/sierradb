@@ -456,7 +456,6 @@ pub struct MultiAppendInfo {
     pub partition_id: u16,
     pub first_partition_sequence: u64,
     pub last_partition_sequence: u64,
-    pub timestamp: SystemTime,
     pub events: Vec<EventInfo>,
 }
 
@@ -472,10 +471,10 @@ impl FromRedisValue for MultiAppendInfo {
     fn from_redis_value(value: &Value) -> RedisResult<Self> {
         match value {
             Value::Array(values) => {
-                if values.len() != 6 {
+                if values.len() != 5 {
                     return Err(RedisError::from((
                         redis::ErrorKind::TypeError,
-                        "Multi append info array must have exactly 6 elements",
+                        "Multi append info array must have exactly 5 elements",
                     )));
                 }
 
@@ -524,20 +523,7 @@ impl FromRedisValue for MultiAppendInfo {
                     }
                 };
 
-                let timestamp = match &values[4] {
-                    Value::Int(nanos) => {
-                        let duration = Duration::from_nanos(*nanos as u64);
-                        UNIX_EPOCH + duration
-                    }
-                    _ => {
-                        return Err(RedisError::from((
-                            redis::ErrorKind::TypeError,
-                            "timestamp must be an integer",
-                        )));
-                    }
-                };
-
-                let events = match &values[5] {
+                let events = match &values[4] {
                     Value::Array(event_arrays) => event_arrays
                         .iter()
                         .map(|event_array| match event_array {
@@ -609,7 +595,6 @@ impl FromRedisValue for MultiAppendInfo {
                     partition_id,
                     first_partition_sequence,
                     last_partition_sequence,
-                    timestamp,
                     events,
                 })
             }

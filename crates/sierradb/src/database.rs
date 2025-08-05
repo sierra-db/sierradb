@@ -252,11 +252,15 @@ impl Database {
         &self,
         partition_id: PartitionId,
         stream_id: StreamId,
+        from_version: u64,
+        reverse: bool,
     ) -> Result<EventStreamIter, StreamIndexError> {
         let bucket_id = partition_id % self.total_buckets;
         EventStreamIter::new(
             stream_id,
             bucket_id,
+            from_version,
+            reverse,
             self.reader_pool.clone(),
             self.writer_pool.indexes(),
         )
@@ -266,7 +270,7 @@ impl Database {
     pub async fn get_stream_version(
         &self,
         partition_id: PartitionId,
-        stream_id: &Arc<str>,
+        stream_id: &StreamId,
     ) -> Result<Option<StreamLatestVersion>, StreamIndexError> {
         let bucket_id = partition_id % self.total_buckets;
         let latest = self
@@ -299,7 +303,7 @@ impl Database {
 
         let (reply_tx, reply_rx) = oneshot::channel();
         self.reader_pool.spawn({
-            let stream_id = Arc::clone(stream_id);
+            let stream_id = stream_id.clone();
             move |with_readers| {
                 with_readers(move |readers| {
                     let res = readers
@@ -939,7 +943,6 @@ pub struct NewEvent {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use smallvec::smallvec;
     use tempfile::tempdir;
@@ -1378,7 +1381,7 @@ mod tests {
         // Read the stream
         let stream_id = StreamId::new(stream_id_str).unwrap();
         let mut stream_iter = db
-            .read_stream(partition_id, stream_id)
+            .read_stream(partition_id, stream_id, 0)
             .await
             .expect("Failed to read stream");
 
@@ -1435,7 +1438,7 @@ mod tests {
         }
 
         // Get the stream version
-        let stream_id = Arc::from(stream_id_str);
+        let stream_id = StreamId::new(stream_id_str).unwrap();
         let version_opt = db
             .get_stream_version(partition_id, &stream_id)
             .await
@@ -1533,7 +1536,7 @@ mod tests {
         let nonexistent_stream = StreamId::new("nonexistent-stream").unwrap();
 
         let mut stream_iter = db
-            .read_stream(partition_id, nonexistent_stream)
+            .read_stream(partition_id, nonexistent_stream, 0)
             .await
             .expect("Failed to read empty stream");
         let event = stream_iter.next(false).await.unwrap();

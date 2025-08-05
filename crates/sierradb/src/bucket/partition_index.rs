@@ -672,10 +672,7 @@ impl PartitionEventIter {
                         .and_then(|segments| {
                             segments.iter_mut().enumerate().rev().find_map(
                                 |(i, (segment_id, reader_set))| {
-                                    let Some(partition_index) = &mut reader_set.partition_index
-                                    else {
-                                        return None;
-                                    };
+                                    let partition_index = reader_set.partition_index.as_mut()?;
 
                                     match partition_index.get_key(partition_id) {
                                         Ok(Some(key))

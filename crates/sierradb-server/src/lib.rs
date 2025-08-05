@@ -1,4 +1,5 @@
 pub mod config;
+pub mod error;
 pub mod request;
 pub mod server;
 pub mod value;

@@ -32,3 +32,10 @@ path = "fuzz_targets/append.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "commands"
+path = "fuzz_targets/commands.rs"
+test = false
+doc = false
+bench = false

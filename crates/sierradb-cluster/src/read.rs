@@ -621,8 +621,10 @@ impl ClusterActor {
             );
 
             // Create iterator and collect events
-            // TODO: Add parameter to provide start from version
-            let mut iter = match database.read_stream(partition_id, stream_id).await {
+            let mut iter = match database
+                .read_stream(partition_id, stream_id, start_version, true)
+                .await
+            {
                 Ok(iter) => iter,
                 Err(err) => {
                     reply_sender.send(Err(ClusterError::Read(err.to_string())));
@@ -921,3 +923,141 @@ impl Message<ReadStream> for ClusterActor {
         delegated_reply
     }
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GetPartitionSequence {
+    pub partition_id: PartitionId,
+    #[serde(skip)]
+    pub skip_local_check: bool,
+}
+
+#[remote_message("a5b2ea0e-e369-4145-99ed-c2020b09a298")]
+impl Message<GetPartitionSequence> for ClusterActor {
+    type Reply = DelegatedReply<Result<Option<u64>, ClusterError>>;
+
+    #[instrument(skip_all, fields(
+        partition_id = msg.partition_id,
+        skip_local_check = msg.skip_local_check,
+    ))]
+    async fn handle(
+        &mut self,
+        msg: GetPartitionSequence,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        if let Some(watermark) = self.watermarks.get(&msg.partition_id) {
+            return ctx.reply(Ok(watermark.get().checked_sub(1)));
+        }
+
+        let (delegated_reply, reply_sender) = ctx.reply_sender();
+        let Some(reply_sender) = reply_sender else {
+            warn!("ignoring get partition sequence with no reply");
+            return delegated_reply;
+        };
+
+        // Check if we own this partition
+        let available_replicas = self
+            .topology_manager()
+            .get_available_replicas(msg.partition_id);
+
+        let Some((partition_owner, _)) = available_replicas
+            .into_iter()
+            .find(|(replica, _)| replica.id().peer_id().unwrap() != &self.local_peer_id)
+        else {
+            reply_sender.send(Err(ClusterError::PartitionUnavailable));
+            return delegated_reply;
+        };
+
+        tokio::spawn(async move {
+            debug!(
+                partition_id = msg.partition_id,
+                target_peer = ?partition_owner.id().peer_id(),
+                "forwarding stream read to owner"
+            );
+
+            let result = partition_owner
+                .ask(&msg)
+                .mailbox_timeout(Duration::from_secs(10))
+                .reply_timeout(Duration::from_secs(10))
+                .await;
+
+            match result {
+                Ok(seq) => {
+                    reply_sender.send(Ok(seq));
+                }
+                Err(err) => {
+                    warn!("failed to forward stream read: {err:?}");
+                    reply_sender.send(Err(ClusterError::from(err)));
+                }
+            }
+        });
+
+        delegated_reply
+    }
+}
+
+// #[derive(Debug, Serialize, Deserialize)]
+// pub struct GetStreamVersion {
+//     pub partition_id: PartitionId,
+//     pub stream_id: StreamId,
+// }
+
+// #[remote_message("a5b2ea0e-e369-4145-99ed-c2020b09a298")]
+// impl Message<GetStreamVersion> for ClusterActor {
+//     type Reply = DelegatedReply<Result<Option<u64>, ClusterError>>;
+
+//     #[instrument(skip_all, fields(
+//         partition_id = msg.partition_id,
+//         stream_id = %msg.stream_id,
+//     ))]
+//     async fn handle(
+//         &mut self,
+//         msg: GetStreamVersion,
+//         ctx: &mut Context<Self, Self::Reply>,
+//     ) -> Self::Reply {
+//         let (delegated_reply, reply_sender) = ctx.reply_sender();
+
+//         let Some(reply_sender) = reply_sender else {
+//             warn!("ignoring get stream version with no reply");
+//             return delegated_reply;
+//         };
+
+//         // Check if we own this partition
+//         if let Some(watermark) = self.watermarks.get(&msg.partition_id) {
+//             debug!(
+//                 partition_id = msg.partition_id,
+//                 stream_id = ?msg.stream_id,
+//                 "handling get stream version locally"
+//             );
+
+//             let database = self.database.clone();
+//             let watermark = watermark.get();
+
+//             tokio::spawn(async move {
+//                 match database
+//                     .read_stream(msg.partition_id, msg.stream_id, watermark,
+// true)                     .await
+//                 {
+//                     Ok(f) => {}
+//                     Err(err) => {
+//                         
+// reply_sender.send(Err(ClusterError::Read(err.to_string())));                 
+// return;                     }
+//                 }
+//             });
+//         } else {
+//             // We don't own this partition - forward to the partition owner
+//             let available_replicas = self
+//                 .topology_manager()
+//                 .get_available_replicas(msg.partition_id);
+
+//             let Some((partition_owner, _)) =
+// available_replicas.into_iter().next() else {                 
+// reply_sender.send(Err(ClusterError::PartitionUnavailable));                 
+// return delegated_reply;             };
+
+//             self.forward_stream_read(partition_owner, msg, reply_sender);
+//         }
+
+//         delegated_reply
+//     }
+// }

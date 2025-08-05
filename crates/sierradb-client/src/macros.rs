@@ -57,7 +57,7 @@ macro_rules! implement_command_sync {
 		fn $name<$lifetime, RV: FromRedisValue, $($tyargs: $ty + Send + Sync + $lifetime,)*>(
 			& $lifetime mut self
 			$(, $argname: $argty)*
-		) -> RedisResult<RV>
+		) -> redis::RedisResult<RV>
 		{
 			Cmd::$name($($argname),*).query(self)
 		}
@@ -182,7 +182,7 @@ macro_rules! implement_commands {
         /// # Ok(()) }
         /// ```
         #[cfg(feature = "aio")]
-        pub trait AsyncCommands : redis::aio::ConnectionLike + Send + Sized {
+        pub trait AsyncCommands: redis::aio::ConnectionLike + Send + Sized {
             $(
                 $(#[$attr])*
                 #[inline]

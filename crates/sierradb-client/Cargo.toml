@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+sierradb-protocol.workspace = true
+
 clap = { workspace = true, features = ["derive"] }
 redis = "0.32.4"
 serde = { workspace = true, features = ["derive"] }

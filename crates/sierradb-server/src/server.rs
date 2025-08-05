@@ -7,12 +7,14 @@ use sierradb::id::{NAMESPACE_PARTITION_KEY, uuid_to_partition_hash, uuid_v7_with
 use sierradb_cluster::ClusterActor;
 use sierradb_cluster::read::{ReadEvent, ReadPartition, ReadStream};
 use sierradb_cluster::write::execute::ExecuteTransaction;
+use sierradb_protocol::ErrorCode;
 use smallvec::{SmallVec, smallvec};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::error::MapRedisError;
 use crate::request::{
     EAppend, EGet, EMAppend, EPScan, EPSeq, ESVer, EScan, ESub, FromArgs, Hello, RangeValue,
 };
@@ -79,7 +81,11 @@ impl Conn {
     async fn run(mut self) -> io::Result<()> {
         loop {
             if let Some(value) = self.decoder.try_decode(&mut self.read)? {
-                self.handle_request(value).await?.encode(&mut self.write);
+                let response = match self.handle_request(value).await {
+                    Ok(value) => value,
+                    Err(error_value) => error_value,
+                };
+                response.encode(&mut self.write);
                 self.socket.write_all(&self.write).await?;
                 self.socket.flush().await?;
                 self.write.clear();
@@ -91,7 +97,7 @@ impl Conn {
         }
     }
 
-    async fn handle_request(&mut self, request: Value) -> io::Result<Value> {
+    async fn handle_request(&mut self, request: Value) -> Result<Value, Value> {
         match request {
             Value::Array(items) => {
                 if items.is_empty() {
@@ -101,7 +107,10 @@ impl Conn {
                 macro_rules! handle_req {
                     ($cmd:ty, $handle:ident) => {
                         match <$cmd>::from_args(&items[1..]) {
-                            Ok(cmd) => self.$handle(cmd).await,
+                            Ok(cmd) => match self.$handle(cmd).await {
+                                Ok(ok) => Ok(ok),
+                                Err(err) => Ok(err),
+                            },
                             Err(err) => Ok(err),
                         }
                     };
@@ -128,7 +137,7 @@ impl Conn {
         }
     }
 
-    async fn handle_hello(&mut self, Hello { version: _ }: Hello) -> io::Result<Value> {
+    async fn handle_hello(&mut self, Hello { version: _ }: Hello) -> Result<Value, Value> {
         Ok(Value::Array(vec![
             Value::Integer(3),                     // protocol version
             Value::String("SIERRADB".to_string()), // server name
@@ -136,7 +145,7 @@ impl Conn {
         ]))
     }
 
-    fn handle_ping(&mut self) -> io::Result<Value> {
+    fn handle_ping(&mut self) -> Result<Value, Value> {
         Ok(Value::String("PONG".to_string()))
     }
 
@@ -148,20 +157,33 @@ impl Conn {
             event_id,
             partition_key,
             expected_version,
+            timestamp,
             payload,
             metadata,
         }: EAppend,
-    ) -> io::Result<Value> {
+    ) -> Result<Value, Value> {
         let partition_key = partition_key
             .unwrap_or_else(|| Uuid::new_v5(&NAMESPACE_PARTITION_KEY, stream_id.as_bytes()));
         let partition_hash = uuid_to_partition_hash(partition_key);
         let event_id = event_id.unwrap_or_else(|| uuid_v7_with_partition_hash(partition_hash));
 
         let partition_id = partition_hash % self.num_partitions;
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| io::Error::other("system time error"))?
-            .as_nanos() as u64;
+        let timestamp = timestamp
+            .map(|timestamp| {
+                timestamp.checked_mul(1_000_000).ok_or(Value::Error(
+                    ErrorCode::InvalidArg
+                        .with_message(
+                            "Invalid timestamp format: expected milliseconds, got nanoseconds",
+                        )
+                        .to_string(),
+                ))
+            })
+            .unwrap_or_else(|| {
+                Ok(SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_redis_err()?
+                    .as_nanos() as u64)
+            })?;
 
         let transaction = match Transaction::new(
             partition_key,
@@ -180,34 +202,30 @@ impl Conn {
             Err(err) => return Ok(Value::Error(err.to_string())),
         };
 
-        match self
+        let append = self
             .cluster_ref
             .ask(ExecuteTransaction::new(transaction))
             .await
-            .map_err(io::Error::other)
-        {
-            Ok(result) => {
-                let mut stream_versions = result.stream_versions.into_iter();
-                let (_, stream_version) = stream_versions.next().unwrap();
-                debug_assert_eq!(stream_versions.next(), None);
-                debug_assert_eq!(
-                    result.first_partition_sequence,
-                    result.last_partition_sequence
-                );
+            .map_redis_err()?;
 
-                let response = vec![
-                    Value::String(event_id.to_string()),
-                    Value::String(partition_key.to_string()),
-                    Value::Integer(partition_id as i64),
-                    Value::Integer(result.first_partition_sequence as i64),
-                    Value::Integer(stream_version as i64),
-                    Value::Integer(timestamp as i64),
-                ];
+        let mut stream_versions = append.stream_versions.into_iter();
+        let (_, stream_version) = stream_versions.next().unwrap();
+        debug_assert_eq!(stream_versions.next(), None);
+        debug_assert_eq!(
+            append.first_partition_sequence,
+            append.last_partition_sequence
+        );
 
-                Ok(Value::Array(response))
-            }
-            Err(err) => Ok(Value::Error(err.to_string())),
-        }
+        let response = vec![
+            Value::String(event_id.to_string()),
+            Value::String(partition_key.to_string()),
+            Value::Integer(partition_id as i64),
+            Value::Integer(append.first_partition_sequence as i64),
+            Value::Integer(stream_version as i64),
+            Value::Integer(timestamp as i64),
+        ];
+
+        Ok(Value::Array(response))
     }
 
     async fn handle_emappend(
@@ -216,12 +234,12 @@ impl Conn {
             partition_key,
             events,
         }: EMAppend,
-    ) -> io::Result<Value> {
+    ) -> Result<Value, Value> {
         let partition_hash = uuid_to_partition_hash(partition_key);
         let partition_id = partition_hash % self.num_partitions;
-        let timestamp = SystemTime::now()
+        let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|_| io::Error::other("system time error"))?
+            .map_redis_err()?
             .as_nanos() as u64;
 
         let events: SmallVec<[_; 4]> = events
@@ -230,7 +248,16 @@ impl Conn {
                 let event_id = event
                     .event_id
                     .unwrap_or_else(|| uuid_v7_with_partition_hash(partition_hash));
-                NewEvent {
+                let timestamp = event
+                    .timestamp
+                    .map(|timestamp| {
+                        timestamp.checked_mul(1_000_000).ok_or(Value::Error(
+                            ErrorCode::InvalidArg.with_message("Invalid timestamp format: expected milliseconds, got nanoseconds").to_string(),
+                        ))
+                    })
+                    .transpose()?
+                    .unwrap_or(now);
+                Ok(NewEvent {
                     event_id,
                     stream_id: event.stream_id,
                     stream_version: event.expected_version,
@@ -238,9 +265,9 @@ impl Conn {
                     timestamp,
                     metadata: event.metadata,
                     payload: event.payload,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<_, Value>>()?;
         let event_ids: SmallVec<[_; 4]> = events.iter().map(|event| event.event_id).collect();
 
         let transaction = match Transaction::new(partition_key, partition_id, events) {
@@ -248,44 +275,44 @@ impl Conn {
             Err(err) => return Ok(Value::Error(err.to_string())),
         };
 
-        match self
+        let result = self
             .cluster_ref
             .ask(ExecuteTransaction::new(transaction))
             .await
-            .map_err(io::Error::other)
-        {
-            Ok(result) => {
-                let stream_versions = result.stream_versions.into_iter();
-                let event_infos = event_ids
-                    .into_iter()
-                    .zip(stream_versions)
-                    .map(|(event_id, (stream_id, stream_version))| {
-                        Value::Array(vec![
-                            Value::String(event_id.to_string()),
-                            Value::String(stream_id.to_string()),
-                            Value::Integer(stream_version as i64),
-                        ])
-                    })
-                    .collect();
+            .map_redis_err()?;
 
-                let response = vec![
-                    Value::String(partition_key.to_string()),
-                    Value::Integer(partition_id as i64),
-                    Value::Integer(result.first_partition_sequence as i64),
-                    Value::Integer(result.last_partition_sequence as i64),
-                    Value::Integer(timestamp as i64),
-                    Value::Array(event_infos),
-                ];
+        let stream_versions = result.stream_versions.into_iter();
+        let event_infos = event_ids
+            .into_iter()
+            .zip(stream_versions)
+            .map(|(event_id, (stream_id, stream_version))| {
+                Value::Array(vec![
+                    Value::String(event_id.to_string()),
+                    Value::String(stream_id.to_string()),
+                    Value::Integer(stream_version as i64),
+                ])
+            })
+            .collect();
 
-                Ok(Value::Array(response))
-            }
-            Err(err) => Ok(Value::Error(err.to_string())),
-        }
+        let response = vec![
+            Value::String(partition_key.to_string()),
+            Value::Integer(partition_id as i64),
+            Value::Integer(result.first_partition_sequence as i64),
+            Value::Integer(result.last_partition_sequence as i64),
+            Value::Array(event_infos),
+        ];
+
+        Ok(Value::Array(response))
     }
 
-    async fn handle_eget(&mut self, EGet { event_id }: EGet) -> io::Result<Value> {
-        match self.cluster_ref.ask(ReadEvent::new(event_id)).await {
-            Ok(Some(record)) => {
+    async fn handle_eget(&mut self, EGet { event_id }: EGet) -> Result<Value, Value> {
+        match self
+            .cluster_ref
+            .ask(ReadEvent::new(event_id))
+            .await
+            .map_redis_err()?
+        {
+            Some(record) => {
                 let response = vec![
                     Value::String(record.event_id.to_string()),
                     Value::String(record.partition_key.to_string()),
@@ -302,8 +329,7 @@ impl Conn {
 
                 Ok(Value::Array(response))
             }
-            Ok(None) => Ok(Value::Null),
-            Err(err) => Ok(Value::Error(err.to_string())),
+            None => Ok(Value::Null),
         }
     }
 
@@ -315,49 +341,50 @@ impl Conn {
             end_sequence,
             count,
         }: EPScan,
-    ) -> io::Result<Value> {
-        let res = self
+    ) -> Result<Value, Value> {
+        let end_sequence = match end_sequence {
+            RangeValue::Start => {
+                return Err(Value::Error(
+                    ErrorCode::Syntax.with_message("end_sequence cannot be '-'"),
+                ));
+            }
+            RangeValue::End => None,
+            RangeValue::Value(n) => Some(n),
+        };
+
+        let records = self
             .cluster_ref
             .ask(ReadPartition {
                 partition_id: partition.into_partition_id(self.num_partitions),
                 start_sequence,
-                end_sequence: match end_sequence {
-                    RangeValue::Start => {
-                        return Err(io::Error::other("end_sequence cannot be '-'"));
-                    }
-                    RangeValue::End => None,
-                    RangeValue::Value(n) => Some(n),
-                },
+                end_sequence,
                 count: count.unwrap_or(100),
             })
-            .await;
-        match res {
-            Ok(records) => {
-                let events = records
-                    .events
-                    .into_iter()
-                    .map(|event| {
-                        Value::Array(vec![
-                            Value::String(event.event_id.to_string()),
-                            Value::String(event.partition_key.to_string()),
-                            Value::Integer(event.partition_id as i64),
-                            Value::String(event.transaction_id.to_string()),
-                            Value::Integer(event.partition_sequence as i64),
-                            Value::Integer(event.stream_version as i64),
-                            Value::Integer(event.timestamp as i64),
-                            Value::String(event.stream_id.to_string()),
-                            Value::String(event.event_name),
-                            Value::Bulk(event.metadata),
-                            Value::Bulk(event.payload),
-                        ])
-                    })
-                    .collect();
-                let response = vec![Value::Boolean(records.has_more), Value::Array(events)];
+            .await
+            .map_redis_err()?;
 
-                Ok(Value::Array(response))
-            }
-            Err(err) => Ok(Value::Error(err.to_string())),
-        }
+        let events = records
+            .events
+            .into_iter()
+            .map(|event| {
+                Value::Array(vec![
+                    Value::String(event.event_id.to_string()),
+                    Value::String(event.partition_key.to_string()),
+                    Value::Integer(event.partition_id as i64),
+                    Value::String(event.transaction_id.to_string()),
+                    Value::Integer(event.partition_sequence as i64),
+                    Value::Integer(event.stream_version as i64),
+                    Value::Integer(event.timestamp as i64),
+                    Value::String(event.stream_id.to_string()),
+                    Value::String(event.event_name),
+                    Value::Bulk(event.metadata),
+                    Value::Bulk(event.payload),
+                ])
+            })
+            .collect();
+        let response = vec![Value::Boolean(records.has_more), Value::Array(events)];
+
+        Ok(Value::Array(response))
     }
 
     async fn handle_escan(
@@ -369,65 +396,84 @@ impl Conn {
             end_version,
             count,
         }: EScan,
-    ) -> io::Result<Value> {
+    ) -> Result<Value, Value> {
         let partition_key = partition_key
             .unwrap_or_else(|| Uuid::new_v5(&NAMESPACE_PARTITION_KEY, stream_id.as_bytes()));
         let partition_hash = uuid_to_partition_hash(partition_key);
         let partition_id = partition_hash % self.num_partitions;
-        let res = self
+
+        let end_version = match end_version {
+            RangeValue::Start => {
+                return Err(Value::Error(
+                    ErrorCode::Syntax.with_message("end_version cannot be '-'"),
+                ));
+            }
+            RangeValue::End => None,
+            RangeValue::Value(n) => Some(n),
+        };
+
+        let records = self
             .cluster_ref
             .ask(ReadStream {
                 stream_id,
                 partition_id,
                 start_version,
-                end_version: match end_version {
-                    RangeValue::Start => {
-                        return Err(io::Error::other("end_version cannot be '-'"));
-                    }
-                    RangeValue::End => None,
-                    RangeValue::Value(n) => Some(n),
-                },
+                end_version,
                 count: count.unwrap_or(100),
             })
-            .await;
-        match res {
-            Ok(records) => {
-                let events = records
-                    .events
-                    .into_iter()
-                    .map(|event| {
-                        Value::Array(vec![
-                            Value::String(event.event_id.to_string()),
-                            Value::String(event.partition_key.to_string()),
-                            Value::Integer(event.partition_id as i64),
-                            Value::String(event.transaction_id.to_string()),
-                            Value::Integer(event.partition_sequence as i64),
-                            Value::Integer(event.stream_version as i64),
-                            Value::Integer(event.timestamp as i64),
-                            Value::String(event.stream_id.to_string()),
-                            Value::String(event.event_name),
-                            Value::Bulk(event.metadata),
-                            Value::Bulk(event.payload),
-                        ])
-                    })
-                    .collect();
-                let response = vec![Value::Boolean(records.has_more), Value::Array(events)];
+            .await
+            .map_redis_err()?;
 
-                Ok(Value::Array(response))
-            }
-            Err(err) => Ok(Value::Error(err.to_string())),
-        }
+        let events = records
+            .events
+            .into_iter()
+            .map(|event| {
+                Value::Array(vec![
+                    Value::String(event.event_id.to_string()),
+                    Value::String(event.partition_key.to_string()),
+                    Value::Integer(event.partition_id as i64),
+                    Value::String(event.transaction_id.to_string()),
+                    Value::Integer(event.partition_sequence as i64),
+                    Value::Integer(event.stream_version as i64),
+                    Value::Integer(event.timestamp as i64),
+                    Value::String(event.stream_id.to_string()),
+                    Value::String(event.event_name),
+                    Value::Bulk(event.metadata),
+                    Value::Bulk(event.payload),
+                ])
+            })
+            .collect();
+        let response = vec![Value::Boolean(records.has_more), Value::Array(events)];
+
+        Ok(Value::Array(response))
     }
 
-    async fn handle_epseq(&mut self, EPSeq { .. }: EPSeq) -> io::Result<Value> {
+    async fn handle_epseq(&mut self, EPSeq { partition: _ }: EPSeq) -> Result<Value, Value> {
+        // let seq = match self
+        //     .watermarks
+        //     .get(partition.into_partition_id(self.num_partitions))
+        // {
+        //     Some(watermark) => watermark.get().checked_sub(1),
+        //     None => {
+        //         let seq = self
+        //             .cluster_ref
+        //             .ask(GetPartitionSequence {
+        //                 skip_local_check: true,
+        //             })
+        //             .await
+        //             .map_redis_err()?;
+        //     }
+        // };
+
+        // Ok(seq.map(|s| Value::Integer(s as i64)).unwrap_or(Value::Null))
+        todo!()
+    }
+
+    async fn handle_esver(&mut self, ESVer { .. }: ESVer) -> Result<Value, Value> {
         Ok(Value::String("Not implemented".to_string()))
     }
 
-    async fn handle_esver(&mut self, ESVer { .. }: ESVer) -> io::Result<Value> {
-        Ok(Value::String("Not implemented".to_string()))
-    }
-
-    async fn handle_esub(&mut self, ESub {}: ESub) -> io::Result<Value> {
+    async fn handle_esub(&mut self, ESub {}: ESub) -> Result<Value, Value> {
         Ok(Value::String("Not implemented".to_string()))
     }
 }
