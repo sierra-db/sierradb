@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 sierradb.workspace = true
 sierradb-cluster.workspace = true
+sierradb-protocol.workspace = true
 
 bytes.workspace = true
 clap = { workspace = true, features = ["derive"] }

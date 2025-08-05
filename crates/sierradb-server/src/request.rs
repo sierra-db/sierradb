@@ -55,6 +55,7 @@ pub struct EAppend {
     pub event_id: Option<Uuid>,
     pub partition_key: Option<Uuid>,
     pub expected_version: ExpectedVersion,
+    pub timestamp: Option<u64>,
     pub payload: Vec<u8>,
     pub metadata: Vec<u8>,
 }
@@ -62,7 +63,14 @@ pub struct EAppend {
 impl_command!(
     EAppend,
     [stream_id, event_name],
-    [event_id, partition_key, expected_version, payload, metadata]
+    [
+        event_id,
+        partition_key,
+        expected_version,
+        timestamp,
+        payload,
+        metadata
+    ]
 );
 
 pub struct Event {
@@ -70,6 +78,7 @@ pub struct Event {
     pub event_name: String,
     pub event_id: Option<Uuid>,
     pub expected_version: ExpectedVersion,
+    pub timestamp: Option<u64>,
     pub payload: Vec<u8>,
     pub metadata: Vec<u8>,
 }
@@ -91,6 +100,7 @@ pub struct Event {
 ///     provided)
 ///   - `expected_version` (optional): Expected stream version (number, "any",
 ///     "exists", "empty")
+///   - `timestamp` (optional): Event timestamp in milliseconds
 ///   - `payload` (optional): Event payload data
 ///   - `metadata` (optional): Event metadata
 ///
@@ -142,6 +152,7 @@ impl FromArgs for EMAppend {
             // Initialize optional fields
             let mut event_id = None;
             let mut expected_version = ExpectedVersion::default();
+            let mut timestamp = None;
             let mut payload = Vec::new();
             let mut metadata = Vec::new();
 
@@ -153,8 +164,14 @@ impl FromArgs for EMAppend {
                 };
 
                 // Check if this looks like a field name
-                if !["event_id", "expected_version", "payload", "metadata"]
-                    .contains(&field_name_str.as_str())
+                if ![
+                    "event_id",
+                    "expected_version",
+                    "timestamp",
+                    "payload",
+                    "metadata",
+                ]
+                .contains(&field_name_str.as_str())
                 {
                     // This is likely a new event's stream_id, don't consume it
                     break;
@@ -179,6 +196,10 @@ impl FromArgs for EMAppend {
                         expected_version = TryFrom::try_from(value)
                             .map_err(|err: io::Error| Value::Error(err.to_string()))?;
                     }
+                    "timestamp" => {
+                        timestamp = TryFrom::try_from(value)
+                            .map_err(|err: io::Error| Value::Error(err.to_string()))?;
+                    }
                     "payload" => {
                         payload = TryFrom::try_from(value)
                             .map_err(|err: io::Error| Value::Error(err.to_string()))?;
@@ -196,6 +217,7 @@ impl FromArgs for EMAppend {
                 event_name,
                 event_id,
                 expected_version,
+                timestamp,
                 payload,
                 metadata,
             });

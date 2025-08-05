@@ -1,16 +1,22 @@
+use std::{
+    borrow::Cow,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
 use redis::{RedisWrite, ToRedisArgs};
 use uuid::Uuid;
 
 use crate::types::ExpectedVersion;
 
 /// Options for the EAPPEND command
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub struct EAppendOptions<'a> {
     event_id: Option<Uuid>,
     partition_key: Option<Uuid>,
     expected_version: ExpectedVersion,
-    payload: &'a [u8],
-    metadata: &'a [u8],
+    timestamp: Option<u64>,
+    payload: Cow<'a, [u8]>,
+    metadata: Cow<'a, [u8]>,
 }
 
 impl<'a> EAppendOptions<'a> {
@@ -19,8 +25,9 @@ impl<'a> EAppendOptions<'a> {
             event_id: None,
             partition_key: None,
             expected_version: ExpectedVersion::Any,
-            payload: &[],
-            metadata: &[],
+            timestamp: None,
+            payload: Cow::Borrowed(&[]),
+            metadata: Cow::Borrowed(&[]),
         }
     }
 
@@ -39,13 +46,25 @@ impl<'a> EAppendOptions<'a> {
         self
     }
 
-    pub fn payload(mut self, payload: &'a [u8]) -> Self {
-        self.payload = payload;
+    pub fn timestamp(mut self, timestamp: SystemTime) -> Self {
+        self.timestamp = Some(
+            timestamp
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+                .try_into()
+                .unwrap(),
+        );
         self
     }
 
-    pub fn metadata(mut self, metadata: &'a [u8]) -> Self {
-        self.metadata = metadata;
+    pub fn payload(mut self, payload: impl Into<Cow<'a, [u8]>>) -> Self {
+        self.payload = payload.into();
+        self
+    }
+
+    pub fn metadata(mut self, metadata: impl Into<Cow<'a, [u8]>>) -> Self {
+        self.metadata = metadata.into();
         self
     }
 }
@@ -78,37 +97,46 @@ impl<'a> ToRedisArgs for EAppendOptions<'a> {
                 out.write_arg(version.to_string().as_bytes());
             }
         }
+        if let Some(timestamp) = self.timestamp {
+            out.write_arg(b"TIMESTAMP");
+            out.write_arg(timestamp.to_string().as_bytes());
+        }
         if !self.payload.is_empty() {
             out.write_arg(b"PAYLOAD");
-            out.write_arg(self.payload);
+            out.write_arg(&self.payload);
         }
         if !self.metadata.is_empty() {
             out.write_arg(b"METADATA");
-            out.write_arg(self.metadata);
+            out.write_arg(&self.metadata);
         }
     }
 }
 
 /// Event configuration for the EMAPPEND command
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub struct EMAppendEvent<'a> {
-    stream_id: &'a str,
-    event_name: &'a str,
+    stream_id: Cow<'a, str>,
+    event_name: Cow<'a, str>,
     event_id: Option<Uuid>,
     expected_version: ExpectedVersion,
-    payload: &'a [u8],
-    metadata: &'a [u8],
+    timestamp: Option<u64>,
+    payload: Cow<'a, [u8]>,
+    metadata: Cow<'a, [u8]>,
 }
 
 impl<'a> EMAppendEvent<'a> {
-    pub fn new(stream_id: &'a str, event_name: &'a str) -> EMAppendEvent<'a> {
+    pub fn new(
+        stream_id: impl Into<Cow<'a, str>>,
+        event_name: impl Into<Cow<'a, str>>,
+    ) -> EMAppendEvent<'a> {
         EMAppendEvent {
-            stream_id,
-            event_name,
+            stream_id: stream_id.into(),
+            event_name: event_name.into(),
             event_id: None,
             expected_version: ExpectedVersion::Any,
-            payload: &[],
-            metadata: &[],
+            timestamp: None,
+            payload: Cow::Borrowed(&[]),
+            metadata: Cow::Borrowed(&[]),
         }
     }
 
@@ -122,13 +150,25 @@ impl<'a> EMAppendEvent<'a> {
         self
     }
 
-    pub fn payload(mut self, payload: &'a [u8]) -> Self {
-        self.payload = payload;
+    pub fn timestamp(mut self, timestamp: SystemTime) -> Self {
+        self.timestamp = Some(
+            timestamp
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+                .try_into()
+                .unwrap(),
+        );
         self
     }
 
-    pub fn metadata(mut self, metadata: &'a [u8]) -> Self {
-        self.metadata = metadata;
+    pub fn payload(mut self, payload: impl Into<Cow<'a, [u8]>>) -> Self {
+        self.payload = payload.into();
+        self
+    }
+
+    pub fn metadata(mut self, metadata: impl Into<Cow<'a, [u8]>>) -> Self {
+        self.metadata = metadata.into();
         self
     }
 }
@@ -159,13 +199,17 @@ impl<'a> ToRedisArgs for EMAppendEvent<'a> {
                 out.write_arg(version.to_string().as_bytes());
             }
         }
+        if let Some(timestamp) = self.timestamp {
+            out.write_arg(b"TIMESTAMP");
+            out.write_arg(timestamp.to_string().as_bytes());
+        }
         if !self.payload.is_empty() {
             out.write_arg(b"PAYLOAD");
-            out.write_arg(self.payload);
+            out.write_arg(&self.payload);
         }
         if !self.metadata.is_empty() {
             out.write_arg(b"METADATA");
-            out.write_arg(self.metadata);
+            out.write_arg(&self.metadata);
         }
     }
 }

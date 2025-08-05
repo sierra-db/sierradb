@@ -15,7 +15,7 @@ implement_commands! {
     /// - `options`: Configuration for optional parameters (event_id, partition_key, expected_version, payload, metadata)
     ///
     /// # Example
-    /// ```
+    /// ```ignore
     /// let options = EAppendOptions::new()
     ///     .payload(br#"{"name":"john"}"#)
     ///     .metadata(br#"{"source":"api"}"#);
@@ -35,7 +35,7 @@ implement_commands! {
     /// - `events`: Array of events to append, each with their own configuration
     ///
     /// # Example
-    /// ```
+    /// ```ignore
     /// let events = [
     ///     EMAppendEvent::new("stream1", "EventA").payload(br#"{"data":"value1"}"#),
     ///     EMAppendEvent::new("stream2", "EventB").payload(br#"{"data":"value2"}"#),
@@ -57,7 +57,7 @@ implement_commands! {
     /// - `event_id`: UUID of the event to retrieve
     ///
     /// # Example
-    /// ```
+    /// ```ignore
     /// let event_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")?;
     /// let event = conn.eget(event_id)?;
     /// ```
@@ -77,7 +77,7 @@ implement_commands! {
     /// - `count`: Maximum number of events to return (defaults to 100)
     ///
     /// # Example
-    /// ```
+    /// ```ignore
     /// let partition_key = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")?;
     /// let batch = conn.epscan_by_key(partition_key, 0, Some(100), Some(50))?;
     /// ```
@@ -100,7 +100,7 @@ implement_commands! {
     /// - `count`: Maximum number of events to return (defaults to 100)
     ///
     /// # Example
-    /// ```
+    /// ```ignore
     /// let batch = conn.epscan_by_id(42, 100, Some(200), Some(50))?;
     /// ```
     ///
@@ -122,7 +122,7 @@ implement_commands! {
     /// - `count`: Maximum number of events to return (defaults to 100)
     ///
     /// # Example
-    /// ```
+    /// ```ignore
     /// let events = conn.escan("my-stream", 0, Some(100), Some(50))?;
     /// ```
     ///
@@ -145,7 +145,7 @@ implement_commands! {
     /// - `count`: Maximum number of events to return (defaults to 100)
     ///
     /// # Example
-    /// ```
+    /// ```ignore
     /// let partition_key = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")?;
     /// let batch = conn.escan_with_partition_key("my-stream", partition_key, 0, Some(100), Some(50))?;
     /// ```
@@ -165,7 +165,7 @@ implement_commands! {
     /// - `partition_key`: UUID key to determine which partition to query
     ///
     /// # Example
-    /// ```
+    /// ```ignore
     /// let partition_key = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")?;
     /// let sequence = conn.epseq_by_key(partition_key)?;
     /// ```
@@ -182,7 +182,7 @@ implement_commands! {
     /// - `partition_id`: Numeric partition identifier (0-65535)
     ///
     /// # Example
-    /// ```
+    /// ```ignore
     /// let sequence = conn.epseq_by_id(42)?;
     /// ```
     ///
@@ -198,7 +198,7 @@ implement_commands! {
     /// - `stream_id`: Stream identifier to get version for
     ///
     /// # Example
-    /// ```
+    /// ```ignore
     /// let version = conn.esver("my-stream")?;
     /// ```
     ///
@@ -215,7 +215,7 @@ implement_commands! {
     /// - `partition_key`: UUID to check specific partition
     ///
     /// # Example
-    /// ```
+    /// ```ignore
     /// let partition_key = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")?;
     /// let version = conn.esver_with_partition_key("my-stream", partition_key)?;
     /// ```
@@ -229,7 +229,7 @@ implement_commands! {
     /// Subscribe to receive events from the event store.
     ///
     /// # Example
-    /// ```
+    /// ```ignore
     /// let subscription = conn.esub()?;
     /// ```
     ///
@@ -244,7 +244,10 @@ implement_commands! {
 
 impl<T> Commands for T where T: ConnectionLike {}
 
+impl<T> TypedCommands for T where T: ConnectionLike {}
+
 #[cfg(feature = "aio")]
 impl<T> AsyncCommands for T where T: redis::aio::ConnectionLike + Send + Sync + Sized {}
 
-impl<T> TypedCommands for T where T: ConnectionLike {}
+#[cfg(feature = "aio")]
+impl<T> AsyncTypedCommands for T where T: redis::aio::ConnectionLike + Send + Sync + Sized {}

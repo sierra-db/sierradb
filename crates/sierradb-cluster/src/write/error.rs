@@ -75,9 +75,39 @@ pub enum WriteError {
     },
 }
 
+impl WriteError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            WriteError::AllReplicasFailed => "ALLREPLICASFAILED",
+            WriteError::BufferEvicted => "BUFFEREVICTED",
+            WriteError::BufferFull => "BUFFERFULL",
+            WriteError::CircuitBreakerOpen { .. } => "CIRCUITOPEN",
+            WriteError::ConfirmationFailed(_) => "CONFIRMFAILED",
+            WriteError::ReplicationConfirmationFailed(_) => "REPLCONFIRMFAILED",
+            WriteError::DatabaseOperationFailed(_) => "DBOPFAILED",
+            WriteError::InsufficientHealthyReplicas { .. } => "INSUFFICIENTREPLICAS",
+            WriteError::InvalidSender => "INVALIDSENDER",
+            WriteError::StaleWrite => "STALEWRITE",
+            WriteError::MissingExpectedPartitionSequence => "MISSINGPARTSEQ",
+            WriteError::PartitionNotOwned { .. } => "PARTNOTOWNED",
+            WriteError::ReplicationQuorumFailed { .. } => "QUORUMFAILED",
+            WriteError::RequestTimeout => "TIMEOUT",
+            WriteError::MaximumForwardsExceeded { .. } => "MAXFORWARDS",
+            WriteError::RemoteOperationFailed(_) => "REMOTEOPFAILED",
+            WriteError::SequenceConflict => "SEQCONFLICT",
+            WriteError::WrongExpectedSequence { .. } => "WRONGSEQ",
+        }
+    }
+}
+
 impl From<sierradb::error::WriteError> for WriteError {
     fn from(err: sierradb::error::WriteError) -> Self {
-        WriteError::DatabaseOperationFailed(err.to_string())
+        match err {
+            sierradb::error::WriteError::WrongExpectedVersion {
+                current, expected, ..
+            } => WriteError::WrongExpectedSequence { current, expected },
+            err => WriteError::DatabaseOperationFailed(err.to_string()),
+        }
     }
 }
 
