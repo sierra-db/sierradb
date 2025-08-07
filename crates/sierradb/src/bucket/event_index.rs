@@ -117,7 +117,7 @@ impl OpenEventIndex {
     /// Hydrates the index from a reader.
     pub fn hydrate(&mut self, reader: &mut BucketSegmentReader) -> Result<(), EventIndexError> {
         let mut reader_iter = reader.iter();
-        while let Some(record) = reader_iter.next_record(true)? {
+        while let Some(record) = reader_iter.next_record()? {
             match record {
                 Record::Event(EventRecord {
                     offset, event_id, ..

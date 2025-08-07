@@ -39,7 +39,7 @@ impl Message<ConfirmTransaction> for ClusterActor {
             };
 
             let offsets = match database
-                .read_transaction(msg.partition_id, *first_event_id, true)
+                .read_transaction(msg.partition_id, *first_event_id)
                 .await
                 .map_err(|err| ConfirmTransactionError::Read(err.to_string()))?
             {

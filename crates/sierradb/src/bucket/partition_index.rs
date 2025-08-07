@@ -232,7 +232,7 @@ impl OpenPartitionIndex {
     /// Hydrates the index from a reader.
     pub fn hydrate(&mut self, reader: &mut BucketSegmentReader) -> Result<(), PartitionIndexError> {
         let mut reader_iter = reader.iter();
-        while let Some(record) = reader_iter.next_record(true)? {
+        while let Some(record) = reader_iter.next_record()? {
             match record {
                 Record::Event(EventRecord {
                     offset,
@@ -766,10 +766,7 @@ impl PartitionEventIter {
         }
     }
 
-    pub async fn next(
-        &mut self,
-        header_only: bool,
-    ) -> Result<Option<CommittedEvents>, PartitionIndexError> {
+    pub async fn next(&mut self) -> Result<Option<CommittedEvents>, PartitionIndexError> {
         struct ReadResult {
             events: Option<CommittedEvents>,
             new_offsets: Option<(SegmentId, VecDeque<PartitionSequenceOffset>)>,
@@ -797,11 +794,9 @@ impl PartitionEventIter {
                                 // We have an offset from the last batch
                                 match segments.get_mut(&segment_id) {
                                     Some(reader_set) => {
-                                        let (events, _) = reader_set.reader.read_committed_events(
-                                            offset,
-                                            false,
-                                            header_only,
-                                        )?;
+                                        let (events, _) = reader_set
+                                            .reader
+                                            .read_committed_events(offset, false)?;
 
                                         Ok(ReadResult {
                                             events,
@@ -860,11 +855,9 @@ impl PartitionEventIter {
                                         continue;
                                     };
 
-                                    let (events, _) = reader_set.reader.read_committed_events(
-                                        next_offset.offset,
-                                        false,
-                                        header_only,
-                                    )?;
+                                    let (events, _) = reader_set
+                                        .reader
+                                        .read_committed_events(next_offset.offset, false)?;
 
                                     return Ok(ReadResult {
                                         events,
@@ -886,11 +879,9 @@ impl PartitionEventIter {
                                             });
                                         };
 
-                                        let (events, _) = reader_set.reader.read_committed_events(
-                                            offset,
-                                            false,
-                                            header_only,
-                                        )?;
+                                        let (events, _) = reader_set
+                                            .reader
+                                            .read_committed_events(offset, false)?;
 
                                         Ok(ReadResult {
                                             events,

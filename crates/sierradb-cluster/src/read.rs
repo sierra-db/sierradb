@@ -135,7 +135,7 @@ impl ClusterActor {
 
         tokio::spawn(async move {
             // 1. Read the event from local storage
-            let event = match database.read_event(partition_id, event_id, false).await {
+            let event = match database.read_event(partition_id, event_id).await {
                 Ok(event) => event,
                 Err(err) => {
                     reply_sender.send(Err(ClusterError::Read(err.to_string())));
@@ -503,7 +503,7 @@ impl ClusterActor {
             let mut has_more = false;
             let mut events_collected = 0;
 
-            while let Some(commit) = match iter.next(false).await {
+            while let Some(commit) = match iter.next().await {
                 Ok(commit) => commit,
                 Err(err) => {
                     reply_sender.send(Err(ClusterError::Read(err.to_string())));

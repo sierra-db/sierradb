@@ -312,12 +312,10 @@ enum Command {
     ReadEvent {
         partition_id: Option<u64>,
         event_id: Option<Uuid>,
-        header_only: bool,
     },
     ReadTransaction {
         partition_id: Option<u64>,
         first_event_id: Option<Uuid>,
-        header_only: bool,
     },
     ReadPartition {
         partition_id: Option<u64>,
@@ -770,7 +768,6 @@ impl CommandGenerationState {
                 Ok(Some(Command::ReadEvent {
                     partition_id: Some(partition_id),
                     event_id,
-                    header_only: u.arbitrary()?,
                 }))
             }
             1 => {
@@ -1104,7 +1101,6 @@ impl Commands {
                         } else {
                             None
                         },
-                        header_only: u.arbitrary()?,
                     }),
                     1 => Ok(Command::ReadTransaction {
                         partition_id: if u.arbitrary()? {
@@ -1117,7 +1113,6 @@ impl Commands {
                         } else {
                             None
                         },
-                        header_only: u.arbitrary()?,
                     }),
                     2 => Ok(Command::ReadPartition {
                         partition_id: if u.arbitrary()? {
@@ -1434,13 +1429,11 @@ async fn execute_command(
         Command::ReadEvent {
             partition_id,
             event_id,
-            header_only,
-        } => execute_read_event(state, partition_id, event_id, header_only).await,
+        } => execute_read_event(state, partition_id, event_id).await,
         Command::ReadTransaction {
             partition_id,
             first_event_id,
-            header_only,
-        } => execute_read_transaction(state, partition_id, first_event_id, header_only).await,
+        } => execute_read_transaction(state, partition_id, first_event_id).await,
         Command::ReadPartition {
             partition_id,
             from_sequence,
@@ -1706,7 +1699,6 @@ async fn execute_read_event(
     state: &mut TestState,
     partition_id: Option<u64>,
     event_id: Option<Uuid>,
-    header_only: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (partition_id, event_id) = match (partition_id, event_id) {
         (Some(pid), Some(eid)) => (pid, eid),
@@ -1731,19 +1723,14 @@ async fn execute_read_event(
 
     let db_result = state
         .database
-        .read_event(partition_id as u16, event_id, header_only)
+        .read_event(partition_id as u16, event_id)
         .await?;
     let model_event = state.model.get_event(partition_id, event_id);
 
     match (db_result, model_event) {
         (Some(db_event), Some(model_event)) => {
             // Validate the event matches our model
-            validate_event_record(
-                state.init_args.total_buckets,
-                &db_event,
-                model_event,
-                header_only,
-            )?;
+            validate_event_record(state.init_args.total_buckets, &db_event, model_event)?;
         }
         (None, None) => {
             // Both agree the event doesn't exist - good
@@ -1763,7 +1750,6 @@ fn validate_event_record(
     total_buckets: u16,
     db_event: &EventRecord,
     model_event: &ModelEvent,
-    header_only: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Validate basic event identity
     if db_event.event_id != model_event.event_id {
@@ -1805,6 +1791,13 @@ fn validate_event_record(
         )
         .into());
     }
+    if db_event.stream_id != model_event.stream_id {
+        return Err(format!(
+            "Stream ID mismatch: db={}, model={}",
+            db_event.stream_id, model_event.stream_id
+        )
+        .into());
+    }
 
     // Validate transaction information
     if db_event.transaction_id != model_event.transaction_id {
@@ -1824,45 +1817,35 @@ fn validate_event_record(
         .into());
     }
 
-    // Validate event data if not header-only
-    if !header_only {
-        if db_event.stream_id != model_event.stream_id {
-            return Err(format!(
-                "Stream ID mismatch: db={}, model={}",
-                db_event.stream_id, model_event.stream_id
-            )
-            .into());
-        }
-        if db_event.event_name != model_event.event_name {
-            return Err(format!(
-                "Event name mismatch: db='{}', model='{}'",
-                db_event.event_name, model_event.event_name
-            )
-            .into());
-        }
-        if db_event.metadata != model_event.metadata {
-            return Err(format!(
-                "Metadata mismatch: db={:?}, model={:?}",
-                db_event.metadata, model_event.metadata
-            )
-            .into());
-        }
-        if db_event.payload != model_event.payload {
-            return Err(format!(
-                "Payload mismatch: db={:?}, model={:?}",
-                db_event.payload, model_event.payload
-            )
-            .into());
-        }
+    if db_event.event_name != model_event.event_name {
+        return Err(format!(
+            "Event name mismatch: db='{}', model='{}'",
+            db_event.event_name, model_event.event_name
+        )
+        .into());
+    }
+    if db_event.metadata != model_event.metadata {
+        return Err(format!(
+            "Metadata mismatch: db={:?}, model={:?}",
+            db_event.metadata, model_event.metadata
+        )
+        .into());
+    }
+    if db_event.payload != model_event.payload {
+        return Err(format!(
+            "Payload mismatch: db={:?}, model={:?}",
+            db_event.payload, model_event.payload
+        )
+        .into());
+    }
 
-        // Validate reasonable field values (sequences and versions start from 0)
-        // Note: Both partition_sequence and stream_version are valid starting from 0
-        if model_event.event_name.is_empty() {
-            return Err("Event name cannot be empty".into());
-        }
-        if model_event.stream_id.is_empty() {
-            return Err("Stream ID cannot be empty".into());
-        }
+    // Validate reasonable field values (sequences and versions start from 0)
+    // Note: Both partition_sequence and stream_version are valid starting from 0
+    if model_event.event_name.is_empty() {
+        return Err("Event name cannot be empty".into());
+    }
+    if model_event.stream_id.is_empty() {
+        return Err("Stream ID cannot be empty".into());
     }
 
     // Validate bucket assignment (assuming dynamic bucket calculation)
@@ -1882,7 +1865,6 @@ async fn execute_read_transaction(
     state: &mut TestState,
     partition_id: Option<u64>,
     first_event_id: Option<Uuid>,
-    header_only: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (partition_id, first_event_id) = match (partition_id, first_event_id) {
         (Some(pid), Some(eid)) => (pid, eid),
@@ -1906,7 +1888,7 @@ async fn execute_read_transaction(
 
     let db_result = state
         .database
-        .read_transaction(partition_id as u16, first_event_id, header_only)
+        .read_transaction(partition_id as u16, first_event_id)
         .await?;
 
     // Find the corresponding transaction in our model
@@ -1941,12 +1923,7 @@ async fn execute_read_transaction(
                         )
                         .into());
                     }
-                    validate_event_record(
-                        state.init_args.total_buckets,
-                        db_event,
-                        model_event,
-                        header_only,
-                    )?;
+                    validate_event_record(state.init_args.total_buckets, db_event, model_event)?;
                 }
 
                 // Validate that all events belong to the same transaction
@@ -2002,7 +1979,7 @@ async fn execute_read_partition(
     let mut db_events = Vec::new();
     let mut all_db_event_records = Vec::new();
 
-    while let Some(committed_events) = db_iter.next(false).await? {
+    while let Some(committed_events) = db_iter.next().await? {
         // Collect individual events for comparison
         let events_vec: Vec<EventRecord> = committed_events.clone().into_iter().collect();
         all_db_event_records.extend(events_vec);
@@ -2042,7 +2019,7 @@ async fn execute_read_partition(
                 .find(|db_event| db_event.event_id == model_event.event_id);
 
             if let Some(db_event) = matching_db_event {
-                validate_event_record(state.init_args.total_buckets, db_event, model_event, false)?;
+                validate_event_record(state.init_args.total_buckets, db_event, model_event)?;
             }
         }
 
@@ -2284,7 +2261,7 @@ async fn execute_read_stream(
                 .find(|db_event| db_event.event_id == model_event.event_id);
 
             if let Some(db_event) = matching_db_event {
-                validate_event_record(state.init_args.total_buckets, db_event, model_event, false)?;
+                validate_event_record(state.init_args.total_buckets, db_event, model_event)?;
 
                 // Additional stream-specific validation
                 if db_event.stream_id != model_event.stream_id {
