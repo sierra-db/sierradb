@@ -28,7 +28,7 @@ use uuid::Uuid;
 
 use super::segment::{BucketSegmentReader, EventRecord, Record};
 use super::{BucketId, BucketSegmentId, SegmentId};
-use crate::bucket::segment::CommittedEvents;
+use crate::bucket::segment::{CommittedEvents, ReadHint};
 use crate::error::{EventValidationError, StreamIndexError, ThreadPoolError};
 use crate::reader_thread_pool::{ReaderSet, ReaderThreadPool};
 use crate::writer_thread_pool::LiveIndexes;
@@ -848,8 +848,9 @@ impl EventStreamIter {
                                     },
                                 )?;
 
-                                let (events, _) =
-                                    reader_set.reader.read_committed_events(offset, false)?;
+                                let (events, _) = reader_set
+                                    .reader
+                                    .read_committed_events(offset, ReadHint::Random)?;
 
                                 Ok(ReadResult {
                                     events,
@@ -894,7 +895,7 @@ impl EventStreamIter {
 
                                     let (events, _) = reader_set
                                         .reader
-                                        .read_committed_events(next_offset, false)?;
+                                        .read_committed_events(next_offset, ReadHint::Random)?;
 
                                     Ok(ControlFlow::Break(ReadResult {
                                         events,
@@ -919,7 +920,7 @@ impl EventStreamIter {
 
                                             let (events, _) = reader_set
                                                 .reader
-                                                .read_committed_events(offset, false)?;
+                                                .read_committed_events(offset, ReadHint::Random)?;
 
                                             Ok(Some(ReadResult {
                                                 events,

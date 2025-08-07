@@ -20,7 +20,7 @@ use crate::bucket::event_index::ClosedEventIndex;
 use crate::bucket::partition_index::{
     ClosedPartitionIndex, PartitionEventIter, PartitionIndexRecord, PartitionOffsets,
 };
-use crate::bucket::segment::{BucketSegmentReader, CommittedEvents, EventRecord};
+use crate::bucket::segment::{BucketSegmentReader, CommittedEvents, EventRecord, ReadHint};
 use crate::bucket::stream_index::{
     ClosedStreamIndex, EventStreamIter, StreamIndexRecord, StreamOffsets,
 };
@@ -114,7 +114,7 @@ impl Database {
 
                         let res = reader_set
                             .reader
-                            .read_committed_events(offset, false)
+                            .read_committed_events(offset, ReadHint::Random)
                             .map(|(events, _)| events);
                         let _ = reply_tx.send(res);
                     }
@@ -130,7 +130,7 @@ impl Database {
                                     Ok(Some(offset)) => {
                                         let res = reader_set
                                             .reader
-                                            .read_committed_events(offset, false)
+                                            .read_committed_events(offset, ReadHint::Random)
                                             .map(|(events, _)| events);
                                         let _ = reply_tx.send(res);
                                         return;

@@ -25,7 +25,7 @@ use tracing::{error, warn};
 
 use super::segment::{BucketSegmentReader, EventRecord, Record};
 use super::{BucketId, BucketSegmentId, PartitionId, SegmentId};
-use crate::bucket::segment::CommittedEvents;
+use crate::bucket::segment::{CommittedEvents, ReadHint};
 use crate::error::{PartitionIndexError, ThreadPoolError};
 use crate::reader_thread_pool::ReaderThreadPool;
 use crate::writer_thread_pool::LiveIndexes;
@@ -796,7 +796,7 @@ impl PartitionEventIter {
                                     Some(reader_set) => {
                                         let (events, _) = reader_set
                                             .reader
-                                            .read_committed_events(offset, false)?;
+                                            .read_committed_events(offset, ReadHint::Random)?;
 
                                         Ok(ReadResult {
                                             events,
@@ -855,9 +855,10 @@ impl PartitionEventIter {
                                         continue;
                                     };
 
-                                    let (events, _) = reader_set
-                                        .reader
-                                        .read_committed_events(next_offset.offset, false)?;
+                                    let (events, _) = reader_set.reader.read_committed_events(
+                                        next_offset.offset,
+                                        ReadHint::Random,
+                                    )?;
 
                                     return Ok(ReadResult {
                                         events,
@@ -881,7 +882,7 @@ impl PartitionEventIter {
 
                                         let (events, _) = reader_set
                                             .reader
-                                            .read_committed_events(offset, false)?;
+                                            .read_committed_events(offset, ReadHint::Random)?;
 
                                         Ok(ReadResult {
                                             events,

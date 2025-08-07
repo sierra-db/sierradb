@@ -134,6 +134,12 @@ impl DoubleEndedIterator for CommittedEventsIntoIter {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadHint {
+    Random,
+    Sequential,
+}
+
 pub struct BucketSegmentReader {
     file: File,
     header_buf: [u8; HEADER_BUF_SIZE],
@@ -314,7 +320,7 @@ impl BucketSegmentReader {
     pub fn read_committed_events(
         &mut self,
         mut offset: u64,
-        sequential: bool,
+        hint: ReadHint,
     ) -> Result<(Option<CommittedEvents>, Option<u64>), ReadError> {
         let mut this = self;
         let mut events = SmallVec::new();
@@ -324,7 +330,7 @@ impl BucketSegmentReader {
                 (Option<CommittedEvents>, Option<u64>),
                 ReadError,
             > {
-                let record = polonius_try!(this.read_record(offset, sequential));
+                let record = polonius_try!(this.read_record(offset, hint));
                 match record {
                     Some(Record::Event(
                         event @ EventRecord {
@@ -389,7 +395,7 @@ impl BucketSegmentReader {
     pub fn read_record(
         &mut self,
         start_offset: u64,
-        sequential: bool,
+        hint: ReadHint,
     ) -> Result<Option<Record>, ReadError> {
         // This is the only check needed. We don't need to check for the event body,
         // since if the offset supports this header read, then the event body would have
@@ -399,7 +405,7 @@ impl BucketSegmentReader {
         }
 
         let mut offset = start_offset;
-        let header_buf = if sequential {
+        let header_buf = if matches!(hint, ReadHint::Sequential) {
             self.read_from_read_ahead(offset, COMMIT_SIZE)?
         } else {
             self.file
@@ -417,7 +423,7 @@ impl BucketSegmentReader {
             // Backtrack the event count
             offset -= mem::size_of::<u32>() as u64;
 
-            self.read_event_body(start_offset, record_header, offset, sequential)
+            self.read_event_body(start_offset, record_header, offset, hint)
                 .map(|event| Some(Record::Event(event)))
         } else if record_header.record_kind == 1 {
             let event_count = u32::from_le_bytes(
@@ -440,10 +446,10 @@ impl BucketSegmentReader {
         start_offset: u64,
         record_header: RecordHeader,
         mut offset: u64,
-        sequential: bool,
+        hint: ReadHint,
     ) -> Result<EventRecord, ReadError> {
         let length = EVENT_HEADER_SIZE - RECORD_HEADER_SIZE;
-        let header_buf = if sequential {
+        let header_buf = if matches!(hint, ReadHint::Sequential) {
             self.read_from_read_ahead(offset, length)?
         } else {
             self.file
@@ -456,7 +462,7 @@ impl BucketSegmentReader {
             bincode::decode_from_slice::<EventHeader, _>(header_buf, BINCODE_CONFIG)?;
 
         let body_len = event_header.body_len();
-        let body = if sequential {
+        let body = if matches!(hint, ReadHint::Sequential) {
             let body_buf = self.read_from_read_ahead(offset, body_len)?;
             bincode::decode_from_slice_with_context(body_buf, BINCODE_CONFIG, &event_header)?.0
         } else if body_len > self.body_buf.len() {
@@ -548,7 +554,10 @@ impl BucketSegmentIter<'_> {
         let mut this = self;
         loop {
             polonius!(|this| -> Result<Option<CommittedEvents>, ReadError> {
-                match this.reader.read_committed_events(this.offset, true) {
+                match this
+                    .reader
+                    .read_committed_events(this.offset, ReadHint::Sequential)
+                {
                     Ok((Some(events), _)) => {
                         match &events {
                             CommittedEvents::Single(event) => {
@@ -572,7 +581,7 @@ impl BucketSegmentIter<'_> {
     }
 
     pub fn next_record(&mut self) -> Result<Option<Record>, ReadError> {
-        match self.reader.read_record(self.offset, true) {
+        match self.reader.read_record(self.offset, ReadHint::Sequential) {
             Ok(Some(record)) => {
                 self.offset = record.offset() + record.len();
                 Ok(Some(record))
