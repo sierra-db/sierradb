@@ -3573,6 +3573,7 @@ dependencies = [
  "rand 0.9.1",
  "rayon",
  "serde",
+ "sierradb-protocol",
  "smallvec",
  "tempfile",
  "thiserror 2.0.12",
@@ -3627,8 +3628,11 @@ dependencies = [
  "lazy_static",
  "libfuzzer-sys",
  "once_cell",
+ "serde",
+ "serde_json",
  "sierradb",
  "smallvec",
+ "tempfile",
  "tokio",
  "uuid",
 ]
@@ -3636,6 +3640,9 @@ dependencies = [
 [[package]]
 name = "sierradb-protocol"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "sierradb-server"

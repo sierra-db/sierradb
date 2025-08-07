@@ -289,8 +289,14 @@ impl PartitionReplicatorActor {
             .await
             .map_err(|err| match err {
                 sierradb::error::WriteError::WrongExpectedSequence {
-                    current, expected, ..
-                } => WriteError::WrongExpectedSequence { current, expected },
+                    partition_id,
+                    current,
+                    expected,
+                } => WriteError::WrongExpectedSequence {
+                    partition_id,
+                    current,
+                    expected,
+                },
                 err => WriteError::DatabaseOperationFailed(err.to_string()),
             });
 

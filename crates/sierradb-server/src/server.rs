@@ -5,7 +5,7 @@ use libp2p::bytes::BytesMut;
 use sierradb::database::{NewEvent, Transaction};
 use sierradb::id::{NAMESPACE_PARTITION_KEY, uuid_to_partition_hash, uuid_v7_with_partition_hash};
 use sierradb_cluster::ClusterActor;
-use sierradb_cluster::read::{ReadEvent, ReadPartition, ReadStream};
+use sierradb_cluster::read::{GetStreamVersion, ReadEvent, ReadPartition, ReadStream};
 use sierradb_cluster::write::execute::ExecuteTransaction;
 use sierradb_protocol::ErrorCode;
 use smallvec::{SmallVec, smallvec};
@@ -222,7 +222,7 @@ impl Conn {
             Value::Integer(partition_id as i64),
             Value::Integer(append.first_partition_sequence as i64),
             Value::Integer(stream_version as i64),
-            Value::Integer(timestamp as i64),
+            Value::Integer((timestamp / 1_000_000) as i64),
         ];
 
         Ok(Value::Array(response))
@@ -268,7 +268,10 @@ impl Conn {
                 })
             })
             .collect::<Result<_, Value>>()?;
-        let event_ids: SmallVec<[_; 4]> = events.iter().map(|event| event.event_id).collect();
+        let event_ids_timestamps: SmallVec<[_; 4]> = events
+            .iter()
+            .map(|event| (event.event_id, event.timestamp))
+            .collect();
 
         let transaction = match Transaction::new(partition_key, partition_id, events) {
             Ok(transaction) => transaction,
@@ -282,14 +285,15 @@ impl Conn {
             .map_redis_err()?;
 
         let stream_versions = result.stream_versions.into_iter();
-        let event_infos = event_ids
+        let event_infos = event_ids_timestamps
             .into_iter()
             .zip(stream_versions)
-            .map(|(event_id, (stream_id, stream_version))| {
+            .map(|((event_id, timestamp), (stream_id, stream_version))| {
                 Value::Array(vec![
                     Value::String(event_id.to_string()),
                     Value::String(stream_id.to_string()),
                     Value::Integer(stream_version as i64),
+                    Value::Integer((timestamp / 1_000_000) as i64),
                 ])
             })
             .collect();
@@ -320,7 +324,7 @@ impl Conn {
                     Value::String(record.transaction_id.to_string()),
                     Value::Integer(record.partition_sequence as i64),
                     Value::Integer(record.stream_version as i64),
-                    Value::Integer(record.timestamp as i64),
+                    Value::Integer((record.timestamp / 1_000_000) as i64),
                     Value::String(record.stream_id.to_string()),
                     Value::String(record.event_name),
                     Value::Bulk(record.metadata),
@@ -374,7 +378,7 @@ impl Conn {
                     Value::String(event.transaction_id.to_string()),
                     Value::Integer(event.partition_sequence as i64),
                     Value::Integer(event.stream_version as i64),
-                    Value::Integer(event.timestamp as i64),
+                    Value::Integer((event.timestamp / 1_000_000) as i64),
                     Value::String(event.stream_id.to_string()),
                     Value::String(event.event_name),
                     Value::Bulk(event.metadata),
@@ -435,7 +439,7 @@ impl Conn {
                     Value::String(event.transaction_id.to_string()),
                     Value::Integer(event.partition_sequence as i64),
                     Value::Integer(event.stream_version as i64),
-                    Value::Integer(event.timestamp as i64),
+                    Value::Integer((event.timestamp / 1_000_000) as i64),
                     Value::String(event.stream_id.to_string()),
                     Value::String(event.event_name),
                     Value::Bulk(event.metadata),
@@ -469,8 +473,30 @@ impl Conn {
         todo!()
     }
 
-    async fn handle_esver(&mut self, ESVer { .. }: ESVer) -> Result<Value, Value> {
-        Ok(Value::String("Not implemented".to_string()))
+    async fn handle_esver(
+        &mut self,
+        ESVer {
+            stream_id,
+            partition_key,
+        }: ESVer,
+    ) -> Result<Value, Value> {
+        let partition_key = partition_key
+            .unwrap_or_else(|| Uuid::new_v5(&NAMESPACE_PARTITION_KEY, stream_id.as_bytes()));
+        let partition_id = uuid_to_partition_hash(partition_key) % self.num_partitions;
+
+        let version = self
+            .cluster_ref
+            .ask(GetStreamVersion {
+                partition_id,
+                stream_id,
+            })
+            .await
+            .map_redis_err()?;
+
+        match version {
+            Some(version) => Ok(Value::Integer(version as i64)),
+            None => Ok(Value::Null),
+        }
     }
 
     async fn handle_esub(&mut self, ESub {}: ESub) -> Result<Value, Value> {

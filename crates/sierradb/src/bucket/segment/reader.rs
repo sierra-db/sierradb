@@ -4,7 +4,7 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::{mem, vec};
+use std::{mem, option, vec};
 
 use bincode::Decode;
 use bincode::de::Decoder;
@@ -87,7 +87,9 @@ impl IntoIterator for CommittedEvents {
 
     fn into_iter(self) -> Self::IntoIter {
         let inner = match self {
-            CommittedEvents::Single(event) => CommittedEventsIntoIterInner::Single(Some(event)),
+            CommittedEvents::Single(event) => {
+                CommittedEventsIntoIterInner::Single(Some(event).into_iter())
+            }
             CommittedEvents::Transaction { events, .. } => {
                 CommittedEventsIntoIterInner::Transaction(Box::new(events.into_iter()))
             }
@@ -101,7 +103,7 @@ pub struct CommittedEventsIntoIter {
 }
 
 enum CommittedEventsIntoIterInner {
-    Single(Option<EventRecord>),
+    Single(option::IntoIter<EventRecord>),
     Transaction(Box<smallvec::IntoIter<[EventRecord; 4]>>),
 }
 
@@ -110,8 +112,24 @@ impl Iterator for CommittedEventsIntoIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         match &mut self.inner {
-            CommittedEventsIntoIterInner::Single(event) => event.take(),
+            CommittedEventsIntoIterInner::Single(iter) => iter.next(),
             CommittedEventsIntoIterInner::Transaction(iter) => iter.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match &self.inner {
+            CommittedEventsIntoIterInner::Single(iter) => iter.size_hint(),
+            CommittedEventsIntoIterInner::Transaction(iter) => iter.size_hint(),
+        }
+    }
+}
+
+impl DoubleEndedIterator for CommittedEventsIntoIter {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        match &mut self.inner {
+            CommittedEventsIntoIterInner::Single(iter) => iter.next_back(),
+            CommittedEventsIntoIterInner::Transaction(iter) => iter.next_back(),
         }
     }
 }

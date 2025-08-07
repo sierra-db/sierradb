@@ -805,6 +805,7 @@ impl WriterSet {
                     }
                     ExpectedVersion::Empty => {
                         return Err(WriteError::WrongExpectedVersion {
+                            partition_key,
                             stream_id: event.stream_id.clone(),
                             current: CurrentVersion::Current(*entry.get()),
                             expected: event.stream_version,
@@ -815,6 +816,7 @@ impl WriterSet {
 
                         if *entry.get() != expected_version {
                             return Err(WriteError::WrongExpectedVersion {
+                                partition_key,
                                 stream_id: event.stream_id.clone(),
                                 current: CurrentVersion::Current(*entry.get()),
                                 expected: ExpectedVersion::Exact(expected_version),
@@ -902,6 +904,7 @@ impl WriterSet {
                             None => {
                                 // Stream doesn't exist, which violates the StreamExists expectation
                                 return Err(WriteError::WrongExpectedVersion {
+                                    partition_key,
                                     stream_id: event.stream_id.clone(),
                                     current: CurrentVersion::Empty,
                                     expected: ExpectedVersion::Exists,
@@ -943,6 +946,7 @@ impl WriterSet {
                                 }
 
                                 return Err(WriteError::WrongExpectedVersion {
+                                    partition_key,
                                     stream_id: event.stream_id.clone(),
                                     current: CurrentVersion::Current(version),
                                     expected: event.stream_version,
@@ -992,6 +996,7 @@ impl WriterSet {
 
                                 if version != expected_version {
                                     return Err(WriteError::WrongExpectedVersion {
+                                        partition_key,
                                         stream_id: event.stream_id.clone(),
                                         current: CurrentVersion::Current(version),
                                         expected: ExpectedVersion::Exact(expected_version),
@@ -1006,6 +1011,7 @@ impl WriterSet {
                             }
                             None => {
                                 return Err(WriteError::WrongExpectedVersion {
+                                    partition_key,
                                     stream_id: event.stream_id.clone(),
                                     current: CurrentVersion::Empty,
                                     expected: ExpectedVersion::Exact(expected_version),

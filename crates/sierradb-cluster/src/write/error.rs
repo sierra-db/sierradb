@@ -3,11 +3,13 @@ use std::time::Duration;
 use kameo::prelude::*;
 use serde::{Deserialize, Serialize};
 use sierradb::{
+    StreamId,
     bucket::PartitionId,
     database::{CurrentVersion, ExpectedVersion},
 };
 use thiserror::Error;
 use tracing::error;
+use uuid::Uuid;
 
 #[derive(Clone, Debug, Error, Serialize, Deserialize)]
 pub enum WriteError {
@@ -68,8 +70,21 @@ pub enum WriteError {
     #[error("sequence is already being processed")]
     SequenceConflict,
 
-    #[error("current partition sequence is {current} but expected {expected}")]
+    #[error(
+        "current partition sequence is {current} but expected {expected} for partition {partition_id}"
+    )]
     WrongExpectedSequence {
+        partition_id: PartitionId,
+        current: CurrentVersion,
+        expected: ExpectedVersion,
+    },
+
+    #[error(
+        "current stream version is {current} but expected {expected} for partition key {partition_key} and stream id {stream_id}"
+    )]
+    WrongExpectedVersion {
+        partition_key: Uuid,
+        stream_id: StreamId,
         current: CurrentVersion,
         expected: ExpectedVersion,
     },
@@ -96,6 +111,7 @@ impl WriteError {
             WriteError::RemoteOperationFailed(_) => "REMOTEOPFAILED",
             WriteError::SequenceConflict => "SEQCONFLICT",
             WriteError::WrongExpectedSequence { .. } => "WRONGSEQ",
+            WriteError::WrongExpectedVersion { .. } => "WRONGVER",
         }
     }
 }
@@ -104,8 +120,16 @@ impl From<sierradb::error::WriteError> for WriteError {
     fn from(err: sierradb::error::WriteError) -> Self {
         match err {
             sierradb::error::WriteError::WrongExpectedVersion {
-                current, expected, ..
-            } => WriteError::WrongExpectedSequence { current, expected },
+                partition_key,
+                stream_id,
+                current,
+                expected,
+            } => WriteError::WrongExpectedVersion {
+                partition_key,
+                stream_id,
+                current,
+                expected,
+            },
             err => WriteError::DatabaseOperationFailed(err.to_string()),
         }
     }

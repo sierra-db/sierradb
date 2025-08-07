@@ -645,7 +645,7 @@ impl EventStreamIter {
                         ..
                     }) => {
                         if version_min <= from_version {
-                            let to_remove = from_version - version_min;
+                            let to_remove = (from_version - version_min).min(offsets.len() as u64);
                             offsets.drain(0..to_remove as usize);
 
                             let mut live_segment_offsets: VecDeque<_> = offsets.into();
@@ -712,7 +712,9 @@ impl EventStreamIter {
                                                     if let StreamOffsets::Offsets(offsets) =
                                                         &mut offsets
                                                     {
-                                                        let to_remove = from_version - version_min;
+                                                        let to_remove = (from_version
+                                                            - version_min)
+                                                            .min(offsets.len() as u64);
                                                         offsets.drain(0..to_remove as usize);
                                                     }
 
@@ -814,10 +816,7 @@ impl EventStreamIter {
         }
     }
 
-    pub async fn next(
-        &mut self,
-        header_only: bool,
-    ) -> Result<Option<CommittedEvents>, StreamIndexError> {
+    pub async fn next(&mut self) -> Result<Option<CommittedEvents>, StreamIndexError> {
         struct ReadResult {
             events: Option<CommittedEvents>,
             new_offsets: Option<(SegmentId, VecDeque<u64>)>,
@@ -849,11 +848,9 @@ impl EventStreamIter {
                                     },
                                 )?;
 
-                                let (events, _) = reader_set.reader.read_committed_events(
-                                    offset,
-                                    false,
-                                    header_only,
-                                )?;
+                                let (events, _) = reader_set
+                                    .reader
+                                    .read_committed_events(offset, false, false)?;
 
                                 Ok(ReadResult {
                                     events,
@@ -899,7 +896,7 @@ impl EventStreamIter {
                                     let (events, _) = reader_set.reader.read_committed_events(
                                         next_offset,
                                         false,
-                                        header_only,
+                                        false,
                                     )?;
 
                                     Ok(ControlFlow::Break(ReadResult {
@@ -923,12 +920,9 @@ impl EventStreamIter {
                                                 return Ok(None);
                                             };
 
-                                            let (events, _) =
-                                                reader_set.reader.read_committed_events(
-                                                    offset,
-                                                    false,
-                                                    header_only,
-                                                )?;
+                                            let (events, _) = reader_set
+                                                .reader
+                                                .read_committed_events(offset, false, false)?;
 
                                             Ok(Some(ReadResult {
                                                 events,
