@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 pub use self::reader::{
     BucketSegmentIter, BucketSegmentReader, CommitRecord, CommittedEvents, CommittedEventsIntoIter,
-    EventRecord, Record,
+    EventRecord, ReadHint, Record,
 };
 pub use self::writer::{AppendEvent, BucketSegmentWriter};
 use crate::error::WriteError;
@@ -284,7 +284,14 @@ mod tests {
 
         for (i, (kind, offset)) in offsets.into_iter().enumerate() {
             let record = reader
-                .read_record(offset, i.is_multiple_of(2))
+                .read_record(
+                    offset,
+                    if i.is_multiple_of(2) {
+                        ReadHint::Sequential
+                    } else {
+                        ReadHint::Random
+                    },
+                )
                 .unwrap()
                 .unwrap();
             match record {
