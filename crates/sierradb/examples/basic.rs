@@ -1,51 +1,86 @@
 use std::time::Duration;
 
-use sierradb::database::DatabaseBuilder;
-use smallvec::smallvec;
+use sierradb::StreamId;
+use sierradb::database::{DatabaseBuilder, ExpectedVersion, NewEvent, Transaction};
+use sierradb::id::{uuid_to_partition_hash, uuid_v7_with_partition_hash};
 use uuid::Uuid;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = std::fs::remove_dir_all("./target/db-debug");
     let db = DatabaseBuilder::new()
-        // .segment_size(8 * 1024)
+        .segment_size(33304748)
         .total_buckets(64)
-        // .bucket_ids_from_range(0..4)
-        .reader_threads(8)
-        .writer_threads(4)
+        .bucket_ids_from_range(0..64)
+        .writer_threads(8)
+        .reader_threads(3)
         .flush_interval_duration(Duration::MAX)
         .flush_interval_events(1)
-        .open("./target/db")?;
+        .open("./target/db-debug")?;
 
-    db.set_confirmations(225, smallvec![344], Uuid::nil(), 2)
-        .await?;
+    struct AppendEvent {
+        partition_id: u16,
+        stream_id: StreamId,
+        expected_version: ExpectedVersion,
+        event_name: String,
+        timestamp: u64,
+        metadata: Vec<u8>,
+        payload: Vec<u8>,
+    }
 
-    // let mut events = db.read_stream(0, StreamId::new("user-123")?).await?;
-    // while let Some(event) = events.next().await? {
-    //     dbg!(event);
-    // }
+    let partition_id = 0;
+    let stream_id = StreamId::new("\u{ffff}").unwrap();
 
-    // let partition_key = Uuid::new_v4();
-    // let partition_hash = uuid_to_partition_hash(partition_key);
-    // let partition_id = partition_hash % 4; // using 4 arbitrarily here for number
-    // of buckets for i in 0..100 {
-    //     let batch = Transaction::new(
-    //         partition_hash,
-    //         smallvec![NewEvent {
-    //             event_id: Uuid::new_v4(),
-    //             partition_key,
-    //             partition_id: 0,
-    //             stream_id: StreamId::new("user-456")?,
-    //             stream_version: ExpectedVersion::Any,
-    //             event_name: "MyEvent".to_string(),
-    //             timestamp: i,
-    //             metadata: vec![1, 2, 3],
-    //             payload: b"Hello!!!".to_vec(),
-    //         }],
-    //     )?;
-    //     let res = db.append_events(partition_id, batch).await?;
+    let events = [AppendEvent {
+        partition_id,
+        stream_id: stream_id.clone(),
+        expected_version: ExpectedVersion::Any,
+        event_name: "aa".to_string(),
+        timestamp: 2305844100135687424,
+        metadata: vec![],
+        payload: vec![],
+    }];
 
-    //     dbg!(res.offsets);
-    // }
+    let partition_key = Uuid::new_v4();
+    let partition_hash = uuid_to_partition_hash(partition_key);
+
+    let new_events: smallvec::SmallVec<[NewEvent; 4]> = events
+        .iter()
+        .map(|event| {
+            // Ensure timestamp is valid (< 2^63)
+            let timestamp = if event.timestamp >= (1u64 << 63) {
+                1u64 << 62 // Use a safe timestamp if the generated one is too large
+            } else {
+                event.timestamp
+            };
+
+            NewEvent {
+                event_id: uuid_v7_with_partition_hash(partition_hash),
+                stream_id: event.stream_id.clone(),
+                stream_version: event.expected_version,
+                event_name: event.event_name.clone(),
+                timestamp,
+                metadata: event.metadata.clone(),
+                payload: event.payload.clone(),
+            }
+        })
+        .collect();
+
+    let transaction = Transaction::new(partition_key, partition_id, new_events.clone()).unwrap();
+
+    db.append_events(transaction).await.unwrap();
+
+    let res = db
+        .read_stream(
+            partition_id,
+            new_events.first().unwrap().stream_id.clone(),
+            362,
+            true,
+        )
+        .await
+        .unwrap();
+
+    dbg!(res);
 
     Ok(())
 }

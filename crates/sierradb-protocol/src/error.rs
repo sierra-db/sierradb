@@ -73,6 +73,8 @@ pub enum ErrorCode {
     SeqConflict,
     /// Wrong expected sequence
     WrongSeq,
+    /// Wrong expected version
+    WrongVer,
 }
 
 impl ErrorCode {
@@ -163,6 +165,7 @@ impl std::fmt::Display for ErrorCode {
             ErrorCode::RemoteOpFailed => "REMOTEOPFAILED",
             ErrorCode::SeqConflict => "SEQCONFLICT",
             ErrorCode::WrongSeq => "WRONGSEQ",
+            ErrorCode::WrongVer => "WRONGVER",
         };
         write!(f, "{code}")
     }

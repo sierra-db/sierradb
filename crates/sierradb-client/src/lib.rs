@@ -16,7 +16,7 @@ pub use options::*;
 pub use types::*;
 
 // Re-export protocol types for convenience
-pub use sierradb_protocol::{ErrorCode, ParsedError};
+pub use sierradb_protocol::{CurrentVersion, ErrorCode, ExpectedVersion, ParsedError, VersionGap};
 
 // Uuid::new_v5(&Uuid::NAMESPACE_DNS, b"sierradb.tqwewe.com")
 const NAMESPACE_PARTITION_KEY: Uuid = uuid!("219bd637-e279-53e9-9e2b-eabe5d9120cc");

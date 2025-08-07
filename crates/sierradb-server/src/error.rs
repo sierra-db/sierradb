@@ -60,38 +60,10 @@ impl AsRedisError for WriteError {
             WriteError::RemoteOperationFailed(_) => ErrorCode::RemoteOpFailed,
             WriteError::SequenceConflict => ErrorCode::SeqConflict,
             WriteError::WrongExpectedSequence { .. } => ErrorCode::WrongSeq,
+            WriteError::WrongExpectedVersion { .. } => ErrorCode::WrongVer,
         };
 
-        match self {
-            WriteError::AllReplicasFailed => format!("{code} {self}"),
-            WriteError::BufferEvicted => format!("{code} {self}"),
-            WriteError::BufferFull => format!("{code} {self}"),
-            WriteError::CircuitBreakerOpen { .. } => format!("{code} {self}"),
-            WriteError::ConfirmationFailed(_) => format!("{code} {self}"),
-            WriteError::ReplicationConfirmationFailed(_) => {
-                format!("{code} {self}")
-            }
-            WriteError::DatabaseOperationFailed(_) => format!("{code} {self}"),
-            WriteError::InsufficientHealthyReplicas { .. } => {
-                format!("{code} {self}")
-            }
-            WriteError::InvalidSender => format!("{code} {self}"),
-            WriteError::StaleWrite => format!("{code} {self}"),
-            WriteError::MissingExpectedPartitionSequence => {
-                format!("{code} {self}")
-            }
-            WriteError::PartitionNotOwned { .. } => format!("{code} {self}"),
-            WriteError::ReplicationQuorumFailed { .. } => {
-                format!("{code} {self}")
-            }
-            WriteError::RequestTimeout => format!("{code} {self}"),
-            WriteError::MaximumForwardsExceeded { .. } => {
-                format!("{code} {self}")
-            }
-            WriteError::RemoteOperationFailed(_) => format!("{code} {self}"),
-            WriteError::SequenceConflict => format!("{code} {self}"),
-            WriteError::WrongExpectedSequence { .. } => format!("{code} {self}"),
-        }
+        format!("{code} {self}")
     }
 }
 

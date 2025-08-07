@@ -4,9 +4,8 @@ use std::{
 };
 
 use redis::{RedisWrite, ToRedisArgs};
+use sierradb_protocol::ExpectedVersion;
 use uuid::Uuid;
-
-use crate::types::ExpectedVersion;
 
 /// Options for the EAPPEND command
 #[derive(Clone, Default)]

@@ -88,8 +88,8 @@ impl FromRedisValue for AppendInfo {
                 };
 
                 let timestamp = match &values[5] {
-                    Value::Int(nanos) => {
-                        let duration = Duration::from_nanos(*nanos as u64);
+                    Value::Int(ms) => {
+                        let duration = Duration::from_millis(*ms as u64);
                         UNIX_EPOCH + duration
                     }
                     _ => {
@@ -213,7 +213,7 @@ pub struct Event {
     /// version of an entity.
     pub stream_version: u64,
 
-    /// Unix timestamp (in nanoseconds) when the event was created.
+    /// Unix timestamp (in milliseconds) when the event was created.
     ///
     /// Useful for time-based queries and analysis, though not used for event
     /// ordering.
@@ -334,8 +334,8 @@ impl FromRedisValue for Event {
                 };
 
                 let timestamp = match &values[6] {
-                    Value::Int(nanos) => {
-                        let duration = Duration::from_nanos(*nanos as u64);
+                    Value::Int(ms) => {
+                        let duration = Duration::from_millis(*ms as u64);
                         UNIX_EPOCH + duration
                     }
                     _ => {
@@ -409,20 +409,6 @@ impl FromRedisValue for Event {
     }
 }
 
-/// The expected version **before** the event is inserted.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ExpectedVersion {
-    /// Accept any version, whether the stream/partition exists or not.
-    #[default]
-    Any,
-    /// The stream/partition must exist (have at least one event).
-    Exists,
-    /// The stream/partition must be empty (have no events yet).
-    Empty,
-    /// The stream/partition must be exactly at this version.
-    Exact(u64),
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RangeValue {
     Start,      // "-"
@@ -465,6 +451,7 @@ pub struct EventInfo {
     pub event_id: Uuid,
     pub stream_id: String,
     pub stream_version: u64,
+    pub timestamp: SystemTime,
 }
 
 impl FromRedisValue for MultiAppendInfo {
@@ -528,10 +515,10 @@ impl FromRedisValue for MultiAppendInfo {
                         .iter()
                         .map(|event_array| match event_array {
                             Value::Array(event_values) => {
-                                if event_values.len() != 3 {
+                                if event_values.len() != 4 {
                                     return Err(RedisError::from((
                                         redis::ErrorKind::TypeError,
-                                        "Event info array must have exactly 3 elements",
+                                        "Event info array must have exactly 4 elements",
                                     )));
                                 }
 
@@ -570,10 +557,24 @@ impl FromRedisValue for MultiAppendInfo {
                                     }
                                 };
 
+                                let timestamp = match &event_values[3] {
+                                    Value::Int(ms) => {
+                                        let duration = Duration::from_millis(*ms as u64);
+                                        UNIX_EPOCH + duration
+                                    }
+                                    _ => {
+                                        return Err(RedisError::from((
+                                            redis::ErrorKind::TypeError,
+                                            "timestamp must be an integer",
+                                        )));
+                                    }
+                                };
+
                                 Ok(EventInfo {
                                     event_id,
                                     stream_id,
                                     stream_version,
+                                    timestamp,
                                 })
                             }
                             _ => Err(RedisError::from((

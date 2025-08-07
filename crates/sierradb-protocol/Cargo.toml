@@ -5,4 +5,4 @@ edition = "2024"
 description = "Shared protocol types and utilities for SierraDB"
 
 [dependencies]
-# No external dependencies - pure Rust for maximum compatibility
+serde.workspace = true

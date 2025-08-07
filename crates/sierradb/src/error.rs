@@ -105,6 +105,7 @@ pub enum WriteError {
     /// Wrong expected version
     #[error("current stream version is {current} but expected {expected} for stream {stream_id}")]
     WrongExpectedVersion {
+        partition_key: Uuid,
         stream_id: StreamId,
         current: CurrentVersion,
         expected: ExpectedVersion,
