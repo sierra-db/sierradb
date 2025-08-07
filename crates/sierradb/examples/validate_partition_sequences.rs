@@ -80,7 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut reader = BucketSegmentReader::open(events_file, None)?;
         let mut iter = reader.iter();
 
-        while let Some(record) = iter.next_record(false).transpose() {
+        while let Some(record) = iter.next_record().transpose() {
             match record {
                 Ok(Record::Event(event)) => {
                     let expected = match next_sequences.entry(event.partition_id) {

@@ -284,7 +284,7 @@ mod tests {
 
         for (i, (kind, offset)) in offsets.into_iter().enumerate() {
             let record = reader
-                .read_record(offset, i.is_multiple_of(2), false)
+                .read_record(offset, i.is_multiple_of(2))
                 .unwrap()
                 .unwrap();
             match record {

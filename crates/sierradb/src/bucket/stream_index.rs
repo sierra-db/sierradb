@@ -263,7 +263,7 @@ impl OpenStreamIndex {
     /// Hydrates the index from a reader.
     pub fn hydrate(&mut self, reader: &mut BucketSegmentReader) -> Result<(), StreamIndexError> {
         let mut reader_iter = reader.iter();
-        while let Some(record) = reader_iter.next_record(false)? {
+        while let Some(record) = reader_iter.next_record()? {
             match record {
                 Record::Event(EventRecord {
                     offset,
@@ -848,9 +848,8 @@ impl EventStreamIter {
                                     },
                                 )?;
 
-                                let (events, _) = reader_set
-                                    .reader
-                                    .read_committed_events(offset, false, false)?;
+                                let (events, _) =
+                                    reader_set.reader.read_committed_events(offset, false)?;
 
                                 Ok(ReadResult {
                                     events,
@@ -893,11 +892,9 @@ impl EventStreamIter {
                                         return Ok(ControlFlow::Continue(()));
                                     };
 
-                                    let (events, _) = reader_set.reader.read_committed_events(
-                                        next_offset,
-                                        false,
-                                        false,
-                                    )?;
+                                    let (events, _) = reader_set
+                                        .reader
+                                        .read_committed_events(next_offset, false)?;
 
                                     Ok(ControlFlow::Break(ReadResult {
                                         events,
@@ -922,7 +919,7 @@ impl EventStreamIter {
 
                                             let (events, _) = reader_set
                                                 .reader
-                                                .read_committed_events(offset, false, false)?;
+                                                .read_committed_events(offset, false)?;
 
                                             Ok(Some(ReadResult {
                                                 events,

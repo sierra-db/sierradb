@@ -76,10 +76,9 @@ impl Database {
         &self,
         partition_id: PartitionId,
         event_id: Uuid,
-        header_only: bool,
     ) -> Result<Option<EventRecord>, ReadError> {
         Ok(self
-            .read_transaction(partition_id, event_id, header_only)
+            .read_transaction(partition_id, event_id)
             .await?
             .and_then(|events| events.into_iter().next()))
     }
@@ -88,7 +87,6 @@ impl Database {
         &self,
         partition_id: PartitionId,
         first_event_id: Uuid,
-        header_only: bool,
     ) -> Result<Option<CommittedEvents>, ReadError> {
         let bucket_id = partition_id % self.total_buckets;
         let segment_id_offset = self
@@ -116,7 +114,7 @@ impl Database {
 
                         let res = reader_set
                             .reader
-                            .read_committed_events(offset, false, header_only)
+                            .read_committed_events(offset, false)
                             .map(|(events, _)| events);
                         let _ = reply_tx.send(res);
                     }
@@ -132,7 +130,7 @@ impl Database {
                                     Ok(Some(offset)) => {
                                         let res = reader_set
                                             .reader
-                                            .read_committed_events(offset, false, header_only)
+                                            .read_committed_events(offset, false)
                                             .map(|(events, _)| events);
                                         let _ = reply_tx.send(res);
                                         return;
@@ -1053,7 +1051,7 @@ mod tests {
             .expect("Failed to append event");
 
         // Read the event back
-        let result = db.read_event(partition_id, event_id, false).await;
+        let result = db.read_event(partition_id, event_id).await;
         assert!(result.is_ok(), "Failed to read event: {:?}", result.err());
 
         let event_opt = result.unwrap();
@@ -1081,9 +1079,7 @@ mod tests {
         let partition_id = 1;
         let nonexistent_event_id = Uuid::new_v4();
 
-        let result = db
-            .read_event(partition_id, nonexistent_event_id, false)
-            .await;
+        let result = db.read_event(partition_id, nonexistent_event_id).await;
         assert!(
             result.is_ok(),
             "Read should succeed even for nonexistent events"
@@ -1126,7 +1122,7 @@ mod tests {
 
         // Collect all events
         let mut events = Vec::new();
-        while let Some(event) = partition_iter.next(false).await.unwrap() {
+        while let Some(event) = partition_iter.next().await.unwrap() {
             events.push(event);
         }
 
@@ -1140,7 +1136,7 @@ mod tests {
 
         // Collect all events
         let mut events = Vec::new();
-        while let Some(event) = partition_iter.next(false).await.unwrap() {
+        while let Some(event) = partition_iter.next().await.unwrap() {
             events.push(event);
         }
 
@@ -1419,7 +1415,7 @@ mod tests {
             .read_partition(unused_partition_id, 0)
             .await
             .expect("Failed to read empty partition");
-        let event = partition_iter.next(false).await.unwrap();
+        let event = partition_iter.next().await.unwrap();
         assert!(event.is_none(), "Expected no events in empty partition");
     }
 

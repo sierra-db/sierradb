@@ -65,7 +65,7 @@ fn benchmark_reads(c: &mut Criterion) {
         b.iter(|| {
             let offset = iter.next().unwrap();
             reader
-                .read_record(*offset, false, false)
+                .read_record(*offset, false)
                 .expect("Failed to read event");
         });
     });
@@ -76,7 +76,7 @@ fn benchmark_reads(c: &mut Criterion) {
         b.iter(|| {
             let offset = iter.next().unwrap();
             reader
-                .read_record(*offset, true, false)
+                .read_record(*offset, true)
                 .expect("Failed to read event");
         });
     });

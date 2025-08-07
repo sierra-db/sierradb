@@ -522,7 +522,7 @@ impl Message<PartitionSyncRequest> for ClusterActor {
                 .map_err(|err| ClusterError::Read(err.to_string()))?;
             let mut commits = Vec::new();
             while let Some(commit) = iter
-                .next(false)
+                .next()
                 .await
                 .map_err(|err| ClusterError::Read(err.to_string()))?
             {
