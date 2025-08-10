@@ -19,6 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .open("./target/db-debug")?;
 
     struct AppendEvent {
+        #[allow(dead_code)]
         partition_id: u16,
         stream_id: StreamId,
         expected_version: ExpectedVersion,

@@ -16,8 +16,14 @@ bytes.workspace = true
 clap = { workspace = true, features = ["derive"] }
 config.workspace = true
 directories.workspace = true
+futures.workspace = true
 kameo.workspace = true
 libp2p.workspace = true
+redis-protocol = { version = "6.0.0", features = [
+  "std",
+  "resp3",
+  "bytes",
+], default-features = false }
 serde = { workspace = true, features = ["derive"] }
 smallvec.workspace = true
 thiserror.workspace = true

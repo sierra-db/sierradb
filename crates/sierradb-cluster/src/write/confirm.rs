@@ -20,7 +20,7 @@ pub struct ConfirmTransaction {
     pub confirmation_count: u8,
 }
 
-#[remote_message("93087af8-6b1f-4df0-8225-13fe694203c1")]
+#[remote_message]
 impl Message<ConfirmTransaction> for ClusterActor {
     type Reply = DelegatedReply<Result<(), ConfirmTransactionError>>;
 

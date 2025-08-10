@@ -64,13 +64,18 @@ impl SegmentKind {
     }
 
     /// Get the full path for a specific segment file
-    pub fn get_path(&self, base_dir: &Path, bucket_segment_id: BucketSegmentId) -> PathBuf {
+    pub fn get_path(
+        &self,
+        base_dir: impl AsRef<Path>,
+        bucket_segment_id: BucketSegmentId,
+    ) -> PathBuf {
         let BucketSegmentId {
             bucket_id,
             segment_id,
         } = bucket_segment_id;
 
         base_dir
+            .as_ref()
             .join("buckets")
             .join(format!("{bucket_id:05}"))
             .join("segments")
@@ -79,9 +84,9 @@ impl SegmentKind {
     }
 
     /// Parse a full path back into bucket_segment_id and kind
-    pub fn parse_path(path: &Path) -> Option<(BucketSegmentId, SegmentKind)> {
+    pub fn parse_path(path: impl AsRef<Path>) -> Option<(BucketSegmentId, SegmentKind)> {
         // Get filename
-        let file_name = path.file_name()?.to_str()?;
+        let file_name = path.as_ref().file_name()?.to_str()?;
 
         // Determine segment kind from filename
         let kind = match file_name {
@@ -93,7 +98,7 @@ impl SegmentKind {
         };
 
         // Extract segment_id from parent directory
-        let segments_dir = path.parent()?;
+        let segments_dir = path.as_ref().parent()?;
         let segment_id_str = segments_dir.file_name()?.to_str()?;
         let segment_id = segment_id_str.parse::<SegmentId>().ok()?;
 
@@ -110,7 +115,7 @@ impl SegmentKind {
     /// Helper method to create the directory structure for a segment if it
     /// doesn't exist
     pub fn ensure_segment_dir(
-        base_dir: &Path,
+        base_dir: impl AsRef<Path>,
         bucket_segment_id: BucketSegmentId,
     ) -> std::io::Result<PathBuf> {
         let BucketSegmentId {
@@ -119,6 +124,7 @@ impl SegmentKind {
         } = bucket_segment_id;
 
         let segment_dir = base_dir
+            .as_ref()
             .join("buckets")
             .join(format!("{bucket_id:05}"))
             .join("segments")

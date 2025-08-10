@@ -4,6 +4,15 @@ use redis::{FromRedisValue, RedisError, RedisResult, RedisWrite, ToRedisArgs, Va
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Represents messages received from SierraDB subscriptions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SierraMessage {
+    /// An event received from a subscription.
+    Event(Event),
+    /// Confirmation that a subscription was successfully created.
+    SubscriptionConfirmed { subscription_count: i64 },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppendInfo {
     pub event_id: Uuid,
@@ -17,88 +26,142 @@ pub struct AppendInfo {
 impl FromRedisValue for AppendInfo {
     fn from_redis_value(value: &Value) -> RedisResult<Self> {
         match value {
-            Value::Array(values) => {
-                // Ensure we have the expected number of fields
-                if values.len() != 6 {
-                    return Err(RedisError::from((
-                        redis::ErrorKind::TypeError,
-                        "Append info array must have exactly 6 elements",
-                    )));
+            Value::Map(fields) => {
+                let mut event_id = None;
+                let mut partition_key = None;
+                let mut partition_id = None;
+                let mut partition_sequence = None;
+                let mut stream_version = None;
+                let mut timestamp = None;
+
+                // Extract fields from map
+                for (key, val) in fields {
+                    let field_name = match key {
+                        Value::SimpleString(s) => s.as_str(),
+                        _ => continue,
+                    };
+
+                    match field_name {
+                        "event_id" => {
+                            event_id = Some(match val {
+                                Value::SimpleString(s) => Uuid::parse_str(s).map_err(|_| {
+                                    RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "Invalid UUID format for event_id",
+                                    ))
+                                })?,
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "event_id must be a string",
+                                    )));
+                                }
+                            });
+                        }
+                        "partition_key" => {
+                            partition_key = Some(match val {
+                                Value::SimpleString(s) => Uuid::parse_str(s).map_err(|_| {
+                                    RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "Invalid UUID format for partition_key",
+                                    ))
+                                })?,
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "partition_key must be a string",
+                                    )));
+                                }
+                            });
+                        }
+                        "partition_id" => {
+                            partition_id = Some(match val {
+                                Value::Int(n) => *n as u16,
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "partition_id must be an integer",
+                                    )));
+                                }
+                            });
+                        }
+                        "partition_sequence" => {
+                            partition_sequence = Some(match val {
+                                Value::Int(n) => *n as u64,
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "partition_sequence must be an integer",
+                                    )));
+                                }
+                            });
+                        }
+                        "stream_version" => {
+                            stream_version = Some(match val {
+                                Value::Int(n) => *n as u64,
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "stream_version must be an integer",
+                                    )));
+                                }
+                            });
+                        }
+                        "timestamp" => {
+                            timestamp = Some(match val {
+                                Value::Int(ms) => {
+                                    let duration = Duration::from_millis(*ms as u64);
+                                    UNIX_EPOCH + duration
+                                }
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "timestamp must be an integer",
+                                    )));
+                                }
+                            });
+                        }
+                        _ => {} // Ignore unknown fields
+                    }
                 }
 
-                // Extract and parse each field
-                let event_id = match &values[0] {
-                    Value::SimpleString(s) => Uuid::parse_str(s).map_err(|_| {
-                        RedisError::from((
-                            redis::ErrorKind::TypeError,
-                            "Invalid UUID format for event_id",
-                        ))
-                    })?,
-                    _ => {
-                        return Err(RedisError::from((
-                            redis::ErrorKind::TypeError,
-                            "event_id must be a string",
-                        )));
-                    }
-                };
-
-                let partition_key = match &values[1] {
-                    Value::SimpleString(s) => Uuid::parse_str(s).map_err(|_| {
-                        RedisError::from((
-                            redis::ErrorKind::TypeError,
-                            "Invalid UUID format for partition_key",
-                        ))
-                    })?,
-                    _ => {
-                        return Err(RedisError::from((
-                            redis::ErrorKind::TypeError,
-                            "partition_key must be a string",
-                        )));
-                    }
-                };
-
-                let partition_id = match &values[2] {
-                    Value::Int(n) => *n as u16,
-                    _ => {
-                        return Err(RedisError::from((
-                            redis::ErrorKind::TypeError,
-                            "partition_id must be an integer",
-                        )));
-                    }
-                };
-
-                let partition_sequence = match &values[3] {
-                    Value::Int(n) => *n as u64,
-                    _ => {
-                        return Err(RedisError::from((
-                            redis::ErrorKind::TypeError,
-                            "partition_sequence must be an integer",
-                        )));
-                    }
-                };
-
-                let stream_version = match &values[4] {
-                    Value::Int(n) => *n as u64,
-                    _ => {
-                        return Err(RedisError::from((
-                            redis::ErrorKind::TypeError,
-                            "stream_version must be an integer",
-                        )));
-                    }
-                };
-
-                let timestamp = match &values[5] {
-                    Value::Int(ms) => {
-                        let duration = Duration::from_millis(*ms as u64);
-                        UNIX_EPOCH + duration
-                    }
-                    _ => {
-                        return Err(RedisError::from((
-                            redis::ErrorKind::TypeError,
-                            "timestamp must be an integer",
-                        )));
-                    }
-                };
+                // Ensure all required fields are present
+                let event_id = event_id.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: event_id",
+                    ))
+                })?;
+                let partition_key = partition_key.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: partition_key",
+                    ))
+                })?;
+                let partition_id = partition_id.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: partition_id",
+                    ))
+                })?;
+                let partition_sequence = partition_sequence.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: partition_sequence",
+                    ))
+                })?;
+                let stream_version = stream_version.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: stream_version",
+                    ))
+                })?;
+                let timestamp = timestamp.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: timestamp",
+                    ))
+                })?;
 
                 Ok(AppendInfo {
                     event_id,
@@ -111,7 +174,7 @@ impl FromRedisValue for AppendInfo {
             }
             _ => Err(RedisError::from((
                 redis::ErrorKind::TypeError,
-                "Append info must be a Redis array",
+                "Append info must be a Redis map",
             ))),
         }
     }
@@ -126,44 +189,66 @@ pub struct EventBatch {
 impl FromRedisValue for EventBatch {
     fn from_redis_value(value: &Value) -> RedisResult<Self> {
         match value {
-            Value::Array(values) => {
-                // Ensure we have the expected number of fields
-                if values.len() != 2 {
-                    return Err(RedisError::from((
-                        redis::ErrorKind::TypeError,
-                        "Event batch array must have exactly 2 elements",
-                    )));
+            Value::Map(fields) => {
+                let mut has_more = None;
+                let mut events = None;
+
+                // Extract fields from map
+                for (key, val) in fields {
+                    let field_name = match key {
+                        Value::SimpleString(s) => s.as_str(),
+                        _ => continue,
+                    };
+
+                    match field_name {
+                        "has_more" => {
+                            has_more = Some(match val {
+                                Value::Boolean(b) => *b,
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "has_more must be a boolean",
+                                    )));
+                                }
+                            });
+                        }
+                        "events" => {
+                            events = Some(match val {
+                                Value::Array(event_values) => event_values
+                                    .iter()
+                                    .map(Event::from_redis_value)
+                                    .collect::<Result<Vec<_>, _>>()?,
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "events must be an array",
+                                    )));
+                                }
+                            });
+                        }
+                        _ => {} // Ignore unknown fields
+                    }
                 }
 
-                // Extract and parse each field
-                let has_more = match &values[0] {
-                    Value::Boolean(b) => *b,
-                    _ => {
-                        return Err(RedisError::from((
-                            redis::ErrorKind::TypeError,
-                            "has_more must be a boolean",
-                        )));
-                    }
-                };
-
-                let events = match &values[1] {
-                    Value::Array(events) => events
-                        .iter()
-                        .map(Event::from_redis_value)
-                        .collect::<Result<Vec<_>, _>>()?,
-                    _ => {
-                        return Err(RedisError::from((
-                            redis::ErrorKind::TypeError,
-                            "events must be an array",
-                        )));
-                    }
-                };
+                // Ensure all required fields are present
+                let has_more = has_more.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: has_more",
+                    ))
+                })?;
+                let events = events.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: events",
+                    ))
+                })?;
 
                 Ok(EventBatch { events, has_more })
             }
             _ => Err(RedisError::from((
                 redis::ErrorKind::TypeError,
-                "Append info must be a Redis array",
+                "Event batch must be a Redis map",
             ))),
         }
     }
@@ -248,144 +333,238 @@ pub struct Event {
 impl FromRedisValue for Event {
     fn from_redis_value(value: &Value) -> RedisResult<Self> {
         match value {
-            Value::Array(values) => {
-                // Ensure we have the expected number of fields
-                if values.len() != 11 {
-                    return Err(RedisError::from((
-                        redis::ErrorKind::TypeError,
-                        "Event array must have exactly 11 elements",
-                    )));
+            Value::Map(fields) => {
+                let mut event_id = None;
+                let mut partition_key = None;
+                let mut partition_id = None;
+                let mut transaction_id = None;
+                let mut partition_sequence = None;
+                let mut stream_version = None;
+                let mut timestamp = None;
+                let mut stream_id = None;
+                let mut event_name = None;
+                let mut metadata = None;
+                let mut payload = None;
+
+                // Extract fields from map
+                for (key, val) in fields {
+                    let field_name = match key {
+                        Value::SimpleString(s) => s.as_str(),
+                        _ => continue,
+                    };
+
+                    match field_name {
+                        "event_id" => {
+                            event_id = Some(match val {
+                                Value::SimpleString(s) => Uuid::parse_str(s).map_err(|_| {
+                                    RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "Invalid UUID format for event_id",
+                                    ))
+                                })?,
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "event_id must be a string",
+                                    )));
+                                }
+                            });
+                        }
+                        "partition_key" => {
+                            partition_key = Some(match val {
+                                Value::SimpleString(s) => Uuid::parse_str(s).map_err(|_| {
+                                    RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "Invalid UUID format for partition_key",
+                                    ))
+                                })?,
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "partition_key must be a string",
+                                    )));
+                                }
+                            });
+                        }
+                        "partition_id" => {
+                            partition_id = Some(match val {
+                                Value::Int(n) => *n as u16,
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "partition_id must be an integer",
+                                    )));
+                                }
+                            });
+                        }
+                        "transaction_id" => {
+                            transaction_id = Some(match val {
+                                Value::SimpleString(s) => Uuid::parse_str(s).map_err(|_| {
+                                    RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "Invalid UUID format for transaction_id",
+                                    ))
+                                })?,
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "transaction_id must be a string",
+                                    )));
+                                }
+                            });
+                        }
+                        "partition_sequence" => {
+                            partition_sequence = Some(match val {
+                                Value::Int(n) => *n as u64,
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "partition_sequence must be an integer",
+                                    )));
+                                }
+                            });
+                        }
+                        "stream_version" => {
+                            stream_version = Some(match val {
+                                Value::Int(n) => *n as u64,
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "stream_version must be an integer",
+                                    )));
+                                }
+                            });
+                        }
+                        "timestamp" => {
+                            timestamp = Some(match val {
+                                Value::Int(ms) => {
+                                    let duration = Duration::from_millis(*ms as u64);
+                                    UNIX_EPOCH + duration
+                                }
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "timestamp must be an integer",
+                                    )));
+                                }
+                            });
+                        }
+                        "stream_id" => {
+                            stream_id = Some(match val {
+                                Value::SimpleString(s) => s.clone(),
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "stream_id must be a string",
+                                    )));
+                                }
+                            });
+                        }
+                        "event_name" => {
+                            event_name = Some(match val {
+                                Value::SimpleString(s) => s.clone(),
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "event_name must be a string",
+                                    )));
+                                }
+                            });
+                        }
+                        "metadata" => {
+                            metadata = Some(match val {
+                                Value::BulkString(data) => data.clone(),
+                                Value::Nil => Vec::new(), // Handle null metadata
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "metadata must be bulk data",
+                                    )));
+                                }
+                            });
+                        }
+                        "payload" => {
+                            payload = Some(match val {
+                                Value::BulkString(data) => data.clone(),
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "payload must be bulk data",
+                                    )));
+                                }
+                            });
+                        }
+                        _ => {} // Ignore unknown fields
+                    }
                 }
 
-                // Extract and parse each field
-                let event_id = match &values[0] {
-                    Value::SimpleString(s) => Uuid::parse_str(s).map_err(|_| {
-                        RedisError::from((
-                            redis::ErrorKind::TypeError,
-                            "Invalid UUID format for event_id",
-                        ))
-                    })?,
-                    _ => {
-                        return Err(RedisError::from((
-                            redis::ErrorKind::TypeError,
-                            "event_id must be a string",
-                        )));
-                    }
-                };
-
-                let partition_key = match &values[1] {
-                    Value::SimpleString(s) => Uuid::parse_str(s).map_err(|_| {
-                        RedisError::from((
-                            redis::ErrorKind::TypeError,
-                            "Invalid UUID format for partition_key",
-                        ))
-                    })?,
-                    _ => {
-                        return Err(RedisError::from((
-                            redis::ErrorKind::TypeError,
-                            "partition_key must be a string",
-                        )));
-                    }
-                };
-
-                let partition_id = match &values[2] {
-                    Value::Int(n) => *n as u16,
-                    _ => {
-                        return Err(RedisError::from((
-                            redis::ErrorKind::TypeError,
-                            "partition_id must be an integer",
-                        )));
-                    }
-                };
-
-                let transaction_id = match &values[3] {
-                    Value::SimpleString(s) => Uuid::parse_str(s).map_err(|_| {
-                        RedisError::from((
-                            redis::ErrorKind::TypeError,
-                            "Invalid UUID format for transaction_id",
-                        ))
-                    })?,
-                    _ => {
-                        return Err(RedisError::from((
-                            redis::ErrorKind::TypeError,
-                            "transaction_id must be a string",
-                        )));
-                    }
-                };
-
-                let partition_sequence = match &values[4] {
-                    Value::Int(n) => *n as u64,
-                    _ => {
-                        return Err(RedisError::from((
-                            redis::ErrorKind::TypeError,
-                            "partition_sequence must be an integer",
-                        )));
-                    }
-                };
-
-                let stream_version = match &values[5] {
-                    Value::Int(n) => *n as u64,
-                    _ => {
-                        return Err(RedisError::from((
-                            redis::ErrorKind::TypeError,
-                            "stream_version must be an integer",
-                        )));
-                    }
-                };
-
-                let timestamp = match &values[6] {
-                    Value::Int(ms) => {
-                        let duration = Duration::from_millis(*ms as u64);
-                        UNIX_EPOCH + duration
-                    }
-                    _ => {
-                        return Err(RedisError::from((
-                            redis::ErrorKind::TypeError,
-                            "timestamp must be an integer",
-                        )));
-                    }
-                };
-
-                let stream_id = match &values[7] {
-                    Value::SimpleString(s) => s.clone(),
-                    _ => {
-                        return Err(RedisError::from((
-                            redis::ErrorKind::TypeError,
-                            "stream_id must be a string",
-                        )));
-                    }
-                };
-
-                let event_name = match &values[8] {
-                    Value::SimpleString(s) => s.clone(),
-                    _ => {
-                        return Err(RedisError::from((
-                            redis::ErrorKind::TypeError,
-                            "event_name must be a string",
-                        )));
-                    }
-                };
-
-                let metadata = match &values[9] {
-                    Value::BulkString(data) => data.clone(),
-                    Value::Nil => Vec::new(), // Handle null metadata
-                    _ => {
-                        return Err(RedisError::from((
-                            redis::ErrorKind::TypeError,
-                            "metadata must be bulk data",
-                        )));
-                    }
-                };
-
-                let payload = match &values[10] {
-                    Value::BulkString(data) => data.clone(),
-                    _ => {
-                        return Err(RedisError::from((
-                            redis::ErrorKind::TypeError,
-                            "payload must be bulk data",
-                        )));
-                    }
-                };
+                // Ensure all required fields are present
+                let event_id = event_id.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: event_id",
+                    ))
+                })?;
+                let partition_key = partition_key.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: partition_key",
+                    ))
+                })?;
+                let partition_id = partition_id.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: partition_id",
+                    ))
+                })?;
+                let transaction_id = transaction_id.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: transaction_id",
+                    ))
+                })?;
+                let partition_sequence = partition_sequence.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: partition_sequence",
+                    ))
+                })?;
+                let stream_version = stream_version.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: stream_version",
+                    ))
+                })?;
+                let timestamp = timestamp.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: timestamp",
+                    ))
+                })?;
+                let stream_id = stream_id.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: stream_id",
+                    ))
+                })?;
+                let event_name = event_name.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: event_name",
+                    ))
+                })?;
+                let metadata = metadata.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: metadata",
+                    ))
+                })?;
+                let payload = payload.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: payload",
+                    ))
+                })?;
 
                 Ok(Event {
                     event_id,
@@ -403,7 +582,7 @@ impl FromRedisValue for Event {
             }
             _ => Err(RedisError::from((
                 redis::ErrorKind::TypeError,
-                "Event must be a Redis array",
+                "Event must be a Redis map",
             ))),
         }
     }
@@ -454,142 +633,236 @@ pub struct EventInfo {
     pub timestamp: SystemTime,
 }
 
+impl FromRedisValue for EventInfo {
+    fn from_redis_value(value: &Value) -> RedisResult<Self> {
+        match value {
+            Value::Map(fields) => {
+                let mut event_id = None;
+                let mut stream_id = None;
+                let mut stream_version = None;
+                let mut timestamp = None;
+
+                // Extract fields from map
+                for (key, val) in fields {
+                    let field_name = match key {
+                        Value::SimpleString(s) => s.as_str(),
+                        _ => continue,
+                    };
+
+                    match field_name {
+                        "event_id" => {
+                            event_id = Some(match val {
+                                Value::SimpleString(s) => Uuid::parse_str(s).map_err(|_| {
+                                    RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "Invalid UUID format for event_id",
+                                    ))
+                                })?,
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "event_id must be a string",
+                                    )));
+                                }
+                            });
+                        }
+                        "stream_id" => {
+                            stream_id = Some(match val {
+                                Value::SimpleString(s) => s.clone(),
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "stream_id must be a string",
+                                    )));
+                                }
+                            });
+                        }
+                        "stream_version" => {
+                            stream_version = Some(match val {
+                                Value::Int(n) => *n as u64,
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "stream_version must be an integer",
+                                    )));
+                                }
+                            });
+                        }
+                        "timestamp" => {
+                            timestamp = Some(match val {
+                                Value::Int(ms) => {
+                                    let duration = Duration::from_millis(*ms as u64);
+                                    UNIX_EPOCH + duration
+                                }
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "timestamp must be an integer",
+                                    )));
+                                }
+                            });
+                        }
+                        _ => {} // Ignore unknown fields
+                    }
+                }
+
+                // Ensure all required fields are present
+                let event_id = event_id.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: event_id",
+                    ))
+                })?;
+                let stream_id = stream_id.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: stream_id",
+                    ))
+                })?;
+                let stream_version = stream_version.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: stream_version",
+                    ))
+                })?;
+                let timestamp = timestamp.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: timestamp",
+                    ))
+                })?;
+
+                Ok(EventInfo {
+                    event_id,
+                    stream_id,
+                    stream_version,
+                    timestamp,
+                })
+            }
+            _ => Err(RedisError::from((
+                redis::ErrorKind::TypeError,
+                "Event info must be a Redis map",
+            ))),
+        }
+    }
+}
+
 impl FromRedisValue for MultiAppendInfo {
     fn from_redis_value(value: &Value) -> RedisResult<Self> {
         match value {
-            Value::Array(values) => {
-                if values.len() != 5 {
-                    return Err(RedisError::from((
-                        redis::ErrorKind::TypeError,
-                        "Multi append info array must have exactly 5 elements",
-                    )));
-                }
+            Value::Map(fields) => {
+                let mut partition_key = None;
+                let mut partition_id = None;
+                let mut first_partition_sequence = None;
+                let mut last_partition_sequence = None;
+                let mut events = None;
 
-                let partition_key = match &values[0] {
-                    Value::SimpleString(s) => Uuid::parse_str(s).map_err(|_| {
-                        RedisError::from((
-                            redis::ErrorKind::TypeError,
-                            "Invalid UUID format for partition_key",
-                        ))
-                    })?,
-                    _ => {
-                        return Err(RedisError::from((
-                            redis::ErrorKind::TypeError,
-                            "partition_key must be a string",
-                        )));
-                    }
-                };
+                // Extract fields from map
+                for (key, val) in fields {
+                    let field_name = match key {
+                        Value::SimpleString(s) => s.as_str(),
+                        _ => continue,
+                    };
 
-                let partition_id = match &values[1] {
-                    Value::Int(n) => *n as u16,
-                    _ => {
-                        return Err(RedisError::from((
-                            redis::ErrorKind::TypeError,
-                            "partition_id must be an integer",
-                        )));
-                    }
-                };
-
-                let first_partition_sequence = match &values[2] {
-                    Value::Int(n) => *n as u64,
-                    _ => {
-                        return Err(RedisError::from((
-                            redis::ErrorKind::TypeError,
-                            "first_partition_sequence must be an integer",
-                        )));
-                    }
-                };
-
-                let last_partition_sequence = match &values[3] {
-                    Value::Int(n) => *n as u64,
-                    _ => {
-                        return Err(RedisError::from((
-                            redis::ErrorKind::TypeError,
-                            "last_partition_sequence must be an integer",
-                        )));
-                    }
-                };
-
-                let events = match &values[4] {
-                    Value::Array(event_arrays) => event_arrays
-                        .iter()
-                        .map(|event_array| match event_array {
-                            Value::Array(event_values) => {
-                                if event_values.len() != 4 {
+                    match field_name {
+                        "partition_key" => {
+                            partition_key = Some(match val {
+                                Value::SimpleString(s) => Uuid::parse_str(s).map_err(|_| {
+                                    RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "Invalid UUID format for partition_key",
+                                    ))
+                                })?,
+                                _ => {
                                     return Err(RedisError::from((
                                         redis::ErrorKind::TypeError,
-                                        "Event info array must have exactly 4 elements",
+                                        "partition_key must be a string",
                                     )));
                                 }
-
-                                let event_id = match &event_values[0] {
-                                    Value::SimpleString(s) => Uuid::parse_str(s).map_err(|_| {
-                                        RedisError::from((
-                                            redis::ErrorKind::TypeError,
-                                            "Invalid UUID format for event_id",
-                                        ))
-                                    })?,
-                                    _ => {
-                                        return Err(RedisError::from((
-                                            redis::ErrorKind::TypeError,
-                                            "event_id must be a string",
-                                        )));
-                                    }
-                                };
-
-                                let stream_id = match &event_values[1] {
-                                    Value::SimpleString(s) => s.clone(),
-                                    _ => {
-                                        return Err(RedisError::from((
-                                            redis::ErrorKind::TypeError,
-                                            "stream_id must be a string",
-                                        )));
-                                    }
-                                };
-
-                                let stream_version = match &event_values[2] {
-                                    Value::Int(n) => *n as u64,
-                                    _ => {
-                                        return Err(RedisError::from((
-                                            redis::ErrorKind::TypeError,
-                                            "stream_version must be an integer",
-                                        )));
-                                    }
-                                };
-
-                                let timestamp = match &event_values[3] {
-                                    Value::Int(ms) => {
-                                        let duration = Duration::from_millis(*ms as u64);
-                                        UNIX_EPOCH + duration
-                                    }
-                                    _ => {
-                                        return Err(RedisError::from((
-                                            redis::ErrorKind::TypeError,
-                                            "timestamp must be an integer",
-                                        )));
-                                    }
-                                };
-
-                                Ok(EventInfo {
-                                    event_id,
-                                    stream_id,
-                                    stream_version,
-                                    timestamp,
-                                })
-                            }
-                            _ => Err(RedisError::from((
-                                redis::ErrorKind::TypeError,
-                                "Event info must be an array",
-                            ))),
-                        })
-                        .collect::<Result<Vec<_>, _>>()?,
-                    _ => {
-                        return Err(RedisError::from((
-                            redis::ErrorKind::TypeError,
-                            "events must be an array",
-                        )));
+                            });
+                        }
+                        "partition_id" => {
+                            partition_id = Some(match val {
+                                Value::Int(n) => *n as u16,
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "partition_id must be an integer",
+                                    )));
+                                }
+                            });
+                        }
+                        "first_partition_sequence" => {
+                            first_partition_sequence = Some(match val {
+                                Value::Int(n) => *n as u64,
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "first_partition_sequence must be an integer",
+                                    )));
+                                }
+                            });
+                        }
+                        "last_partition_sequence" => {
+                            last_partition_sequence = Some(match val {
+                                Value::Int(n) => *n as u64,
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "last_partition_sequence must be an integer",
+                                    )));
+                                }
+                            });
+                        }
+                        "events" => {
+                            events = Some(match val {
+                                Value::Array(event_values) => event_values
+                                    .iter()
+                                    .map(EventInfo::from_redis_value)
+                                    .collect::<Result<Vec<_>, _>>()?,
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "events must be an array",
+                                    )));
+                                }
+                            });
+                        }
+                        _ => {} // Ignore unknown fields
                     }
-                };
+                }
+
+                // Ensure all required fields are present
+                let partition_key = partition_key.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: partition_key",
+                    ))
+                })?;
+                let partition_id = partition_id.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: partition_id",
+                    ))
+                })?;
+                let first_partition_sequence = first_partition_sequence.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: first_partition_sequence",
+                    ))
+                })?;
+                let last_partition_sequence = last_partition_sequence.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: last_partition_sequence",
+                    ))
+                })?;
+                let events = events.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: events",
+                    ))
+                })?;
 
                 Ok(MultiAppendInfo {
                     partition_key,
@@ -601,28 +874,105 @@ impl FromRedisValue for MultiAppendInfo {
             }
             _ => Err(RedisError::from((
                 redis::ErrorKind::TypeError,
-                "Multi append info must be a Redis array",
+                "Multi append info must be a Redis map",
             ))),
         }
     }
 }
 
 /// Information about an event subscription.
-/// For now, this is just a placeholder since ESUB is not yet implemented.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubscriptionInfo {
-    pub subscription_id: String,
+    /// The type of subscription ("subscribe")
+    pub subscription_type: String,
+    /// The channel/topic name being subscribed to
+    pub channel: String,
+    /// Current number of active subscriptions on this connection
+    pub active_subscriptions: i64,
 }
 
 impl FromRedisValue for SubscriptionInfo {
     fn from_redis_value(value: &Value) -> RedisResult<Self> {
         match value {
-            Value::SimpleString(s) => Ok(SubscriptionInfo {
-                subscription_id: s.clone(),
-            }),
+            Value::Map(fields) => {
+                let mut subscription_type = None;
+                let mut channel = None;
+                let mut active_subscriptions = None;
+
+                // Extract fields from map
+                for (key, val) in fields {
+                    let field_name = match key {
+                        Value::SimpleString(s) => s.as_str(),
+                        _ => continue,
+                    };
+
+                    match field_name {
+                        "subscription_type" => {
+                            subscription_type = Some(match val {
+                                Value::SimpleString(s) => s.clone(),
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "subscription_type must be a string",
+                                    )));
+                                }
+                            });
+                        }
+                        "channel" => {
+                            channel = Some(match val {
+                                Value::SimpleString(s) => s.clone(),
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "channel must be a string",
+                                    )));
+                                }
+                            });
+                        }
+                        "active_subscriptions" => {
+                            active_subscriptions = Some(match val {
+                                Value::Int(n) => *n,
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "active_subscriptions must be an integer",
+                                    )));
+                                }
+                            });
+                        }
+                        _ => {} // Ignore unknown fields
+                    }
+                }
+
+                // Ensure all required fields are present
+                let subscription_type = subscription_type.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: subscription_type",
+                    ))
+                })?;
+                let channel = channel.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: channel",
+                    ))
+                })?;
+                let active_subscriptions = active_subscriptions.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: active_subscriptions",
+                    ))
+                })?;
+
+                Ok(SubscriptionInfo {
+                    subscription_type,
+                    channel,
+                    active_subscriptions,
+                })
+            }
             _ => Err(RedisError::from((
                 redis::ErrorKind::TypeError,
-                "Subscription info must be a string",
+                "Subscription info must be a Redis map",
             ))),
         }
     }

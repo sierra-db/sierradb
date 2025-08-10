@@ -391,30 +391,65 @@ impl AppConfig {
         Ok(errs)
     }
 
+    // pub fn assigned_buckets(&self) -> Result<HashSet<BucketId>, ConfigError> {
+    //     match &self.bucket.ids {
+    //         Some(ids) => Ok(ids.iter().copied().collect()),
+    //         None => {
+    //             let node_count = self.node_count()?;
+    //             let replication_factor = self.replication.factor as usize;
+    //             let current_node_index = self.node.index as usize;
+
+    //             // Cap replication factor at node count (every node owns
+    // everything if RF >=             // node count)
+    //             let effective_replication_factor =
+    // replication_factor.min(node_count);
+
+    //             let mut assigned = HashSet::new();
+
+    //             for bucket_id in 0..self.bucket.count {
+    //                 let primary_node = bucket_id as usize % node_count;
+
+    //                 // Check if current node is one of the replica nodes for this
+    // bucket                 for replica_offset in
+    // 0..effective_replication_factor {                     let replica_node =
+    // (primary_node + replica_offset) % node_count;                     if
+    // replica_node == current_node_index {
+    // assigned.insert(bucket_id);                         break;
+    //                     }
+    //                 }
+    //             }
+
+    //             Ok(assigned)
+    //         }
+    //     }
+    // }
+
     pub fn assigned_buckets(&self) -> Result<HashSet<BucketId>, ConfigError> {
         match &self.bucket.ids {
             Some(ids) => Ok(ids.iter().copied().collect()),
             None => {
                 let node_count = self.node_count()?;
-                let replication_factor = self.replication.factor as usize;
-                let current_node_index = self.node.index as usize;
-
-                // Cap replication factor at node count (every node owns everything if RF >=
-                // node count)
-                let effective_replication_factor = replication_factor.min(node_count);
-
+                let effective_replication_factor =
+                    (self.replication.factor as usize).min(node_count);
                 let mut assigned = HashSet::new();
 
-                for bucket_id in 0..self.bucket.count {
-                    let primary_node = bucket_id as usize % node_count;
+                let buckets_per_node = self.bucket.count as usize / node_count;
+                let extra_buckets = self.bucket.count as usize % node_count;
 
-                    // Check if current node is one of the replica nodes for this bucket
-                    for replica_offset in 0..effective_replication_factor {
-                        let replica_node = (primary_node + replica_offset) % node_count;
-                        if replica_node == current_node_index {
-                            assigned.insert(bucket_id);
-                            break;
-                        }
+                // For each replica position this node participates in
+                for replica_offset in 0..effective_replication_factor {
+                    // Which node position are we a replica for?
+                    let primary_node =
+                        (self.node.index as usize + node_count - replica_offset) % node_count;
+
+                    // Calculate that node's bucket range
+                    let start = primary_node * buckets_per_node + primary_node.min(extra_buckets);
+                    let extra = if primary_node < extra_buckets { 1 } else { 0 };
+                    let count = buckets_per_node + extra;
+
+                    // Add all buckets in that range
+                    for bucket_id in start..(start + count) {
+                        assigned.insert(bucket_id.try_into().unwrap());
                     }
                 }
 

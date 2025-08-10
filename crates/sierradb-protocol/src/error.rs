@@ -1,3 +1,5 @@
+use std::fmt;
+
 /// Error codes used in Sierra server responses.
 ///
 /// These codes follow Redis conventions where applicable, with Sierra-specific
@@ -75,6 +77,10 @@ pub enum ErrorCode {
     WrongSeq,
     /// Wrong expected version
     WrongVer,
+
+    // Subscription-specific error codes
+    /// Redirect request to another node
+    Redirect,
 }
 
 impl ErrorCode {
@@ -84,10 +90,10 @@ impl ErrorCode {
     /// ```
     /// use sierradb_protocol::ErrorCode;
     ///
-    /// let error = ErrorCode::InvalidArg.with_message("Invalid timestamp format");
-    /// assert_eq!(error, "INVALIDARG Invalid timestamp format");
+    /// let error = ErrorCode::InvalidArg.with_message("invalid timestamp format");
+    /// assert_eq!(error, "INVALIDARG invalid timestamp format");
     /// ```
-    pub fn with_message(&self, message: &str) -> String {
+    pub fn with_message(&self, message: impl fmt::Display) -> String {
         format!("{self} {message}")
     }
 
@@ -166,6 +172,9 @@ impl std::fmt::Display for ErrorCode {
             ErrorCode::SeqConflict => "SEQCONFLICT",
             ErrorCode::WrongSeq => "WRONGSEQ",
             ErrorCode::WrongVer => "WRONGVER",
+
+            // Subscription-specific codes
+            ErrorCode::Redirect => "REDIRECT",
         };
         write!(f, "{code}")
     }
@@ -313,7 +322,7 @@ mod tests {
 
     #[test]
     fn test_with_message() {
-        let error = ErrorCode::InvalidArg.with_message("Invalid timestamp format");
-        assert_eq!(error, "INVALIDARG Invalid timestamp format");
+        let error = ErrorCode::InvalidArg.with_message("invalid timestamp format");
+        assert_eq!(error, "INVALIDARG invalid timestamp format");
     }
 }

@@ -5,16 +5,14 @@ use sierradb_cluster::ClusterError;
 use sierradb_cluster::write::error::WriteError;
 use sierradb_protocol::ErrorCode;
 
-use crate::value::Value;
-
 /// Extension trait for converting results to Redis error format.
 pub trait MapRedisError<T> {
-    fn map_redis_err(self) -> Result<T, Value>;
+    fn map_redis_err(self) -> Result<T, String>;
 }
 
 impl<T, E: AsRedisError> MapRedisError<T> for Result<T, E> {
-    fn map_redis_err(self) -> Result<T, Value> {
-        self.map_err(|err| Value::Error(err.as_redis_error()))
+    fn map_redis_err(self) -> Result<T, String> {
+        self.map_err(|err| err.as_redis_error())
     }
 }
 
@@ -26,12 +24,12 @@ pub trait AsRedisError {
 impl<M, E: AsRedisError> AsRedisError for SendError<M, E> {
     fn as_redis_error(&self) -> String {
         match self {
-            SendError::ActorNotRunning(_) => ErrorCode::ActorDown.with_message("Actor not running"),
+            SendError::ActorNotRunning(_) => ErrorCode::ActorDown.with_message("actor not running"),
             SendError::ActorStopped => {
-                ErrorCode::ActorStopped.with_message("Actor died when executing request")
+                ErrorCode::ActorStopped.with_message("actor died when executing request")
             }
             SendError::MailboxFull(_) => {
-                ErrorCode::MailboxFull.with_message("Actor mailbox is full")
+                ErrorCode::MailboxFull.with_message("actor mailbox is full")
             }
             SendError::HandlerError(err) => err.as_redis_error(),
             SendError::Timeout(_) => ErrorCode::Timeout.to_string(),
@@ -69,7 +67,13 @@ impl AsRedisError for WriteError {
 
 impl AsRedisError for SystemTimeError {
     fn as_redis_error(&self) -> String {
-        ErrorCode::ClockErr.with_message(&self.to_string())
+        ErrorCode::ClockErr.with_message(self.to_string())
+    }
+}
+
+impl AsRedisError for kameo::error::Infallible {
+    fn as_redis_error(&self) -> String {
+        unreachable!()
     }
 }
 
@@ -95,37 +99,35 @@ impl AsRedisError for ClusterError {
 
         match self {
             ClusterError::InsufficientPartitionsForQuorum { alive, required } => code.with_message(
-                &format!("Insufficient partitions alive for quorum ({alive}/{required})"),
+                format!("insufficient partitions alive for quorum ({alive}/{required})"),
             ),
-            ClusterError::NoAvailablePartitions => code.with_message("No available partitions"),
-            ClusterError::PartitionUnavailable => code.with_message("Partition unavailable"),
-            ClusterError::NoAvailableLeaders => code.with_message("No available leaders"),
+            ClusterError::NoAvailablePartitions => code.with_message("no available partitions"),
+            ClusterError::PartitionUnavailable => code.with_message("partition unavailable"),
+            ClusterError::NoAvailableLeaders => code.with_message("no available leaders"),
             ClusterError::QuorumNotAchieved {
                 confirmed,
                 required,
-            } => code.with_message(&format!("Quorum not achieved ({confirmed}/{required})")),
-            ClusterError::WriteTimeout => code.with_message("Write timed out"),
-            ClusterError::TooManyForwards => code.with_message("Too many forwards"),
+            } => code.with_message(format!("quorum not achieved ({confirmed}/{required})")),
+            ClusterError::WriteTimeout => code.with_message("write timed out"),
+            ClusterError::TooManyForwards => code.with_message("too many forwards"),
             ClusterError::CircuitBreakerOpen {
                 estimated_recovery_time,
             } => match estimated_recovery_time {
-                Some(time) => code.with_message(&format!(
-                    "Circuit breaker open: estimated recovery time: {time:?}"
+                Some(time) => code.with_message(format!(
+                    "circuit breaker open: estimated recovery time: {time:?}"
                 )),
-                None => code.with_message("Circuit breaker open"),
+                None => code.with_message("circuit breaker open"),
             },
             ClusterError::ConfirmationFailure(msg) => {
-                code.with_message(&format!("Failed to write confirmation count: {msg}"))
+                code.with_message(format!("failed to write confirmation count: {msg}"))
             }
-            ClusterError::Read(msg) => code.with_message(&format!("Read error: {msg}")),
-            ClusterError::Write(msg) => code.with_message(&format!("Write error: {msg}")),
-            ClusterError::RemoteSend(err) => {
-                code.with_message(&format!("Remote send error: {err}"))
-            }
-            ClusterError::Noise(err) => code.with_message(&format!("Noise error: {err}")),
-            ClusterError::Transport(err) => code.with_message(&format!("Transport error: {err}")),
+            ClusterError::Read(msg) => code.with_message(format!("read error: {msg}")),
+            ClusterError::Write(msg) => code.with_message(format!("write error: {msg}")),
+            ClusterError::RemoteSend(err) => code.with_message(format!("remote send error: {err}")),
+            ClusterError::Noise(err) => code.with_message(format!("noise error: {err}")),
+            ClusterError::Transport(err) => code.with_message(format!("transport error: {err}")),
             ClusterError::SwarmBuilder(err) => {
-                code.with_message(&format!("Swarm builder error: {err}"))
+                code.with_message(format!("swarm builder error: {err}"))
             }
         }
     }

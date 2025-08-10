@@ -410,7 +410,7 @@ pub struct ReplicateWrite {
     pub transaction: Transaction,
 }
 
-#[remote_message("ae8dc4cc-e382-4a68-9451-d10c5347d3c9")]
+#[remote_message]
 impl Message<ReplicateWrite> for ClusterActor {
     type Reply = ForwardedReply<ReplicateWrite, DelegatedReply<Result<AppendResult, WriteError>>>;
 
@@ -501,7 +501,7 @@ struct PartitionSyncRequest {
     to_seq: u64,
 }
 
-#[remote_message("9b26d88a-4467-432b-a308-c1279b317b73")]
+#[remote_message]
 impl Message<PartitionSyncRequest> for ClusterActor {
     type Reply = DelegatedReply<Result<Vec<CommittedEvents>, ClusterError>>;
 

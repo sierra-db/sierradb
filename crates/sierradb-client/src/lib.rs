@@ -7,12 +7,15 @@ mod macros;
 mod commands;
 mod error;
 mod options;
+mod subscription;
 mod types;
 
 // Re-export public types
 pub use commands::*;
+// pub use connection::*;
 pub use error::*;
 pub use options::*;
+pub use subscription::*;
 pub use types::*;
 
 // Re-export protocol types for convenience

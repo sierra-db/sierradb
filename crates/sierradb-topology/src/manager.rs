@@ -251,7 +251,7 @@ impl<T: ClusterKey> TopologyManager<T> {
         // Validate node count consistency
         if total_node_count != self.total_node_count {
             warn!(
-                "Node {peer_id} reports total_node_count={total_node_count} but expected {}",
+                "node {peer_id} reports total_node_count={total_node_count} but expected {}",
                 self.total_node_count
             );
         }
@@ -275,7 +275,7 @@ impl<T: ClusterKey> TopologyManager<T> {
 
         if owned_partitions != &expected_partitions {
             warn!(
-                "Node {peer_id} claims partitions ({} items) but expected ({} items)",
+                "node {peer_id} claims partitions ({} items) but expected ({} items)",
                 owned_partitions.len(),
                 expected_partitions.len()
             );
@@ -334,7 +334,7 @@ impl<T: ClusterKey> TopologyManager<T> {
         // Validate node count consistency
         if total_node_count != self.total_node_count {
             warn!(
-                "Node {peer_id} reports total_node_count={total_node_count} but expected {}",
+                "node {peer_id} reports total_node_count={total_node_count} but expected {}",
                 self.total_node_count
             );
         }
@@ -343,7 +343,7 @@ impl<T: ClusterKey> TopologyManager<T> {
         if let Some((_existing_alive_since, existing_index)) = self.active_nodes.get(&peer_id) {
             if *existing_index != node_index {
                 warn!(
-                    "Node {peer_id} changed index from {} to {}",
+                    "node {peer_id} changed index from {} to {}",
                     existing_index, node_index
                 );
                 self.active_nodes.insert(peer_id, (alive_since, node_index));
@@ -368,7 +368,7 @@ impl<T: ClusterKey> TopologyManager<T> {
 
         if owned_partitions != &expected_partitions {
             warn!(
-                "Node {peer_id} heartbeat shows {} partitions but expected {}",
+                "node {peer_id} heartbeat shows {} partitions but expected {}",
                 owned_partitions.len(),
                 expected_partitions.len(),
             );
@@ -470,11 +470,6 @@ impl<T: ClusterKey> TopologyManager<T> {
             );
             self.partition_replicas.insert(partition_id, replicas);
         }
-
-        // Log a sample for debugging
-        if let Some((partition_id, replicas)) = self.partition_replicas.iter().next() {
-            info!("partition {partition_id} has {} replicas", replicas.len());
-        }
     }
 
     /// Ensure local partition assignments are consistent with our configuration
@@ -489,7 +484,7 @@ impl<T: ClusterKey> TopologyManager<T> {
 
         if self.assigned_partitions != expected_partitions {
             warn!(
-                "Local partition assignments ({} items) don't match expected ({} items)",
+                "local partition assignments ({} items) don't match expected ({} items)",
                 self.assigned_partitions.len(),
                 expected_partitions.len()
             );
@@ -565,7 +560,7 @@ mod replica_manager_tests {
             .collect();
         assert!(
             !overlap_0_1.is_empty(),
-            "Should have some overlapping partitions"
+            "should have some overlapping partitions"
         );
 
         // Each partition should be owned by exactly 3 nodes
@@ -584,7 +579,7 @@ mod replica_manager_tests {
 
             assert_eq!(
                 owners, 3,
-                "Partition {partition_id} should have exactly 3 replicas"
+                "partition {partition_id} should have exactly 3 replicas"
             );
         }
     }
@@ -622,7 +617,7 @@ mod replica_manager_tests {
 
             assert_eq!(
                 owners, 3,
-                "Partition {partition_id} should have exactly 3 replicas"
+                "partition {partition_id} should have exactly 3 replicas"
             );
         }
     }

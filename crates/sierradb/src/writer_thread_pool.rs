@@ -535,7 +535,7 @@ pub struct WriteOperation<'a> {
     pub partition_key: Uuid,
     pub partition_id: PartitionId,
     pub transaction_id: Uuid,
-    pub events: &'a SmallVec<[NewEvent; 4]>,
+    pub events: &'a [NewEvent],
     pub event_versions: Vec<CurrentVersion>,
     pub expected_partition_sequence: ExpectedVersion,
     pub unique_streams: usize,
@@ -577,7 +577,8 @@ impl WriterSet {
         let mut stream_versions = HashMap::with_capacity(req.unique_streams);
 
         let event_count = req.events.len();
-        for (event, stream_version) in req.events.into_iter().zip(req.event_versions) {
+        debug_assert_eq!(req.events.len(), req.event_versions.len());
+        for (event, stream_version) in req.events.iter().zip(req.event_versions) {
             let partition_sequence = next_partition_sequence;
             let stream_version = stream_version.next();
             stream_versions.insert(event.stream_id.clone(), stream_version);
@@ -787,7 +788,7 @@ impl WriterSet {
     fn validate_event_versions(
         &self,
         partition_key: Uuid,
-        events: &SmallVec<[NewEvent; 4]>,
+        events: &[NewEvent],
     ) -> Result<Vec<CurrentVersion>, WriteError> {
         let mut stream_versions: HashMap<StreamId, u64> = HashMap::new();
         let mut event_versions = Vec::with_capacity(events.len());
@@ -822,6 +823,8 @@ impl WriterSet {
                                 expected: ExpectedVersion::Exact(expected_version),
                             });
                         }
+
+                        *entry.get_mut() += 1;
                     }
                 },
                 Entry::Vacant(entry) => match event.stream_version {
@@ -850,7 +853,7 @@ impl WriterSet {
                         match latest_stream_version {
                             Some(StreamLatestVersion::LatestVersion { version, .. }) => {
                                 event_versions.push(CurrentVersion::Current(version));
-                                entry.insert(version);
+                                entry.insert(version + 1);
                             }
                             Some(StreamLatestVersion::ExternalBucket { .. }) => {
                                 todo!()
@@ -1004,7 +1007,7 @@ impl WriterSet {
                                 }
 
                                 event_versions.push(CurrentVersion::Current(version));
-                                entry.insert(expected_version);
+                                entry.insert(expected_version + 1);
                             }
                             Some(StreamLatestVersion::ExternalBucket { .. }) => {
                                 todo!()
@@ -1272,6 +1275,564 @@ fn validate_partition_sequence(
                     current: CurrentVersion::Current(next_partition_sequence - 1),
                     expected,
                 })
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::slice;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU32;
+    use std::time::{Duration, Instant};
+
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+    use rayon::ThreadPoolBuilder;
+    use sierradb_protocol::{CurrentVersion, ExpectedVersion};
+    use tempfile::{TempDir, tempdir};
+    use tokio::sync::RwLock;
+    use uuid::Uuid;
+
+    use crate::StreamId;
+    use crate::bucket::event_index::OpenEventIndex;
+    use crate::bucket::partition_index::OpenPartitionIndex;
+    use crate::bucket::segment::{BucketSegmentReader, BucketSegmentWriter};
+    use crate::bucket::stream_index::OpenStreamIndex;
+    use crate::bucket::{PartitionHash, SegmentKind};
+    use crate::database::NewEvent;
+    use crate::id::{NAMESPACE_PARTITION_KEY, uuid_to_partition_hash, uuid_v7_with_partition_hash};
+    use crate::reader_thread_pool::ReaderThreadPool;
+    use crate::writer_thread_pool::{LiveIndexSet, WriteOperation, WriterSet};
+
+    fn setup_writer_set() -> (WriterSet, TempDir) {
+        let dir = tempdir().unwrap();
+        let bucket_id = 0;
+        let segment_size = 1024 * 1024;
+        let reader_threads = 1;
+        let now = Instant::now();
+        let flush_interval_duration = Duration::MAX;
+        let flush_interval_events = 1;
+
+        let thread_pool = Arc::new(ThreadPoolBuilder::new().build().unwrap());
+        let reader_pool = ReaderThreadPool::new(reader_threads);
+
+        let (bucket_segment_id, writer) = BucketSegmentWriter::latest(bucket_id, &dir).unwrap();
+        let mut reader = BucketSegmentReader::open(
+            SegmentKind::Events.get_path(&dir, bucket_segment_id),
+            Some(writer.flushed_offset()),
+        )
+        .unwrap();
+
+        let mut event_index = OpenEventIndex::open(
+            bucket_segment_id,
+            SegmentKind::EventIndex.get_path(&dir, bucket_segment_id),
+        )
+        .unwrap();
+        let mut partition_index = OpenPartitionIndex::open(
+            bucket_segment_id,
+            SegmentKind::PartitionIndex.get_path(&dir, bucket_segment_id),
+        )
+        .unwrap();
+        let mut stream_index = OpenStreamIndex::open(
+            bucket_segment_id,
+            SegmentKind::StreamIndex.get_path(&dir, bucket_segment_id),
+            segment_size,
+        )
+        .unwrap();
+
+        if let Err(err) = event_index.hydrate(&mut reader) {
+            panic!("failed to hydrate event index for {bucket_segment_id}: {err}");
+        }
+        if let Err(err) = partition_index.hydrate(&mut reader) {
+            panic!("failed to hydrate partition index for {bucket_segment_id}: {err}");
+        }
+        if let Err(err) = stream_index.hydrate(&mut reader) {
+            panic!("failed to hydrate stream index for {bucket_segment_id}: {err}");
+        }
+
+        reader_pool.add_bucket_segment(bucket_segment_id, &reader, None, None, None);
+
+        let indexes = Arc::new(RwLock::new(LiveIndexSet {
+            event_index,
+            partition_index,
+            stream_index,
+        }));
+
+        let writer_set = WriterSet {
+            dir: dir.path().to_owned(),
+            reader,
+            reader_pool: reader_pool.clone(),
+            bucket_segment_id,
+            segment_size,
+            writer,
+            next_partition_sequences: HashMap::new(),
+            index_segment_id: Arc::new(AtomicU32::new(bucket_segment_id.segment_id)),
+            indexes,
+            pending_indexes: Vec::with_capacity(128),
+            last_flushed: now,
+            unflushed_events: 0,
+            flush_interval_duration,
+            flush_interval_events,
+            thread_pool,
+        };
+
+        (writer_set, dir)
+    }
+
+    fn events_from_expected_fn(
+        partition_hash: PartitionHash,
+    ) -> impl Fn(&[(&StreamId, ExpectedVersion)]) -> Vec<NewEvent> {
+        move |expected| {
+            expected
+                .iter()
+                .map(|(stream_id, expected)| NewEvent {
+                    event_id: uuid_v7_with_partition_hash(partition_hash),
+                    stream_id: (*stream_id).clone(),
+                    stream_version: *expected,
+                    event_name: "MyEvent".to_string(),
+                    timestamp: 1069,
+                    metadata: vec![],
+                    payload: vec![],
+                })
+                .collect()
+        }
+    }
+
+    fn test_validate_event_versions(
+        from_empty: [ExpectedVersion; 3],
+        from_one: [ExpectedVersion; 3],
+        from_four: [ExpectedVersion; 3],
+        random_from_one: [ExpectedVersion; 3],
+    ) {
+        let (mut writer_set, _dir) = setup_writer_set();
+
+        let stream_id = StreamId::new("my-stream").unwrap();
+        let random_stream_id = StreamId::new("random").unwrap();
+        let partition_key = Uuid::new_v5(&NAMESPACE_PARTITION_KEY, stream_id.as_bytes());
+        let partition_hash = uuid_to_partition_hash(partition_key);
+        let partition_id = 0;
+        let events_from_expected = events_from_expected_fn(partition_hash);
+
+        // Any tests
+        let versions = writer_set
+            .validate_event_versions(
+                partition_key,
+                &events_from_expected(
+                    &from_empty
+                        .iter()
+                        .map(|expected| (&stream_id, *expected))
+                        .collect::<Vec<_>>(),
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            versions,
+            [
+                CurrentVersion::Empty,
+                CurrentVersion::Current(0),
+                CurrentVersion::Current(1),
+            ]
+        );
+
+        writer_set
+            .handle_write(WriteOperation {
+                partition_key,
+                partition_id,
+                transaction_id: Uuid::new_v4(),
+                events: &events_from_expected(&[(&stream_id, ExpectedVersion::Empty)]),
+                event_versions: vec![CurrentVersion::Empty],
+                expected_partition_sequence: ExpectedVersion::Empty,
+                unique_streams: 1,
+                confirmation_count: 1,
+            })
+            .unwrap();
+
+        let versions = writer_set
+            .validate_event_versions(
+                partition_key,
+                &events_from_expected(
+                    &from_one
+                        .iter()
+                        .map(|expected| (&stream_id, *expected))
+                        .collect::<Vec<_>>(),
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            versions,
+            [
+                CurrentVersion::Current(0),
+                CurrentVersion::Current(1),
+                CurrentVersion::Current(2),
+            ]
+        );
+
+        writer_set
+            .handle_write(WriteOperation {
+                partition_key,
+                partition_id,
+                transaction_id: Uuid::new_v4(),
+                events: &events_from_expected(&[
+                    (&stream_id, ExpectedVersion::Exact(0)),
+                    (&stream_id, ExpectedVersion::Exact(1)),
+                    (&random_stream_id, ExpectedVersion::Empty),
+                    (&stream_id, ExpectedVersion::Exact(2)),
+                    (&stream_id, ExpectedVersion::Exact(3)),
+                ]),
+                event_versions: vec![
+                    CurrentVersion::Current(0),
+                    CurrentVersion::Current(1),
+                    CurrentVersion::Empty,
+                    CurrentVersion::Current(2),
+                    CurrentVersion::Current(3),
+                ],
+                expected_partition_sequence: ExpectedVersion::Exact(0),
+                unique_streams: 2,
+                confirmation_count: 1,
+            })
+            .unwrap();
+
+        let versions = writer_set
+            .validate_event_versions(
+                partition_key,
+                &events_from_expected(
+                    &from_four
+                        .iter()
+                        .map(|expected| (&stream_id, *expected))
+                        .collect::<Vec<_>>(),
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            versions,
+            [
+                CurrentVersion::Current(4),
+                CurrentVersion::Current(5),
+                CurrentVersion::Current(6),
+            ]
+        );
+
+        let versions = writer_set
+            .validate_event_versions(
+                partition_key,
+                &events_from_expected(
+                    &random_from_one
+                        .iter()
+                        .map(|expected| (&random_stream_id, *expected))
+                        .collect::<Vec<_>>(),
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            versions,
+            [
+                CurrentVersion::Current(0),
+                CurrentVersion::Current(1),
+                CurrentVersion::Current(2),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_validate_event_versions_any() {
+        use ExpectedVersion::*;
+        test_validate_event_versions([Any; 3], [Any; 3], [Any; 3], [Any; 3]);
+    }
+
+    #[test]
+    fn test_validate_event_versions_vague() {
+        use ExpectedVersion::*;
+        test_validate_event_versions(
+            [Empty, Exists, Exists],
+            [Exists; 3],
+            [Exists; 3],
+            [Exists; 3],
+        );
+    }
+
+    #[test]
+    fn test_validate_event_versions_precise() {
+        use ExpectedVersion::*;
+        test_validate_event_versions(
+            [Empty, Exact(0), Exact(1)],
+            [Exact(0), Exact(1), Exact(2)],
+            [Exact(4), Exact(5), Exact(6)],
+            [Exact(0), Exact(1), Exact(2)],
+        );
+    }
+
+    // Helper function to create a NewEvent with given properties
+    fn new_event(
+        partition_hash: PartitionHash,
+        stream_id: StreamId,
+        expected_version: ExpectedVersion,
+    ) -> NewEvent {
+        NewEvent {
+            event_id: uuid_v7_with_partition_hash(partition_hash),
+            stream_id,
+            stream_version: expected_version,
+            event_name: "TestEvent".to_string(),
+            timestamp: 1000,
+            metadata: vec![],
+            payload: vec![],
+        }
+    }
+
+    // Strategy for generating StreamIds
+    prop_compose! {
+        fn arb_stream_id()(name in "[a-z][a-z0-9_-]{0,19}") -> StreamId {
+            StreamId::new(name).unwrap()
+        }
+    }
+
+    // Strategy for generating ExpectedVersions
+    fn arb_expected_version() -> impl Strategy<Value = ExpectedVersion> {
+        prop_oneof![
+            Just(ExpectedVersion::Any),
+            Just(ExpectedVersion::Exists),
+            Just(ExpectedVersion::Empty),
+            (0u64..10).prop_map(ExpectedVersion::Exact),
+        ]
+    }
+
+    // Strategy for generating events with the same partition
+    prop_compose! {
+        fn arb_events_same_partition(max_events: usize)(
+            stream_ids in vec(arb_stream_id(), 1..=3),
+            events in vec(
+                (any::<prop::sample::Index>(), arb_expected_version()),
+                1..=max_events
+            )
+        ) -> (PartitionHash, Uuid, Vec<NewEvent>) {
+            let partition_key = Uuid::new_v4();
+            let partition_hash = uuid_to_partition_hash(partition_key);
+
+            let events: Vec<NewEvent> = events
+                .into_iter()
+                .map(|(stream_idx, expected_version)| {
+                    let stream_id = stream_ids[stream_idx.index(stream_ids.len())].clone();
+                    new_event(partition_hash, stream_id, expected_version)
+                })
+                .collect();
+
+            (partition_hash, partition_key, events)
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn prop_validate_returns_correct_number_of_versions(
+            (_, partition_key, events) in arb_events_same_partition(20)
+        ) {
+            let (writer_set, _dir) = setup_writer_set();
+
+            match writer_set.validate_event_versions(partition_key, &events) {
+                Ok(versions) => {
+                    prop_assert_eq!(versions.len(), events.len());
+                },
+                Err(_) => {
+                    // Validation can fail, which is expected for some inputs
+                }
+            }
+        }
+
+        #[test]
+        fn prop_any_version_never_fails_on_empty_writer(
+            stream_ids in vec(arb_stream_id(), 1..=5),
+            num_events in 1usize..=10
+        ) {
+            let (writer_set, _dir) = setup_writer_set();
+            let partition_key = Uuid::new_v4();
+            let partition_hash = uuid_to_partition_hash(partition_key);
+
+            let events: Vec<NewEvent> = (0..num_events)
+                .map(|i| {
+                    let stream_id = stream_ids[i % stream_ids.len()].clone();
+                    new_event(partition_hash, stream_id, ExpectedVersion::Any)
+                })
+                .collect();
+
+            let result = writer_set.validate_event_versions(partition_key, &events);
+            prop_assert!(result.is_ok());
+
+            let versions = result.unwrap();
+            prop_assert_eq!(versions.len(), events.len());
+        }
+
+        #[test]
+        fn prop_empty_version_fails_after_events_written(
+            stream_id in arb_stream_id()
+        ) {
+            let (mut writer_set, _dir) = setup_writer_set();
+            let partition_key = Uuid::new_v5(&NAMESPACE_PARTITION_KEY, stream_id.as_bytes());
+            let partition_hash = uuid_to_partition_hash(partition_key);
+
+            // First write an event to make the stream non-empty
+            let initial_event = new_event(partition_hash, stream_id.clone(), ExpectedVersion::Empty);
+            let versions = writer_set.validate_event_versions(partition_key, slice::from_ref(&initial_event)).unwrap();
+
+            writer_set.handle_write(WriteOperation {
+                partition_key,
+                partition_id: 0,
+                transaction_id: Uuid::new_v4(),
+                events: &[initial_event],
+                event_versions: versions,
+                expected_partition_sequence: ExpectedVersion::Empty,
+                unique_streams: 1,
+                confirmation_count: 1,
+            }).unwrap();
+
+            // Now try to write with Empty expectation - should fail
+            let empty_event = new_event(partition_hash, stream_id, ExpectedVersion::Empty);
+            let result = writer_set.validate_event_versions(partition_key, &[empty_event]);
+            prop_assert!(result.is_err());
+        }
+
+        #[test]
+        fn prop_exists_version_fails_on_nonexistent_stream(
+            stream_id in arb_stream_id()
+        ) {
+            let (writer_set, _dir) = setup_writer_set();
+            let partition_key = Uuid::new_v5(&NAMESPACE_PARTITION_KEY, stream_id.as_bytes());
+            let partition_hash = uuid_to_partition_hash(partition_key);
+
+            let event = new_event(partition_hash, stream_id, ExpectedVersion::Exists);
+            let result = writer_set.validate_event_versions(partition_key, &[event]);
+            prop_assert!(result.is_err());
+        }
+
+        #[test]
+        fn prop_exact_version_must_match_current(
+            stream_id in arb_stream_id(),
+            wrong_version in 1u64..10
+        ) {
+            let (mut writer_set, _dir) = setup_writer_set();
+            let partition_key = Uuid::new_v5(&NAMESPACE_PARTITION_KEY, stream_id.as_bytes());
+            let partition_hash = uuid_to_partition_hash(partition_key);
+
+            // Write initial event
+            let initial_event = new_event(partition_hash, stream_id.clone(), ExpectedVersion::Empty);
+            let versions = writer_set.validate_event_versions(partition_key, slice::from_ref(&initial_event)).unwrap();
+
+            writer_set.handle_write(WriteOperation {
+                partition_key,
+                partition_id: 0,
+                transaction_id: Uuid::new_v4(),
+                events: &[initial_event],
+                event_versions: versions,
+                expected_partition_sequence: ExpectedVersion::Empty,
+                unique_streams: 1,
+                confirmation_count: 1,
+            }).unwrap();
+
+            // Current version should be 0, so wrong_version (1-9) should fail
+            let exact_event = new_event(partition_hash, stream_id, ExpectedVersion::Exact(wrong_version));
+            let result = writer_set.validate_event_versions(partition_key, &[exact_event]);
+            prop_assert!(result.is_err());
+        }
+
+        #[test]
+        fn prop_versions_increment_within_batch(
+            stream_id in arb_stream_id(),
+            num_events in 2usize..=10
+        ) {
+            let (writer_set, _dir) = setup_writer_set();
+            let partition_key = Uuid::new_v5(&NAMESPACE_PARTITION_KEY, stream_id.as_bytes());
+            let partition_hash = uuid_to_partition_hash(partition_key);
+
+            // Create multiple events for the same stream with Any version
+            let events: Vec<NewEvent> = (0..num_events)
+                .map(|_| new_event(partition_hash, stream_id.clone(), ExpectedVersion::Any))
+                .collect();
+
+            let result = writer_set.validate_event_versions(partition_key, &events);
+            prop_assert!(result.is_ok());
+
+            let versions = result.unwrap();
+            prop_assert_eq!(versions.len(), num_events);
+
+            // First version should be Empty for a new stream
+            prop_assert_eq!(versions[0], CurrentVersion::Empty);
+
+            // Subsequent versions should increment
+            for i in 1..versions.len() {
+                match (&versions[i-1], &versions[i]) {
+                    (CurrentVersion::Empty, CurrentVersion::Current(0)) => {}, // First transition
+                    (CurrentVersion::Current(prev), CurrentVersion::Current(curr)) => {
+                        prop_assert_eq!(*curr, prev + 1);
+                    },
+                    _ => prop_assert!(false, "Unexpected version sequence: {:?} -> {:?}", versions[i-1], versions[i])
+                }
+            }
+        }
+
+        #[test]
+        fn prop_multiple_streams_maintain_independent_versions(
+            stream_ids in vec(arb_stream_id(), 2..=4),
+            events_per_stream in 1usize..=5
+        ) {
+            let (writer_set, _dir) = setup_writer_set();
+            let partition_key = Uuid::new_v4();
+            let partition_hash = uuid_to_partition_hash(partition_key);
+
+            let mut all_events = Vec::new();
+            let mut expected_stream_positions: HashMap<StreamId, usize> = HashMap::new();
+
+            // Create events distributed across streams
+            for _ in 0..events_per_stream * stream_ids.len() {
+                for stream_id in &stream_ids {
+                    let event = new_event(partition_hash, stream_id.clone(), ExpectedVersion::Any);
+                    all_events.push(event);
+                    *expected_stream_positions.entry(stream_id.clone()).or_insert(0) += 1;
+                }
+            }
+
+            let result = writer_set.validate_event_versions(partition_key, &all_events);
+            prop_assert!(result.is_ok());
+
+            let versions = result.unwrap();
+            prop_assert_eq!(versions.len(), all_events.len());
+
+            // Track actual stream positions as we go through versions
+            let mut actual_stream_positions: std::collections::HashMap<StreamId, u64> = std::collections::HashMap::new();
+
+            for (i, event) in all_events.iter().enumerate() {
+                let expected_pos = *actual_stream_positions.get(&event.stream_id).unwrap_or(&0);
+
+                match versions[i] {
+                    CurrentVersion::Empty if expected_pos == 0 => {
+                        actual_stream_positions.insert(event.stream_id.clone(), 0);
+                    },
+                    CurrentVersion::Current(pos) if pos == expected_pos => {
+                        actual_stream_positions.insert(event.stream_id.clone(), pos + 1);
+                    },
+                    _ => prop_assert!(false, "Version mismatch for stream {:?} at position {}: expected {}, got {:?}",
+                                   event.stream_id, i, expected_pos, versions[i])
+                }
+            }
+        }
+
+        #[test]
+        fn prop_batch_consistency_maintained(
+            (_, partition_key, events) in arb_events_same_partition(15)
+        ) {
+            let (writer_set, _dir) = setup_writer_set();
+
+            // Validate twice with same input - should get same result
+            let result1 = writer_set.validate_event_versions(partition_key, &events);
+            let result2 = writer_set.validate_event_versions(partition_key, &events);
+
+            match (result1, result2) {
+                (Ok(versions1), Ok(versions2)) => {
+                    prop_assert_eq!(versions1, versions2);
+                },
+                (Err(_), Err(_)) => {
+                    // Both failed, which is consistent
+                },
+                _ => prop_assert!(false, "Inconsistent validation results")
             }
         }
     }

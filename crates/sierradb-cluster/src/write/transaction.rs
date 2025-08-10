@@ -14,9 +14,10 @@ use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use crate::{
-    ClusterActor,
+    ClusterActor, ReplicaRefs,
     circuit_breaker::WriteCircuitBreaker,
     confirmation::actor::{ConfirmationActor, UpdateConfirmation},
+    subscription::NotifyEvent,
     write::confirm::ConfirmTransaction,
 };
 
@@ -27,10 +28,11 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// Configuration for distributed write operations
 pub struct WriteConfig {
     pub database: Database,
-    pub local_cluster_ref: RemoteActorRef<ClusterActor>,
+    pub local_cluster_ref: ActorRef<ClusterActor>,
+    pub local_remote_cluster_ref: RemoteActorRef<ClusterActor>,
     pub local_alive_since: u64,
     pub confirmation_ref: ActorRef<ConfirmationActor>,
-    pub replicas: ArrayVec<(RemoteActorRef<ClusterActor>, u64), MAX_REPLICATION_FACTOR>,
+    pub replicas: ReplicaRefs,
     pub replication_factor: u8,
     pub circuit_breaker: Arc<WriteCircuitBreaker>,
 }
@@ -55,7 +57,7 @@ pub fn spawn(
             TIMEOUT,
             run(
                 &config.database,
-                &config.local_cluster_ref,
+                &config.local_remote_cluster_ref,
                 config.local_alive_since,
                 config.replicas,
                 config.replication_factor,
@@ -126,8 +128,43 @@ pub fn spawn(
                         }
 
                         if let Some(tx) = reply_sender {
-                            tx.send(Ok(append));
+                            tx.send(Ok(append.clone()));
                         }
+
+                        // Notify subscriptions about new events
+                        // partition_id already available from above
+                        let database_clone = config.database.clone();
+                        let cluster_ref_clone = config.local_cluster_ref.clone();
+                        let append_clone = append.clone();
+                        tokio::spawn(async move {
+                            // Read the events that were just written to notify subscriptions
+                            let read_result = database_clone
+                                .read_partition(partition_id, append_clone.first_partition_sequence)
+                                .await;
+                            if let Ok(mut iter) = read_result
+                                && let Ok(Some(commit)) = iter.next().await
+                            {
+                                for event in commit {
+                                    // Only notify if the event is within the range we just wrote
+                                    if event.partition_sequence
+                                        >= append_clone.first_partition_sequence
+                                        && event.partition_sequence
+                                            <= append_clone.last_partition_sequence
+                                    {
+                                        let res = cluster_ref_clone
+                                            .tell(NotifyEvent {
+                                                partition_id,
+                                                event,
+                                            })
+                                            .send()
+                                            .await;
+                                        if let Err(err) = res {
+                                            error!("failed to notify event to cluster: {err}");
+                                        }
+                                    }
+                                }
+                            }
+                        });
 
                         // Confirm writes for other partitions which still succeeded
                         while let Ok(Some((cluster_ref, res))) =
@@ -190,7 +227,7 @@ async fn run(
     database: &Database,
     local_cluster_ref: &RemoteActorRef<ClusterActor>,
     local_alive_since: u64,
-    replicas: ArrayVec<(RemoteActorRef<ClusterActor>, u64), MAX_REPLICATION_FACTOR>,
+    replicas: ReplicaRefs,
     replication_factor: u8,
     mut transaction: Transaction,
 ) -> Result<

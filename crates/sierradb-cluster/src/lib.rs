@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use arrayvec::ArrayVec;
 use circuit_breaker::WriteCircuitBreaker;
 use confirmation::{AtomicWatermark, actor::ConfirmationActor};
 use futures::StreamExt;
@@ -16,17 +17,25 @@ use libp2p::{
     mdns, noise, swarm::NetworkBehaviour, tcp, yamux,
 };
 use serde::{Deserialize, Serialize};
-use sierradb::{bucket::PartitionId, database::Database, error::WriteError};
+use sierradb::{
+    MAX_REPLICATION_FACTOR, bucket::PartitionId, database::Database, error::WriteError,
+};
 use sierradb_topology::TopologyManager;
 use thiserror::Error;
 use tracing::{error, trace};
 
-use crate::write::replicate::{PartitionReplicatorActor, PartitionReplicatorActorArgs};
+use crate::{
+    subscription::SubscriptionManager,
+    write::replicate::{PartitionReplicatorActor, PartitionReplicatorActorArgs},
+};
 
 pub mod circuit_breaker;
 pub mod confirmation;
 pub mod read;
+pub mod subscription;
 pub mod write;
+
+pub type ReplicaRefs = ArrayVec<(RemoteActorRef<ClusterActor>, u64), MAX_REPLICATION_FACTOR>;
 
 /// Maximum number of request forwards allowed to prevent loops
 const MAX_FORWARDS: u8 = 3;
@@ -48,6 +57,7 @@ pub struct ClusterActor {
     watermarks: HashMap<PartitionId, Arc<AtomicWatermark>>,
     circuit_breaker: Arc<WriteCircuitBreaker>,
     replicator_refs: HashMap<PartitionId, ActorRef<PartitionReplicatorActor>>,
+    subscription_manager: SubscriptionManager,
 }
 
 impl ClusterActor {
@@ -213,6 +223,7 @@ impl Actor for ClusterActor {
             watermarks,
             circuit_breaker,
             replicator_refs,
+            subscription_manager: SubscriptionManager::new(),
         })
     }
 

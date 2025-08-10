@@ -24,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let config = AppConfig::load(args)?;
-    debug!("Configuration:\n{config}");
+    debug!("configuration:\n{config}");
     let errs = config.validate()?;
     let has_errs = !errs.is_empty();
     for err in errs {

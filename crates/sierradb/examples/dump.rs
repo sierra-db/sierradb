@@ -76,7 +76,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 while let Some(record) = iter.next_record().transpose() {
                     match record {
-                        Ok(Record::Event(event)) => {
+                        Ok(Record::Event(mut event)) => {
+                            event.metadata.clear();
+                            event.payload.clear();
+                            if event.stream_id != "BankAccount-abc" {
+                                continue;
+                            }
                             println!(
                                 "{bsid} -- {}/{} {}@{} - {} (confirmations: {})",
                                 event.partition_id,

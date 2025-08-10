@@ -79,6 +79,20 @@ impl CommittedEvents {
             CommittedEvents::Transaction { events, .. } => events.first(),
         }
     }
+
+    pub fn len(&self) -> usize {
+        match self {
+            CommittedEvents::Single(_) => 1,
+            CommittedEvents::Transaction { events, .. } => events.len(),
+        }
+    }
+    
+    pub fn is_empty(&self) -> bool {
+        match self {
+            CommittedEvents::Single(_) => false,
+            CommittedEvents::Transaction { events, .. } => events.is_empty(),
+        }
+    }
 }
 
 impl IntoIterator for CommittedEvents {

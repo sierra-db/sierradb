@@ -924,6 +924,7 @@ struct Commands {
 }
 
 impl Commands {
+    #[allow(dead_code)]
     fn print_commands_summary(&self) {
         println!("Executing {} commands:", self.commands.len());
         for cmd in &self.commands {
@@ -1343,7 +1344,7 @@ fn run(commands: Commands) -> libfuzzer_sys::Corpus {
                         // Validate model consistency periodically
                         if i.is_multiple_of(10) {
                             for &partition_id in state.model.partitions.keys() {
-                                if let Err(e) = state
+                                if let Err(err) = state
                                     .model
                                     .validate_partition_sequence_ordering(partition_id)
                                 {
@@ -1354,14 +1355,14 @@ fn run(commands: Commands) -> libfuzzer_sys::Corpus {
                                         "Model consistency error at command {}/{}: {}",
                                         i + 1,
                                         total_commands,
-                                        e
+                                        err
                                     );
                                     eprintln!(
                                         "Partition {}: {:?}",
                                         partition_id,
                                         state.model.partitions.get(&partition_id)
                                     );
-                                    panic!("Periodic model consistency check failed: {e}");
+                                    panic!("Periodic model consistency check failed: {err}");
                                 }
                             }
                         }
@@ -1374,18 +1375,18 @@ fn run(commands: Commands) -> libfuzzer_sys::Corpus {
 
             // Final consistency check
             for &partition_id in state.model.partitions.keys() {
-                if let Err(e) = state
+                if let Err(err) = state
                     .model
                     .validate_partition_sequence_ordering(partition_id)
                 {
                     eprintln!("=== FATAL MODEL CONSISTENCY ERROR ===");
-                    eprintln!("Partition sequence ordering violation: {e}");
+                    eprintln!("Partition sequence ordering violation: {err}");
                     eprintln!(
                         "Partition {}: {:?}",
                         partition_id,
                         state.model.partitions.get(&partition_id)
                     );
-                    panic!("Final model consistency check failed: {e}");
+                    panic!("Final model consistency check failed: {err}");
                 }
             }
 
@@ -1554,7 +1555,7 @@ async fn execute_append_events(
             // Don't update the model since the append failed
             Ok(())
         }
-        Err(e) => Err(Box::new(e)),
+        Err(err) => Err(Box::new(err)),
     }
 }
 
@@ -1691,7 +1692,7 @@ async fn execute_set_confirmations(
 
             Ok(())
         }
-        Err(e) => Err(Box::new(e)),
+        Err(err) => Err(Box::new(err)),
     }
 }
 

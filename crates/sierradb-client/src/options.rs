@@ -112,7 +112,7 @@ impl<'a> ToRedisArgs for EAppendOptions<'a> {
 }
 
 /// Event configuration for the EMAPPEND command
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EMAppendEvent<'a> {
     stream_id: Cow<'a, str>,
     event_name: Cow<'a, str>,

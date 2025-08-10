@@ -1,7 +1,8 @@
-use redis::{ConnectionLike, ToRedisArgs, cmd};
+use redis::{Client, ConnectionLike, RedisResult, ToRedisArgs, cmd};
 use uuid::Uuid;
 
 use crate::options::{EAppendOptions, EMAppendEvent};
+use crate::subscription::SubscriptionManager;
 use crate::types::{AppendInfo, Event, EventBatch, MultiAppendInfo, RangeValue, SubscriptionInfo};
 
 implement_commands! {
@@ -226,21 +227,162 @@ implement_commands! {
         cmd("ESVER").arg(stream_id).arg("PARTITION_KEY").arg(partition_key.to_string())
     }
 
-    /// Subscribe to receive events from the event store.
+    /// Subscribe to events from a stream.
+    ///
+    /// # Parameters
+    /// - `stream_id`: Stream identifier to subscribe to
     ///
     /// # Example
     /// ```ignore
-    /// let subscription = conn.esub()?;
+    /// let subscription = conn.esub("my-stream")?;
     /// ```
     ///
     /// # Returns
     /// Returns subscription information.
     ///
-    /// **Note:** Establishes a persistent connection to receive real-time events.
-    fn esub<>() -> (SubscriptionInfo) {
-        &mut cmd("ESUB")
+    /// **Note:** Establishes a persistent connection to receive real-time stream events.
+    fn esub<S: ToRedisArgs>(stream_id: S) -> (SubscriptionInfo) {
+        cmd("ESUB").arg(stream_id)
+    }
+
+    /// Subscribe to events from a stream with partition key.
+    ///
+    /// # Parameters
+    /// - `stream_id`: Stream identifier to subscribe to
+    /// - `partition_key`: UUID to subscribe to specific partition
+    ///
+    /// # Example
+    /// ```ignore
+    /// let partition_key = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")?;
+    /// let subscription = conn.esub_with_partition_key("my-stream", partition_key)?;
+    /// ```
+    ///
+    /// # Returns
+    /// Returns subscription information.
+    fn esub_with_partition_key<S: ToRedisArgs>(stream_id: S, partition_key: Uuid) -> (SubscriptionInfo) {
+        cmd("ESUB").arg(stream_id).arg("PARTITION_KEY").arg(partition_key.to_string())
+    }
+
+    /// Subscribe to events from a stream starting from a specific version.
+    ///
+    /// # Parameters
+    /// - `stream_id`: Stream identifier to subscribe to
+    /// - `from_version`: Start streaming from this version number
+    ///
+    /// # Example
+    /// ```ignore
+    /// let subscription = conn.esub_from_version("my-stream", 100)?;
+    /// ```
+    ///
+    /// # Returns
+    /// Returns subscription information.
+    fn esub_from_version<S: ToRedisArgs>(stream_id: S, from_version: u64) -> (SubscriptionInfo) {
+        cmd("ESUB").arg(stream_id).arg("FROM_VERSION").arg(from_version)
+    }
+
+    /// Subscribe to events from a stream with partition key and version.
+    ///
+    /// # Parameters
+    /// - `stream_id`: Stream identifier to subscribe to
+    /// - `partition_key`: UUID to subscribe to specific partition
+    /// - `from_version`: Starting version number
+    ///
+    /// # Example
+    /// ```ignore
+    /// let partition_key = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")?;
+    /// let subscription = conn.esub_with_partition_and_version("my-stream", partition_key, 100)?;
+    /// ```
+    ///
+    /// # Returns
+    /// Returns subscription information.
+    fn esub_with_partition_and_version<S: ToRedisArgs>(stream_id: S, partition_key: Uuid, from_version: u64) -> (SubscriptionInfo) {
+        cmd("ESUB").arg(stream_id).arg("PARTITION_KEY").arg(partition_key.to_string()).arg("FROM_VERSION").arg(from_version)
+    }
+
+    /// Subscribe to events from a partition by partition key.
+    ///
+    /// # Parameters
+    /// - `partition_key`: UUID key to determine which partition to subscribe to
+    ///
+    /// # Example
+    /// ```ignore
+    /// let partition_key = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")?;
+    /// let subscription = conn.epsub_by_key(partition_key)?;
+    /// ```
+    ///
+    /// # Returns
+    /// Returns subscription information.
+    fn epsub_by_key<>(partition_key: Uuid) -> (SubscriptionInfo) {
+        cmd("EPSUB").arg(partition_key.to_string())
+    }
+
+    /// Subscribe to events from a partition by partition ID.
+    ///
+    /// # Parameters
+    /// - `partition_id`: Numeric partition identifier (0-65535)
+    ///
+    /// # Example
+    /// ```ignore
+    /// let subscription = conn.epsub_by_id(42)?;
+    /// ```
+    ///
+    /// # Returns
+    /// Returns subscription information.
+    fn epsub_by_id<>(partition_id: u16) -> (SubscriptionInfo) {
+        cmd("EPSUB").arg(partition_id)
+    }
+
+    /// Subscribe to events from a partition by partition key, starting from a specific sequence.
+    ///
+    /// # Parameters
+    /// - `partition_key`: UUID key to determine which partition to subscribe to
+    /// - `from_sequence`: Start streaming from this sequence number
+    ///
+    /// # Example
+    /// ```ignore
+    /// let partition_key = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")?;
+    /// let subscription = conn.epsub_by_key_from_sequence(partition_key, 1000)?;
+    /// ```
+    ///
+    /// # Returns
+    /// Returns subscription information.
+    fn epsub_by_key_from_sequence<>(partition_key: Uuid, from_sequence: u64) -> (SubscriptionInfo) {
+        cmd("EPSUB").arg(partition_key.to_string()).arg("FROM_SEQUENCE").arg(from_sequence)
+    }
+
+    /// Subscribe to events from a partition by partition ID, starting from a specific sequence.
+    ///
+    /// # Parameters
+    /// - `partition_id`: Numeric partition identifier (0-65535)
+    /// - `from_sequence`: Start streaming from this sequence number
+    ///
+    /// # Example
+    /// ```ignore
+    /// let subscription = conn.epsub_by_id_from_sequence(42, 1000)?;
+    /// ```
+    ///
+    /// # Returns
+    /// Returns subscription information.
+    fn epsub_by_id_from_sequence<>(partition_id: u16, from_sequence: u64) -> (SubscriptionInfo) {
+        cmd("EPSUB").arg(partition_id).arg("FROM_SEQUENCE").arg(from_sequence)
     }
 }
+
+/// Extension trait for Redis clients to provide SierraDB async subscription functionality.
+/// 
+/// This trait provides convenience methods for creating typed subscriptions using
+/// a `SubscriptionManager`.
+pub trait SierraAsyncClientExt {
+    /// Create a new subscription manager for this client.
+    fn subscription_manager(&self) -> impl std::future::Future<Output = RedisResult<SubscriptionManager>> + Send;
+}
+
+impl SierraAsyncClientExt for Client {
+    fn subscription_manager(&self) -> impl std::future::Future<Output = RedisResult<SubscriptionManager>> + Send {
+        SubscriptionManager::new(self)
+    }
+}
+
 
 impl<T> Commands for T where T: ConnectionLike {}
 

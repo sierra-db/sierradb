@@ -580,9 +580,9 @@ impl ClosedStreamIndex {
                             .collect();
                         Ok(StreamOffsets::Offsets(offsets))
                     }
-                    Err(e) => {
+                    Err(err) => {
                         // If we can't read the values, use the offset and len for diagnostic info
-                        Err(StreamIndexError::Io(e))
+                        Err(StreamIndexError::Io(err))
                     }
                 }
             }
@@ -1005,13 +1005,28 @@ impl EventStreamIter {
                     };
 
                     if let Some(_max_version) = max_returned_version {
-                        // Skip all offsets that might contain events with
-                        // stream_version <= max_version
-                        // Note: We can't know which offsets correspond to which
-                        // versions without reading, but
-                        // we can still benefit from skipping some redundant
-                        // reads This is a best-effort
-                        // optimization
+                        // Remove duplicate offsets that point to other events in the same transaction.
+                        // When we read a transaction, we get all events in that transaction at once,
+                        // so we need to remove any remaining offsets in our queue that point to 
+                        // other events within the same transaction to avoid duplicates.
+                        if let CommittedEvents::Transaction { events: tx_events, .. } = committed_events {
+                            // Find the range of offsets covered by this transaction
+                            let min_event_offset = tx_events.iter().map(|e| e.offset).min().unwrap_or(0);
+                            let max_event_offset = tx_events.iter().map(|e| e.offset).max().unwrap_or(0);
+
+                            // Remove offsets from the appropriate queue that fall within this transaction
+                            let queue_to_check = if is_live {
+                                &mut self.live_segment_offsets
+                            } else {
+                                &mut self.segment_offsets
+                            };
+
+                            // Remove any queued offsets that are within the transaction's event range
+                            queue_to_check.retain(|&offset| {
+                                offset < min_event_offset || offset > max_event_offset
+                            });
+                        }
+                        // For CommittedEvents::Single, no deduplication needed since it's just one event
                     } else {
                         // No events from our stream in this transaction
                         events = None;
