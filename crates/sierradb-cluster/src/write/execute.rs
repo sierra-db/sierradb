@@ -1,18 +1,16 @@
 use std::{collections::HashSet, panic::panic_any, time::Duration};
 
-use arrayvec::ArrayVec;
 use kameo::prelude::*;
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use sierradb::bucket::{PartitionHash, PartitionId};
 use sierradb::{
-    MAX_REPLICATION_FACTOR, database::Transaction, id::uuid_to_partition_hash,
-    writer_thread_pool::AppendResult,
+    database::Transaction, id::uuid_to_partition_hash, writer_thread_pool::AppendResult,
 };
 use tracing::instrument;
 
 use crate::write::transaction::WriteConfig;
-use crate::{ClusterActor, MAX_FORWARDS};
+use crate::{ClusterActor, MAX_FORWARDS, ReplicaRefs};
 
 use super::{error::WriteError, transaction};
 
@@ -72,6 +70,7 @@ impl ClusterActor {
     /// Routes a write request to the appropriate destination
     fn route_write_request(
         &mut self,
+        local_cluster_ref: &ActorRef<ClusterActor>,
         destination: WriteDestination,
         transaction: Transaction,
         metadata: WriteRequestMetadata,
@@ -93,7 +92,8 @@ impl ClusterActor {
                 transaction::spawn(
                     WriteConfig {
                         database: self.database.clone(),
-                        local_cluster_ref: self.topology_manager().local_cluster_ref.clone(),
+                        local_cluster_ref: local_cluster_ref.clone(),
+                        local_remote_cluster_ref: self.topology_manager().local_cluster_ref.clone(),
                         local_alive_since: self.topology_manager().alive_since,
                         confirmation_ref: self.confirmation_ref.clone(),
                         replicas,
@@ -189,13 +189,11 @@ impl ClusterActor {
 /// Represents a destination for a write request
 enum WriteDestination {
     /// Process locally as the leader
-    Local {
-        replicas: ArrayVec<(RemoteActorRef<ClusterActor>, u64), MAX_REPLICATION_FACTOR>,
-    },
+    Local { replicas: ReplicaRefs },
     /// Forward to a remote leader
     Remote {
         primary_cluster_ref: RemoteActorRef<ClusterActor>,
-        replicas: ArrayVec<(RemoteActorRef<ClusterActor>, u64), MAX_REPLICATION_FACTOR>,
+        replicas: ReplicaRefs,
     },
 }
 
@@ -223,7 +221,7 @@ impl ExecuteTransaction {
     }
 }
 
-#[remote_message("e0e82b26-9528-4afb-a819-c5914c08b218")]
+#[remote_message]
 impl Message<ExecuteTransaction> for ClusterActor {
     type Reply = DelegatedReply<Result<AppendResult, WriteError>>;
 
@@ -242,9 +240,13 @@ impl Message<ExecuteTransaction> for ClusterActor {
 
         // Phase 1: Write Request Routing
         match self.resolve_write_destination(msg.transaction.partition_id(), &msg.metadata) {
-            Ok(destination) => {
-                self.route_write_request(destination, msg.transaction, msg.metadata, reply_sender)
-            }
+            Ok(destination) => self.route_write_request(
+                ctx.actor_ref(),
+                destination,
+                msg.transaction,
+                msg.metadata,
+                reply_sender,
+            ),
             Err(err) => match reply_sender {
                 Some(tx) => {
                     tx.send(Err(err));

@@ -1,18 +1,17 @@
 use std::{collections::HashSet, time::Duration};
 
-use arrayvec::ArrayVec;
 use kameo::prelude::*;
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use sierradb::{
-    MAX_REPLICATION_FACTOR, StreamId,
+    StreamId,
     bucket::{PartitionHash, PartitionId, segment::EventRecord},
     id::uuid_to_partition_hash,
 };
 use tracing::{debug, instrument, warn};
 use uuid::Uuid;
 
-use crate::{ClusterActor, ClusterError};
+use crate::{ClusterActor, ClusterError, ReplicaRefs};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReadRequestMetadata {
@@ -28,11 +27,11 @@ pub struct ReadRequestMetadata {
 pub enum ReadDestination {
     Local {
         partition_id: PartitionId,
-        available_replicas: ArrayVec<(RemoteActorRef<ClusterActor>, u64), MAX_REPLICATION_FACTOR>,
+        available_replicas: ReplicaRefs,
     },
     Remote {
         cluster_ref: RemoteActorRef<ClusterActor>,
-        available_replicas: ArrayVec<(RemoteActorRef<ClusterActor>, u64), MAX_REPLICATION_FACTOR>,
+        available_replicas: ReplicaRefs,
     },
 }
 
@@ -122,7 +121,7 @@ impl ClusterActor {
         partition_id: PartitionId,
         event_id: Uuid,
         mut metadata: ReadRequestMetadata,
-        available_replicas: ArrayVec<(RemoteActorRef<ClusterActor>, u64), MAX_REPLICATION_FACTOR>,
+        available_replicas: ReplicaRefs,
         reply_sender: ReplySender<Result<Option<EventRecord>, ClusterError>>,
     ) {
         let database = self.database.clone();
@@ -254,7 +253,7 @@ impl ClusterActor {
         cluster_ref: RemoteActorRef<ClusterActor>,
         event_id: Uuid,
         mut metadata: ReadRequestMetadata,
-        available_replicas: ArrayVec<(RemoteActorRef<ClusterActor>, u64), MAX_REPLICATION_FACTOR>,
+        available_replicas: ReplicaRefs,
         reply_sender: ReplySender<Result<Option<EventRecord>, ClusterError>>,
     ) {
         let required_quorum = (self.replication_factor / 2) + 1;
@@ -325,7 +324,7 @@ impl ClusterActor {
 
     /// Try next replica when previous replica returned "not found"
     async fn try_next_replica_for_not_found(
-        available_replicas: ArrayVec<(RemoteActorRef<ClusterActor>, u64), MAX_REPLICATION_FACTOR>,
+        available_replicas: ReplicaRefs,
         event_id: Uuid,
         mut metadata: ReadRequestMetadata,
         required_quorum: u8,
@@ -387,7 +386,7 @@ impl ClusterActor {
 
     /// Try next replica on network failure (doesn't count as "not found")
     async fn try_next_replica(
-        available_replicas: ArrayVec<(RemoteActorRef<ClusterActor>, u64), MAX_REPLICATION_FACTOR>,
+        available_replicas: ReplicaRefs,
         event_id: Uuid,
         mut metadata: ReadRequestMetadata,
         required_quorum: u8,
@@ -747,7 +746,7 @@ impl ReadEvent {
     }
 }
 
-#[remote_message("85746195-02a-44a1-b88c-6485a03723c")]
+#[remote_message]
 impl Message<ReadEvent> for ClusterActor {
     type Reply = DelegatedReply<Result<Option<EventRecord>, ClusterError>>;
 
@@ -798,7 +797,7 @@ pub struct PartitionEvents {
     pub has_more: bool, // whether there are more events beyond what we returned
 }
 
-#[remote_message("f0eb3680-2571-4248-9a40-6bc3064b124f")]
+#[remote_message]
 impl Message<ReadPartition> for ClusterActor {
     type Reply = DelegatedReply<Result<PartitionEvents, ClusterError>>;
 
@@ -867,7 +866,7 @@ pub struct StreamEvents {
     pub has_more: bool, // whether there are more events beyond what we returned
 }
 
-#[remote_message("29cd4fe2-ec0e-49c8-ad30-3101cab06ada")]
+#[remote_message]
 impl Message<ReadStream> for ClusterActor {
     type Reply = DelegatedReply<Result<StreamEvents, ClusterError>>;
 
@@ -927,18 +926,13 @@ impl Message<ReadStream> for ClusterActor {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GetPartitionSequence {
     pub partition_id: PartitionId,
-    #[serde(skip)]
-    pub skip_local_check: bool,
 }
 
-#[remote_message("a5b2ea0e-e369-4145-99ed-c2020b09a298")]
+#[remote_message]
 impl Message<GetPartitionSequence> for ClusterActor {
     type Reply = DelegatedReply<Result<Option<u64>, ClusterError>>;
 
-    #[instrument(skip_all, fields(
-        partition_id = msg.partition_id,
-        skip_local_check = msg.skip_local_check,
-    ))]
+    #[instrument(skip_all, fields(partition_id = msg.partition_id))]
     async fn handle(
         &mut self,
         msg: GetPartitionSequence,
@@ -1001,7 +995,7 @@ pub struct GetStreamVersion {
     pub stream_id: StreamId,
 }
 
-#[remote_message("a5b2ea0e-e369-4145-99ed-c2020b09a298")]
+#[remote_message]
 impl Message<GetStreamVersion> for ClusterActor {
     type Reply = DelegatedReply<Result<Option<u64>, ClusterError>>;
 

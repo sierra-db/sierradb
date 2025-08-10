@@ -1,429 +1,307 @@
-use std::io;
+pub mod eappend;
+pub mod eget;
+pub mod emappend;
+pub mod epscan;
+pub mod epseq;
+pub mod epsub;
+pub mod escan;
+pub mod esub;
+pub mod esver;
+pub mod hello;
+pub mod ping;
 
+use std::collections::HashMap;
+use std::num::{ParseIntError, TryFromIntError};
+
+use bytes::Bytes;
+use redis_protocol::resp3::types::{BytesFrame, VerbatimStringFormat};
 use sierradb::StreamId;
 use sierradb::bucket::PartitionId;
+use sierradb::bucket::segment::EventRecord;
 use sierradb::database::ExpectedVersion;
 use sierradb::id::uuid_to_partition_hash;
+use sierradb_protocol::ErrorCode;
+use tokio::io;
+use tracing::warn;
 use uuid::Uuid;
 
-use crate::impl_command;
-use crate::value::Value;
+use crate::request::eappend::EAppend;
+use crate::request::eget::EGet;
+use crate::request::emappend::EMAppend;
+use crate::request::epscan::EPScan;
+use crate::request::epseq::EPSeq;
+use crate::request::epsub::EPSub;
+use crate::request::escan::EScan;
+use crate::request::esub::ESub;
+use crate::request::esver::ESVer;
+use crate::request::hello::Hello;
+use crate::request::ping::Ping;
+use crate::server::Conn;
 
-pub struct Hello {
-    pub version: Option<i64>,
-}
-
-impl FromArgs for Hello {
-    fn from_args(args: &[Value]) -> Result<Self, Value> {
-        let version = if args.len() > 1 {
-            match args[1].as_integer() {
-                Ok(v) => Some(v),
-                Err(_) => return Err(Value::Error("Invalid protocol version".into())),
-            }
-        } else {
-            None
-        };
-
-        Ok(Hello { version })
-    }
-}
-
-/// Append an event to a stream.
-///
-/// # Syntax
-/// ```text
-/// EAPPEND <stream_id> <event_name> [EVENT_ID <event_id>] [PARTITION_KEY <partition_key>] [EXPECTED_VERSION <version>] [PAYLOAD <payload>] [METADATA <metadata>]
-/// ```
-///
-/// # Parameters
-/// - `stream_id`: Stream identifier to append the event to
-/// - `event_name`: Name/type of the event
-/// - `event_id` (optional): UUID for the event (auto-generated if not provided)
-/// - `partition_key` (optional): UUID to determine event partitioning
-/// - `expected_version` (optional): Expected stream version (number, "any",
-///   "exists", "empty")
-/// - `payload` (optional): Event payload data
-/// - `metadata` (optional): Event metadata
-///
-/// # Example
-/// ```text
-/// EAPPEND my-stream UserCreated PAYLOAD '{"name":"john"}' METADATA '{"source":"api"}'
-/// ```
-pub struct EAppend {
-    pub stream_id: StreamId,
-    pub event_name: String,
-    pub event_id: Option<Uuid>,
-    pub partition_key: Option<Uuid>,
-    pub expected_version: ExpectedVersion,
-    pub timestamp: Option<u64>,
-    pub payload: Vec<u8>,
-    pub metadata: Vec<u8>,
-}
-
-impl_command!(
+pub enum Command {
     EAppend,
-    [stream_id, event_name],
-    [
-        event_id,
-        partition_key,
-        expected_version,
-        timestamp,
-        payload,
-        metadata
-    ]
-);
-
-pub struct Event {
-    pub stream_id: StreamId,
-    pub event_name: String,
-    pub event_id: Option<Uuid>,
-    pub expected_version: ExpectedVersion,
-    pub timestamp: Option<u64>,
-    pub payload: Vec<u8>,
-    pub metadata: Vec<u8>,
+    EGet,
+    EMAppend,
+    EPScan,
+    EPSeq,
+    EPSub,
+    ESVer,
+    EScan,
+    ESub,
+    Hello,
+    Ping,
 }
 
-/// Append multiple events to streams in a single transaction.
-///
-/// # Syntax
-/// ```text
-/// EMAPPEND <partition_key> <stream_id1> <event_name1> [EVENT_ID <event_id1>] [EXPECTED_VERSION <version1>] [PAYLOAD <payload1>] [METADATA <metadata1>] [<stream_id2> <event_name2> ...]
-/// ```
-///
-/// # Parameters
-/// - `partition_key`: UUID that determines which partition all events will be
-///   written to
-/// - For each event:
-///   - `stream_id`: Stream identifier to append the event to
-///   - `event_name`: Name/type of the event
-///   - `event_id` (optional): UUID for the event (auto-generated if not
-///     provided)
-///   - `expected_version` (optional): Expected stream version (number, "any",
-///     "exists", "empty")
-///   - `timestamp` (optional): Event timestamp in milliseconds
-///   - `payload` (optional): Event payload data
-///   - `metadata` (optional): Event metadata
-///
-/// # Example
-/// ```text
-/// EMAPPEND 550e8400-e29b-41d4-a716-446655440000 stream1 EventA PAYLOAD '{"data":"value1"}' stream2 EventB PAYLOAD '{"data":"value2"}'
-/// ```
-///
-/// **Note:** All events are appended atomically in a single transaction.
-pub struct EMAppend {
-    pub partition_key: Uuid,
-    pub events: Vec<Event>,
-}
-
-impl FromArgs for EMAppend {
-    fn from_args(args: &[Value]) -> Result<Self, Value> {
-        if args.is_empty() {
-            return Err(Value::Error("Missing partition_key argument".to_string()));
+impl Command {
+    pub async fn handle(
+        &self,
+        args: &[BytesFrame],
+        conn: &mut Conn,
+    ) -> Result<Option<BytesFrame>, io::Error> {
+        macro_rules! handle_commands {
+            ( $( $name:ident ),* $(,)? ) => {
+                match self {
+                    $( Command::$name => {
+                        match $name::from_args(args) {
+                            Ok(cmd) => cmd.handle_request_failable(conn).await,
+                            Err(err) => {
+                                Ok(Some(BytesFrame::SimpleError {
+                                    data: err.into(),
+                                    attributes: None,
+                                }))
+                            }
+                        }
+                    } )*
+                }
+            };
         }
 
-        let mut i = 0;
-
-        // Parse required partition_key (first positional argument)
-        let partition_key =
-            TryFrom::try_from(&args[i]).map_err(|err: io::Error| Value::Error(err.to_string()))?;
-        i += 1;
-
-        let mut events = Vec::new();
-
-        while i < args.len() {
-            // Parse stream_id (required for each event)
-            let stream_id = TryFrom::try_from(&args[i])
-                .map_err(|err: io::Error| Value::Error(err.to_string()))?;
-            i += 1;
-
-            if i >= args.len() {
-                return Err(Value::Error(
-                    "Missing event_name after stream_id".to_string(),
-                ));
-            }
-
-            // Parse event_name (required for each event)
-            let event_name = args[i]
-                .as_str()
-                .map_err(|_| Value::Error("Expected event name".to_string()))?
-                .to_string();
-            i += 1;
-
-            // Initialize optional fields
-            let mut event_id = None;
-            let mut expected_version = ExpectedVersion::default();
-            let mut timestamp = None;
-            let mut payload = Vec::new();
-            let mut metadata = Vec::new();
-
-            // Parse optional fields for this event
-            while i < args.len() {
-                let field_name_str = match args[i].as_str() {
-                    Ok(s) => s.to_lowercase(),
-                    Err(_) => break, // Not a string, probably next event's stream_id
-                };
-
-                // Check if this looks like a field name
-                if ![
-                    "event_id",
-                    "expected_version",
-                    "timestamp",
-                    "payload",
-                    "metadata",
-                ]
-                .contains(&field_name_str.as_str())
-                {
-                    // This is likely a new event's stream_id, don't consume it
-                    break;
-                }
-
-                i += 1; // consume field name
-                if i >= args.len() {
-                    return Err(Value::Error("Missing value for field".to_string()));
-                }
-
-                let value = &args[i];
-                i += 1; // consume field value
-
-                match field_name_str.as_str() {
-                    "event_id" => {
-                        event_id = Some(
-                            TryFrom::try_from(value)
-                                .map_err(|err: io::Error| Value::Error(err.to_string()))?,
-                        );
-                    }
-                    "expected_version" => {
-                        expected_version = TryFrom::try_from(value)
-                            .map_err(|err: io::Error| Value::Error(err.to_string()))?;
-                    }
-                    "timestamp" => {
-                        timestamp = TryFrom::try_from(value)
-                            .map_err(|err: io::Error| Value::Error(err.to_string()))?;
-                    }
-                    "payload" => {
-                        payload = TryFrom::try_from(value)
-                            .map_err(|err: io::Error| Value::Error(err.to_string()))?;
-                    }
-                    "metadata" => {
-                        metadata = TryFrom::try_from(value)
-                            .map_err(|err: io::Error| Value::Error(err.to_string()))?;
-                    }
-                    _ => return Err(Value::Error(format!("Unknown field {field_name_str}"))),
-                }
-            }
-
-            events.push(Event {
-                stream_id,
-                event_name,
-                event_id,
-                expected_version,
-                timestamp,
-                payload,
-                metadata,
-            });
-        }
-
-        if events.is_empty() {
-            return Err(Value::Error("At least one event required".to_string()));
-        }
-
-        Ok(EMAppend {
-            partition_key,
-            events,
-        })
+        handle_commands![
+            EAppend, EGet, EMAppend, EPScan, EPSeq, EPSub, EScan, ESVer, ESub, Hello, Ping
+        ]
     }
 }
 
-/// Get an event by its unique identifier.
-///
-/// # Syntax
-/// ```text
-/// EGET <event_id>
-/// ```
-///
-/// # Parameters
-/// - `event_id`: UUID of the event to retrieve
-///
-/// # Example
-/// ```text
-/// EGET 550e8400-e29b-41d4-a716-446655440000
-/// ```
-pub struct EGet {
-    pub event_id: Uuid,
+impl TryFrom<&BytesFrame> for Command {
+    type Error = String;
+
+    fn try_from(frame: &BytesFrame) -> Result<Self, Self::Error> {
+        match frame {
+            BytesFrame::BlobString { data, .. }
+            | BytesFrame::SimpleString { data, .. }
+            | BytesFrame::BigNumber { data, .. }
+            | BytesFrame::VerbatimString {
+                data,
+                format: VerbatimStringFormat::Text,
+                ..
+            } => {
+                match str::from_utf8(data)
+                    .map_err(|_| "invalid command".to_string())?
+                    .to_ascii_uppercase()
+                    .as_str()
+                {
+                    "EAPPEND" => Ok(Command::EAppend),
+                    "EGET" => Ok(Command::EGet),
+                    "EMAPPEND" => Ok(Command::EMAppend),
+                    "EPSCAN" => Ok(Command::EPScan),
+                    "EPSEQ" => Ok(Command::EPSeq),
+                    "EPSUB" => Ok(Command::EPSub),
+                    "ESVER" => Ok(Command::ESVer),
+                    "ESCAN" => Ok(Command::EScan),
+                    "ESUB" => Ok(Command::ESub),
+                    "HELLO" => Ok(Command::Hello),
+                    "PING" => Ok(Command::Ping),
+                    cmd => {
+                        warn!("received unknown command {cmd}");
+                        Err(ErrorCode::InvalidArg.with_message(format!("unknown command '{cmd}'")))
+                    }
+                }
+            }
+            _ => Err(ErrorCode::InvalidArg.with_message("invalid type for command name")),
+        }
+    }
 }
 
-impl_command!(EGet, [event_id], []);
+pub trait HandleRequest: Sized + Send {
+    type Ok: Into<BytesFrame>;
+    type Error: ToString;
 
-/// Scan events in a partition by sequence number range.
-///
-/// # Syntax
-/// ```text
-/// EPSCAN <partition> <start_sequence> <end_sequence> [COUNT <count>]
-/// ```
-///
-/// # Parameters
-/// - `partition`: Partition selector (partition ID 0-65535 or UUID key)
-/// - `start_sequence`: Starting sequence number (use "-" for beginning)
-/// - `end_sequence`: Ending sequence number (use "+" for end, or specific
-///   number)
-/// - `count` (optional): Maximum number of events to return
-///
-/// # Examples
-/// ```text
-/// EPSCAN 42 100 200 COUNT 50
-/// EPSCAN 550e8400-e29b-41d4-a716-446655440000 - + COUNT 100
-/// ```
-pub struct EPScan {
-    pub partition: PartitionSelector,
-    pub start_sequence: u64,
-    pub end_sequence: RangeValue,
-    pub count: Option<u64>,
+    fn handle_request(
+        self,
+        conn: &mut Conn,
+    ) -> impl Future<Output = Result<Option<Self::Ok>, Self::Error>> + Send;
+
+    fn handle_request_failable(
+        self,
+        conn: &mut Conn,
+    ) -> impl Future<Output = Result<Option<BytesFrame>, io::Error>> + Send {
+        async move {
+            match self.handle_request(conn).await {
+                Ok(Some(resp)) => Ok(Some(resp.into())),
+                Ok(None) => Ok(None),
+                Err(err) => Ok(Some(BytesFrame::SimpleError {
+                    data: err.to_string().into(),
+                    attributes: None,
+                })),
+            }
+        }
+    }
 }
-
-impl_command!(EPScan, [partition, start_sequence, end_sequence], [count]);
-
-/// Scan events in a stream by version range.
-///
-/// # Syntax
-/// ```text
-/// ESCAN <stream_id> <start_version> <end_version> [PARTITION_KEY <partition_key>] [COUNT <count>]
-/// ```
-///
-/// # Parameters
-/// - `stream_id`: Stream identifier to scan
-/// - `start_version`: Starting version number (use "-" for beginning)
-/// - `end_version`: Ending version number (use "+" for end, or specific number)
-/// - `partition_key` (optional): UUID to scan specific partition
-/// - `count` (optional): Maximum number of events to return
-///
-/// # Examples
-/// ```text
-/// ESCAN my-stream 0 100 COUNT 50
-/// ESCAN my-stream - + PARTITION_KEY 550e8400-e29b-41d4-a716-446655440000
-/// ```
-pub struct EScan {
-    pub stream_id: StreamId,
-    pub start_version: u64,
-    pub end_version: RangeValue,
-    pub partition_key: Option<Uuid>,
-    pub count: Option<u64>,
-}
-
-impl_command!(
-    EScan,
-    [stream_id, start_version, end_version],
-    [partition_key, count]
-);
-
-/// Get the current sequence number for a partition.
-///
-/// # Syntax
-/// ```text
-/// EPSEQ <partition>
-/// ```
-///
-/// # Parameters
-/// - `partition`: Partition selector (partition ID 0-65535 or UUID key)
-///
-/// # Examples
-/// ```text
-/// EPSEQ 42
-/// EPSEQ 550e8400-e29b-41d4-a716-446655440000
-/// ```
-pub struct EPSeq {
-    pub partition: PartitionSelector,
-}
-
-impl_command!(EPSeq, [partition], []);
-
-/// Get the current version number for a stream.
-///
-/// # Syntax
-/// ```text
-/// ESVER <stream_id> [PARTITION_KEY <partition_key>]
-/// ```
-///
-/// # Parameters
-/// - `stream_id`: Stream identifier to get version for
-/// - `partition_key` (optional): UUID to check specific partition
-///
-/// # Examples
-/// ```text
-/// ESVER my-stream
-/// ESVER my-stream PARTITION_KEY 550e8400-e29b-41d4-a716-446655440000
-/// ```
-pub struct ESVer {
-    pub stream_id: StreamId,
-    pub partition_key: Option<Uuid>,
-}
-
-impl_command!(ESVer, [stream_id], [partition_key]);
-
-/// Subscribe to receive events from the event store.
-///
-/// # Syntax
-/// ```text
-/// ESUB
-/// ```
-///
-/// # Parameters
-/// None
-///
-/// # Example
-/// ```text
-/// ESUB
-/// ```
-///
-/// **Note:** Establishes a persistent connection to receive real-time events.
-pub struct ESub {}
-
-impl_command!(ESub, [], []);
 
 pub trait FromArgs: Sized {
-    fn from_args(args: &[Value]) -> Result<Self, Value>;
+    fn from_args(args: &[BytesFrame]) -> Result<Self, String>;
 }
 
-impl TryFrom<&Value> for Option<Uuid> {
-    type Error = io::Error;
-
-    fn try_from(value: &Value) -> Result<Self, Self::Error> {
-        Ok(Some(value.try_into()?))
-    }
+pub trait FromBytesFrame<'a>: Sized {
+    fn from_bytes_frame(frame: &'a BytesFrame) -> Result<Self, String>;
 }
 
-impl TryFrom<&Value> for StreamId {
-    type Error = io::Error;
-
-    fn try_from(value: &Value) -> Result<Self, Self::Error> {
-        StreamId::new(value.as_str()?).map_err(io::Error::other)
-    }
-}
-
-impl TryFrom<&Value> for Uuid {
-    type Error = io::Error;
-
-    fn try_from(value: &Value) -> Result<Self, Self::Error> {
-        value.as_str()?.parse().map_err(io::Error::other)
-    }
-}
-
-impl TryFrom<&Value> for ExpectedVersion {
-    type Error = io::Error;
-
-    fn try_from(value: &Value) -> Result<Self, Self::Error> {
-        match value.as_integer() {
-            Ok(v) => Ok(ExpectedVersion::Exact(
-                u64::try_from(v).map_err(io::Error::other)?,
-            )),
-            Err(_) => match value.as_str()?.to_lowercase().as_str() {
-                "any" => Ok(ExpectedVersion::Any),
-                "exists" => Ok(ExpectedVersion::Exists),
-                "empty" => Ok(ExpectedVersion::Empty),
-                _ => Err(io::Error::other(
-                    "Invalid version format, expected number or: any/exists/empty",
-                )),
-            },
+impl<'a, T> FromBytesFrame<'a> for Option<T>
+where
+    T: FromBytesFrame<'a>,
+{
+    fn from_bytes_frame(frame: &'a BytesFrame) -> Result<Self, String> {
+        match frame {
+            BytesFrame::Null => Ok(None),
+            _ => Ok(Some(T::from_bytes_frame(frame)?)),
         }
+    }
+}
+
+impl FromBytesFrame<'_> for i64 {
+    fn from_bytes_frame(frame: &BytesFrame) -> Result<Self, String> {
+        match frame {
+            BytesFrame::BlobString { data, .. }
+            | BytesFrame::SimpleString { data, .. }
+            | BytesFrame::BigNumber { data, .. }
+            | BytesFrame::VerbatimString {
+                data,
+                format: VerbatimStringFormat::Text,
+                ..
+            } => str::from_utf8(data)
+                .map_err(|err| err.to_string())?
+                .parse()
+                .map_err(|err: ParseIntError| err.to_string()),
+            BytesFrame::Number { data, .. } => Ok(*data),
+            _ => Err("unsupported type, expecting i64".to_string()),
+        }
+    }
+}
+
+impl FromBytesFrame<'_> for u64 {
+    fn from_bytes_frame(frame: &BytesFrame) -> Result<Self, String> {
+        match frame {
+            BytesFrame::BlobString { data, .. }
+            | BytesFrame::SimpleString { data, .. }
+            | BytesFrame::BigNumber { data, .. }
+            | BytesFrame::VerbatimString {
+                data,
+                format: VerbatimStringFormat::Text,
+                ..
+            } => str::from_utf8(data)
+                .map_err(|err| err.to_string())?
+                .parse()
+                .map_err(|err: ParseIntError| err.to_string()),
+            BytesFrame::Number { data, .. } => (*data)
+                .try_into()
+                .map_err(|err: TryFromIntError| err.to_string()),
+            _ => Err("unsupported type, expecting i64".to_string()),
+        }
+    }
+}
+
+impl FromBytesFrame<'_> for u16 {
+    fn from_bytes_frame(frame: &BytesFrame) -> Result<Self, String> {
+        match frame {
+            BytesFrame::BlobString { data, .. }
+            | BytesFrame::SimpleString { data, .. }
+            | BytesFrame::BigNumber { data, .. }
+            | BytesFrame::VerbatimString {
+                data,
+                format: VerbatimStringFormat::Text,
+                ..
+            } => str::from_utf8(data)
+                .map_err(|err| err.to_string())?
+                .parse()
+                .map_err(|err: ParseIntError| err.to_string()),
+            BytesFrame::Number { data, .. } => (*data)
+                .try_into()
+                .map_err(|err: TryFromIntError| err.to_string()),
+            _ => Err("unsupported type, expecting i64".to_string()),
+        }
+    }
+}
+
+impl<'a> FromBytesFrame<'a> for &'a str {
+    fn from_bytes_frame(frame: &'a BytesFrame) -> Result<Self, String> {
+        match frame {
+            BytesFrame::BlobString { data, .. }
+            | BytesFrame::SimpleString { data, .. }
+            | BytesFrame::BigNumber { data, .. }
+            | BytesFrame::VerbatimString {
+                data,
+                format: VerbatimStringFormat::Text,
+                ..
+            } => str::from_utf8(data).map_err(|err| err.to_string()),
+            _ => Err("unsupported type, expecting string".to_string()),
+        }
+    }
+}
+
+impl FromBytesFrame<'_> for String {
+    fn from_bytes_frame(frame: &BytesFrame) -> Result<Self, String> {
+        <&str>::from_bytes_frame(frame).map(ToOwned::to_owned)
+    }
+}
+
+impl<'a> FromBytesFrame<'a> for &'a [u8] {
+    fn from_bytes_frame(frame: &'a BytesFrame) -> Result<Self, String> {
+        match frame {
+            BytesFrame::BlobString { data, .. }
+            | BytesFrame::SimpleString { data, .. }
+            | BytesFrame::BigNumber { data, .. }
+            | BytesFrame::VerbatimString {
+                data,
+                format: VerbatimStringFormat::Text,
+                ..
+            } => Ok(data),
+            _ => Err("unsupported type, expecting bytes".to_string()),
+        }
+    }
+}
+
+impl FromBytesFrame<'_> for Vec<u8> {
+    fn from_bytes_frame(frame: &BytesFrame) -> Result<Self, String> {
+        <&[u8]>::from_bytes_frame(frame).map(ToOwned::to_owned)
+    }
+}
+
+impl FromBytesFrame<'_> for StreamId {
+    fn from_bytes_frame(frame: &BytesFrame) -> Result<Self, String> {
+        StreamId::new(<String>::from_bytes_frame(frame)?).map_err(|err| err.to_string())
+    }
+}
+
+impl FromBytesFrame<'_> for Uuid {
+    fn from_bytes_frame(frame: &BytesFrame) -> Result<Self, String> {
+        <&str>::from_bytes_frame(frame)?
+            .parse()
+            .map_err(|err: uuid::Error| err.to_string())
+    }
+}
+
+impl FromBytesFrame<'_> for ExpectedVersion {
+    fn from_bytes_frame(frame: &BytesFrame) -> Result<Self, String> {
+        <u64>::from_bytes_frame(frame)
+            .map(ExpectedVersion::Exact)
+            .or_else(|_| {
+                <&str>::from_bytes_frame(frame).and_then(|s| match s {
+                    "any" | "ANY" => Ok(ExpectedVersion::Any),
+                    "exists" | "EXISTS" => Ok(ExpectedVersion::Exists),
+                    "empty" | "EMPTY" => Ok(ExpectedVersion::Empty),
+                    _ => Err("unknown expected version value".to_string()),
+                })
+            })
     }
 }
 
@@ -434,39 +312,20 @@ pub enum RangeValue {
     Value(u64), // specific number
 }
 
-impl TryFrom<&Value> for RangeValue {
-    type Error = io::Error;
-
-    fn try_from(value: &Value) -> Result<Self, Self::Error> {
-        match value.as_str() {
-            Ok(s) => match s {
+impl FromBytesFrame<'_> for RangeValue {
+    fn from_bytes_frame(frame: &BytesFrame) -> Result<Self, String> {
+        <&str>::from_bytes_frame(frame)
+            .and_then(|s| match s {
                 "-" => Ok(RangeValue::Start),
                 "+" => Ok(RangeValue::End),
-                _ => {
-                    // Try to parse as u64
-                    s.parse::<u64>().map(RangeValue::Value).map_err(|_| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("Invalid range value: expected number, '-', or '+', got '{s}'"),
-                        )
-                    })
-                }
-            },
-            Err(_) => {
-                // Try to parse as u64 directly if it's not a string
-                let num = u64::try_from(value).map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "Range value must be a number, '-', or '+'",
-                    )
-                })?;
-                Ok(RangeValue::Value(num))
-            }
-        }
+                _ => Err(String::default()),
+            })
+            .or_else(|_| <u64>::from_bytes_frame(frame).map(RangeValue::Value))
+            .map_err(|_| "unknown range value, expected '-', '+', or number".to_string())
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PartitionSelector {
     ById(PartitionId), // 0-65535
     ByKey(Uuid),       // 550e8400-e29b-41d4-a716-446655440000
@@ -481,29 +340,91 @@ impl PartitionSelector {
     }
 }
 
-impl TryFrom<&Value> for PartitionSelector {
-    type Error = io::Error;
-
-    fn try_from(value: &Value) -> Result<Self, Self::Error> {
-        match value.as_str() {
-            Ok(s) => {
-                // Try UUID first (has dashes)
-                if let Ok(uuid) = Uuid::parse_str(s) {
-                    Ok(PartitionSelector::ByKey(uuid))
-                } else if let Ok(id) = s.parse::<PartitionId>() {
-                    Ok(PartitionSelector::ById(id))
-                } else {
-                    Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "Invalid partition selector: expected UUID or partition ID (0-65535)",
-                    ))
-                }
-            }
-            Err(_) => {
-                // Try as integer
-                let id = u16::try_from(value)?;
-                Ok(PartitionSelector::ById(id))
-            }
-        }
+impl FromBytesFrame<'_> for PartitionSelector {
+    fn from_bytes_frame(frame: &BytesFrame) -> Result<Self, String> {
+        <Uuid>::from_bytes_frame(frame)
+            .map(PartitionSelector::ByKey)
+            .or_else(|_| <PartitionId>::from_bytes_frame(frame).map(PartitionSelector::ById))
     }
+}
+
+#[inline(always)]
+pub fn simple_str(s: impl Into<Bytes>) -> BytesFrame {
+    BytesFrame::SimpleString {
+        data: s.into(),
+        attributes: None,
+    }
+}
+
+#[inline(always)]
+pub fn blob_str(s: impl Into<Bytes>) -> BytesFrame {
+    BytesFrame::BlobString {
+        data: s.into(),
+        attributes: None,
+    }
+}
+
+#[inline(always)]
+pub fn number(n: i64) -> BytesFrame {
+    BytesFrame::Number {
+        data: n,
+        attributes: None,
+    }
+}
+
+#[inline(always)]
+pub fn map(items: HashMap<BytesFrame, BytesFrame>) -> BytesFrame {
+    BytesFrame::Map {
+        data: items,
+        attributes: None,
+    }
+}
+
+#[inline(always)]
+pub fn array(items: Vec<BytesFrame>) -> BytesFrame {
+    BytesFrame::Array {
+        data: items,
+        attributes: None,
+    }
+}
+
+#[inline(always)]
+pub fn encode_event(record: EventRecord) -> BytesFrame {
+    map(HashMap::from_iter([
+        (
+            simple_str("event_id"),
+            blob_str(record.event_id.to_string()),
+        ),
+        (
+            simple_str("partition_key"),
+            simple_str(record.partition_key.to_string()),
+        ),
+        (
+            simple_str("partition_id"),
+            number(record.partition_id as i64),
+        ),
+        (
+            simple_str("transaction_id"),
+            simple_str(record.transaction_id.to_string()),
+        ),
+        (
+            simple_str("partition_sequence"),
+            number(record.partition_sequence as i64),
+        ),
+        (
+            simple_str("stream_version"),
+            number(record.stream_version as i64),
+        ),
+        (
+            simple_str("timestamp"),
+            number((record.timestamp / 1_000_000) as i64),
+        ),
+        (
+            simple_str("stream_id"),
+            blob_str(record.stream_id.to_string()),
+        ),
+        (simple_str("event_name"), blob_str(record.event_name)),
+        (simple_str("metadata"), blob_str(record.metadata)),
+        (simple_str("payload"), blob_str(record.payload)),
+    ]))
 }

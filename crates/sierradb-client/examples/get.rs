@@ -1,24 +1,29 @@
-use std::time::Duration;
-
-use sierradb_client::{
-    Commands, EAppendOptions, EMAppendEvent, ExpectedVersion, stream_partition_key,
-};
+use redis::cluster::ClusterClient;
+use sierradb_client::{Commands, EAppendOptions, ExpectedVersion};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = redis::Client::open("redis://127.0.0.1:9090/")?;
-    let mut con = client.get_connection()?;
+    let nodes = vec![
+        "redis://127.0.0.1:9090/",
+        // "redis://127.0.0.1:6378/",
+        // "redis://127.0.0.1:6377/",
+    ];
+    let client = ClusterClient::new(nodes).unwrap();
+    let mut connection = client.get_connection().unwrap();
 
-    let res = con
-        .eappend(
-            "fiz",
-            "gjksfhg",
-            EAppendOptions::new().expected_version(ExpectedVersion::Exact(1)),
-        )
-        .unwrap_err();
-    dbg!(res.kind());
-    dbg!(res.detail());
-    dbg!(res.code());
-    dbg!(res.category());
+    // let client = redis::Client::open("redis://127.0.0.1:9090/")?;
+    // let mut con = client.get_connection()?;
+
+    // let res = con
+    //     .eappend(
+    //         "fiz",
+    //         "gjksfhg",
+    //         EAppendOptions::new().expected_version(ExpectedVersion::Exact(1)),
+    //     )
+    //     .unwrap_err();
+    // dbg!(res.kind());
+    // dbg!(res.detail());
+    // dbg!(res.code());
+    // dbg!(res.category());
 
     // let info = con.eappend("foo", "bar",
     // EAppendOptions::new().payload(b"hola"))?; println!("Appended event!");

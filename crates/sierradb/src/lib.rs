@@ -88,6 +88,18 @@ impl borrow::Borrow<str> for StreamId {
     }
 }
 
+impl PartialEq<&str> for StreamId {
+    fn eq(&self, other: &&str) -> bool {
+        self.inner.as_ref() == *other
+    }
+}
+
+impl PartialEq<StreamId> for &str {
+    fn eq(&self, other: &StreamId) -> bool {
+        *self == other.inner.as_ref()
+    }
+}
+
 #[macro_export]
 macro_rules! from_bytes {
     ($buf:expr, $pos:expr, [ $( $t:tt ),* ]) => {

@@ -201,9 +201,9 @@ async fn process_write_buffer(&mut self, partition_id: PartitionId) {
                 next_seq += 1;
                 buffer.next_expected_seq.store(next_seq, Ordering::Release);
             }
-            Err(e) => {
+            Err(err) => {
                 // Send error response and re-buffer if retryable
-                self.send_write_error(partition_id, next_seq, e).await;
+                self.send_write_error(partition_id, next_seq, err).await;
                 if buffered_write.retry_count < MAX_RETRIES {
                     buffer.buffered_writes.insert(next_seq, BufferedWrite {
                         retry_count: buffered_write.retry_count + 1,
