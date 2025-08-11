@@ -4,6 +4,47 @@ use redis::{FromRedisValue, RedisError, RedisResult, RedisWrite, ToRedisArgs, Va
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+macro_rules! parse_value {
+    (String, $value:ident, $field:literal) => {
+        match $value {
+            Value::SimpleString(s) => Ok(s.clone()),
+            Value::BulkString(s) => String::from_utf8(s.clone()).map_err(|_| {
+                RedisError::from((
+                    redis::ErrorKind::TypeError,
+                    concat!("Invalid string for ", $field),
+                ))
+            }),
+            _ => Err(RedisError::from((
+                redis::ErrorKind::TypeError,
+                concat!($field, " must be a string"),
+            ))),
+        }
+    };
+    (Uuid, $value:ident, $field:literal) => {
+        match $value {
+            Value::SimpleString(s) => Uuid::parse_str(s).map_err(|_| {
+                RedisError::from((
+                    redis::ErrorKind::TypeError,
+                    concat!("Invalid UUID format for ", $field),
+                ))
+            }),
+            Value::BulkString(s) => str::from_utf8(s)
+                .ok()
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        concat!("Invalid UUID format for ", $field),
+                    ))
+                }),
+            _ => Err(RedisError::from((
+                redis::ErrorKind::TypeError,
+                concat!($field, " must be a string"),
+            ))),
+        }
+    };
+}
+
 /// Represents messages received from SierraDB subscriptions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SierraMessage {
@@ -43,36 +84,10 @@ impl FromRedisValue for AppendInfo {
 
                     match field_name {
                         "event_id" => {
-                            event_id = Some(match val {
-                                Value::SimpleString(s) => Uuid::parse_str(s).map_err(|_| {
-                                    RedisError::from((
-                                        redis::ErrorKind::TypeError,
-                                        "Invalid UUID format for event_id",
-                                    ))
-                                })?,
-                                _ => {
-                                    return Err(RedisError::from((
-                                        redis::ErrorKind::TypeError,
-                                        "event_id must be a string",
-                                    )));
-                                }
-                            });
+                            event_id = Some(parse_value!(Uuid, val, "event_id")?);
                         }
                         "partition_key" => {
-                            partition_key = Some(match val {
-                                Value::SimpleString(s) => Uuid::parse_str(s).map_err(|_| {
-                                    RedisError::from((
-                                        redis::ErrorKind::TypeError,
-                                        "Invalid UUID format for partition_key",
-                                    ))
-                                })?,
-                                _ => {
-                                    return Err(RedisError::from((
-                                        redis::ErrorKind::TypeError,
-                                        "partition_key must be a string",
-                                    )));
-                                }
-                            });
+                            partition_key = Some(parse_value!(Uuid, val, "partition_key")?);
                         }
                         "partition_id" => {
                             partition_id = Some(match val {
@@ -330,6 +345,34 @@ pub struct Event {
     pub payload: Vec<u8>,
 }
 
+impl Event {
+    /// Get the sequence/version number to use for acknowledgment.
+    ///
+    /// For stream subscriptions, this returns the stream_version.
+    /// For partition subscriptions, this returns the partition_sequence.
+    /// Use this value with `acknowledge_events()` to acknowledge this event.
+    pub fn sequence_or_version_for_stream(&self) -> u64 {
+        self.stream_version
+    }
+
+    /// Get the sequence number to use for partition subscription
+    /// acknowledgment.
+    ///
+    /// Use this value with `acknowledge_events()` when acknowledging
+    /// events from a partition subscription.
+    pub fn sequence_for_partition(&self) -> u64 {
+        self.partition_sequence
+    }
+
+    /// Get the version number to use for stream subscription acknowledgment.
+    ///
+    /// Use this value with `acknowledge_events()` when acknowledging
+    /// events from a stream subscription.
+    pub fn version_for_stream(&self) -> u64 {
+        self.stream_version
+    }
+}
+
 impl FromRedisValue for Event {
     fn from_redis_value(value: &Value) -> RedisResult<Self> {
         match value {
@@ -355,36 +398,10 @@ impl FromRedisValue for Event {
 
                     match field_name {
                         "event_id" => {
-                            event_id = Some(match val {
-                                Value::SimpleString(s) => Uuid::parse_str(s).map_err(|_| {
-                                    RedisError::from((
-                                        redis::ErrorKind::TypeError,
-                                        "Invalid UUID format for event_id",
-                                    ))
-                                })?,
-                                _ => {
-                                    return Err(RedisError::from((
-                                        redis::ErrorKind::TypeError,
-                                        "event_id must be a string",
-                                    )));
-                                }
-                            });
+                            event_id = Some(parse_value!(Uuid, val, "event_id")?);
                         }
                         "partition_key" => {
-                            partition_key = Some(match val {
-                                Value::SimpleString(s) => Uuid::parse_str(s).map_err(|_| {
-                                    RedisError::from((
-                                        redis::ErrorKind::TypeError,
-                                        "Invalid UUID format for partition_key",
-                                    ))
-                                })?,
-                                _ => {
-                                    return Err(RedisError::from((
-                                        redis::ErrorKind::TypeError,
-                                        "partition_key must be a string",
-                                    )));
-                                }
-                            });
+                            partition_key = Some(parse_value!(Uuid, val, "partition_key")?);
                         }
                         "partition_id" => {
                             partition_id = Some(match val {
@@ -398,20 +415,7 @@ impl FromRedisValue for Event {
                             });
                         }
                         "transaction_id" => {
-                            transaction_id = Some(match val {
-                                Value::SimpleString(s) => Uuid::parse_str(s).map_err(|_| {
-                                    RedisError::from((
-                                        redis::ErrorKind::TypeError,
-                                        "Invalid UUID format for transaction_id",
-                                    ))
-                                })?,
-                                _ => {
-                                    return Err(RedisError::from((
-                                        redis::ErrorKind::TypeError,
-                                        "transaction_id must be a string",
-                                    )));
-                                }
-                            });
+                            transaction_id = Some(parse_value!(Uuid, val, "transaction_id")?);
                         }
                         "partition_sequence" => {
                             partition_sequence = Some(match val {
@@ -450,26 +454,10 @@ impl FromRedisValue for Event {
                             });
                         }
                         "stream_id" => {
-                            stream_id = Some(match val {
-                                Value::SimpleString(s) => s.clone(),
-                                _ => {
-                                    return Err(RedisError::from((
-                                        redis::ErrorKind::TypeError,
-                                        "stream_id must be a string",
-                                    )));
-                                }
-                            });
+                            stream_id = Some(parse_value!(String, val, "stream_id")?);
                         }
                         "event_name" => {
-                            event_name = Some(match val {
-                                Value::SimpleString(s) => s.clone(),
-                                _ => {
-                                    return Err(RedisError::from((
-                                        redis::ErrorKind::TypeError,
-                                        "event_name must be a string",
-                                    )));
-                                }
-                            });
+                            event_name = Some(parse_value!(String, val, "event_name")?);
                         }
                         "metadata" => {
                             metadata = Some(match val {
@@ -486,6 +474,7 @@ impl FromRedisValue for Event {
                         "payload" => {
                             payload = Some(match val {
                                 Value::BulkString(data) => data.clone(),
+                                Value::Nil => Vec::new(),
                                 _ => {
                                     return Err(RedisError::from((
                                         redis::ErrorKind::TypeError,
@@ -651,31 +640,10 @@ impl FromRedisValue for EventInfo {
 
                     match field_name {
                         "event_id" => {
-                            event_id = Some(match val {
-                                Value::SimpleString(s) => Uuid::parse_str(s).map_err(|_| {
-                                    RedisError::from((
-                                        redis::ErrorKind::TypeError,
-                                        "Invalid UUID format for event_id",
-                                    ))
-                                })?,
-                                _ => {
-                                    return Err(RedisError::from((
-                                        redis::ErrorKind::TypeError,
-                                        "event_id must be a string",
-                                    )));
-                                }
-                            });
+                            event_id = Some(parse_value!(Uuid, val, "event_id")?);
                         }
                         "stream_id" => {
-                            stream_id = Some(match val {
-                                Value::SimpleString(s) => s.clone(),
-                                _ => {
-                                    return Err(RedisError::from((
-                                        redis::ErrorKind::TypeError,
-                                        "stream_id must be a string",
-                                    )));
-                                }
-                            });
+                            stream_id = Some(parse_value!(String, val, "stream_id")?);
                         }
                         "stream_version" => {
                             stream_version = Some(match val {
@@ -766,20 +734,7 @@ impl FromRedisValue for MultiAppendInfo {
 
                     match field_name {
                         "partition_key" => {
-                            partition_key = Some(match val {
-                                Value::SimpleString(s) => Uuid::parse_str(s).map_err(|_| {
-                                    RedisError::from((
-                                        redis::ErrorKind::TypeError,
-                                        "Invalid UUID format for partition_key",
-                                    ))
-                                })?,
-                                _ => {
-                                    return Err(RedisError::from((
-                                        redis::ErrorKind::TypeError,
-                                        "partition_key must be a string",
-                                    )));
-                                }
-                            });
+                            partition_key = Some(parse_value!(Uuid, val, "partition_key")?);
                         }
                         "partition_id" => {
                             partition_id = Some(match val {
@@ -908,26 +863,11 @@ impl FromRedisValue for SubscriptionInfo {
 
                     match field_name {
                         "subscription_type" => {
-                            subscription_type = Some(match val {
-                                Value::SimpleString(s) => s.clone(),
-                                _ => {
-                                    return Err(RedisError::from((
-                                        redis::ErrorKind::TypeError,
-                                        "subscription_type must be a string",
-                                    )));
-                                }
-                            });
+                            subscription_type =
+                                Some(parse_value!(String, val, "subscription_type")?);
                         }
                         "channel" => {
-                            channel = Some(match val {
-                                Value::SimpleString(s) => s.clone(),
-                                _ => {
-                                    return Err(RedisError::from((
-                                        redis::ErrorKind::TypeError,
-                                        "channel must be a string",
-                                    )));
-                                }
-                            });
+                            channel = Some(parse_value!(String, val, "channel")?);
                         }
                         "active_subscriptions" => {
                             active_subscriptions = Some(match val {

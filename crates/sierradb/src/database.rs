@@ -355,24 +355,22 @@ pub struct DatabaseBuilder {
     writer_threads: Option<u16>,
     flush_interval_duration: Duration,
     flush_interval_events: u32,
-    cores: u16,
 }
 
 impl DatabaseBuilder {
     pub fn new() -> Self {
-        let total_buckets = 64;
         let cores = num_cpus::get_physical() as u16;
-        let reader_pool_size = cores.clamp(4, 32);
+        let total_buckets = (cores * 2).clamp(2, 16);
+        let reader_threads = (cores * 2).clamp(4, 32);
 
         DatabaseBuilder {
             segment_size: 256_000_000,
             bucket_ids: Arc::from((0..total_buckets).collect::<Vec<_>>()),
             total_buckets,
-            reader_threads: reader_pool_size,
+            reader_threads,
             writer_threads: None,
             flush_interval_duration: Duration::from_millis(100),
             flush_interval_events: 1_000,
-            cores,
         }
     }
 
@@ -383,16 +381,9 @@ impl DatabaseBuilder {
             self.total_buckets
         );
 
-        let writer_threads = self.writer_threads.unwrap_or_else(|| {
-            let bucket_ids_len = self.bucket_ids.len() as u16;
-            // Calculate ideal thread count (clamped)
-            let ideal_threads = (self.cores * 2).clamp(4, 64).min(bucket_ids_len);
-
-            (1..=bucket_ids_len)
-                .filter(|i| bucket_ids_len.is_multiple_of(*i))
-                .min_by_key(|&d| (d as isize - ideal_threads as isize).abs())
-                .unwrap_or(1)
-        });
+        let writer_threads = self
+            .writer_threads
+            .unwrap_or_else(|| self.bucket_ids.len() as u16);
 
         assert!(
             self.bucket_ids

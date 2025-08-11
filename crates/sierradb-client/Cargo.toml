@@ -19,6 +19,7 @@ uuid = { workspace = true, features = ["serde", "v5"] }
 ciborium = "0.2.2"
 redis = { version = "0.32.4", features = ["cluster"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 
 [features]
 default = ["aio", "tokio-comp"]

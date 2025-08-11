@@ -79,9 +79,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Ok(Record::Event(mut event)) => {
                             event.metadata.clear();
                             event.payload.clear();
-                            if event.stream_id != "BankAccount-abc" {
-                                continue;
-                            }
                             println!(
                                 "{bsid} -- {}/{} {}@{} - {} (confirmations: {})",
                                 event.partition_id,
