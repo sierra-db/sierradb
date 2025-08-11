@@ -7,7 +7,7 @@ use smallvec::{SmallVec, smallvec};
 use tracing::{error, instrument};
 use uuid::Uuid;
 
-use crate::{ClusterActor, confirmation::actor::UpdateConfirmation};
+use crate::{ClusterActor, confirmation::actor::UpdateConfirmation, subscription::NotifyEvent};
 
 use super::{error::ConfirmTransactionError, transaction::set_confirmations_with_retry};
 
@@ -32,19 +32,20 @@ impl Message<ConfirmTransaction> for ClusterActor {
     ) -> Self::Reply {
         let database = self.database.clone();
         let confirmation_ref = self.confirmation_ref.clone();
+        let cluster_ref = ctx.actor_ref().clone();
 
         ctx.spawn(async move {
             let Some(first_event_id) = msg.event_ids.first() else {
                 return Err(ConfirmTransactionError::EventsLengthMismatch);
             };
 
-            let offsets = match database
+            let (offsets, commit) = match database
                 .read_transaction(msg.partition_id, *first_event_id)
                 .await
                 .map_err(|err| ConfirmTransactionError::Read(err.to_string()))?
             {
                 Some(CommittedEvents::Single(event)) => {
-                    smallvec![event.offset]
+                    (smallvec![event.offset], CommittedEvents::Single(event))
                 }
                 Some(CommittedEvents::Transaction { events, commit }) => {
                     if events.len() != msg.event_ids.len() {
@@ -63,8 +64,8 @@ impl Message<ConfirmTransaction> for ClusterActor {
                         }
                     }
 
-                    events
-                        .into_iter()
+                    let offsets = events
+                        .iter()
                         .zip(msg.event_ids)
                         .map(|(event, event_id)| {
                             if event.event_id != event_id {
@@ -74,7 +75,9 @@ impl Message<ConfirmTransaction> for ClusterActor {
                             Ok(event.offset)
                         })
                         .chain(iter::once(Ok(commit.offset)))
-                        .collect::<Result<_, _>>()?
+                        .collect::<Result<_, _>>()?;
+
+                    (offsets, CommittedEvents::Transaction { events, commit })
                 }
                 None => {
                     return Err(ConfirmTransactionError::TransactionNotFound);
@@ -96,10 +99,24 @@ impl Message<ConfirmTransaction> for ClusterActor {
                     let _ = confirmation_ref
                         .tell(UpdateConfirmation {
                             partition_id: msg.partition_id,
-                            versions: msg.event_partition_sequences,
+                            versions: msg.event_partition_sequences.clone(),
                             confirmation_count: msg.confirmation_count,
                         })
                         .await;
+
+                    // Notify subscriptions about confirmed events
+                    for event in commit {
+                        let res = cluster_ref
+                            .tell(NotifyEvent {
+                                partition_id: msg.partition_id,
+                                event,
+                            })
+                            .send()
+                            .await;
+                        if let Err(err) = res {
+                            error!("failed to notify confirmed event to cluster: {err}");
+                        }
+                    }
 
                     Ok(())
                 }
