@@ -16,18 +16,20 @@ use crate::server::Conn;
 ///
 /// # Syntax
 /// ```text
-/// EPSUB <partition> [FROM_SEQUENCE <sequence>]
+/// EPSUB <partition> [FROM_SEQUENCE <sequence>] [WINDOW_SIZE <size>]
 /// ```
 ///
 /// # Parameters
 /// - `partition`: Partition selector (partition ID 0-65535 or UUID key)
 /// - `from_sequence` (optional): Start streaming from this sequence number
 ///   (defaults to current end)
+/// - `window_size` (optional): Maximum unacknowledged events (defaults to unlimited)
 ///
 /// # Examples
 /// ```text
 /// EPSUB 42
 /// EPSUB 550e8400-e29b-41d4-a716-446655440000 FROM_SEQUENCE 1000
+/// EPSUB 42 FROM_SEQUENCE 500 WINDOW_SIZE 1000
 /// ```
 ///
 /// **Note:** Establishes a persistent connection to receive real-time partition
@@ -35,9 +37,10 @@ use crate::server::Conn;
 pub struct EPSub {
     pub partition: PartitionSelector,
     pub from_sequence: Option<u64>,
+    pub window_size: Option<u32>,
 }
 
-impl_command!(EPSub, [partition], [from_sequence]);
+impl_command!(EPSub, [partition], [from_sequence, window_size]);
 
 impl HandleRequest for EPSub {
     type Error = String;
@@ -64,6 +67,7 @@ impl HandleRequest for EPSub {
             .ask(CreatePartitionSubscription {
                 partition_id,
                 from_sequence: self.from_sequence,
+                window_size: self.window_size,
                 sender,
             })
             .await

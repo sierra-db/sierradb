@@ -18,7 +18,7 @@ use crate::server::Conn;
 ///
 /// # Syntax
 /// ```text
-/// ESUB <stream_id> [PARTITION_KEY <partition_key>] [FROM_VERSION <version>]
+/// ESUB <stream_id> [PARTITION_KEY <partition_key>] [FROM_VERSION <version>] [WINDOW_SIZE <size>]
 /// ```
 ///
 /// # Parameters
@@ -26,11 +26,13 @@ use crate::server::Conn;
 /// - `partition_key` (optional): UUID to subscribe to specific partition
 /// - `from_version` (optional): Start streaming from this version number
 ///   (defaults to current end)
+/// - `window_size` (optional): Maximum unacknowledged events (defaults to unlimited)
 ///
 /// # Examples
 /// ```text
 /// ESUB my-stream
 /// ESUB my-stream PARTITION_KEY 550e8400-e29b-41d4-a716-446655440000 FROM_VERSION 100
+/// ESUB my-stream FROM_VERSION 50 WINDOW_SIZE 1000
 /// ```
 ///
 /// **Note:** Establishes a persistent connection to receive real-time stream
@@ -39,9 +41,10 @@ pub struct ESub {
     pub stream_id: StreamId,
     pub partition_key: Option<Uuid>,
     pub from_version: Option<u64>,
+    pub window_size: Option<u32>,
 }
 
-impl_command!(ESub, [stream_id], [partition_key, from_version]);
+impl_command!(ESub, [stream_id], [partition_key, from_version, window_size]);
 
 impl HandleRequest for ESub {
     type Error = String;
@@ -67,6 +70,7 @@ impl HandleRequest for ESub {
                 stream_id: self.stream_id.clone(),
                 partition_key: self.partition_key,
                 from_version: self.from_version,
+                window_size: self.window_size,
                 sender,
             })
             .await

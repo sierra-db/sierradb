@@ -3717,6 +3717,7 @@ dependencies = [
  "sierradb-protocol",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

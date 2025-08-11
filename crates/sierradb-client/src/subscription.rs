@@ -13,6 +13,13 @@ use uuid::Uuid;
 
 use crate::types::{Event, SierraMessage};
 
+/// Selector for partition subscriptions
+#[derive(Debug, Clone)]
+enum PartitionSelector {
+    Id(u16),
+    Key(Uuid),
+}
+
 /// A manager for SierraDB subscriptions that handles a shared push channel
 /// and demultiplexes messages to individual subscriptions.
 pub struct SubscriptionManager {
@@ -66,33 +73,18 @@ impl SubscriptionManager {
         &mut self,
         stream_id: S,
     ) -> RedisResult<EventSubscription> {
-        let mut inner = self.inner.lock().await;
+        self.subscribe_to_stream_with_options(stream_id, None, None, None)
+            .await
+    }
 
-        let response: Value = cmd("ESUB")
-            .arg(stream_id)
-            .query_async(&mut inner.connection)
-            .await?;
-
-        let subscription_id = match response {
-            Value::SimpleString(id_str) => Uuid::parse_str(&id_str).map_err(|_| {
-                RedisError::from((redis::ErrorKind::TypeError, "Invalid UUID in response"))
-            })?,
-            _ => {
-                return Err(RedisError::from((
-                    redis::ErrorKind::TypeError,
-                    "Expected subscription ID",
-                )));
-            }
-        };
-
-        let (sender, receiver) = mpsc::unbounded_channel();
-        inner.subscriptions.insert(subscription_id, sender);
-
-        Ok(EventSubscription {
-            subscription_id,
-            receiver,
-            manager: self.inner.clone(),
-        })
+    /// Subscribe to events from a stream with optional windowing.
+    pub async fn subscribe_to_stream_with_window<S: redis::ToRedisArgs>(
+        &mut self,
+        stream_id: S,
+        window_size: u32,
+    ) -> RedisResult<EventSubscription> {
+        self.subscribe_to_stream_with_options(stream_id, None, None, Some(window_size))
+            .await
     }
 
     /// Subscribe to events from a stream starting from a specific version.
@@ -101,14 +93,53 @@ impl SubscriptionManager {
         stream_id: S,
         from_version: u64,
     ) -> RedisResult<EventSubscription> {
+        self.subscribe_to_stream_with_options(stream_id, None, Some(from_version), None)
+            .await
+    }
+
+    /// Subscribe to events from a stream starting from a specific version with
+    /// windowing.
+    pub async fn subscribe_to_stream_from_version_with_window<S: redis::ToRedisArgs>(
+        &mut self,
+        stream_id: S,
+        from_version: u64,
+        window_size: u32,
+    ) -> RedisResult<EventSubscription> {
+        self.subscribe_to_stream_with_options(
+            stream_id,
+            None,
+            Some(from_version),
+            Some(window_size),
+        )
+        .await
+    }
+
+    /// Core method to subscribe to events from a stream with all options.
+    async fn subscribe_to_stream_with_options<S: redis::ToRedisArgs>(
+        &mut self,
+        stream_id: S,
+        partition_key: Option<Uuid>,
+        from_version: Option<u64>,
+        window_size: Option<u32>,
+    ) -> RedisResult<EventSubscription> {
         let mut inner = self.inner.lock().await;
 
-        let response: Value = cmd("ESUB")
-            .arg(stream_id)
-            .arg("FROM_VERSION")
-            .arg(from_version)
-            .query_async(&mut inner.connection)
-            .await?;
+        let mut cmd = cmd("ESUB");
+        cmd.arg(stream_id);
+
+        if let Some(key) = partition_key {
+            cmd.arg("PARTITION_KEY").arg(key.to_string());
+        }
+
+        if let Some(version) = from_version {
+            cmd.arg("FROM_VERSION").arg(version);
+        }
+
+        if let Some(size) = window_size {
+            cmd.arg("WINDOW_SIZE").arg(size);
+        }
+
+        let response: Value = cmd.query_async(&mut inner.connection).await?;
 
         let subscription_id = match response {
             Value::SimpleString(id_str) => Uuid::parse_str(&id_str).map_err(|_| {
@@ -137,33 +168,22 @@ impl SubscriptionManager {
         &mut self,
         partition: u16,
     ) -> RedisResult<EventSubscription> {
-        let mut inner = self.inner.lock().await;
+        self.subscribe_to_partition_with_options(PartitionSelector::Id(partition), None, None)
+            .await
+    }
 
-        let response: Value = cmd("EPSUB")
-            .arg(partition)
-            .query_async(&mut inner.connection)
-            .await?;
-
-        let subscription_id = match response {
-            Value::SimpleString(id_str) => Uuid::parse_str(&id_str).map_err(|_| {
-                RedisError::from((redis::ErrorKind::TypeError, "Invalid UUID in response"))
-            })?,
-            _ => {
-                return Err(RedisError::from((
-                    redis::ErrorKind::TypeError,
-                    "Expected subscription ID",
-                )));
-            }
-        };
-
-        let (sender, receiver) = mpsc::unbounded_channel();
-        inner.subscriptions.insert(subscription_id, sender);
-
-        Ok(EventSubscription {
-            subscription_id,
-            receiver,
-            manager: self.inner.clone(),
-        })
+    /// Subscribe to events from a specific partition with windowing.
+    pub async fn subscribe_to_partition_with_window(
+        &mut self,
+        partition: u16,
+        window_size: u32,
+    ) -> RedisResult<EventSubscription> {
+        self.subscribe_to_partition_with_options(
+            PartitionSelector::Id(partition),
+            None,
+            Some(window_size),
+        )
+        .await
     }
 
     /// Subscribe to events from a partition identified by a UUID key.
@@ -171,33 +191,23 @@ impl SubscriptionManager {
         &mut self,
         key: Uuid,
     ) -> RedisResult<EventSubscription> {
-        let mut inner = self.inner.lock().await;
+        self.subscribe_to_partition_with_options(PartitionSelector::Key(key), None, None)
+            .await
+    }
 
-        let response: Value = cmd("EPSUB")
-            .arg(key.to_string())
-            .query_async(&mut inner.connection)
-            .await?;
-
-        let subscription_id = match response {
-            Value::SimpleString(id_str) => Uuid::parse_str(&id_str).map_err(|_| {
-                RedisError::from((redis::ErrorKind::TypeError, "Invalid UUID in response"))
-            })?,
-            _ => {
-                return Err(RedisError::from((
-                    redis::ErrorKind::TypeError,
-                    "Expected subscription ID",
-                )));
-            }
-        };
-
-        let (sender, receiver) = mpsc::unbounded_channel();
-        inner.subscriptions.insert(subscription_id, sender);
-
-        Ok(EventSubscription {
-            subscription_id,
-            receiver,
-            manager: self.inner.clone(),
-        })
+    /// Subscribe to events from a partition identified by a UUID key with
+    /// windowing.
+    pub async fn subscribe_to_partition_key_with_window(
+        &mut self,
+        key: Uuid,
+        window_size: u32,
+    ) -> RedisResult<EventSubscription> {
+        self.subscribe_to_partition_with_options(
+            PartitionSelector::Key(key),
+            None,
+            Some(window_size),
+        )
+        .await
     }
 
     /// Subscribe to events from a stream with a partition key.
@@ -206,35 +216,24 @@ impl SubscriptionManager {
         stream_id: S,
         partition_key: Uuid,
     ) -> RedisResult<EventSubscription> {
-        let mut inner = self.inner.lock().await;
+        self.subscribe_to_stream_with_options(stream_id, Some(partition_key), None, None)
+            .await
+    }
 
-        let response: Value = cmd("ESUB")
-            .arg(stream_id)
-            .arg("PARTITION_KEY")
-            .arg(partition_key.to_string())
-            .query_async(&mut inner.connection)
-            .await?;
-
-        let subscription_id = match response {
-            Value::SimpleString(id_str) => Uuid::parse_str(&id_str).map_err(|_| {
-                RedisError::from((redis::ErrorKind::TypeError, "Invalid UUID in response"))
-            })?,
-            _ => {
-                return Err(RedisError::from((
-                    redis::ErrorKind::TypeError,
-                    "Expected subscription ID",
-                )));
-            }
-        };
-
-        let (sender, receiver) = mpsc::unbounded_channel();
-        inner.subscriptions.insert(subscription_id, sender);
-
-        Ok(EventSubscription {
-            subscription_id,
-            receiver,
-            manager: self.inner.clone(),
-        })
+    /// Subscribe to events from a stream with a partition key and windowing.
+    pub async fn subscribe_to_stream_with_partition_key_and_window<S: redis::ToRedisArgs>(
+        &mut self,
+        stream_id: S,
+        partition_key: Uuid,
+        window_size: u32,
+    ) -> RedisResult<EventSubscription> {
+        self.subscribe_to_stream_with_options(
+            stream_id,
+            Some(partition_key),
+            None,
+            Some(window_size),
+        )
+        .await
     }
 
     /// Subscribe to events from a stream with both partition key and starting
@@ -245,37 +244,33 @@ impl SubscriptionManager {
         partition_key: Uuid,
         from_version: u64,
     ) -> RedisResult<EventSubscription> {
-        let mut inner = self.inner.lock().await;
+        self.subscribe_to_stream_with_options(
+            stream_id,
+            Some(partition_key),
+            Some(from_version),
+            None,
+        )
+        .await
+    }
 
-        let response: Value = cmd("ESUB")
-            .arg(stream_id)
-            .arg("PARTITION_KEY")
-            .arg(partition_key.to_string())
-            .arg("FROM_VERSION")
-            .arg(from_version)
-            .query_async(&mut inner.connection)
-            .await?;
-
-        let subscription_id = match response {
-            Value::SimpleString(id_str) => Uuid::parse_str(&id_str).map_err(|_| {
-                RedisError::from((redis::ErrorKind::TypeError, "Invalid UUID in response"))
-            })?,
-            _ => {
-                return Err(RedisError::from((
-                    redis::ErrorKind::TypeError,
-                    "Expected subscription ID",
-                )));
-            }
-        };
-
-        let (sender, receiver) = mpsc::unbounded_channel();
-        inner.subscriptions.insert(subscription_id, sender);
-
-        Ok(EventSubscription {
-            subscription_id,
-            receiver,
-            manager: self.inner.clone(),
-        })
+    /// Subscribe to events from a stream with partition key, starting version,
+    /// and windowing.
+    pub async fn subscribe_to_stream_with_partition_and_version_and_window<
+        S: redis::ToRedisArgs,
+    >(
+        &mut self,
+        stream_id: S,
+        partition_key: Uuid,
+        from_version: u64,
+        window_size: u32,
+    ) -> RedisResult<EventSubscription> {
+        self.subscribe_to_stream_with_options(
+            stream_id,
+            Some(partition_key),
+            Some(from_version),
+            Some(window_size),
+        )
+        .await
     }
 
     /// Subscribe to events from a partition starting from a specific sequence.
@@ -284,35 +279,28 @@ impl SubscriptionManager {
         partition: u16,
         from_sequence: u64,
     ) -> RedisResult<EventSubscription> {
-        let mut inner = self.inner.lock().await;
+        self.subscribe_to_partition_with_options(
+            PartitionSelector::Id(partition),
+            Some(from_sequence),
+            None,
+        )
+        .await
+    }
 
-        let response: Value = cmd("EPSUB")
-            .arg(partition)
-            .arg("FROM_SEQUENCE")
-            .arg(from_sequence)
-            .query_async(&mut inner.connection)
-            .await?;
-
-        let subscription_id = match response {
-            Value::SimpleString(id_str) => Uuid::parse_str(&id_str).map_err(|_| {
-                RedisError::from((redis::ErrorKind::TypeError, "Invalid UUID in response"))
-            })?,
-            _ => {
-                return Err(RedisError::from((
-                    redis::ErrorKind::TypeError,
-                    "Expected subscription ID",
-                )));
-            }
-        };
-
-        let (sender, receiver) = mpsc::unbounded_channel();
-        inner.subscriptions.insert(subscription_id, sender);
-
-        Ok(EventSubscription {
-            subscription_id,
-            receiver,
-            manager: self.inner.clone(),
-        })
+    /// Subscribe to events from a partition starting from a specific sequence
+    /// with windowing.
+    pub async fn subscribe_to_partition_from_sequence_with_window(
+        &mut self,
+        partition: u16,
+        from_sequence: u64,
+        window_size: u32,
+    ) -> RedisResult<EventSubscription> {
+        self.subscribe_to_partition_with_options(
+            PartitionSelector::Id(partition),
+            Some(from_sequence),
+            Some(window_size),
+        )
+        .await
     }
 
     /// Subscribe to events from a partition (by key) starting from a specific
@@ -322,14 +310,55 @@ impl SubscriptionManager {
         key: Uuid,
         from_sequence: u64,
     ) -> RedisResult<EventSubscription> {
+        self.subscribe_to_partition_with_options(
+            PartitionSelector::Key(key),
+            Some(from_sequence),
+            None,
+        )
+        .await
+    }
+
+    /// Subscribe to events from a partition (by key) starting from a specific
+    /// sequence with windowing.
+    pub async fn subscribe_to_partition_key_from_sequence_with_window(
+        &mut self,
+        key: Uuid,
+        from_sequence: u64,
+        window_size: u32,
+    ) -> RedisResult<EventSubscription> {
+        self.subscribe_to_partition_with_options(
+            PartitionSelector::Key(key),
+            Some(from_sequence),
+            Some(window_size),
+        )
+        .await
+    }
+
+    /// Core method to subscribe to events from a partition with all options.
+    async fn subscribe_to_partition_with_options(
+        &mut self,
+        partition: PartitionSelector,
+        from_sequence: Option<u64>,
+        window_size: Option<u32>,
+    ) -> RedisResult<EventSubscription> {
         let mut inner = self.inner.lock().await;
 
-        let response: Value = cmd("EPSUB")
-            .arg(key.to_string())
-            .arg("FROM_SEQUENCE")
-            .arg(from_sequence)
-            .query_async(&mut inner.connection)
-            .await?;
+        let mut cmd = cmd("EPSUB");
+
+        match partition {
+            PartitionSelector::Id(id) => cmd.arg(id),
+            PartitionSelector::Key(key) => cmd.arg(key.to_string()),
+        };
+
+        if let Some(sequence) = from_sequence {
+            cmd.arg("FROM_SEQUENCE").arg(sequence);
+        }
+
+        if let Some(size) = window_size {
+            cmd.arg("WINDOW_SIZE").arg(size);
+        }
+
+        let response: Value = cmd.query_async(&mut inner.connection).await?;
 
         let subscription_id = match response {
             Value::SimpleString(id_str) => Uuid::parse_str(&id_str).map_err(|_| {
@@ -351,6 +380,43 @@ impl SubscriptionManager {
             receiver,
             manager: self.inner.clone(),
         })
+    }
+
+    /// Acknowledge events up to a specific sequence/version for a subscription.
+    ///
+    /// For stream subscriptions, this acknowledges all events up to and
+    /// including the specified stream version. For partition subscriptions,
+    /// this acknowledges all events up to and including the specified
+    /// partition sequence.
+    pub async fn acknowledge_events(
+        &mut self,
+        subscription_id: Uuid,
+        up_to_sequence_or_version: u64,
+    ) -> RedisResult<()> {
+        let mut inner = self.inner.lock().await;
+
+        let _response: Value = cmd("EACK")
+            .arg(subscription_id.to_string())
+            .arg(up_to_sequence_or_version)
+            .query_async(&mut inner.connection)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Acknowledge all pending events for a subscription.
+    ///
+    /// This clears all unacknowledged events and resets the subscription
+    /// window, effectively allowing maximum throughput.
+    pub async fn acknowledge_all_events(&mut self, subscription_id: Uuid) -> RedisResult<()> {
+        let mut inner = self.inner.lock().await;
+
+        let _response: Value = cmd("EPACK")
+            .arg(subscription_id.to_string())
+            .query_async(&mut inner.connection)
+            .await?;
+
+        Ok(())
     }
 }
 
@@ -442,6 +508,40 @@ impl EventSubscription {
                 .await
                 .map(|msg| (msg, subscription))
         })
+    }
+
+    /// Acknowledge events up to a specific sequence/version for this
+    /// subscription.
+    ///
+    /// For stream subscriptions, this acknowledges all events up to and
+    /// including the specified stream version. For partition subscriptions,
+    /// this acknowledges all events up to and including the specified
+    /// partition sequence.
+    pub async fn acknowledge_events(&self, up_to_sequence_or_version: u64) -> RedisResult<()> {
+        let mut manager = self.manager.lock().await;
+
+        let _response: Value = cmd("EACK")
+            .arg(self.subscription_id.to_string())
+            .arg(up_to_sequence_or_version)
+            .query_async(&mut manager.connection)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Acknowledge all pending events for this subscription.
+    ///
+    /// This clears all unacknowledged events and resets the subscription
+    /// window, effectively allowing maximum throughput.
+    pub async fn acknowledge_all_events(&self) -> RedisResult<()> {
+        let mut manager = self.manager.lock().await;
+
+        let _response: Value = cmd("EPACK")
+            .arg(self.subscription_id.to_string())
+            .query_async(&mut manager.connection)
+            .await?;
+
+        Ok(())
     }
 
     /// Unsubscribe and close this subscription.

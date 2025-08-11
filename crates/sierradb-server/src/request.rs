@@ -1,6 +1,8 @@
+pub mod eack;
 pub mod eappend;
 pub mod eget;
 pub mod emappend;
+pub mod epack;
 pub mod epscan;
 pub mod epseq;
 pub mod epsub;
@@ -25,9 +27,11 @@ use tokio::io;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::request::eack::EAck;
 use crate::request::eappend::EAppend;
 use crate::request::eget::EGet;
 use crate::request::emappend::EMAppend;
+use crate::request::epack::EPack;
 use crate::request::epscan::EPScan;
 use crate::request::epseq::EPSeq;
 use crate::request::epsub::EPSub;
@@ -39,9 +43,11 @@ use crate::request::ping::Ping;
 use crate::server::Conn;
 
 pub enum Command {
+    EAck,
     EAppend,
     EGet,
     EMAppend,
+    EPack,
     EPScan,
     EPSeq,
     EPSub,
@@ -77,7 +83,7 @@ impl Command {
         }
 
         handle_commands![
-            EAppend, EGet, EMAppend, EPScan, EPSeq, EPSub, EScan, ESVer, ESub, Hello, Ping
+            EAck, EAppend, EGet, EMAppend, EPack, EPScan, EPSeq, EPSub, EScan, ESVer, ESub, Hello, Ping
         ]
     }
 }
@@ -100,9 +106,11 @@ impl TryFrom<&BytesFrame> for Command {
                     .to_ascii_uppercase()
                     .as_str()
                 {
+                    "EACK" => Ok(Command::EAck),
                     "EAPPEND" => Ok(Command::EAppend),
                     "EGET" => Ok(Command::EGet),
                     "EMAPPEND" => Ok(Command::EMAppend),
+                    "EPACK" => Ok(Command::EPack),
                     "EPSCAN" => Ok(Command::EPScan),
                     "EPSEQ" => Ok(Command::EPSeq),
                     "EPSUB" => Ok(Command::EPSub),
@@ -164,6 +172,34 @@ where
         match frame {
             BytesFrame::Null => Ok(None),
             _ => Ok(Some(T::from_bytes_frame(frame)?)),
+        }
+    }
+}
+
+impl FromBytesFrame<'_> for u32 {
+    fn from_bytes_frame(frame: &BytesFrame) -> Result<Self, String> {
+        match frame {
+            BytesFrame::BlobString { data, .. }
+            | BytesFrame::SimpleString { data, .. }
+            | BytesFrame::BigNumber { data, .. }
+            | BytesFrame::VerbatimString {
+                data,
+                format: VerbatimStringFormat::Text,
+                ..
+            } => {
+                let s = std::str::from_utf8(data).map_err(|_| "invalid string".to_string())?;
+                s.parse::<u32>().map_err(|_| "invalid u32".to_string())
+            }
+            BytesFrame::Number { data, .. } => {
+                if *data < 0 {
+                    Err("negative number for u32".to_string())
+                } else if *data > u32::MAX as i64 {
+                    Err("number too large for u32".to_string())
+                } else {
+                    Ok(*data as u32)
+                }
+            }
+            _ => Err("invalid type for u32".to_string()),
         }
     }
 }
