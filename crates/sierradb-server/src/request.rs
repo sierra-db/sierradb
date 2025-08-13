@@ -2,7 +2,6 @@ pub mod eack;
 pub mod eappend;
 pub mod eget;
 pub mod emappend;
-pub mod epack;
 pub mod epscan;
 pub mod epseq;
 pub mod epsub;
@@ -16,22 +15,24 @@ use std::collections::HashMap;
 use std::num::{ParseIntError, TryFromIntError};
 
 use bytes::Bytes;
+use combine::{Parser, eof};
 use redis_protocol::resp3::types::{BytesFrame, VerbatimStringFormat};
 use sierradb::StreamId;
 use sierradb::bucket::PartitionId;
 use sierradb::bucket::segment::EventRecord;
 use sierradb::database::ExpectedVersion;
 use sierradb::id::uuid_to_partition_hash;
+use sierradb_cluster::subscription::{FromSequences, SubscriptionMatcher};
 use sierradb_protocol::ErrorCode;
 use tokio::io;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::parser::frame_stream;
 use crate::request::eack::EAck;
 use crate::request::eappend::EAppend;
 use crate::request::eget::EGet;
 use crate::request::emappend::EMAppend;
-use crate::request::epack::EPack;
 use crate::request::epscan::EPScan;
 use crate::request::epseq::EPSeq;
 use crate::request::epsub::EPSub;
@@ -47,7 +48,6 @@ pub enum Command {
     EAppend,
     EGet,
     EMAppend,
-    EPack,
     EPScan,
     EPSeq,
     EPSub,
@@ -68,11 +68,12 @@ impl Command {
             ( $( $name:ident ),* $(,)? ) => {
                 match self {
                     $( Command::$name => {
-                        match $name::from_args(args) {
-                            Ok(cmd) => cmd.handle_request_failable(conn).await,
+                        let stream = frame_stream(args);
+                        match $name::parser().skip(eof()).parse(stream) {
+                            Ok((cmd, _)) => cmd.handle_request_failable(conn).await,
                             Err(err) => {
                                 Ok(Some(BytesFrame::SimpleError {
-                                    data: err.into(),
+                                    data: err.to_string().into(),
                                     attributes: None,
                                 }))
                             }
@@ -83,7 +84,7 @@ impl Command {
         }
 
         handle_commands![
-            EAck, EAppend, EGet, EMAppend, EPack, EPScan, EPSeq, EPSub, EScan, ESVer, ESub, Hello, Ping
+            EAck, EAppend, EGet, EMAppend, EPScan, EPSeq, EPSub, EScan, ESVer, ESub, Hello, Ping
         ]
     }
 }
@@ -110,7 +111,6 @@ impl TryFrom<&BytesFrame> for Command {
                     "EAPPEND" => Ok(Command::EAppend),
                     "EGET" => Ok(Command::EGet),
                     "EMAPPEND" => Ok(Command::EMAppend),
-                    "EPACK" => Ok(Command::EPack),
                     "EPSCAN" => Ok(Command::EPScan),
                     "EPSEQ" => Ok(Command::EPSeq),
                     "EPSUB" => Ok(Command::EPSub),
@@ -158,6 +158,129 @@ pub trait HandleRequest: Sized + Send {
 
 pub trait FromArgs: Sized {
     fn from_args(args: &[BytesFrame]) -> Result<Self, String>;
+}
+
+impl FromArgs for SubscriptionMatcher {
+    fn from_args(args: &[BytesFrame]) -> Result<Self, String> {
+        let mut i = 0;
+        let kind = <&str>::from_bytes_frame(
+            args.get(i)
+                .ok_or_else(|| ErrorCode::InvalidArg.with_message("missing subscription type"))?,
+        )
+        .map_err(|err| {
+            ErrorCode::InvalidArg.with_message(format!("invalid subscription type: {err}"))
+        })?;
+        i += 1;
+        match kind {
+            "ALL_PARTITIONS" | "all_partitions" => {
+                let from_sequences_kind =
+                    <&str>::from_bytes_frame(args.get(i).ok_or_else(|| {
+                        ErrorCode::InvalidArg.with_message("missing start filter")
+                    })?)
+                    .map_err(|err| {
+                        ErrorCode::InvalidArg.with_message(format!("invalid start filter: {err}"))
+                    })?;
+                i += 1;
+                match from_sequences_kind {
+                    "LATEST" | "latest" => Ok(SubscriptionMatcher::AllPartitions {
+                        from_sequences: FromSequences::Latest,
+                    }),
+                    "ALL" | "all" => {
+                        let from_sequence =
+                            u64::from_bytes_frame(args.get(i).ok_or_else(|| {
+                                ErrorCode::InvalidArg.with_message("missing start sequence")
+                            })?)
+                            .map_err(|err| {
+                                ErrorCode::InvalidArg
+                                    .with_message(format!("invalid start sequence: {err}"))
+                            })?;
+
+                        Ok(SubscriptionMatcher::AllPartitions {
+                            from_sequences: FromSequences::AllPartitions(from_sequence),
+                        })
+                    }
+                    "PARTITIONS" | "partitions" => {
+                        let mut from_sequences = HashMap::new();
+
+                        loop {
+                            let Some(arg) = args.get(i) else {
+                                break;
+                            };
+
+                            i += 1;
+
+                            match PartitionId::from_bytes_frame(arg) {
+                                Ok(partition_id) => {
+                                    let from_sequence =
+                                        u64::from_bytes_frame(args.get(i).ok_or_else(|| {
+                                            ErrorCode::InvalidArg
+                                                .with_message("missing from sequence")
+                                        })?)
+                                        .map_err(
+                                            |err| {
+                                                ErrorCode::InvalidArg.with_message(format!(
+                                                    "invalid from sequence: {err}"
+                                                ))
+                                            },
+                                        )?;
+
+                                    i += 1;
+
+                                    from_sequences.insert(partition_id, from_sequence);
+                                }
+                                Err(err) => {
+                                    let Ok(fallback_keyword) = <&str>::from_bytes_frame(arg) else {
+                                        return Err(err);
+                                    };
+                                    if fallback_keyword != "FALLBACK"
+                                        && fallback_keyword != "fallback"
+                                    {
+                                        return Err(err);
+                                    }
+
+                                    let fallback =
+                                        u64::from_bytes_frame(args.get(i).ok_or_else(|| {
+                                            ErrorCode::InvalidArg
+                                                .with_message("missing fallback sequence")
+                                        })?)
+                                        .map_err(
+                                            |err| {
+                                                ErrorCode::InvalidArg.with_message(format!(
+                                                    "invalid fallback sequence: {err}"
+                                                ))
+                                            },
+                                        )?;
+
+                                    return Ok(SubscriptionMatcher::AllPartitions {
+                                        from_sequences: FromSequences::Partitions {
+                                            from_sequences,
+                                            fallback: Some(fallback),
+                                        },
+                                    });
+                                }
+                            }
+                        }
+
+                        Ok(SubscriptionMatcher::AllPartitions {
+                            from_sequences: FromSequences::Partitions {
+                                from_sequences,
+                                fallback: None,
+                            },
+                        })
+                    }
+                    _ => Err(ErrorCode::InvalidArg
+                        .with_message(format!("unknown start filter '{from_sequences_kind}'"))),
+                }
+            }
+            "PARTITIONS" | "partitions" => {
+                todo!()
+            }
+            "STREAMS" | "streams" => {
+                todo!()
+            }
+            _ => Err(ErrorCode::InvalidArg.with_message("unknown subscription type '{kind}'")),
+        }
+    }
 }
 
 pub trait FromBytesFrame<'a>: Sized {
@@ -381,6 +504,239 @@ impl FromBytesFrame<'_> for PartitionSelector {
         <Uuid>::from_bytes_frame(frame)
             .map(PartitionSelector::ByKey)
             .or_else(|_| <PartitionId>::from_bytes_frame(frame).map(PartitionSelector::ById))
+    }
+}
+
+/// Represents a range of partitions for multi-partition subscriptions
+#[derive(Debug, Clone, PartialEq)]
+pub enum PartitionRange {
+    /// Single partition (backwards compatibility)
+    Single(PartitionSelector),
+    /// Range of partition IDs (inclusive): "0-127", "50-99"
+    Range(u16, u16),
+    /// Explicit list of partitions: "0,1,5,42"
+    List(Vec<PartitionSelector>),
+    /// All partitions: "*"
+    All,
+}
+
+impl PartitionRange {
+    /// Expand the range into a vector of concrete partition IDs
+    pub fn expand(&self, num_partitions: u16) -> Vec<PartitionId> {
+        match self {
+            PartitionRange::Single(selector) => {
+                vec![selector.into_partition_id(num_partitions)]
+            }
+            PartitionRange::Range(start, end) => {
+                let start = (*start).min(num_partitions.saturating_sub(1));
+                let end = (*end).min(num_partitions.saturating_sub(1));
+                if start <= end {
+                    (start..=end).collect()
+                } else {
+                    vec![]
+                }
+            }
+            PartitionRange::List(selectors) => selectors
+                .iter()
+                .map(|s| s.into_partition_id(num_partitions))
+                .collect(),
+            PartitionRange::All => (0..num_partitions).collect(),
+        }
+    }
+}
+
+/// Specification for FROM_SEQUENCE parameter in multi-partition subscriptions  
+#[derive(Debug, Clone)]
+pub enum FromSequenceSpec {
+    /// Same sequence for all partitions
+    Single(u64),
+    /// Individual sequences per partition: {partition_id: sequence}
+    PerPartition(HashMap<u16, u64>),
+}
+
+impl FromSequenceSpec {
+    /// Get the FROM_SEQUENCE value for a specific partition
+    pub fn get_sequence_for_partition(&self, partition_id: u16) -> Option<u64> {
+        match self {
+            FromSequenceSpec::Single(seq) => Some(*seq),
+            FromSequenceSpec::PerPartition(map) => map.get(&partition_id).copied(),
+        }
+    }
+}
+
+impl FromBytesFrame<'_> for PartitionRange {
+    fn from_bytes_frame(frame: &BytesFrame) -> Result<Self, String> {
+        // Try to parse as a string first for ranges, lists, and "*"
+        if let Ok(s) = <&str>::from_bytes_frame(frame) {
+            // Check for wildcard "*"
+            if s == "*" {
+                return Ok(PartitionRange::All);
+            }
+
+            // Check for range format "start-end"
+            if let Some(dash_pos) = s.find('-') {
+                let start_str = &s[..dash_pos];
+                let end_str = &s[dash_pos + 1..];
+
+                let start: u16 = start_str
+                    .parse()
+                    .map_err(|_| format!("invalid start partition ID in range: '{start_str}'"))?;
+                let end: u16 = end_str
+                    .parse()
+                    .map_err(|_| format!("invalid end partition ID in range: '{end_str}'"))?;
+
+                return Ok(PartitionRange::Range(start, end));
+            }
+
+            // Check for comma-separated list "0,1,5,42"
+            if s.contains(',') {
+                let mut selectors = Vec::new();
+                for part in s.split(',') {
+                    let part = part.trim();
+                    // Try UUID first, then partition ID
+                    let selector = if let Ok(uuid) = part.parse::<Uuid>() {
+                        PartitionSelector::ByKey(uuid)
+                    } else if let Ok(id) = part.parse::<u16>() {
+                        PartitionSelector::ById(id)
+                    } else {
+                        return Err(format!("invalid partition selector in list: '{part}'"));
+                    };
+                    selectors.push(selector);
+                }
+                return Ok(PartitionRange::List(selectors));
+            }
+        }
+
+        // Fall back to single partition selector (backwards compatibility)
+        PartitionSelector::from_bytes_frame(frame).map(PartitionRange::Single)
+    }
+}
+
+impl FromBytesFrame<'_> for FromSequenceSpec {
+    fn from_bytes_frame(frame: &BytesFrame) -> Result<Self, String> {
+        // Try parsing as a single number first
+        if let Ok(sequence) = u64::from_bytes_frame(frame) {
+            return Ok(FromSequenceSpec::Single(sequence));
+        }
+
+        // Try parsing as string (could be comma-separated pairs or single number)
+        if let Ok(s) = <&str>::from_bytes_frame(frame) {
+            // Try parsing as single number first
+            if let Ok(sequence) = s.parse::<u64>() {
+                return Ok(FromSequenceSpec::Single(sequence));
+            }
+
+            // Parse as "partition:sequence,partition:sequence" format
+            if s.contains(':') {
+                let mut partition_sequences = HashMap::new();
+
+                for pair in s.split(',') {
+                    let parts: Vec<&str> = pair.split(':').collect();
+                    if parts.len() != 2 {
+                        return Err(format!("invalid partition:sequence pair: '{pair}'"));
+                    }
+
+                    let partition_id: u16 = parts[0]
+                        .parse()
+                        .map_err(|_| format!("invalid partition ID: '{}'", parts[0]))?;
+                    let sequence: u64 = parts[1]
+                        .parse()
+                        .map_err(|_| format!("invalid sequence number: '{}'", parts[1]))?;
+
+                    partition_sequences.insert(partition_id, sequence);
+                }
+
+                if partition_sequences.is_empty() {
+                    return Err("no valid partition:sequence pairs found".to_string());
+                }
+
+                return Ok(FromSequenceSpec::PerPartition(partition_sequences));
+            }
+        }
+
+        match frame {
+            // RESP3 Map format: {"0": 501, "1": 1230}
+            BytesFrame::Map { data, .. } => {
+                let mut partition_sequences = HashMap::new();
+
+                for (key_frame, value_frame) in data {
+                    // Parse partition ID from key
+                    let partition_id = match key_frame {
+                        BytesFrame::SimpleString { data, .. }
+                        | BytesFrame::BlobString { data, .. } => std::str::from_utf8(data)
+                            .map_err(|_| "invalid UTF-8 in partition ID key")?
+                            .parse::<u16>()
+                            .map_err(|_| "invalid partition ID in map key")?,
+                        BytesFrame::Number { data, .. } => {
+                            if *data < 0 || *data > u16::MAX as i64 {
+                                return Err("partition ID out of range".to_string());
+                            }
+                            *data as u16
+                        }
+                        _ => return Err("invalid type for partition ID key in map".to_string()),
+                    };
+
+                    // Parse sequence from value
+                    let sequence = u64::from_bytes_frame(value_frame)
+                        .map_err(|_| "invalid sequence value in map")?;
+
+                    partition_sequences.insert(partition_id, sequence);
+                }
+
+                Ok(FromSequenceSpec::PerPartition(partition_sequences))
+            }
+
+            // RESP3 Array format: [["0", "501"], ["1", "1230"]]
+            BytesFrame::Array { data, .. } => {
+                let mut partition_sequences = HashMap::new();
+
+                for item in data {
+                    if let BytesFrame::Array { data: pair, .. } = item {
+                        if pair.len() != 2 {
+                            return Err(
+                                "expected [partition_id, sequence] pairs in array".to_string()
+                            );
+                        }
+
+                        // Parse partition ID from first element
+                        let partition_id = match &pair[0] {
+                            BytesFrame::SimpleString { data, .. }
+                            | BytesFrame::BlobString { data, .. } => std::str::from_utf8(data)
+                                .map_err(|_| "invalid UTF-8 in partition ID")?
+                                .parse::<u16>()
+                                .map_err(|_| "invalid partition ID in array pair")?,
+                            BytesFrame::Number { data, .. } => {
+                                if *data < 0 || *data > u16::MAX as i64 {
+                                    return Err(
+                                        "partition ID out of range in array pair".to_string()
+                                    );
+                                }
+                                *data as u16
+                            }
+                            _ => {
+                                return Err(
+                                    "invalid type for partition ID in array pair".to_string()
+                                );
+                            }
+                        };
+
+                        // Parse sequence from second element
+                        let sequence = u64::from_bytes_frame(&pair[1])
+                            .map_err(|_| "invalid sequence in array pair")?;
+
+                        partition_sequences.insert(partition_id, sequence);
+                    } else {
+                        return Err(
+                            "expected array pairs in FROM_SEQUENCE array format".to_string()
+                        );
+                    }
+                }
+
+                Ok(FromSequenceSpec::PerPartition(partition_sequences))
+            }
+
+            _ => Err("expected number, map, or array for FROM_SEQUENCE".to_string()),
+        }
     }
 }
 

@@ -1,3 +1,4 @@
+use combine::{Parser, optional};
 use redis_protocol::resp3::types::BytesFrame;
 use sierradb::StreamId;
 use sierradb::id::{NAMESPACE_PARTITION_KEY, uuid_to_partition_hash};
@@ -5,7 +6,7 @@ use sierradb_cluster::read::GetStreamVersion;
 use uuid::Uuid;
 
 use crate::error::MapRedisError;
-use crate::impl_command;
+use crate::parser::{FrameStream, partition_key, stream_id};
 use crate::request::{HandleRequest, number};
 use crate::server::Conn;
 
@@ -30,7 +31,14 @@ pub struct ESVer {
     pub partition_key: Option<Uuid>,
 }
 
-impl_command!(ESVer, [stream_id], [partition_key]);
+impl ESVer {
+    pub fn parser<'a>() -> impl Parser<FrameStream<'a>, Output = ESVer> + 'a {
+        (stream_id(), optional(partition_key())).map(|(stream_id, partition_key)| ESVer {
+            stream_id,
+            partition_key,
+        })
+    }
+}
 
 impl HandleRequest for ESVer {
     type Error = String;

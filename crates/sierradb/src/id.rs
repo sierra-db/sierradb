@@ -3,25 +3,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rand::Rng;
 use uuid::{Uuid, uuid};
 
-use crate::RANDOM_STATE;
 use crate::bucket::{BucketId, PartitionHash, PartitionId};
 
 // Uuid::new_v5(&Uuid::NAMESPACE_DNS, b"sierradb.tqwewe.com")
 pub const NAMESPACE_PARTITION_KEY: Uuid = uuid!("219bd637-e279-53e9-9e2b-eabe5d9120cc");
-
-/// Hashes the stream id, and performs a modulo on the lowest 16 bits of the
-/// hash.
-pub fn stream_id_partition_id(stream_id: &str) -> PartitionId {
-    (RANDOM_STATE.hash_one(stream_id) & 0xFFFF) as u16
-}
-
-pub fn stream_id_bucket(stream_id: &str, num_buckets: u16) -> BucketId {
-    if num_buckets == 1 {
-        return 0;
-    }
-
-    stream_id_partition_id(stream_id) % num_buckets
-}
 
 /// Returns a UUID “inspired” by v7, except that 16 bits from the stream-id hash
 /// are embedded in it (bits 46–61 of the final 128-bit value).

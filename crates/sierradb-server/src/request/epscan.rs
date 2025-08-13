@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 
+use combine::error::StreamError;
+use combine::{Parser, easy, many};
 use redis_protocol::resp3::types::BytesFrame;
 use sierradb::bucket::segment::EventRecord;
 use sierradb_cluster::read::ReadPartition;
 use sierradb_protocol::ErrorCode;
 
 use crate::error::MapRedisError;
-use crate::impl_command;
+use crate::parser::{FrameStream, keyword, number_u64, partition_selector, range_value};
 use crate::request::{
     HandleRequest, PartitionSelector, RangeValue, array, encode_event, map, simple_str,
 };
@@ -33,21 +35,70 @@ use crate::server::Conn;
 /// ```
 pub struct EPScan {
     pub partition: PartitionSelector,
-    pub start_sequence: u64,
+    pub start_sequence: RangeValue,
     pub end_sequence: RangeValue,
     pub count: Option<u64>,
 }
 
-impl_command!(EPScan, [partition, start_sequence, end_sequence], [count]);
+impl EPScan {
+    pub fn parser<'a>() -> impl Parser<FrameStream<'a>, Output = EPScan> + 'a {
+        (
+            partition_selector(),
+            range_value(),
+            range_value(),
+            many::<Vec<_>, _, _>(OptionalArg::parser()),
+        )
+            .and_then(|(partition, start_sequence, end_sequence, args)| {
+                let mut cmd = EPScan {
+                    partition,
+                    start_sequence,
+                    end_sequence,
+                    count: None,
+                };
+
+                for arg in args {
+                    match arg {
+                        OptionalArg::Count(count) => {
+                            if cmd.count.is_some() {
+                                return Err(easy::Error::message_format("count already specified"));
+                            }
+
+                            cmd.count = Some(count);
+                        }
+                    }
+                }
+
+                Ok(cmd)
+            })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum OptionalArg {
+    Count(u64),
+}
+
+impl OptionalArg {
+    fn parser<'a>() -> impl Parser<FrameStream<'a>, Output = OptionalArg> + 'a {
+        keyword("COUNT").with(number_u64()).map(OptionalArg::Count)
+    }
+}
 
 impl HandleRequest for EPScan {
     type Error = String;
     type Ok = EPScanResp;
 
     async fn handle_request(self, conn: &mut Conn) -> Result<Option<Self::Ok>, Self::Error> {
+        let start_sequence = match self.start_sequence {
+            RangeValue::Start => 0,
+            RangeValue::End => {
+                return Err(ErrorCode::InvalidArg.with_message("start sequence cannot be '+'"));
+            }
+            RangeValue::Value(n) => n,
+        };
         let end_sequence = match self.end_sequence {
             RangeValue::Start => {
-                return Err(ErrorCode::Syntax.with_message("end_sequence cannot be '-'"));
+                return Err(ErrorCode::InvalidArg.with_message("end sequence cannot be '-'"));
             }
             RangeValue::End => None,
             RangeValue::Value(n) => Some(n),
@@ -57,7 +108,7 @@ impl HandleRequest for EPScan {
             .cluster_ref
             .ask(ReadPartition {
                 partition_id: self.partition.into_partition_id(conn.num_partitions),
-                start_sequence: self.start_sequence,
+                start_sequence,
                 end_sequence,
                 count: self.count.unwrap_or(100),
             })

@@ -7,7 +7,7 @@ use smallvec::{SmallVec, smallvec};
 use tracing::{error, instrument};
 use uuid::Uuid;
 
-use crate::{ClusterActor, confirmation::actor::UpdateConfirmation, subscription::NotifyEvent};
+use crate::{ClusterActor, confirmation::actor::UpdateConfirmation};
 
 use super::{error::ConfirmTransactionError, transaction::set_confirmations_with_retry};
 
@@ -32,7 +32,7 @@ impl Message<ConfirmTransaction> for ClusterActor {
     ) -> Self::Reply {
         let database = self.database.clone();
         let confirmation_ref = self.confirmation_ref.clone();
-        let cluster_ref = ctx.actor_ref().clone();
+        let broadcast_tx = self.subscription_manager.broadcaster();
 
         ctx.spawn(async move {
             let Some(first_event_id) = msg.event_ids.first() else {
@@ -106,15 +106,8 @@ impl Message<ConfirmTransaction> for ClusterActor {
 
                     // Notify subscriptions about confirmed events
                     for event in commit {
-                        let res = cluster_ref
-                            .tell(NotifyEvent {
-                                partition_id: msg.partition_id,
-                                event,
-                            })
-                            .send()
-                            .await;
-                        if let Err(err) = res {
-                            error!("failed to notify confirmed event to cluster: {err}");
+                        if broadcast_tx.send(event).is_err() {
+                            break;
                         }
                     }
 

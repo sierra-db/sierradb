@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use combine::error::StreamError;
+use combine::{Parser, attempt, choice, easy, many};
 use redis_protocol::resp3::types::BytesFrame;
 use sierradb::StreamId;
 use sierradb::bucket::segment::EventRecord;
@@ -9,7 +11,7 @@ use sierradb_protocol::ErrorCode;
 use uuid::Uuid;
 
 use crate::error::MapRedisError;
-use crate::impl_command;
+use crate::parser::{FrameStream, keyword, number_u64, partition_key, range_value, stream_id};
 use crate::request::{HandleRequest, RangeValue, array, encode_event, map, simple_str};
 use crate::server::Conn;
 
@@ -34,17 +36,71 @@ use crate::server::Conn;
 /// ```
 pub struct EScan {
     pub stream_id: StreamId,
-    pub start_version: u64,
+    pub start_version: RangeValue,
     pub end_version: RangeValue,
     pub partition_key: Option<Uuid>,
     pub count: Option<u64>,
 }
 
-impl_command!(
-    EScan,
-    [stream_id, start_version, end_version],
-    [partition_key, count]
-);
+impl EScan {
+    pub fn parser<'a>() -> impl Parser<FrameStream<'a>, Output = EScan> + 'a {
+        (
+            stream_id(),
+            range_value(),
+            range_value(),
+            many::<Vec<_>, _, _>(OptionalArg::parser()),
+        )
+            .and_then(|(stream_id, start_version, end_version, args)| {
+                let mut cmd = EScan {
+                    stream_id,
+                    start_version,
+                    end_version,
+                    partition_key: None,
+                    count: None,
+                };
+
+                for arg in args {
+                    match arg {
+                        OptionalArg::PartitionKey(partition_key) => {
+                            if cmd.partition_key.is_some() {
+                                return Err(easy::Error::message_format(
+                                    "partition key already specified",
+                                ));
+                            }
+
+                            cmd.partition_key = Some(partition_key);
+                        }
+                        OptionalArg::Count(count) => {
+                            if cmd.count.is_some() {
+                                return Err(easy::Error::message_format("count already specified"));
+                            }
+
+                            cmd.count = Some(count);
+                        }
+                    }
+                }
+
+                Ok(cmd)
+            })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum OptionalArg {
+    PartitionKey(Uuid),
+    Count(u64),
+}
+
+impl OptionalArg {
+    fn parser<'a>() -> impl Parser<FrameStream<'a>, Output = OptionalArg> + 'a {
+        let partition_key = keyword("PARTITION_KEY")
+            .with(partition_key())
+            .map(OptionalArg::PartitionKey);
+        let count = keyword("COUNT").with(number_u64()).map(OptionalArg::Count);
+
+        choice!(attempt(partition_key), attempt(count))
+    }
+}
 
 impl HandleRequest for EScan {
     type Error = String;
@@ -57,9 +113,17 @@ impl HandleRequest for EScan {
         let partition_hash = uuid_to_partition_hash(partition_key);
         let partition_id = partition_hash % conn.num_partitions;
 
+        let start_version = match self.start_version {
+            RangeValue::Start => 0,
+            RangeValue::End => {
+                return Err(ErrorCode::InvalidArg.with_message("start version cannot be '+'"));
+            }
+            RangeValue::Value(n) => n,
+        };
+
         let end_version = match self.end_version {
             RangeValue::Start => {
-                return Err(ErrorCode::Syntax.with_message("end_version cannot be '-'"));
+                return Err(ErrorCode::InvalidArg.with_message("end version cannot be '-'"));
             }
             RangeValue::End => None,
             RangeValue::Value(n) => Some(n),
@@ -70,7 +134,7 @@ impl HandleRequest for EScan {
             .ask(ReadStream {
                 stream_id: self.stream_id,
                 partition_id,
-                start_version: self.start_version,
+                start_version,
                 end_version,
                 count: self.count.unwrap_or(100),
             })

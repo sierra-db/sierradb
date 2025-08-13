@@ -1,14 +1,20 @@
 use std::convert::Infallible;
 
+use combine::{Parser, value};
 use redis_protocol::resp3::types::BytesFrame;
 
-use crate::impl_command;
+use crate::parser::FrameStream;
 use crate::request::{HandleRequest, simple_str};
 use crate::server::Conn;
 
+#[derive(Clone, Copy)]
 pub struct Ping {}
 
-impl_command!(Ping, [], []);
+impl Ping {
+    pub fn parser<'a>() -> impl Parser<FrameStream<'a>, Output = Ping> + 'a {
+        value(Ping {})
+    }
+}
 
 impl HandleRequest for Ping {
     type Error = Infallible;

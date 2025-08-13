@@ -24,40 +24,6 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::ClusterActor;
-
-pub struct Subscribe {
-    pub subscription_id: Uuid,
-    pub matcher: SubscriptionMatcher,
-    pub last_ack_rx: watch::Receiver<Option<u64>>,
-    pub update_tx: UnboundedSender<SubscriptionEvent>,
-    pub window_size: u64,
-}
-
-impl Message<Subscribe> for ClusterActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        Subscribe {
-            subscription_id,
-            matcher,
-            last_ack_rx,
-            update_tx,
-            window_size,
-        }: Subscribe,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        self.subscription_manager.subscribe(
-            subscription_id,
-            matcher,
-            last_ack_rx,
-            update_tx,
-            window_size,
-        );
-    }
-}
-
 pub enum SubscriptionEvent {
     Record {
         subscription_id: Uuid,
@@ -220,6 +186,7 @@ pub struct SubscriptionManager {
     owned_partitions: Arc<HashSet<PartitionId>>,
     num_partitions: u16,
     broadcast_tx: broadcast::Sender<EventRecord>,
+    update_tx: UnboundedSender<SubscriptionEvent>,
 }
 
 impl SubscriptionManager {
@@ -227,14 +194,15 @@ impl SubscriptionManager {
         database: Database,
         owned_partitions: Arc<HashSet<PartitionId>>,
         num_partitions: u16,
+        broadcast_tx: broadcast::Sender<EventRecord>,
+        update_tx: UnboundedSender<SubscriptionEvent>,
     ) -> Self {
-        let (broadcast_tx, _) = broadcast::channel(1_000);
-
         SubscriptionManager {
             database,
             owned_partitions,
             num_partitions,
             broadcast_tx,
+            update_tx,
         }
     }
 
@@ -242,8 +210,7 @@ impl SubscriptionManager {
         &mut self,
         subscription_id: Uuid,
         matcher: SubscriptionMatcher,
-        last_ack_rx: watch::Receiver<Option<u64>>,
-        update_tx: UnboundedSender<SubscriptionEvent>,
+        last_ack_rx: watch::Receiver<u64>,
         window_size: u64,
     ) {
         let subscription = Subscription {
@@ -251,21 +218,13 @@ impl SubscriptionManager {
             owned_partitions: self.owned_partitions.clone(),
             num_partitions: self.num_partitions,
             broadcast_rx: self.broadcast_tx.subscribe(),
-            update_tx,
+            update_tx: self.update_tx.clone(),
             last_ack_rx,
             window_size,
             subscription_id,
             cursor: 0,
         };
         subscription.spawn(matcher);
-    }
-
-    pub fn broadcast(&self, record: EventRecord) {
-        let _ = self.broadcast_tx.send(record);
-    }
-
-    pub fn broadcaster(&self) -> broadcast::Sender<EventRecord> {
-        self.broadcast_tx.clone()
     }
 }
 
@@ -275,7 +234,7 @@ struct Subscription {
     num_partitions: u16,
     broadcast_rx: broadcast::Receiver<EventRecord>,
     update_tx: UnboundedSender<SubscriptionEvent>,
-    last_ack_rx: watch::Receiver<Option<u64>>,
+    last_ack_rx: watch::Receiver<u64>,
     window_size: u64,
     subscription_id: Uuid,
     cursor: u64,
@@ -325,11 +284,8 @@ impl Subscription {
     async fn send_record(&mut self, record: EventRecord) -> Result<(), SubscriptionError> {
         self.last_ack_rx
             .wait_for(|last_ack| {
-                let gap = match last_ack {
-                    Some(last_ack) => self.cursor.saturating_sub(*last_ack),
-                    None => self.cursor + 1,
-                };
-                gap <= self.window_size
+                let gap = self.cursor.saturating_sub(*last_ack);
+                gap < self.window_size
             })
             .await?;
 
@@ -614,7 +570,7 @@ mod tests {
         let num_partitions = owned_partitions.len() as u16;
         let (_broadcast_tx, broadcast_rx) = broadcast::channel(10);
         let (update_tx, _update_rx) = mpsc::unbounded_channel();
-        let (_last_ack_tx, last_ack_rx) = watch::channel(None);
+        let (_last_ack_tx, last_ack_rx) = watch::channel(0);
         let window_size = 10;
         let subscription_id = Uuid::new_v4();
 
@@ -685,7 +641,7 @@ mod tests {
         let num_partitions = owned_partitions.len() as u16;
         let (_broadcast_tx, broadcast_rx) = broadcast::channel(10);
         let (update_tx, _update_rx) = mpsc::unbounded_channel();
-        let (_last_ack_tx, last_ack_rx) = watch::channel(None);
+        let (_last_ack_tx, last_ack_rx) = watch::channel(0);
         let window_size = 10;
         let subscription_id = Uuid::new_v4();
 
@@ -820,7 +776,7 @@ mod tests {
         let num_partitions = owned_partitions.len() as u16;
         let (_broadcast_tx, broadcast_rx) = broadcast::channel(10);
         let (update_tx, _update_rx) = mpsc::unbounded_channel();
-        let (_last_ack_tx, last_ack_rx) = watch::channel(None);
+        let (_last_ack_tx, last_ack_rx) = watch::channel(0);
         let window_size = 10;
         let subscription_id = Uuid::new_v4();
 
@@ -888,7 +844,7 @@ mod tests {
         let num_partitions = owned_partitions.len() as u16;
         let (_broadcast_tx, broadcast_rx) = broadcast::channel(10);
         let (update_tx, _update_rx) = mpsc::unbounded_channel();
-        let (_last_ack_tx, last_ack_rx) = watch::channel(None);
+        let (_last_ack_tx, last_ack_rx) = watch::channel(0);
         let window_size = 10;
         let subscription_id = Uuid::new_v4();
 

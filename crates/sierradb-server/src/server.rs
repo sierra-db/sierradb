@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use kameo::actor::ActorRef;
 use libp2p::bytes::BytesMut;
@@ -7,14 +7,14 @@ use redis_protocol::resp3::decode::complete::decode_bytes_mut;
 use redis_protocol::resp3::types::BytesFrame;
 use sierradb::bucket::segment::EventRecord;
 use sierradb_cluster::ClusterActor;
-use sierradb_cluster::subscription::{RemoveSubscription, SubscriptionMessage};
+use sierradb_cluster::subscription::SubscriptionEvent;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use crate::request::{Command, encode_event, simple_str};
+use crate::request::{Command, encode_event, number, simple_str};
 
 pub struct Server {
     cluster_ref: ActorRef<ClusterActor>,
@@ -56,10 +56,10 @@ pub struct Conn {
     pub read: BytesMut,
     pub write: BytesMut,
     pub subscription_channel: Option<(
-        mpsc::WeakUnboundedSender<SubscriptionMessage>,
-        mpsc::UnboundedReceiver<SubscriptionMessage>,
+        mpsc::WeakUnboundedSender<SubscriptionEvent>,
+        mpsc::UnboundedReceiver<SubscriptionEvent>,
     )>,
-    pub subscriptions: HashSet<Uuid>,
+    pub subscriptions: HashMap<Uuid, watch::Sender<Option<u64>>>,
 }
 
 impl Conn {
@@ -74,7 +74,7 @@ impl Conn {
             write,
             num_partitions,
             subscription_channel: None,
-            subscriptions: HashSet::new(),
+            subscriptions: HashMap::new(),
         }
     }
 
@@ -88,7 +88,7 @@ impl Conn {
                                 Ok(bytes_read) => {
                                     if bytes_read == 0 && self.read.is_empty() {
                                         // Clean up subscriptions on disconnect
-                                        self.cleanup_subscriptions().await;
+                                        self.cleanup_subscriptions();
                                         return Ok(());
                                     }
 
@@ -112,8 +112,17 @@ impl Conn {
                         }
                         msg = rx.recv() => {
                             match msg {
-                                Some(SubscriptionMessage { subscription_id, record }) => self.send_subscription_event(subscription_id, record).await?,
-                                None => self.cleanup_subscriptions().await,
+                                Some(SubscriptionEvent::Record { subscription_id, cursor, record }) => self.send_subscription_event(subscription_id, cursor, record).await?,
+                                Some(SubscriptionEvent::Error { subscription_id, error }) => {
+                                    warn!(%subscription_id, "subscription error: {error}");
+                                }
+                                Some(SubscriptionEvent::Closed { subscription_id }) => {
+                                    self.subscriptions.remove(&subscription_id);
+                                    if self.subscriptions.is_empty() {
+                                        self.cleanup_subscriptions();
+                                    }
+                                }
+                                None => self.cleanup_subscriptions(),
                             }
                         }
                     }
@@ -144,15 +153,7 @@ impl Conn {
         }
     }
 
-    async fn cleanup_subscriptions(&mut self) {
-        for subscription_id in &self.subscriptions {
-            let _ = self
-                .cluster_ref
-                .tell(RemoveSubscription {
-                    subscription_id: *subscription_id,
-                })
-                .await;
-        }
+    fn cleanup_subscriptions(&mut self) {
         self.subscriptions.clear();
         self.subscription_channel = None;
     }
@@ -160,6 +161,7 @@ impl Conn {
     async fn send_subscription_event(
         &mut self,
         subscription_id: Uuid,
+        cursor: u64,
         record: EventRecord,
     ) -> io::Result<()> {
         resp3::encode::complete::extend_encode(
@@ -168,6 +170,7 @@ impl Conn {
                 data: vec![
                     simple_str("message"),
                     simple_str(subscription_id.to_string()),
+                    number(cursor as i64),
                     encode_event(record),
                 ],
                 attributes: None,

@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use combine::error::StreamError;
+use combine::{Parser, attempt, choice, easy, many, many1};
 use redis_protocol::resp3::types::BytesFrame;
 use sierradb::StreamId;
 use sierradb::bucket::PartitionId;
@@ -12,7 +14,11 @@ use smallvec::SmallVec;
 use uuid::Uuid;
 
 use crate::error::MapRedisError;
-use crate::request::{FromArgs, FromBytesFrame, HandleRequest, array, map, number, simple_str};
+use crate::parser::{
+    FrameStream, data, event_id, expected_version, keyword, number_u64, partition_key, stream_id,
+    string,
+};
+use crate::request::{HandleRequest, array, map, number, simple_str};
 use crate::server::Conn;
 
 /// Append multiple events to streams in a single transaction.
@@ -59,134 +65,115 @@ pub struct Event {
     pub metadata: Vec<u8>,
 }
 
-impl FromArgs for EMAppend {
-    fn from_args(args: &[BytesFrame]) -> Result<Self, String> {
-        if args.is_empty() {
-            return Err(ErrorCode::InvalidArg.with_message("missing partition_key argument"));
-        }
-
-        let mut i = 0;
-
-        // Parse required partition_key (first positional argument)
-        let partition_key = Uuid::from_bytes_frame(&args[i]).map_err(|err| {
-            ErrorCode::InvalidArg
-                .with_message(format!("failed to parse partition_key argument: {err}"))
-        })?;
-        i += 1;
-
-        let mut events = Vec::new();
-
-        while i < args.len() {
-            // Parse stream_id (required for each event)
-            let stream_id = StreamId::from_bytes_frame(&args[i]).map_err(|err| {
-                ErrorCode::InvalidArg
-                    .with_message(format!("failed to parse stream_id argument: {err}"))
-            })?;
-            i += 1;
-
-            if i >= args.len() {
-                return Err(ErrorCode::InvalidArg.with_message("missing event_name argument"));
-            }
-
-            // Parse event_name (required for each event)
-            let event_name = String::from_bytes_frame(&args[i])?;
-            i += 1;
-
-            // Initialize optional fields
-            let mut event_id = None;
-            let mut expected_version = ExpectedVersion::default();
-            let mut timestamp = None;
-            let mut payload = Vec::new();
-            let mut metadata = Vec::new();
-
-            // Parse optional fields for this event
-            while i < args.len() {
-                let field_name_str = match <&str>::from_bytes_frame(&args[i]) {
-                    Ok(s) => s.to_lowercase(),
-                    Err(_) => break, // Not a string, probably next event's stream_id
+impl Event {
+    fn parser<'a>() -> impl Parser<FrameStream<'a>, Output = Event> + 'a {
+        (
+            stream_id(),
+            string().expected("event name"),
+            many::<Vec<_>, _, _>(OptionalArg::parser()),
+        )
+            .and_then(|(stream_id, event_name, args)| {
+                let mut cmd = Event {
+                    stream_id,
+                    event_name: event_name.to_string(),
+                    ..Default::default()
                 };
 
-                // Check if this looks like a field name
-                if ![
-                    "event_id",
-                    "expected_version",
-                    "timestamp",
-                    "payload",
-                    "metadata",
-                ]
-                .contains(&field_name_str.as_str())
-                {
-                    // This is likely a new event's stream_id, don't consume it
-                    break;
+                for arg in args {
+                    match arg {
+                        OptionalArg::EventId(event_id) => {
+                            if cmd.event_id.is_some() {
+                                return Err(easy::Error::message_format(
+                                    "event id already specified",
+                                ));
+                            }
+
+                            cmd.event_id = Some(event_id);
+                        }
+                        OptionalArg::ExpectedVersion(expected_version) => {
+                            if !matches!(cmd.expected_version, ExpectedVersion::Any) {
+                                return Err(easy::Error::message_format(
+                                    "expected version already specified",
+                                ));
+                            }
+
+                            cmd.expected_version = expected_version;
+                        }
+                        OptionalArg::Timestamp(timestamp) => {
+                            if cmd.timestamp.is_some() {
+                                return Err(easy::Error::message_format(
+                                    "timestamp already specified",
+                                ));
+                            }
+
+                            cmd.timestamp = Some(timestamp);
+                        }
+                        OptionalArg::Payload(payload) => {
+                            if !cmd.payload.is_empty() {
+                                return Err(easy::Error::message_format(
+                                    "payload already specified",
+                                ));
+                            }
+
+                            cmd.payload = payload.to_vec();
+                        }
+                        OptionalArg::Metadata(metadata) => {
+                            if !cmd.metadata.is_empty() {
+                                return Err(easy::Error::message_format(
+                                    "metadata already specified",
+                                ));
+                            }
+
+                            cmd.metadata = metadata.to_vec();
+                        }
+                    }
                 }
 
-                i += 1; // consume field name
-                if i >= args.len() {
-                    return Err(ErrorCode::InvalidArg
-                        .with_message(format!("expected value after {field_name_str}")));
-                }
+                Ok(cmd)
+            })
+    }
+}
 
-                let value = &args[i];
-                i += 1; // consume field value
+#[derive(Debug, Clone, PartialEq)]
+enum OptionalArg<'a> {
+    EventId(Uuid),
+    ExpectedVersion(ExpectedVersion),
+    Timestamp(u64),
+    Payload(&'a [u8]),
+    Metadata(&'a [u8]),
+}
 
-                match field_name_str.as_str() {
-                    "event_id" => {
-                        event_id = FromBytesFrame::from_bytes_frame(value).map_err(|err| {
-                            ErrorCode::InvalidArg
-                                .with_message(format!("failed to parse event_id arg: {err}"))
-                        })?;
-                    }
-                    "expected_version" => {
-                        expected_version =
-                            FromBytesFrame::from_bytes_frame(value).map_err(|err| {
-                                ErrorCode::InvalidArg.with_message(format!(
-                                    "failed to parse expected_version arg: {err}"
-                                ))
-                            })?;
-                    }
-                    "timestamp" => {
-                        timestamp = FromBytesFrame::from_bytes_frame(value).map_err(|err| {
-                            ErrorCode::InvalidArg
-                                .with_message(format!("failed to parse timestamp arg: {err}"))
-                        })?;
-                    }
-                    "payload" => {
-                        payload = FromBytesFrame::from_bytes_frame(value).map_err(|err| {
-                            ErrorCode::InvalidArg
-                                .with_message(format!("failed to parse payload arg: {err}"))
-                        })?;
-                    }
-                    "metadata" => {
-                        metadata = FromBytesFrame::from_bytes_frame(value).map_err(|err| {
-                            ErrorCode::InvalidArg
-                                .with_message(format!("failed to parse metadata arg: {err}"))
-                        })?;
-                    }
-                    _ => {
-                        return Err(ErrorCode::InvalidArg
-                            .with_message(format!("unknown field '{field_name_str}'")));
-                    }
-                }
+impl<'a> OptionalArg<'a> {
+    fn parser() -> impl Parser<FrameStream<'a>, Output = OptionalArg<'a>> + 'a {
+        let event_id = keyword("EVENT_ID")
+            .with(event_id())
+            .map(OptionalArg::EventId);
+        let expected_version = keyword("EXPECTED_VERSION")
+            .with(expected_version())
+            .map(OptionalArg::ExpectedVersion);
+        let timestamp = keyword("TIMESTAMP")
+            .with(number_u64())
+            .map(OptionalArg::Timestamp);
+        let payload = keyword("PAYLOAD").with(data()).map(OptionalArg::Payload);
+        let metadata = keyword("METADATA").with(data()).map(OptionalArg::Metadata);
+
+        choice!(
+            attempt(event_id),
+            attempt(expected_version),
+            attempt(timestamp),
+            attempt(payload),
+            attempt(metadata)
+        )
+    }
+}
+
+impl EMAppend {
+    pub fn parser<'a>() -> impl Parser<FrameStream<'a>, Output = EMAppend> + 'a {
+        (partition_key(), many1::<Vec<_>, _, _>(Event::parser())).map(|(partition_key, events)| {
+            EMAppend {
+                partition_key,
+                events,
             }
-
-            events.push(Event {
-                stream_id,
-                event_name,
-                event_id,
-                expected_version,
-                timestamp,
-                payload,
-                metadata,
-            });
-        }
-
-        if events.is_empty() {
-            return Err(ErrorCode::InvalidArg.with_message("at least one event required"));
-        }
-
-        Ok(EMAppend {
-            partition_key,
-            events,
         })
     }
 }

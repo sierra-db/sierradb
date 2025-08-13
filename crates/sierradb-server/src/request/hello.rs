@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 
+use combine::Parser;
 use libp2p::PeerId;
 use redis_protocol::resp3::types::BytesFrame;
 
-use crate::impl_command;
+use crate::parser::{FrameStream, number_i64};
 use crate::request::{HandleRequest, blob_str, map, number};
 use crate::server::Conn;
 
@@ -11,7 +12,11 @@ pub struct Hello {
     pub version: i64,
 }
 
-impl_command!(Hello, [version], []);
+impl Hello {
+    pub fn parser<'a>() -> impl Parser<FrameStream<'a>, Output = Hello> + 'a {
+        number_i64().map(|version| Hello { version })
+    }
+}
 
 impl HandleRequest for Hello {
     type Error = String;

@@ -206,11 +206,17 @@ impl Actor for ClusterActor {
             .collect();
 
         let confirmation_actor =
-            ConfirmationActor::new(&database, replication_factor, assigned_partitions)
+            ConfirmationActor::new(&database, replication_factor, assigned_partitions.clone())
                 .await
                 .map_err(|err| ClusterError::ConfirmationFailure(err.to_string()))?;
         let watermarks = confirmation_actor.manager.get_watermarks();
         let confirmation_ref = Actor::spawn(confirmation_actor);
+
+        let subscription_manager = SubscriptionManager::new(
+            database.clone(),
+            Arc::new(assigned_partitions),
+            partition_count,
+        );
 
         let circuit_breaker = Arc::new(WriteCircuitBreaker::with_defaults());
 
@@ -223,7 +229,7 @@ impl Actor for ClusterActor {
             watermarks,
             circuit_breaker,
             replicator_refs,
-            subscription_manager: SubscriptionManager::new(),
+            subscription_manager,
         })
     }
 

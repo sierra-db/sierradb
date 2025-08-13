@@ -1,8 +1,9 @@
+use combine::Parser;
 use redis_protocol::resp3::types::BytesFrame;
 use sierradb_cluster::read::GetPartitionSequence;
 
 use crate::error::MapRedisError;
-use crate::impl_command;
+use crate::parser::{FrameStream, partition_selector};
 use crate::request::{HandleRequest, PartitionSelector, number};
 use crate::server::Conn;
 
@@ -25,7 +26,11 @@ pub struct EPSeq {
     pub partition: PartitionSelector,
 }
 
-impl_command!(EPSeq, [partition], []);
+impl EPSeq {
+    pub fn parser<'a>() -> impl Parser<FrameStream<'a>, Output = EPSeq> + 'a {
+        partition_selector().map(|partition| EPSeq { partition })
+    }
+}
 
 impl HandleRequest for EPSeq {
     type Error = String;
