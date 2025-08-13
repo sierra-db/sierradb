@@ -6,7 +6,7 @@ use sierradb_cluster::read::GetStreamVersion;
 use uuid::Uuid;
 
 use crate::error::MapRedisError;
-use crate::parser::{FrameStream, partition_key, stream_id};
+use crate::parser::{FrameStream, keyword, partition_key, stream_id};
 use crate::request::{HandleRequest, number};
 use crate::server::Conn;
 
@@ -33,10 +33,14 @@ pub struct ESVer {
 
 impl ESVer {
     pub fn parser<'a>() -> impl Parser<FrameStream<'a>, Output = ESVer> + 'a {
-        (stream_id(), optional(partition_key())).map(|(stream_id, partition_key)| ESVer {
-            stream_id,
-            partition_key,
-        })
+        (
+            stream_id(),
+            optional(keyword("PARTITION_KEY").with(partition_key())),
+        )
+            .map(|(stream_id, partition_key)| ESVer {
+                stream_id,
+                partition_key,
+            })
     }
 }
 

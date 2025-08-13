@@ -38,11 +38,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::select! {
             // msg = stream_sub.next_message() => {
             //     match msg {
-            //         Some(SierraMessage::Event(event)) => {
-            //             println!("[Stream] Event: {} v{} - {}",
+            //         Some(SierraMessage::Event { event, cursor }) => {
+            //             println!("[Stream] Event: {} v{} - {} (cursor: {})",
             //                     event.event_name,
             //                     event.stream_version,
-            //                     event.stream_id);
+            //                     event.stream_id,
+            //                     cursor);
+            //             stream_sub.acknowledge_up_to_cursor(cursor).await?;
             //         }
             //         Some(SierraMessage::SubscriptionConfirmed { subscription_count }) => {
             //             println!("[Stream] Subscription confirmed (total active: {subscription_count})");
@@ -55,13 +57,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // }
             msg = partition_sub.next_message() => {
                 match msg {
-                    Some(SierraMessage::Event(event)) => {
-                        println!("[Partition] Event: {} seq{} - {}",
+                    Some(SierraMessage::Event { event, cursor }) => {
+                        println!("[Partition] Event: {} seq{} - {} (cursor: {})",
                             event.event_name,
                             event.partition_sequence,
                             event.stream_id,
+                            cursor,
                         );
-                        partition_sub.acknowledge_all_events().await?;
+                        partition_sub.acknowledge_up_to_cursor(cursor).await?;
                     }
                     Some(SierraMessage::SubscriptionConfirmed { subscription_count }) => {
                         println!("[Partition] Subscription confirmed (total active: {subscription_count})");

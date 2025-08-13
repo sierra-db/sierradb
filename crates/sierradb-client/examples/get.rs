@@ -1,5 +1,4 @@
 use redis::cluster::ClusterClient;
-use sierradb_client::{Commands, EAppendOptions, ExpectedVersion};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let nodes = vec![
@@ -8,7 +7,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // "redis://127.0.0.1:6377/",
     ];
     let client = ClusterClient::new(nodes).unwrap();
-    let mut connection = client.get_connection().unwrap();
+    let _connection = client.get_connection().unwrap();
 
     // let client = redis::Client::open("redis://127.0.0.1:9090/")?;
     // let mut con = client.get_connection()?;

@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
 use combine::{Parser, choice, many1, optional};
-use kameo::error::Infallible;
 use redis_protocol::resp3;
 use redis_protocol::resp3::types::BytesFrame;
 use sierradb::StreamId;
@@ -220,7 +219,8 @@ impl HandleRequest for ESub {
                 window_size: self.window_size.unwrap_or(1_000),
             })
             .await
-            .map_err(|err| match err {
+            .map_err(|err|
+                //match err {
                 // SendError::HandlerError(replicas) => ErrorCode::Redirect.with_message(
                 //     replicas
                 //         .into_iter()
@@ -228,10 +228,9 @@ impl HandleRequest for ESub {
                 //         .collect::<Vec<_>>()
                 //         .join(" "),
                 // ),
-                err => err
-                    .map_err::<Infallible, _>(|_| unreachable!())
-                    .as_redis_error(),
-            })?;
+                err
+                    .map_err::<&'static str, _>(|_| "error")
+                    .as_redis_error())?;
 
         conn.subscriptions.insert(subscription_id, last_ack_tx);
 

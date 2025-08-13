@@ -132,11 +132,11 @@ impl SubscriptionManager {
         }
 
         if let Some(version) = from_version {
-            cmd.arg("FROM_VERSION").arg(version);
+            cmd.arg("FROM").arg(version);
         }
 
         if let Some(size) = window_size {
-            cmd.arg("WINDOW_SIZE").arg(size);
+            cmd.arg("WINDOW").arg(size);
         }
 
         let response: Value = cmd.query_async(&mut inner.connection).await?;
@@ -351,11 +351,11 @@ impl SubscriptionManager {
         };
 
         if let Some(sequence) = from_sequence {
-            cmd.arg("FROM_SEQUENCE").arg(sequence);
+            cmd.arg("FROM").arg(sequence);
         }
 
         if let Some(size) = window_size {
-            cmd.arg("WINDOW_SIZE").arg(size);
+            cmd.arg("WINDOW").arg(size);
         }
 
         let response: Value = cmd.query_async(&mut inner.connection).await?;
@@ -382,37 +382,20 @@ impl SubscriptionManager {
         })
     }
 
-    /// Acknowledge events up to a specific sequence/version for a subscription.
+    /// Acknowledge events up to a specific cursor for a subscription.
     ///
-    /// For stream subscriptions, this acknowledges all events up to and
-    /// including the specified stream version. For partition subscriptions,
-    /// this acknowledges all events up to and including the specified
-    /// partition sequence.
-    pub async fn acknowledge_events(
+    /// The cursor value is provided with each event in the subscription stream.
+    /// Acknowledging up to a cursor allows the subscription window to advance.
+    pub async fn acknowledge_up_to_cursor(
         &mut self,
         subscription_id: Uuid,
-        up_to_sequence_or_version: u64,
+        cursor: u64,
     ) -> RedisResult<()> {
         let mut inner = self.inner.lock().await;
 
         let _response: Value = cmd("EACK")
             .arg(subscription_id.to_string())
-            .arg(up_to_sequence_or_version)
-            .query_async(&mut inner.connection)
-            .await?;
-
-        Ok(())
-    }
-
-    /// Acknowledge all pending events for a subscription.
-    ///
-    /// This clears all unacknowledged events and resets the subscription
-    /// window, effectively allowing maximum throughput.
-    pub async fn acknowledge_all_events(&mut self, subscription_id: Uuid) -> RedisResult<()> {
-        let mut inner = self.inner.lock().await;
-
-        let _response: Value = cmd("EPACK")
-            .arg(subscription_id.to_string())
+            .arg(cursor)
             .query_async(&mut inner.connection)
             .await?;
 
@@ -444,10 +427,10 @@ impl SubscriptionManager {
 
         let mut cmd = cmd("EPSUB");
         cmd.arg(partition_range);
-        cmd.arg("FROM_SEQUENCE").arg(from_sequence);
+        cmd.arg("FROM").arg(from_sequence);
 
         if let Some(size) = window_size {
-            cmd.arg("WINDOW_SIZE").arg(size);
+            cmd.arg("WINDOW").arg(size);
         }
 
         let response: Value = cmd.query_async(&mut inner.connection).await?;
@@ -510,17 +493,16 @@ impl SubscriptionManager {
             partition_sequences.keys().map(|&p| p.to_string()).collect();
         cmd.arg(partition_list.join(","));
 
-        cmd.arg("FROM_SEQUENCE");
+        cmd.arg("FROM");
+        cmd.arg("MAP");
 
-        // Send as simple "partition:sequence,partition:sequence" format
-        let sequence_pairs: Vec<String> = partition_sequences
-            .iter()
-            .map(|(p, s)| format!("{p}:{s}"))
-            .collect();
-        cmd.arg(sequence_pairs.join(","));
+        // Send as space-separated "partition=sequence partition=sequence" format
+        for (partition_id, sequence) in &partition_sequences {
+            cmd.arg(format!("{partition_id}={sequence}"));
+        }
 
         if let Some(size) = window_size {
-            cmd.arg("WINDOW_SIZE").arg(size);
+            cmd.arg("WINDOW").arg(size);
         }
 
         let response: Value = cmd.query_async(&mut inner.connection).await?;
@@ -584,54 +566,154 @@ impl SubscriptionManager {
         self.subscribe_to_partitions(&range, from_sequence, window_size)
             .await
     }
+
+    /// Subscribe to events from a stream starting from latest.
+    pub async fn subscribe_to_stream_from_latest<S: redis::ToRedisArgs>(
+        &mut self,
+        stream_id: S,
+    ) -> RedisResult<EventSubscription> {
+        let mut inner = self.inner.lock().await;
+
+        let mut cmd = cmd("ESUB");
+        cmd.arg(stream_id);
+        cmd.arg("FROM");
+        cmd.arg("LATEST");
+
+        let response: Value = cmd.query_async(&mut inner.connection).await?;
+
+        let subscription_id = match response {
+            Value::SimpleString(id_str) => Uuid::parse_str(&id_str).map_err(|_| {
+                RedisError::from((redis::ErrorKind::TypeError, "Invalid UUID in response"))
+            })?,
+            _ => {
+                return Err(RedisError::from((
+                    redis::ErrorKind::TypeError,
+                    "Expected subscription ID",
+                )));
+            }
+        };
+
+        let (sender, receiver) = mpsc::unbounded_channel();
+        inner.subscriptions.insert(subscription_id, sender);
+
+        Ok(EventSubscription {
+            subscription_id,
+            receiver,
+            manager: self.inner.clone(),
+        })
+    }
+
+    /// Subscribe to events from all partitions starting from latest.
+    pub async fn subscribe_to_all_partitions_from_latest(
+        &mut self,
+    ) -> RedisResult<EventSubscription> {
+        let mut inner = self.inner.lock().await;
+
+        let mut cmd = cmd("EPSUB");
+        cmd.arg("*");
+        cmd.arg("FROM");
+        cmd.arg("LATEST");
+
+        let response: Value = cmd.query_async(&mut inner.connection).await?;
+
+        let subscription_id = match response {
+            Value::SimpleString(id_str) => Uuid::parse_str(&id_str).map_err(|_| {
+                RedisError::from((redis::ErrorKind::TypeError, "Invalid UUID in response"))
+            })?,
+            _ => {
+                return Err(RedisError::from((
+                    redis::ErrorKind::TypeError,
+                    "Expected subscription ID",
+                )));
+            }
+        };
+
+        let (sender, receiver) = mpsc::unbounded_channel();
+        inner.subscriptions.insert(subscription_id, sender);
+
+        Ok(EventSubscription {
+            subscription_id,
+            receiver,
+            manager: self.inner.clone(),
+        })
+    }
 }
 
 impl SubscriptionManagerInner {
     async fn handle_push_message(&mut self, push_info: PushInfo) -> Result<(), RedisError> {
         let PushInfo { kind, data } = push_info;
 
-        match data.as_slice() {
-            [Value::SimpleString(subscription_id_str), third] => {
-                let subscription_id = Uuid::parse_str(subscription_id_str).map_err(|_| {
-                    RedisError::from((redis::ErrorKind::TypeError, "Invalid subscription ID"))
-                })?;
-
-                if let Some(sender) = self.subscriptions.get(&subscription_id) {
-                    let message = match kind {
-                        PushKind::Subscribe => {
-                            if let Value::Int(count) = third {
-                                SierraMessage::SubscriptionConfirmed {
-                                    subscription_count: *count,
-                                }
-                            } else {
-                                return Err(RedisError::from((
+        match kind {
+            PushKind::Message => {
+                // Message format: data = [subscription_id, cursor, event]
+                match data.as_slice() {
+                    [
+                        Value::SimpleString(subscription_id_str),
+                        Value::Int(cursor),
+                        event_value,
+                    ] => {
+                        let subscription_id =
+                            Uuid::parse_str(subscription_id_str).map_err(|_| {
+                                RedisError::from((
                                     redis::ErrorKind::TypeError,
-                                    "Invalid subscription count",
-                                )));
+                                    "Invalid subscription ID",
+                                ))
+                            })?;
+
+                        if let Some(sender) = self.subscriptions.get(&subscription_id) {
+                            let event = Event::from_redis_value(event_value)?;
+                            let cursor = *cursor as u64;
+                            let message = SierraMessage::Event { event, cursor };
+
+                            if sender.send(message).is_err() {
+                                // Subscription was dropped, remove it
+                                self.subscriptions.remove(&subscription_id);
                             }
                         }
-                        PushKind::Message => {
-                            let event = Event::from_redis_value(third)?;
-                            SierraMessage::Event(event)
-                        }
-                        _ => {
-                            return Err(RedisError::from((
-                                redis::ErrorKind::TypeError,
-                                "Unknown message type",
-                            )));
-                        }
-                    };
+                    }
+                    _ => {
+                        return Err(RedisError::from((
+                            redis::ErrorKind::TypeError,
+                            "Unexpected message format",
+                        )));
+                    }
+                }
+            }
+            PushKind::Subscribe => {
+                // Subscribe format: data = [subscription_id, count]
+                match data.as_slice() {
+                    [Value::SimpleString(subscription_id_str), Value::Int(count)] => {
+                        let subscription_id =
+                            Uuid::parse_str(subscription_id_str).map_err(|_| {
+                                RedisError::from((
+                                    redis::ErrorKind::TypeError,
+                                    "Invalid subscription ID",
+                                ))
+                            })?;
 
-                    if sender.send(message).is_err() {
-                        // Subscription was dropped, remove it
-                        self.subscriptions.remove(&subscription_id);
+                        if let Some(sender) = self.subscriptions.get(&subscription_id) {
+                            let message = SierraMessage::SubscriptionConfirmed {
+                                subscription_count: *count,
+                            };
+
+                            if sender.send(message).is_err() {
+                                // Subscription was dropped, remove it
+                                self.subscriptions.remove(&subscription_id);
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(RedisError::from((
+                            redis::ErrorKind::TypeError,
+                            "Unexpected subscribe format",
+                        )));
                     }
                 }
             }
             _ => {
                 return Err(RedisError::from((
                     redis::ErrorKind::TypeError,
-                    "Unexpected push message format",
+                    "Unknown push kind",
                 )));
             }
         }
@@ -676,34 +758,16 @@ impl EventSubscription {
         })
     }
 
-    /// Acknowledge events up to a specific sequence/version for this
-    /// subscription.
+    /// Acknowledge events up to a specific cursor for this subscription.
     ///
-    /// For stream subscriptions, this acknowledges all events up to and
-    /// including the specified stream version. For partition subscriptions,
-    /// this acknowledges all events up to and including the specified
-    /// partition sequence.
-    pub async fn acknowledge_events(&self, up_to_sequence_or_version: u64) -> RedisResult<()> {
+    /// The cursor value is provided with each event in the subscription stream.
+    /// Acknowledging up to a cursor allows the subscription window to advance.
+    pub async fn acknowledge_up_to_cursor(&self, cursor: u64) -> RedisResult<()> {
         let mut manager = self.manager.lock().await;
 
         let _response: Value = cmd("EACK")
             .arg(self.subscription_id.to_string())
-            .arg(up_to_sequence_or_version)
-            .query_async(&mut manager.connection)
-            .await?;
-
-        Ok(())
-    }
-
-    /// Acknowledge all pending events for this subscription.
-    ///
-    /// This clears all unacknowledged events and resets the subscription
-    /// window, effectively allowing maximum throughput.
-    pub async fn acknowledge_all_events(&self) -> RedisResult<()> {
-        let mut manager = self.manager.lock().await;
-
-        let _response: Value = cmd("EPACK")
-            .arg(self.subscription_id.to_string())
+            .arg(cursor)
             .query_async(&mut manager.connection)
             .await?;
 

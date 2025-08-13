@@ -20,6 +20,7 @@ ciborium = "0.2.2"
 redis = { version = "0.32.4", features = ["cluster"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+uuid = { workspace = true, features = ["serde", "v4", "v5"] }
 
 [features]
 default = ["aio", "tokio-comp"]

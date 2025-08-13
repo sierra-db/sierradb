@@ -21,6 +21,18 @@ pub trait AsRedisError {
     fn as_redis_error(&self) -> String;
 }
 
+impl AsRedisError for String {
+    fn as_redis_error(&self) -> String {
+        self.clone()
+    }
+}
+
+impl AsRedisError for &str {
+    fn as_redis_error(&self) -> String {
+        self.to_string()
+    }
+}
+
 impl<M, E: AsRedisError> AsRedisError for SendError<M, E> {
     fn as_redis_error(&self) -> String {
         match self {
