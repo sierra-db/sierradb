@@ -25,7 +25,7 @@ use crate::server::Conn;
 ///
 /// # Syntax
 /// ```text
-/// EAPPEND <stream_id> <event_name> [EVENT_ID <event_id>] [PARTITION_KEY <partition_key>] [EXPECTED_VERSION <version>] [PAYLOAD <payload>] [METADATA <metadata>]
+/// EAPPEND <stream_id> <event_name> [EVENT_ID <event_id>] [PARTITION_KEY <partition_key>] [EXPECTED_VERSION <version>] [TIMESTAMP <timestamp>] [PAYLOAD <payload>] [METADATA <metadata>]
 /// ```
 ///
 /// # Parameters

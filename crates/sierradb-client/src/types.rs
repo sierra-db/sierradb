@@ -48,8 +48,8 @@ macro_rules! parse_value {
 /// Represents messages received from SierraDB subscriptions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SierraMessage {
-    /// An event received from a subscription.
-    Event(Event),
+    /// An event received from a subscription with cursor information.
+    Event { event: Event, cursor: u64 },
     /// Confirmation that a subscription was successfully created.
     SubscriptionConfirmed { subscription_count: i64 },
 }

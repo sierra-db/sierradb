@@ -4,7 +4,7 @@ use std::fmt;
 use combine::error::{StreamError, Tracked};
 use combine::parser::choice::or;
 use combine::stream::{ResetStream, StreamErrorFor, StreamOnce};
-use combine::{ParseError, Parser, Positioned, choice, easy, satisfy_map};
+use combine::{ParseError, Parser, Positioned, attempt, choice, easy, satisfy_map};
 use redis_protocol::resp3::types::{BytesFrame, VerbatimStringFormat};
 use sierradb::StreamId;
 use sierradb::bucket::PartitionId;
@@ -415,7 +415,7 @@ pub fn range_value<'a>() -> impl Parser<FrameStream<'a>, Output = RangeValue> + 
 
 pub fn partition_selector<'a>() -> impl Parser<FrameStream<'a>, Output = PartitionSelector> + 'a {
     or(
-        partition_key().map(PartitionSelector::ByKey),
+        attempt(partition_key().map(PartitionSelector::ByKey)),
         partition_id().map(PartitionSelector::ById),
     )
     .expected("partition id or key")

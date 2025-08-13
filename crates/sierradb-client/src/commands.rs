@@ -277,7 +277,7 @@ implement_commands! {
     /// # Returns
     /// Returns subscription information.
     fn esub_from_version<S: ToRedisArgs>(stream_id: S, from_version: u64) -> (SubscriptionInfo) {
-        cmd("ESUB").arg(stream_id).arg("FROM_VERSION").arg(from_version)
+        cmd("ESUB").arg(stream_id).arg("FROM").arg(from_version)
     }
 
     /// Subscribe to events from a stream with partition key and version.
@@ -296,7 +296,7 @@ implement_commands! {
     /// # Returns
     /// Returns subscription information.
     fn esub_with_partition_and_version<S: ToRedisArgs>(stream_id: S, partition_key: Uuid, from_version: u64) -> (SubscriptionInfo) {
-        cmd("ESUB").arg(stream_id).arg("PARTITION_KEY").arg(partition_key.to_string()).arg("FROM_VERSION").arg(from_version)
+        cmd("ESUB").arg(stream_id).arg("PARTITION_KEY").arg(partition_key.to_string()).arg("FROM").arg(from_version)
     }
 
     /// Subscribe to events from a partition by partition key.
@@ -347,7 +347,7 @@ implement_commands! {
     /// # Returns
     /// Returns subscription information.
     fn epsub_by_key_from_sequence<>(partition_key: Uuid, from_sequence: u64) -> (SubscriptionInfo) {
-        cmd("EPSUB").arg(partition_key.to_string()).arg("FROM_SEQUENCE").arg(from_sequence)
+        cmd("EPSUB").arg(partition_key.to_string()).arg("FROM").arg(from_sequence)
     }
 
     /// Subscribe to events from a partition by partition ID, starting from a specific sequence.
@@ -364,25 +364,76 @@ implement_commands! {
     /// # Returns
     /// Returns subscription information.
     fn epsub_by_id_from_sequence<>(partition_id: u16, from_sequence: u64) -> (SubscriptionInfo) {
-        cmd("EPSUB").arg(partition_id).arg("FROM_SEQUENCE").arg(from_sequence)
+        cmd("EPSUB").arg(partition_id).arg("FROM").arg(from_sequence)
+    }
+
+    /// Handshake with the SierraDB server.
+    ///
+    /// # Parameters
+    /// - `version`: Protocol version (must be 3)
+    ///
+    /// # Example
+    /// ```ignore
+    /// let server_info = conn.hello(3)?;
+    /// ```
+    ///
+    /// # Returns
+    /// Returns server information including name, version, peer_id, and num_partitions.
+    fn hello<>(version: u32) -> (redis::Value) {
+        cmd("HELLO").arg(version)
+    }
+
+    /// Health check command.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let response = conn.ping()?;
+    /// ```
+    ///
+    /// # Returns
+    /// Returns "PONG" string.
+    fn ping<>() -> (String) {
+        &mut cmd("PING")
+    }
+
+    /// Acknowledge events up to a specific cursor for a subscription.
+    ///
+    /// # Parameters
+    /// - `subscription_id`: UUID of the subscription
+    /// - `cursor`: Cursor number to acknowledge up to
+    ///
+    /// # Example
+    /// ```ignore
+    /// let subscription_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")?;
+    /// conn.eack(subscription_id, 100)?;
+    /// ```
+    ///
+    /// # Returns
+    /// Returns "OK" on success.
+    fn eack<>(subscription_id: Uuid, cursor: u64) -> (String) {
+        cmd("EACK").arg(subscription_id.to_string()).arg(cursor)
     }
 }
 
-/// Extension trait for Redis clients to provide SierraDB async subscription functionality.
-/// 
-/// This trait provides convenience methods for creating typed subscriptions using
-/// a `SubscriptionManager`.
+/// Extension trait for Redis clients to provide SierraDB async subscription
+/// functionality.
+///
+/// This trait provides convenience methods for creating typed subscriptions
+/// using a `SubscriptionManager`.
 pub trait SierraAsyncClientExt {
     /// Create a new subscription manager for this client.
-    fn subscription_manager(&self) -> impl std::future::Future<Output = RedisResult<SubscriptionManager>> + Send;
+    fn subscription_manager(
+        &self,
+    ) -> impl std::future::Future<Output = RedisResult<SubscriptionManager>> + Send;
 }
 
 impl SierraAsyncClientExt for Client {
-    fn subscription_manager(&self) -> impl std::future::Future<Output = RedisResult<SubscriptionManager>> + Send {
+    fn subscription_manager(
+        &self,
+    ) -> impl std::future::Future<Output = RedisResult<SubscriptionManager>> + Send {
         SubscriptionManager::new(self)
     }
 }
-
 
 impl<T> Commands for T where T: ConnectionLike {}
 
