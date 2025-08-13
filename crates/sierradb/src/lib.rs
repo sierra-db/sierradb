@@ -2,7 +2,6 @@ use core::fmt;
 use std::sync::Arc;
 use std::{borrow, ops};
 
-use ahash::RandomState;
 use error::StreamIdError;
 use serde::{Deserialize, Serialize};
 
@@ -13,11 +12,6 @@ pub mod id;
 pub mod reader_thread_pool;
 pub mod writer_thread_pool;
 
-const SEED_K0: u64 = 0x53C8FF368077E723;
-const SEED_K1: u64 = 0x586C670340740E26;
-const SEED_K2: u64 = 0x34C309D85840FAF5;
-const SEED_K3: u64 = 0x392F381A75A0BE2B;
-const RANDOM_STATE: RandomState = RandomState::with_seeds(SEED_K0, SEED_K1, SEED_K2, SEED_K3);
 const BLOOM_SEED: [u8; 32] = [
     242, 218, 55, 84, 243, 117, 63, 59, 8, 112, 190, 73, 105, 98, 165, 58, 214, 159, 14, 184, 159,
     111, 33, 192, 108, 225, 81, 138, 231, 213, 234, 217,

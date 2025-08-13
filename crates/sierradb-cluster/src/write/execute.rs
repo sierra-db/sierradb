@@ -99,6 +99,7 @@ impl ClusterActor {
                         replicas,
                         replication_factor: self.replication_factor,
                         circuit_breaker: self.circuit_breaker.clone(),
+                        broadcast_tx: self.subscription_manager.broadcaster(),
                     },
                     transaction,
                     reply_sender,

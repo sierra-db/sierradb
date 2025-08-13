@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use sierradb_client::{SierraAsyncClientExt, SierraMessage};
 use tracing_subscriber::EnvFilter;
 
@@ -21,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     .subscribe_to_stream_from_version("mypartition", 0)
     //     .await?;
     let mut partition_sub = manager
-        .subscribe_to_partition_from_sequence_with_window(204, 0, 2)
+        .subscribe_to_partitions_with_sequences(HashMap::from_iter([(204, 0), (364, 0)]), Some(2))
         .await?;
 
     // println!("Stream subscription ID: {}", stream_sub.subscription_id());
@@ -59,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             event.partition_sequence,
                             event.stream_id,
                         );
-                        partition_sub.acknowledge_events(event.partition_sequence).await?;
+                        partition_sub.acknowledge_all_events().await?;
                     }
                     Some(SierraMessage::SubscriptionConfirmed { subscription_count }) => {
                         println!("[Partition] Subscription confirmed (total active: {subscription_count})");

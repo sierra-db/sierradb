@@ -14,6 +14,7 @@ sierradb-protocol.workspace = true
 
 bytes.workspace = true
 clap = { workspace = true, features = ["derive"] }
+combine = "4.6.7"
 config.workspace = true
 directories.workspace = true
 futures.workspace = true

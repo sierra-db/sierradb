@@ -17,6 +17,8 @@ pub enum ErrorCode {
     Syntax,
     /// Invalid argument provided
     InvalidArg,
+    /// Resource not found
+    NotFound,
 
     // Sierra-specific error codes
     /// Too many request forwards (loop prevention)
@@ -140,6 +142,7 @@ impl std::fmt::Display for ErrorCode {
             ErrorCode::Timeout => "TIMEOUT",
             ErrorCode::Syntax => "SYNTAX",
             ErrorCode::InvalidArg => "INVALIDARG",
+            ErrorCode::NotFound => "NOTFOUND",
 
             // Sierra-specific error codes
             ErrorCode::MaxForwards => "MAXFORWARDS",

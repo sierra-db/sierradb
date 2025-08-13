@@ -1,10 +1,11 @@
+use combine::Parser;
 use redis_protocol::resp3::types::BytesFrame;
 use sierradb::bucket::segment::EventRecord;
 use sierradb_cluster::read::ReadEvent;
 use uuid::Uuid;
 
 use crate::error::MapRedisError;
-use crate::impl_command;
+use crate::parser::{FrameStream, event_id};
 use crate::request::{HandleRequest, encode_event};
 use crate::server::Conn;
 
@@ -26,7 +27,11 @@ pub struct EGet {
     pub event_id: Uuid,
 }
 
-impl_command!(EGet, [event_id], []);
+impl EGet {
+    pub fn parser<'a>() -> impl Parser<FrameStream<'a>, Output = EGet> + 'a {
+        event_id().map(|event_id| EGet { event_id })
+    }
+}
 
 impl HandleRequest for EGet {
     type Error = String;

@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 sierradb-protocol.workspace = true
 
-ahash = "0.8"
 arc-swap = "1.7.1"
 bincode = { workspace = true, features = ["serde"] }
 bloomfilter = "3.0.1"

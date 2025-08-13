@@ -418,6 +418,172 @@ impl SubscriptionManager {
 
         Ok(())
     }
+
+    /// Subscribe to events from multiple partitions with the same starting
+    /// sequence.
+    ///
+    /// # Arguments
+    /// * `partition_range` - String specifying partitions: "*", "0-127",
+    ///   "0,1,5", or "42"
+    /// * `from_sequence` - Starting sequence number for all partitions
+    /// * `window_size` - Optional window size for flow control
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// let sub = manager.subscribe_to_partitions("*", 1000, Some(100)).await?;
+    /// let sub = manager.subscribe_to_partitions("0-127", 500, None).await?;
+    /// let sub = manager.subscribe_to_partitions("0,1,5", 0, Some(50)).await?;
+    /// ```
+    pub async fn subscribe_to_partitions(
+        &mut self,
+        partition_range: &str,
+        from_sequence: u64,
+        window_size: Option<u32>,
+    ) -> RedisResult<EventSubscription> {
+        let mut inner = self.inner.lock().await;
+
+        let mut cmd = cmd("EPSUB");
+        cmd.arg(partition_range);
+        cmd.arg("FROM_SEQUENCE").arg(from_sequence);
+
+        if let Some(size) = window_size {
+            cmd.arg("WINDOW_SIZE").arg(size);
+        }
+
+        let response: Value = cmd.query_async(&mut inner.connection).await?;
+
+        let subscription_id = match response {
+            Value::SimpleString(id_str) => Uuid::parse_str(&id_str).map_err(|_| {
+                RedisError::from((redis::ErrorKind::TypeError, "Invalid UUID in response"))
+            })?,
+            _ => {
+                return Err(RedisError::from((
+                    redis::ErrorKind::TypeError,
+                    "Expected subscription ID",
+                )));
+            }
+        };
+
+        let (sender, receiver) = mpsc::unbounded_channel();
+        inner.subscriptions.insert(subscription_id, sender);
+
+        Ok(EventSubscription {
+            subscription_id,
+            receiver,
+            manager: self.inner.clone(),
+        })
+    }
+
+    /// Subscribe to events from multiple partitions with per-partition
+    /// sequences.
+    ///
+    /// # Arguments
+    /// * `partition_sequences` - Map of partition_id -> from_sequence
+    /// * `window_size` - Optional window size for flow control
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let mut sequences = HashMap::new();
+    /// sequences.insert(0, 500);
+    /// sequences.insert(1, 1200);
+    /// sequences.insert(127, 999);
+    /// let sub = manager.subscribe_to_partitions_with_sequences(sequences, Some(100)).await?;
+    /// ```
+    pub async fn subscribe_to_partitions_with_sequences(
+        &mut self,
+        partition_sequences: HashMap<u16, u64>,
+        window_size: Option<u32>,
+    ) -> RedisResult<EventSubscription> {
+        if partition_sequences.is_empty() {
+            return Err(RedisError::from((
+                redis::ErrorKind::InvalidClientConfig,
+                "At least one partition must be specified",
+            )));
+        }
+
+        let mut inner = self.inner.lock().await;
+
+        let mut cmd = cmd("EPSUB");
+
+        // Create partition list from the keys
+        let partition_list: Vec<String> =
+            partition_sequences.keys().map(|&p| p.to_string()).collect();
+        cmd.arg(partition_list.join(","));
+
+        cmd.arg("FROM_SEQUENCE");
+
+        // Send as simple "partition:sequence,partition:sequence" format
+        let sequence_pairs: Vec<String> = partition_sequences
+            .iter()
+            .map(|(p, s)| format!("{p}:{s}"))
+            .collect();
+        cmd.arg(sequence_pairs.join(","));
+
+        if let Some(size) = window_size {
+            cmd.arg("WINDOW_SIZE").arg(size);
+        }
+
+        let response: Value = cmd.query_async(&mut inner.connection).await?;
+
+        let subscription_id = match response {
+            Value::SimpleString(id_str) => Uuid::parse_str(&id_str).map_err(|_| {
+                RedisError::from((redis::ErrorKind::TypeError, "Invalid UUID in response"))
+            })?,
+            _ => {
+                return Err(RedisError::from((
+                    redis::ErrorKind::TypeError,
+                    "Expected subscription ID",
+                )));
+            }
+        };
+
+        let (sender, receiver) = mpsc::unbounded_channel();
+        inner.subscriptions.insert(subscription_id, sender);
+
+        Ok(EventSubscription {
+            subscription_id,
+            receiver,
+            manager: self.inner.clone(),
+        })
+    }
+
+    /// Subscribe to all partitions starting from the same sequence.
+    ///
+    /// This is a convenience method equivalent to `subscribe_to_partitions("*",
+    /// from_sequence, window_size)`.
+    pub async fn subscribe_to_all_partitions(
+        &mut self,
+        from_sequence: u64,
+        window_size: Option<u32>,
+    ) -> RedisResult<EventSubscription> {
+        self.subscribe_to_partitions("*", from_sequence, window_size)
+            .await
+    }
+
+    /// Subscribe to a range of partitions starting from the same sequence.
+    ///
+    /// # Arguments
+    /// * `start_partition` - Starting partition ID (inclusive)
+    /// * `end_partition` - Ending partition ID (inclusive)
+    /// * `from_sequence` - Starting sequence number for all partitions in range
+    /// * `window_size` - Optional window size for flow control
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// // Subscribe to partitions 0-127 starting from sequence 1000
+    /// let sub = manager.subscribe_to_partition_range(0, 127, 1000, Some(50)).await?;
+    /// ```
+    pub async fn subscribe_to_partition_range(
+        &mut self,
+        start_partition: u16,
+        end_partition: u16,
+        from_sequence: u64,
+        window_size: Option<u32>,
+    ) -> RedisResult<EventSubscription> {
+        let range = format!("{start_partition}-{end_partition}");
+        self.subscribe_to_partitions(&range, from_sequence, window_size)
+            .await
+    }
 }
 
 impl SubscriptionManagerInner {

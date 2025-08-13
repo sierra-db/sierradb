@@ -5,11 +5,12 @@ use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use kameo::prelude::*;
 use sierradb::{
     MAX_REPLICATION_FACTOR,
-    bucket::PartitionId,
+    bucket::{PartitionId, segment::EventRecord},
     database::{Database, ExpectedVersion, Transaction},
     writer_thread_pool::AppendResult,
 };
 use smallvec::SmallVec;
+use tokio::sync::broadcast;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
@@ -17,7 +18,6 @@ use crate::{
     ClusterActor, ReplicaRefs,
     circuit_breaker::WriteCircuitBreaker,
     confirmation::actor::{ConfirmationActor, UpdateConfirmation},
-    subscription::NotifyEvent,
     write::confirm::ConfirmTransaction,
 };
 
@@ -35,6 +35,7 @@ pub struct WriteConfig {
     pub replicas: ReplicaRefs,
     pub replication_factor: u8,
     pub circuit_breaker: Arc<WriteCircuitBreaker>,
+    pub broadcast_tx: broadcast::Sender<EventRecord>,
 }
 
 pub fn spawn(
@@ -134,8 +135,8 @@ pub fn spawn(
                         // Notify subscriptions about new events
                         // partition_id already available from above
                         let database_clone = config.database.clone();
-                        let cluster_ref_clone = config.local_cluster_ref.clone();
                         let append_clone = append.clone();
+                        let broadcast_tx = config.broadcast_tx.clone();
                         tokio::spawn(async move {
                             // Read the events that were just written to notify subscriptions
                             let read_result = database_clone
@@ -151,15 +152,9 @@ pub fn spawn(
                                         && event.partition_sequence
                                             <= append_clone.last_partition_sequence
                                     {
-                                        let res = cluster_ref_clone
-                                            .tell(NotifyEvent {
-                                                partition_id,
-                                                event,
-                                            })
-                                            .send()
-                                            .await;
-                                        if let Err(err) = res {
-                                            error!("failed to notify event to cluster: {err}");
+                                        let res = broadcast_tx.send(event);
+                                        if res.is_err() {
+                                            break;
                                         }
                                     }
                                 }

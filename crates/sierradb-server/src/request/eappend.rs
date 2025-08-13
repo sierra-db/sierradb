@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use combine::error::StreamError;
+use combine::{Parser, attempt, choice, easy, many};
 use redis_protocol::resp3::types::BytesFrame;
 use sierradb::StreamId;
 use sierradb::bucket::PartitionId;
@@ -12,7 +14,10 @@ use smallvec::smallvec;
 use uuid::Uuid;
 
 use crate::error::MapRedisError;
-use crate::impl_command;
+use crate::parser::{
+    FrameStream, data, event_id, expected_version, keyword, number_u64, partition_key, stream_id,
+    string,
+};
 use crate::request::{HandleRequest, map, number, simple_str};
 use crate::server::Conn;
 
@@ -37,6 +42,7 @@ use crate::server::Conn;
 /// ```text
 /// EAPPEND my-stream UserCreated PAYLOAD '{"name":"john"}' METADATA '{"source":"api"}'
 /// ```
+#[derive(Clone, Debug, Default)]
 pub struct EAppend {
     pub stream_id: StreamId,
     pub event_name: String,
@@ -48,18 +54,121 @@ pub struct EAppend {
     pub metadata: Vec<u8>,
 }
 
-impl_command!(
-    EAppend,
-    [stream_id, event_name],
-    [
-        event_id,
-        partition_key,
-        expected_version,
-        timestamp,
-        payload,
-        metadata
-    ]
-);
+#[derive(Debug, Clone, PartialEq)]
+enum OptionalArg<'a> {
+    EventId(Uuid),
+    PartitionKey(Uuid),
+    ExpectedVersion(ExpectedVersion),
+    Timestamp(u64),
+    Payload(&'a [u8]),
+    Metadata(&'a [u8]),
+}
+
+impl<'a> OptionalArg<'a> {
+    fn parser() -> impl Parser<FrameStream<'a>, Output = OptionalArg<'a>> + 'a {
+        let event_id = keyword("EVENT_ID")
+            .with(event_id())
+            .map(OptionalArg::EventId);
+        let partition_key = keyword("PARTITION_KEY")
+            .with(partition_key())
+            .map(OptionalArg::PartitionKey);
+        let expected_version = keyword("EXPECTED_VERSION")
+            .with(expected_version())
+            .map(OptionalArg::ExpectedVersion);
+        let timestamp = keyword("TIMESTAMP")
+            .with(number_u64())
+            .map(OptionalArg::Timestamp);
+        let payload = keyword("PAYLOAD").with(data()).map(OptionalArg::Payload);
+        let metadata = keyword("METADATA").with(data()).map(OptionalArg::Metadata);
+
+        choice!(
+            attempt(event_id),
+            attempt(partition_key),
+            attempt(expected_version),
+            attempt(timestamp),
+            attempt(payload),
+            attempt(metadata)
+        )
+    }
+}
+
+impl EAppend {
+    pub fn parser<'a>() -> impl Parser<FrameStream<'a>, Output = EAppend> + 'a {
+        (
+            stream_id(),
+            string().expected("event name"),
+            many::<Vec<_>, _, _>(OptionalArg::parser()),
+        )
+            .and_then(|(stream_id, event_name, args)| {
+                let mut cmd = EAppend {
+                    stream_id,
+                    event_name: event_name.to_string(),
+                    ..Default::default()
+                };
+
+                for arg in args {
+                    match arg {
+                        OptionalArg::EventId(event_id) => {
+                            if cmd.event_id.is_some() {
+                                return Err(easy::Error::message_format(
+                                    "event id already specified",
+                                ));
+                            }
+
+                            cmd.event_id = Some(event_id);
+                        }
+                        OptionalArg::PartitionKey(partition_key) => {
+                            if cmd.partition_key.is_some() {
+                                return Err(easy::Error::message_format(
+                                    "partition key already specified",
+                                ));
+                            }
+
+                            cmd.partition_key = Some(partition_key);
+                        }
+                        OptionalArg::ExpectedVersion(expected_version) => {
+                            if !matches!(cmd.expected_version, ExpectedVersion::Any) {
+                                return Err(easy::Error::message_format(
+                                    "expected version already specified",
+                                ));
+                            }
+
+                            cmd.expected_version = expected_version;
+                        }
+                        OptionalArg::Timestamp(timestamp) => {
+                            if cmd.timestamp.is_some() {
+                                return Err(easy::Error::message_format(
+                                    "timestamp already specified",
+                                ));
+                            }
+
+                            cmd.timestamp = Some(timestamp);
+                        }
+                        OptionalArg::Payload(payload) => {
+                            if !cmd.payload.is_empty() {
+                                return Err(easy::Error::message_format(
+                                    "payload already specified",
+                                ));
+                            }
+
+                            cmd.payload = payload.to_vec();
+                        }
+                        OptionalArg::Metadata(metadata) => {
+                            if !cmd.metadata.is_empty() {
+                                return Err(easy::Error::message_format(
+                                    "metadata already specified",
+                                ));
+                            }
+
+                            cmd.metadata = metadata.to_vec();
+                        }
+                    }
+                }
+
+                Ok(cmd)
+            })
+    }
+}
 
 impl HandleRequest for EAppend {
     type Error = String;
