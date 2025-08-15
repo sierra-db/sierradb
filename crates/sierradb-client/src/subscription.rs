@@ -637,6 +637,122 @@ impl SubscriptionManager {
             manager: self.inner.clone(),
         })
     }
+
+    /// Subscribe to events from all partitions with custom starting sequences for specific partitions and a fallback.
+    ///
+    /// # Arguments
+    /// * `partition_sequences` - Map of partition_id -> starting_sequence for specific partitions
+    /// * `fallback_sequence` - Starting sequence for all other partitions not specified in the map
+    /// * `window_size` - Optional window size for flow control
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let mut sequences = HashMap::new();
+    /// sequences.insert(0, 1000);    // Partition 0 starts from sequence 1000
+    /// sequences.insert(5, 2500);    // Partition 5 starts from sequence 2500
+    /// // All other partitions start from sequence 100 (fallback)
+    /// let sub = manager.subscribe_to_all_partitions_with_fallback(sequences, 100, Some(50)).await?;
+    /// ```
+    pub async fn subscribe_to_all_partitions_with_fallback(
+        &mut self,
+        partition_sequences: HashMap<u16, u64>,
+        fallback_sequence: u64,
+        window_size: Option<u32>,
+    ) -> RedisResult<EventSubscription> {
+        self.subscribe_to_all_partitions_flexible(partition_sequences, Some(fallback_sequence), window_size)
+            .await
+    }
+
+    /// Subscribe to events from all partitions with flexible starting position options.
+    ///
+    /// # Arguments
+    /// * `from_map` - Map of partition_id -> starting_sequence for specific partitions (empty map means no overrides)
+    /// * `fallback_sequence` - Optional fallback sequence for partitions not in the map
+    /// * `window_size` - Optional window size for flow control
+    ///
+    /// # Examples
+    /// ```rust,ignore
+    /// // Subscribe from latest on all partitions
+    /// let sub = manager.subscribe_to_all_partitions_flexible(HashMap::new(), None, Some(50)).await?;
+    ///
+    /// // Subscribe with specific sequences for some partitions, latest for others
+    /// let mut sequences = HashMap::new();
+    /// sequences.insert(0, 1000);
+    /// sequences.insert(5, 2500);
+    /// let sub = manager.subscribe_to_all_partitions_flexible(sequences, None, Some(50)).await?;
+    ///
+    /// // Subscribe with fallback for all partitions not specified
+    /// let sub = manager.subscribe_to_all_partitions_flexible(sequences, Some(100), Some(50)).await?;
+    /// ```
+    pub async fn subscribe_to_all_partitions_flexible(
+        &mut self,
+        from_map: HashMap<u16, u64>,
+        fallback_sequence: Option<u64>,
+        window_size: Option<u32>,
+    ) -> RedisResult<EventSubscription> {
+        let mut inner = self.inner.lock().await;
+
+        let mut cmd = cmd("EPSUB");
+        cmd.arg("*");
+
+        // Determine FROM clause based on parameters
+        if from_map.is_empty() {
+            match fallback_sequence {
+                None => {
+                    // Default to FROM LATEST
+                    cmd.arg("FROM");
+                    cmd.arg("LATEST");
+                }
+                Some(fallback) => {
+                    // FROM <fallback> for all partitions
+                    cmd.arg("FROM");
+                    cmd.arg(fallback);
+                }
+            }
+        } else {
+            // FROM MAP with optional DEFAULT
+            cmd.arg("FROM");
+            cmd.arg("MAP");
+
+            // Send partition=sequence pairs
+            for (partition_id, sequence) in &from_map {
+                cmd.arg(format!("{}={}", partition_id, sequence));
+            }
+
+            // Add fallback sequence if provided
+            if let Some(fallback) = fallback_sequence {
+                cmd.arg("DEFAULT");
+                cmd.arg(fallback);
+            }
+        }
+
+        if let Some(size) = window_size {
+            cmd.arg("WINDOW").arg(size);
+        }
+
+        let response: Value = cmd.query_async(&mut inner.connection).await?;
+
+        let subscription_id = match response {
+            Value::SimpleString(id_str) => Uuid::parse_str(&id_str).map_err(|_| {
+                RedisError::from((redis::ErrorKind::TypeError, "Invalid UUID in response"))
+            })?,
+            _ => {
+                return Err(RedisError::from((
+                    redis::ErrorKind::TypeError,
+                    "Expected subscription ID",
+                )));
+            }
+        };
+
+        let (sender, receiver) = mpsc::unbounded_channel();
+        inner.subscriptions.insert(subscription_id, sender);
+
+        Ok(EventSubscription {
+            subscription_id,
+            receiver,
+            manager: self.inner.clone(),
+        })
+    }
 }
 
 impl SubscriptionManagerInner {
