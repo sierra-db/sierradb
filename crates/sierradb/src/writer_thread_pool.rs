@@ -183,7 +183,7 @@ impl WriterThreadPool {
                 reply_tx,
             })
             .await
-            .map_err(|_| WriteError::WriterThreadNotRunning)?;
+            .map_err(|_| WriteError::WriterThreadNotRunning { bucket_id })?;
         reply_rx.await.map_err(|_| WriteError::NoThreadReply)?
     }
 
@@ -214,7 +214,7 @@ impl WriterThreadPool {
                 reply_tx,
             })
             .await
-            .map_err(|_| WriteError::WriterThreadNotRunning)?;
+            .map_err(|_| WriteError::WriterThreadNotRunning { bucket_id })?;
         reply_rx.await.map_err(|_| WriteError::NoThreadReply)?
     }
 
@@ -851,7 +851,19 @@ impl WriterSet {
                             .transpose()?;
 
                         match latest_stream_version {
-                            Some(StreamLatestVersion::LatestVersion { version, .. }) => {
+                            Some(StreamLatestVersion::LatestVersion {
+                                partition_key: existing_partition_key,
+                                version,
+                            }) => {
+                                if partition_key != existing_partition_key {
+                                    return Err(WriteError::Validation(
+                                        EventValidationError::PartitionKeyMismatch {
+                                            existing_partition_key,
+                                            new_partition_key: partition_key,
+                                        },
+                                    ));
+                                }
+
                                 event_versions.push(CurrentVersion::Current(version));
                                 entry.insert(version + 1);
                             }
@@ -888,13 +900,16 @@ impl WriterSet {
 
                         match latest_stream_version {
                             Some(StreamLatestVersion::LatestVersion {
-                                partition_key: latest_partition_key,
+                                partition_key: existing_partition_key,
                                 version,
                             }) => {
                                 // Stream exists, so this is fine
-                                if partition_key != latest_partition_key {
+                                if partition_key != existing_partition_key {
                                     return Err(WriteError::Validation(
-                                        EventValidationError::PartitionKeyMismatch,
+                                        EventValidationError::PartitionKeyMismatch {
+                                            existing_partition_key,
+                                            new_partition_key: partition_key,
+                                        },
                                     ));
                                 }
 
@@ -939,12 +954,15 @@ impl WriterSet {
 
                         match latest_stream_version {
                             Some(StreamLatestVersion::LatestVersion {
-                                partition_key: latest_partition_key,
+                                partition_key: existing_partition_key,
                                 version,
                             }) => {
-                                if partition_key != latest_partition_key {
+                                if partition_key != existing_partition_key {
                                     return Err(WriteError::Validation(
-                                        EventValidationError::PartitionKeyMismatch,
+                                        EventValidationError::PartitionKeyMismatch {
+                                            existing_partition_key,
+                                            new_partition_key: partition_key,
+                                        },
                                     ));
                                 }
 
@@ -988,12 +1006,15 @@ impl WriterSet {
 
                         match latest_stream_version {
                             Some(StreamLatestVersion::LatestVersion {
-                                partition_key: latest_partition_key,
+                                partition_key: existing_partition_key,
                                 version,
                             }) => {
-                                if partition_key != latest_partition_key {
+                                if partition_key != existing_partition_key {
                                     return Err(WriteError::Validation(
-                                        EventValidationError::PartitionKeyMismatch,
+                                        EventValidationError::PartitionKeyMismatch {
+                                            existing_partition_key,
+                                            new_partition_key: partition_key,
+                                        },
                                     ));
                                 }
 

@@ -10,7 +10,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::StreamId;
-use crate::bucket::{BucketSegmentId, PartitionId, event_index, partition_index, stream_index};
+use crate::bucket::{
+    BucketId, BucketSegmentId, PartitionId, event_index, partition_index, stream_index,
+};
 use crate::database::{CurrentVersion, ExpectedVersion};
 
 /// Errors which can occur in background threads.
@@ -87,8 +89,8 @@ pub enum WriteError {
     BucketWriterNotFound,
     #[error("stream version too high")]
     StreamVersionTooHigh,
-    #[error("writer thread is not running")]
-    WriterThreadNotRunning,
+    #[error("writer thread is not running for bucket id {bucket_id}")]
+    WriterThreadNotRunning { bucket_id: BucketId },
     #[error("events exceed the size of a single segment")]
     EventsExceedSegmentSize,
     #[error("offset {offset} exceeds the file size {size}")]
@@ -234,8 +236,13 @@ pub enum StreamIndexError {
 pub enum EventValidationError {
     #[error("the event id must embed the partition hash")]
     InvalidEventId,
-    #[error("partition key must be the same for all events in a stream")]
-    PartitionKeyMismatch,
+    #[error(
+        "partition key must be the same for all events in a stream: expected {existing_partition_key}, got {new_partition_key}"
+    )]
+    PartitionKeyMismatch {
+        existing_partition_key: Uuid,
+        new_partition_key: Uuid,
+    },
     #[error("transaction has no events")]
     EmptyTransaction,
 }
