@@ -785,7 +785,7 @@ pub fn encode_event(record: EventRecord) -> BytesFrame {
     map(HashMap::from_iter([
         (
             simple_str("event_id"),
-            blob_str(record.event_id.to_string()),
+            simple_str(record.event_id.to_string()),
         ),
         (
             simple_str("partition_key"),

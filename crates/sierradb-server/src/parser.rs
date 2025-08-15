@@ -372,7 +372,7 @@ pub fn partition_id<'a>() -> impl Parser<FrameStream<'a>, Output = PartitionId> 
 fn uuid<'a>(expected: &'static str) -> impl Parser<FrameStream<'a>, Output = Uuid> + 'a {
     string()
         .and_then(move |s| {
-            Uuid::parse_str(s)
+            Uuid::parse_str(s.trim())
                 .map_err(|_| easy::Error::message_format(format!("invalid {expected}")))
         })
         .expected(expected)
