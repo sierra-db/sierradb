@@ -203,7 +203,10 @@ impl OpenStreamIndex {
                 let entry = entry.get_mut();
                 if entry.partition_key != partition_key {
                     return Err(StreamIndexError::Validation(
-                        EventValidationError::PartitionKeyMismatch,
+                        EventValidationError::PartitionKeyMismatch {
+                            existing_partition_key: entry.partition_key,
+                            new_partition_key: partition_key,
+                        },
                     ));
                 }
                 entry.version_min = entry.version_min.min(stream_version);
@@ -241,7 +244,10 @@ impl OpenStreamIndex {
                 let entry = entry.get_mut();
                 if entry.partition_key != partition_key {
                     return Err(StreamIndexError::Validation(
-                        EventValidationError::PartitionKeyMismatch,
+                        EventValidationError::PartitionKeyMismatch {
+                            existing_partition_key: entry.partition_key,
+                            new_partition_key: partition_key,
+                        },
                     ));
                 }
                 match &mut entry.offsets {
@@ -1005,28 +1011,37 @@ impl EventStreamIter {
                     };
 
                     if let Some(_max_version) = max_returned_version {
-                        // Remove duplicate offsets that point to other events in the same transaction.
-                        // When we read a transaction, we get all events in that transaction at once,
-                        // so we need to remove any remaining offsets in our queue that point to 
+                        // Remove duplicate offsets that point to other events in the same
+                        // transaction. When we read a transaction, we get
+                        // all events in that transaction at once,
+                        // so we need to remove any remaining offsets in our queue that point to
                         // other events within the same transaction to avoid duplicates.
-                        if let CommittedEvents::Transaction { events: tx_events, .. } = committed_events {
+                        if let CommittedEvents::Transaction {
+                            events: tx_events, ..
+                        } = committed_events
+                        {
                             // Find the range of offsets covered by this transaction
-                            let min_event_offset = tx_events.iter().map(|e| e.offset).min().unwrap_or(0);
-                            let max_event_offset = tx_events.iter().map(|e| e.offset).max().unwrap_or(0);
+                            let min_event_offset =
+                                tx_events.iter().map(|e| e.offset).min().unwrap_or(0);
+                            let max_event_offset =
+                                tx_events.iter().map(|e| e.offset).max().unwrap_or(0);
 
-                            // Remove offsets from the appropriate queue that fall within this transaction
+                            // Remove offsets from the appropriate queue that fall within this
+                            // transaction
                             let queue_to_check = if is_live {
                                 &mut self.live_segment_offsets
                             } else {
                                 &mut self.segment_offsets
                             };
 
-                            // Remove any queued offsets that are within the transaction's event range
+                            // Remove any queued offsets that are within the transaction's event
+                            // range
                             queue_to_check.retain(|&offset| {
                                 offset < min_event_offset || offset > max_event_offset
                             });
                         }
-                        // For CommittedEvents::Single, no deduplication needed since it's just one event
+                        // For CommittedEvents::Single, no deduplication needed
+                        // since it's just one event
                     } else {
                         // No events from our stream in this transaction
                         events = None;
