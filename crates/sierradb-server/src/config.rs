@@ -162,7 +162,7 @@ impl AppConfig {
         let overrides = builder.build_cloned()?;
 
         builder = builder
-            .set_default("bucket.count", 64)?
+            .set_default("bucket.count", 4)?
             .set_default("flush.events_threshold", 1)?
             .set_default("flush.interval_ms", 0)?
             .set_default("heartbeat.interval_ms", 1000)?
@@ -170,7 +170,7 @@ impl AppConfig {
             .set_default("network.cluster_enabled", true)?
             .set_default("network.cluster_address", "/ip4/0.0.0.0/tcp/0")?
             .set_default("network.client_address", "0.0.0.0:9090")?
-            .set_default("partition.count", 1024)?
+            .set_default("partition.count", 32)?
             .set_default("replication.buffer_size", 1000)?
             .set_default("replication.buffer_timeout_ms", 8000)?
             .set_default("replication.catchup_timeout_ms", 2000)?

@@ -1530,7 +1530,7 @@ async fn execute_append_events(
             // Invalid event ID is a valid scenario for fuzzing
             return Ok(());
         }
-        Err(sierradb::error::EventValidationError::PartitionKeyMismatch) => {
+        Err(sierradb::error::EventValidationError::PartitionKeyMismatch { .. }) => {
             // Partition key mismatch is a valid scenario for fuzzing
             return Ok(());
         }
