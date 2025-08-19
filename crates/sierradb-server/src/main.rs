@@ -63,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         vec![]
     };
 
-    let swarm_ref = ClusterActor::spawn(ClusterArgs {
+    let cluster_ref = ClusterActor::spawn(ClusterArgs {
         keypair,
         database,
         listen_addrs,
@@ -80,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         replication_catchup_timeout: Duration::from_millis(config.replication.catchup_timeout_ms),
     });
 
-    Server::new(swarm_ref, config.partition.count)
+    Server::new(cluster_ref, config.partition.count)
         .listen(config.network.client_address)
         .await?;
 
