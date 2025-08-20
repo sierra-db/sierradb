@@ -80,9 +80,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         replication_catchup_timeout: Duration::from_millis(config.replication.catchup_timeout_ms),
     });
 
-    Server::new(cluster_ref, config.partition.count)
-        .listen(config.network.client_address)
-        .await?;
+    tokio::spawn(async move {
+        if let Err(err) = Server::new(cluster_ref, config.partition.count)
+            .listen(config.network.client_address)
+            .await
+        {
+            error!("server failed: {err}");
+            std::process::exit(1);
+        } else {
+            std::process::exit(0);
+        }
+    });
+
+    tokio::signal::ctrl_c()
+        .await
+        .expect("failed to listen ctrl c signal");
+
+    println!("goodbye :)");
 
     Ok(())
 }
