@@ -174,14 +174,18 @@ impl AppConfig {
             .set_default("replication.buffer_size", 1000)?
             .set_default("replication.buffer_timeout_ms", 8000)?
             .set_default("replication.catchup_timeout_ms", 2000)?
-            .set_default("replication.factor", 3)?
             .set_default("segment.size_bytes", 256_000_000)?;
 
         // Apply any overrides from the node config
         {
             let mut nodes = overrides.get_array("nodes").ok().unwrap_or_default();
-            let nodes_count = nodes.len() as u32;
+            let nodes_count = if nodes.is_empty() {
+                1
+            } else {
+                nodes.len() as u32
+            };
             builder = builder.set_default("node.count", nodes_count)?;
+
             let node_index = args
                 .node_index
                 .or_else(|| overrides.get_int("node.index").map(|n| n as u32).ok());
@@ -206,21 +210,28 @@ impl AppConfig {
             .set_override_option("node.index", args.node_index)?
             .set_override_option("node.count", args.node_count)?;
 
+        {
+            // First build to check node count and handle node.index conditionally
+            let temp_config = builder.build_cloned()?;
+            let node_count = temp_config.get::<u32>("node.count").unwrap_or(1);
+            builder = builder.set_default("replication.factor", node_count.clamp(1, 3))?;
+
+            // Handle node.index based on whether it's single or multi-node
+            let node_index_set =
+                args.node_index.is_some() || temp_config.get::<u32>("node.index").is_ok();
+
+            if node_count == 1 && !node_index_set {
+                // Single node: default to 0
+                builder = builder.set_override("node.index", 0)?;
+            } else if node_count > 1 && !node_index_set {
+                // Multi-node: require explicit setting
+                return Err(ConfigError::Message(
+                    "node.index is required when node.count > 1 (use --node-index or set in config file)".to_string(),
+                ));
+            }
+        }
+
         let config: AppConfig = builder.build()?.try_deserialize()?;
-
-        let node_count = config.node_count()?;
-
-        if node_count == 0 {
-            return Err(ConfigError::Message(
-                "node.count must be greater than zero".to_string(),
-            ));
-        }
-
-        if config.node.index >= node_count as u32 {
-            return Err(ConfigError::Message(
-                "node.index must be less than node.count".to_string(),
-            ));
-        }
 
         Ok(config)
     }
