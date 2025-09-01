@@ -617,16 +617,20 @@ pub struct MultiAppendInfo {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventInfo {
     pub event_id: Uuid,
+    pub partition_id: u16,
+    pub partition_sequence: u64,
     pub stream_id: String,
     pub stream_version: u64,
     pub timestamp: SystemTime,
 }
 
-impl FromRedisValue for EventInfo {
-    fn from_redis_value(value: &Value) -> RedisResult<Self> {
+impl EventInfo {
+    fn from_redis_value_inner(value: &Value, is_multi: bool) -> RedisResult<Self> {
         match value {
             Value::Map(fields) => {
                 let mut event_id = None;
+                let mut partition_id = None;
+                let mut partition_sequence = None;
                 let mut stream_id = None;
                 let mut stream_version = None;
                 let mut timestamp = None;
@@ -641,6 +645,28 @@ impl FromRedisValue for EventInfo {
                     match field_name {
                         "event_id" => {
                             event_id = Some(parse_value!(Uuid, val, "event_id")?);
+                        }
+                        "partition_id" => {
+                            partition_id = Some(match val {
+                                Value::Int(n) => *n as u16,
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "partition_id must be an integer",
+                                    )));
+                                }
+                            });
+                        }
+                        "partition_sequence" => {
+                            partition_sequence = Some(match val {
+                                Value::Int(n) => *n as u64,
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "partition_sequence must be an integer",
+                                    )));
+                                }
+                            });
                         }
                         "stream_id" => {
                             stream_id = Some(parse_value!(String, val, "stream_id")?);
@@ -681,6 +707,21 @@ impl FromRedisValue for EventInfo {
                         "Missing required field: event_id",
                     ))
                 })?;
+                let partition_id = partition_id.or(is_multi.then_some(0)).ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: partition_id",
+                    ))
+                })?;
+                let partition_sequence =
+                    partition_sequence
+                        .or(is_multi.then_some(0))
+                        .ok_or_else(|| {
+                            RedisError::from((
+                                redis::ErrorKind::TypeError,
+                                "Missing required field: partition_sequence",
+                            ))
+                        })?;
                 let stream_id = stream_id.ok_or_else(|| {
                     RedisError::from((
                         redis::ErrorKind::TypeError,
@@ -702,6 +743,8 @@ impl FromRedisValue for EventInfo {
 
                 Ok(EventInfo {
                     event_id,
+                    partition_id,
+                    partition_sequence,
                     stream_id,
                     stream_version,
                     timestamp,
@@ -712,6 +755,12 @@ impl FromRedisValue for EventInfo {
                 "Event info must be a Redis map",
             ))),
         }
+    }
+}
+
+impl FromRedisValue for EventInfo {
+    fn from_redis_value(value: &Value) -> RedisResult<Self> {
+        Self::from_redis_value_inner(value, false)
     }
 }
 
@@ -773,7 +822,7 @@ impl FromRedisValue for MultiAppendInfo {
                             events = Some(match val {
                                 Value::Array(event_values) => event_values
                                     .iter()
-                                    .map(EventInfo::from_redis_value)
+                                    .map(|value| EventInfo::from_redis_value_inner(value, true))
                                     .collect::<Result<Vec<_>, _>>()?,
                                 _ => {
                                     return Err(RedisError::from((
@@ -812,12 +861,21 @@ impl FromRedisValue for MultiAppendInfo {
                         "Missing required field: last_partition_sequence",
                     ))
                 })?;
-                let events = events.ok_or_else(|| {
-                    RedisError::from((
-                        redis::ErrorKind::TypeError,
-                        "Missing required field: events",
-                    ))
-                })?;
+                let events = events
+                    .ok_or_else(|| {
+                        RedisError::from((
+                            redis::ErrorKind::TypeError,
+                            "Missing required field: events",
+                        ))
+                    })?
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, mut event)| {
+                        event.partition_id = partition_id;
+                        event.partition_sequence = first_partition_sequence + i as u64;
+                        event
+                    })
+                    .collect();
 
                 Ok(MultiAppendInfo {
                     partition_key,

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "fuzz"]
+members = ["crates/*", "tests", "fuzz"]
 
 [workspace.dependencies]
 sierradb = { path = "crates/sierradb" }
@@ -31,6 +31,7 @@ libp2p = "0.56"
 rand = "0.9"
 serde = "1.0"
 smallvec = "1.15"
+strum = { version = "0.27", features = ["derive"] }
 tempfile = "3.16"
 tokio = "1.44"
 thiserror = "2.0"

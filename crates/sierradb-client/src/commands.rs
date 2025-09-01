@@ -173,7 +173,7 @@ implement_commands! {
     ///
     /// # Returns
     /// Returns the current sequence number for the partition.
-    fn epseq_by_key<>(partition_key: Uuid) -> (u64) {
+    fn epseq_by_key<>(partition_key: Uuid) -> (Option<u64>) {
         cmd("EPSEQ").arg(partition_key.to_string())
     }
 
@@ -189,7 +189,7 @@ implement_commands! {
     ///
     /// # Returns
     /// Returns the current sequence number for the partition.
-    fn epseq_by_id<>(partition_id: u16) -> (u64) {
+    fn epseq_by_id<>(partition_id: u16) -> (Option<u64>) {
         cmd("EPSEQ").arg(partition_id)
     }
 
@@ -205,7 +205,7 @@ implement_commands! {
     ///
     /// # Returns
     /// Returns the current version number for the stream.
-    fn esver<>(stream_id: &'a str) -> (u64) {
+    fn esver<>(stream_id: &'a str) -> (Option<u64>) {
         cmd("ESVER").arg(stream_id)
     }
 
@@ -223,7 +223,7 @@ implement_commands! {
     ///
     /// # Returns
     /// Returns the current version number for the stream in the specified partition.
-    fn esver_with_partition_key<>(stream_id: &'a str, partition_key: Uuid) -> (u64) {
+    fn esver_with_partition_key<>(stream_id: &'a str, partition_key: Uuid) -> (Option<u64>) {
         cmd("ESVER").arg(stream_id).arg("PARTITION_KEY").arg(partition_key.to_string())
     }
 

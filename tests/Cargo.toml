@@ -1,0 +1,19 @@
+[package]
+name = "tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dev-dependencies]
+kameo.workspace = true
+libp2p.workspace = true
+sierradb.workspace = true
+sierradb-cluster.workspace = true
+smallvec.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[[test]]
+name = "subscriptions"
+path = "subscriptions.rs"

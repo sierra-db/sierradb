@@ -1,11 +1,12 @@
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 
 use futures::{FutureExt, future::BoxFuture};
 use kameo::prelude::*;
+use rand::{SeedableRng, rngs::StdRng, seq::IteratorRandom};
 use sierradb::{
     StreamId,
     bucket::{PartitionId, segment::EventRecord},
@@ -24,7 +25,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::ClusterActor;
+use crate::{ClusterActor, confirmation::AtomicWatermark};
 
 pub struct Subscribe {
     pub subscription_id: Uuid,
@@ -58,6 +59,7 @@ impl Message<Subscribe> for ClusterActor {
     }
 }
 
+#[derive(Debug)]
 pub enum SubscriptionEvent {
     Record {
         subscription_id: Uuid,
@@ -122,7 +124,7 @@ impl SubscriptionMatcher {
                 partition_id,
                 from_sequence,
             } => {
-                if &record.partition_id == partition_id {
+                if &record.partition_id != partition_id {
                     return true; // Ignore this event, it doesn't match our criteria
                 }
 
@@ -195,6 +197,98 @@ impl SubscriptionMatcher {
             }
         }
     }
+
+    fn update_state(
+        &mut self,
+        partition_id: PartitionId,
+        partition_sequence: u64,
+        partition_key: Uuid,
+        stream_id: StreamId,
+        stream_version: u64,
+    ) {
+        match self {
+            SubscriptionMatcher::AllPartitions { from_sequences } => {
+                Self::update_from_sequences(from_sequences, partition_id, partition_sequence);
+            }
+            SubscriptionMatcher::Partition {
+                partition_id: pid,
+                from_sequence,
+            } => {
+                if pid == &partition_id {
+                    *from_sequence = Some(partition_sequence + 1);
+                }
+            }
+            SubscriptionMatcher::Partitions {
+                partition_ids,
+                from_sequences,
+            } => {
+                if partition_ids.contains(&partition_id) {
+                    Self::update_from_sequences(from_sequences, partition_id, partition_sequence);
+                }
+            }
+            SubscriptionMatcher::Stream {
+                partition_key: pk,
+                stream_id: sid,
+                from_version,
+            } => {
+                if pk == &partition_key && sid == &stream_id {
+                    *from_version = Some(stream_version + 1);
+                }
+            }
+            SubscriptionMatcher::Streams {
+                stream_ids,
+                from_versions,
+            } => {
+                let key = (partition_key, stream_id);
+                if stream_ids.contains(&key) {
+                    match from_versions {
+                        FromVersions::Latest => {
+                            *from_versions = FromVersions::Streams(HashMap::from_iter([(
+                                key,
+                                stream_version + 1,
+                            )]));
+                        }
+                        FromVersions::Streams(streams) => {
+                            streams.insert(key, stream_version + 1);
+                        }
+                        FromVersions::AllStreams(_) => {
+                            *from_versions = FromVersions::Streams(HashMap::from_iter([(
+                                key,
+                                stream_version + 1,
+                            )]));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn update_from_sequences(
+        from_sequences: &mut FromSequences,
+        partition_id: PartitionId,
+        partition_sequence: u64,
+    ) {
+        match from_sequences {
+            FromSequences::Latest => {
+                *from_sequences = FromSequences::Partitions {
+                    from_sequences: HashMap::from_iter([(partition_id, partition_sequence + 1)]),
+                    fallback: None,
+                };
+            }
+            FromSequences::Partitions {
+                from_sequences: sequences,
+                fallback: _,
+            } => {
+                sequences.insert(partition_id, partition_sequence + 1);
+            }
+            FromSequences::AllPartitions(_) => {
+                *from_sequences = FromSequences::Partitions {
+                    from_sequences: HashMap::from_iter([(partition_id, partition_sequence + 1)]),
+                    fallback: None,
+                };
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -218,6 +312,7 @@ pub enum FromVersions {
 pub struct SubscriptionManager {
     database: Database,
     owned_partitions: Arc<HashSet<PartitionId>>,
+    watermarks: Arc<HashMap<PartitionId, Arc<AtomicWatermark>>>,
     num_partitions: u16,
     broadcast_tx: broadcast::Sender<EventRecord>,
 }
@@ -226,6 +321,7 @@ impl SubscriptionManager {
     pub fn new(
         database: Database,
         owned_partitions: Arc<HashSet<PartitionId>>,
+        watermarks: Arc<HashMap<PartitionId, Arc<AtomicWatermark>>>,
         num_partitions: u16,
     ) -> Self {
         let (broadcast_tx, _) = broadcast::channel(1_000);
@@ -233,6 +329,7 @@ impl SubscriptionManager {
         SubscriptionManager {
             database,
             owned_partitions,
+            watermarks,
             num_partitions,
             broadcast_tx,
         }
@@ -249,6 +346,7 @@ impl SubscriptionManager {
         let subscription = Subscription {
             database: self.database.clone(),
             owned_partitions: self.owned_partitions.clone(),
+            watermarks: self.watermarks.clone(),
             num_partitions: self.num_partitions,
             broadcast_rx: self.broadcast_tx.subscribe(),
             update_tx,
@@ -272,6 +370,7 @@ impl SubscriptionManager {
 struct Subscription {
     database: Database,
     owned_partitions: Arc<HashSet<PartitionId>>,
+    watermarks: Arc<HashMap<PartitionId, Arc<AtomicWatermark>>>,
     num_partitions: u16,
     broadcast_rx: broadcast::Receiver<EventRecord>,
     update_tx: UnboundedSender<SubscriptionEvent>,
@@ -308,7 +407,21 @@ impl Subscription {
             match self.broadcast_rx.recv().await {
                 Ok(record) => {
                     if !matcher.has_seen(&record) {
+                        let partition_id = record.partition_id;
+                        let partition_sequence = record.partition_sequence;
+                        let partition_key = record.partition_key;
+                        let stream_id = record.stream_id.clone();
+                        let stream_version = record.stream_version;
+
                         self.send_record(record).await?;
+
+                        matcher.update_state(
+                            partition_id,
+                            partition_sequence,
+                            partition_key,
+                            stream_id,
+                            stream_version,
+                        );
                     }
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -393,12 +506,31 @@ impl Subscription {
         partition_id: PartitionId,
         from_sequence: &mut u64,
     ) -> Result<(), SubscriptionError> {
+        let watermark = self
+            .watermarks
+            .get(&partition_id)
+            .ok_or(SubscriptionError::PartitionWatermarkNotFound { partition_id })?
+            .clone();
+        if !watermark.can_read(*from_sequence) {
+            return Ok(());
+        }
+
         let mut iter = self
             .database
             .read_partition(partition_id, *from_sequence)
             .await?;
         while let Some(commit) = iter.next().await? {
+            let Some(first_partition_sequence) = commit.first_partition_sequence() else {
+                continue;
+            };
+
+            if !watermark.can_read(first_partition_sequence) {
+                break;
+            }
+
             for event in commit {
+                debug_assert!(watermark.can_read(event.partition_sequence));
+
                 let sequence = event.partition_sequence;
                 self.send_record(event).await?;
 
@@ -439,11 +571,54 @@ impl Subscription {
                     from_sequences,
                     fallback: None,
                 } => {
-                    for partition_id in partition_ids.as_ref() {
-                        let from_sequence = from_sequences.get_mut(partition_id);
-                        if let Some(from_sequence) = from_sequence {
-                            self.read_partition_history(*partition_id, from_sequence)
-                                .await?;
+                    let mut partition_iters = BTreeMap::new();
+                    for (partition_id, from_sequence) in from_sequences
+                        .iter_mut()
+                        .filter(|(partition_id, _)| partition_ids.contains(partition_id))
+                    {
+                        let iter = self
+                            .database
+                            .read_partition(*partition_id, *from_sequence)
+                            .await?;
+                        partition_iters.insert(*partition_id, (iter, from_sequence));
+                    }
+
+                    let mut rng = StdRng::from_rng(&mut rand::rng());
+
+                    while let Some((partition_id, (iter, from_sequence))) =
+                        partition_iters.iter_mut().choose(&mut rng)
+                    {
+                        let Some(commit) = iter.next().await? else {
+                            let partition_id = *partition_id;
+                            partition_iters.remove(&partition_id);
+                            continue;
+                        };
+
+                        let Some(first_partition_sequence) = commit.first_partition_sequence()
+                        else {
+                            continue;
+                        };
+
+                        let watermark = self
+                            .watermarks
+                            .get(&partition_id)
+                            .ok_or(SubscriptionError::PartitionWatermarkNotFound {
+                                partition_id: *partition_id,
+                            })?
+                            .clone();
+                        if !watermark.can_read(first_partition_sequence) {
+                            let partition_id = *partition_id;
+                            partition_iters.remove(&partition_id);
+                            continue;
+                        }
+
+                        for event in commit {
+                            debug_assert!(watermark.can_read(event.partition_sequence));
+
+                            let sequence = event.partition_sequence;
+                            self.send_record(event).await?;
+
+                            **from_sequence = sequence + 1;
                         }
                     }
                 }
@@ -486,12 +661,28 @@ impl Subscription {
         let partition_hash = uuid_to_partition_hash(partition_key);
         let partition_id = partition_hash % self.num_partitions;
 
+        let watermark = self
+            .watermarks
+            .get(&partition_id)
+            .ok_or(SubscriptionError::PartitionWatermarkNotFound { partition_id })?
+            .clone();
+
         let mut iter = self
             .database
             .read_stream(partition_id, stream_id, *from_version, false)
             .await?;
         while let Some(commit) = iter.next().await? {
+            let Some(first_partition_sequence) = commit.first_partition_sequence() else {
+                continue;
+            };
+
+            if !watermark.can_read(first_partition_sequence) {
+                break;
+            }
+
             for event in commit {
+                debug_assert!(watermark.can_read(event.partition_sequence));
+
                 let version = event.stream_version;
                 self.send_record(event).await?;
 
@@ -540,6 +731,8 @@ impl Subscription {
 pub enum SubscriptionError {
     #[error("receiver closed")]
     ReceiverClosed,
+    #[error("partition watermark not found for partition {partition_id}")]
+    PartitionWatermarkNotFound { partition_id: PartitionId },
     #[error(transparent)]
     PartitionIndex(#[from] PartitionIndexError),
     #[error(transparent)]

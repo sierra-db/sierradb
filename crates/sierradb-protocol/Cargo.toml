@@ -6,3 +6,4 @@ description = "Shared protocol types and utilities for SierraDB"
 
 [dependencies]
 serde.workspace = true
+strum.workspace = true
