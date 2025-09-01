@@ -111,13 +111,14 @@ async fn test_subscriptions() -> Result<(), Box<dyn std::error::Error>> {
         let mut count = 0;
         let mut received_events = HashSet::new();
         let mut last_event_id = Uuid::nil();
-        while let Ok(event) = update_rx.try_recv() {
+        while let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(1), update_rx.recv()).await
+        {
             if let SubscriptionEvent::Record { record, cursor, .. } = event {
                 assert_ne!(last_event_id, record.event_id);
                 last_event_id = record.event_id;
                 assert!(received_events.insert(record.event_id));
                 last_ack_tx.send(Some(cursor))?;
-                tokio::time::sleep(Duration::from_millis(1)).await;
                 count += 1;
             }
         }
@@ -155,13 +156,12 @@ async fn test_subscriptions() -> Result<(), Box<dyn std::error::Error>> {
             })
             .await?;
 
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
         let mut count = 0;
-        while let Ok(event) = update_rx.try_recv() {
+        while let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(1), update_rx.recv()).await
+        {
             if let SubscriptionEvent::Record { cursor, .. } = event {
                 last_ack_tx.send(Some(cursor))?;
-                tokio::time::sleep(Duration::from_millis(1)).await;
                 count += 1;
             }
         }

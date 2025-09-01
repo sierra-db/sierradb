@@ -323,9 +323,8 @@ impl SubscriptionManager {
         owned_partitions: Arc<HashSet<PartitionId>>,
         watermarks: Arc<HashMap<PartitionId, Arc<AtomicWatermark>>>,
         num_partitions: u16,
+        broadcast_tx: broadcast::Sender<EventRecord>,
     ) -> Self {
-        let (broadcast_tx, _) = broadcast::channel(1_000);
-
         SubscriptionManager {
             database,
             owned_partitions,
@@ -406,23 +405,25 @@ impl Subscription {
         loop {
             match self.broadcast_rx.recv().await {
                 Ok(record) => {
-                    if !matcher.has_seen(&record) {
-                        let partition_id = record.partition_id;
-                        let partition_sequence = record.partition_sequence;
-                        let partition_key = record.partition_key;
-                        let stream_id = record.stream_id.clone();
-                        let stream_version = record.stream_version;
-
-                        self.send_record(record).await?;
-
-                        matcher.update_state(
-                            partition_id,
-                            partition_sequence,
-                            partition_key,
-                            stream_id,
-                            stream_version,
-                        );
+                    if matcher.has_seen(&record) {
+                        continue;
                     }
+
+                    let partition_id = record.partition_id;
+                    let partition_sequence = record.partition_sequence;
+                    let partition_key = record.partition_key;
+                    let stream_id = record.stream_id.clone();
+                    let stream_version = record.stream_version;
+
+                    self.send_record(record).await?;
+
+                    matcher.update_state(
+                        partition_id,
+                        partition_sequence,
+                        partition_key,
+                        stream_id,
+                        stream_version,
+                    );
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
                 Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -601,7 +602,7 @@ impl Subscription {
 
                         let watermark = self
                             .watermarks
-                            .get(&partition_id)
+                            .get(partition_id)
                             .ok_or(SubscriptionError::PartitionWatermarkNotFound {
                                 partition_id: *partition_id,
                             })?
@@ -811,9 +812,18 @@ mod tests {
         let window_size = 10;
         let subscription_id = Uuid::new_v4();
 
+        // Create dummy watermarks for testing
+        let watermarks = Arc::new(
+            owned_partitions
+                .iter()
+                .map(|&id| (id, Arc::new(AtomicWatermark::new(0))))
+                .collect::<HashMap<_, _>>(),
+        );
+
         let mut subscription = Subscription {
             database: db.clone(),
             owned_partitions,
+            watermarks,
             num_partitions,
             broadcast_rx,
             update_tx,
@@ -843,6 +853,15 @@ mod tests {
 
         append_event(&db, partition_key, num_partitions, stream_id.clone()).await;
 
+        // Update watermark to allow reading the event we just wrote
+        let partition_hash = uuid_to_partition_hash(partition_key);
+        let partition_id = partition_hash % num_partitions;
+        subscription
+            .watermarks
+            .get(&partition_id)
+            .unwrap()
+            .advance(1);
+
         let mut matcher = SubscriptionMatcher::Stream {
             partition_key,
             stream_id: stream_id.clone(),
@@ -859,6 +878,15 @@ mod tests {
         );
 
         append_event(&db, partition_key, num_partitions, stream_id.clone()).await;
+
+        // Update watermark to allow reading the second event
+        let partition_hash = uuid_to_partition_hash(partition_key);
+        let partition_id = partition_hash % num_partitions;
+        subscription
+            .watermarks
+            .get(&partition_id)
+            .unwrap()
+            .advance(2);
 
         subscription.read_history(&mut matcher).await.unwrap();
         assert_eq!(
@@ -882,9 +910,18 @@ mod tests {
         let window_size = 10;
         let subscription_id = Uuid::new_v4();
 
+        // Create dummy watermarks for testing
+        let watermarks = Arc::new(
+            owned_partitions
+                .iter()
+                .map(|&id| (id, Arc::new(AtomicWatermark::new(0))))
+                .collect::<HashMap<_, _>>(),
+        );
+
         let mut subscription = Subscription {
             database: db.clone(),
             owned_partitions,
+            watermarks,
             num_partitions,
             broadcast_rx,
             update_tx,
@@ -931,6 +968,15 @@ mod tests {
             }
         );
 
+        // Update watermark to allow reading the event we just wrote
+        let partition_hash_a = uuid_to_partition_hash(partition_key_a);
+        let partition_id_a = partition_hash_a % num_partitions;
+        subscription
+            .watermarks
+            .get(&partition_id_a)
+            .unwrap()
+            .advance(1);
+
         let mut matcher = SubscriptionMatcher::Streams {
             stream_ids: stream_ids.clone(),
             from_versions: FromVersions::Streams(HashMap::from_iter([(
@@ -971,6 +1017,13 @@ mod tests {
             }
         );
 
+        // Update watermark for second event on stream A
+        subscription
+            .watermarks
+            .get(&partition_id_a)
+            .unwrap()
+            .advance(2);
+
         let mut matcher = SubscriptionMatcher::Streams {
             stream_ids: stream_ids.clone(),
             from_versions: FromVersions::AllStreams(0),
@@ -988,6 +1041,15 @@ mod tests {
         );
 
         append_event(&db, partition_key_b, num_partitions, stream_id_b.clone()).await;
+
+        // Update watermark for event on stream B
+        let partition_hash_b = uuid_to_partition_hash(partition_key_b);
+        let partition_id_b = partition_hash_b % num_partitions;
+        subscription
+            .watermarks
+            .get(&partition_id_b)
+            .unwrap()
+            .advance(1);
 
         let mut matcher = SubscriptionMatcher::Streams {
             stream_ids: stream_ids.clone(),
@@ -1017,9 +1079,18 @@ mod tests {
         let window_size = 10;
         let subscription_id = Uuid::new_v4();
 
+        // Create dummy watermarks for testing
+        let watermarks = Arc::new(
+            owned_partitions
+                .iter()
+                .map(|&id| (id, Arc::new(AtomicWatermark::new(0))))
+                .collect::<HashMap<_, _>>(),
+        );
+
         let mut subscription = Subscription {
             database: db.clone(),
             owned_partitions,
+            watermarks,
             num_partitions,
             broadcast_rx,
             update_tx,
@@ -1049,6 +1120,13 @@ mod tests {
 
         append_event(&db, partition_key, num_partitions, stream_id.clone()).await;
 
+        // Update watermark to allow reading the event we just wrote
+        subscription
+            .watermarks
+            .get(&partition_id)
+            .unwrap()
+            .advance(1);
+
         let mut matcher = SubscriptionMatcher::Partition {
             partition_id,
             from_sequence: Some(0),
@@ -1063,6 +1141,13 @@ mod tests {
         );
 
         append_event(&db, partition_key, num_partitions, stream_id.clone()).await;
+
+        // Update watermark to allow reading the second event
+        subscription
+            .watermarks
+            .get(&partition_id)
+            .unwrap()
+            .advance(2);
 
         subscription.read_history(&mut matcher).await.unwrap();
         assert_eq!(
@@ -1085,9 +1170,18 @@ mod tests {
         let window_size = 10;
         let subscription_id = Uuid::new_v4();
 
+        // Create dummy watermarks for testing
+        let watermarks = Arc::new(
+            owned_partitions
+                .iter()
+                .map(|&id| (id, Arc::new(AtomicWatermark::new(0))))
+                .collect::<HashMap<_, _>>(),
+        );
+
         let mut subscription = Subscription {
             database: db.clone(),
             owned_partitions,
+            watermarks,
             num_partitions,
             broadcast_rx,
             update_tx,
@@ -1137,6 +1231,13 @@ mod tests {
             }
         );
 
+        // Update watermark to allow reading the event we just wrote
+        subscription
+            .watermarks
+            .get(&partition_id_a)
+            .unwrap()
+            .advance(1);
+
         let mut matcher = SubscriptionMatcher::Partitions {
             partition_ids: partition_ids.clone(),
             from_sequences: FromSequences::Partitions {
@@ -1177,6 +1278,13 @@ mod tests {
             }
         );
 
+        // Update watermark for second event on partition A
+        subscription
+            .watermarks
+            .get(&partition_id_a)
+            .unwrap()
+            .advance(2);
+
         let mut matcher = SubscriptionMatcher::Partitions {
             partition_ids: partition_ids.clone(),
             from_sequences: FromSequences::Partitions {
@@ -1213,6 +1321,13 @@ mod tests {
         );
 
         append_event(&db, partition_key_b, num_partitions, stream_id_b.clone()).await;
+
+        // Update watermark for event on partition B
+        subscription
+            .watermarks
+            .get(&partition_id_b)
+            .unwrap()
+            .advance(1);
 
         let mut matcher = SubscriptionMatcher::Partitions {
             partition_ids: partition_ids.clone(),
