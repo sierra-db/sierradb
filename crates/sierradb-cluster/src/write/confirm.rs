@@ -32,20 +32,19 @@ impl Message<ConfirmTransaction> for ClusterActor {
     ) -> Self::Reply {
         let database = self.database.clone();
         let confirmation_ref = self.confirmation_ref.clone();
-        let broadcast_tx = self.subscription_manager.broadcaster();
 
         ctx.spawn(async move {
             let Some(first_event_id) = msg.event_ids.first() else {
                 return Err(ConfirmTransactionError::EventsLengthMismatch);
             };
 
-            let (offsets, commit) = match database
+            let offsets = match database
                 .read_transaction(msg.partition_id, *first_event_id)
                 .await
                 .map_err(|err| ConfirmTransactionError::Read(err.to_string()))?
             {
                 Some(CommittedEvents::Single(event)) => {
-                    (smallvec![event.offset], CommittedEvents::Single(event))
+                    smallvec![event.offset]
                 }
                 Some(CommittedEvents::Transaction { events, commit }) => {
                     if events.len() != msg.event_ids.len() {
@@ -64,7 +63,7 @@ impl Message<ConfirmTransaction> for ClusterActor {
                         }
                     }
 
-                    let offsets = events
+                    events
                         .iter()
                         .zip(msg.event_ids)
                         .map(|(event, event_id)| {
@@ -75,9 +74,7 @@ impl Message<ConfirmTransaction> for ClusterActor {
                             Ok(event.offset)
                         })
                         .chain(iter::once(Ok(commit.offset)))
-                        .collect::<Result<_, _>>()?;
-
-                    (offsets, CommittedEvents::Transaction { events, commit })
+                        .collect::<Result<_, _>>()?
                 }
                 None => {
                     return Err(ConfirmTransactionError::TransactionNotFound);
@@ -104,12 +101,7 @@ impl Message<ConfirmTransaction> for ClusterActor {
                         })
                         .await;
 
-                    // Notify subscriptions about confirmed events
-                    for event in commit {
-                        if broadcast_tx.send(event).is_err() {
-                            break;
-                        }
-                    }
+                    // Events will be broadcast automatically by confirmation actor
 
                     Ok(())
                 }

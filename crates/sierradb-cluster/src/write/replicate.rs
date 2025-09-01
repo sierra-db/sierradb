@@ -20,6 +20,7 @@ use tracing::{debug, error, instrument, warn};
 
 use crate::{
     ClusterActor, ClusterError,
+    confirmation::actor::{ConfirmationActor, UpdateConfirmationWithBroadcast},
     write::{
         ordered_queue::{self, OrderedValue},
         timeout_ordered_queue::{TimedOrderedValue, TimeoutOrderedQueue},
@@ -31,6 +32,7 @@ use super::error::WriteError;
 pub struct PartitionReplicatorActor {
     partition_id: PartitionId,
     database: Database,
+    confirmation_ref: ActorRef<ConfirmationActor>,
     buffered_writes: TimeoutOrderedQueue<u64, BufferedWrite>,
     buffer_timeout: Duration,
     catching_up: bool,
@@ -40,6 +42,7 @@ pub struct PartitionReplicatorActor {
 pub struct PartitionReplicatorActorArgs {
     pub partition_id: PartitionId,
     pub database: Database,
+    pub confirmation_ref: ActorRef<ConfirmationActor>,
     /// Maximum number of out-of-order writes to buffer per partition
     pub buffer_size: usize,
     /// Maximum time to keep buffered writes before timing out
@@ -56,6 +59,7 @@ impl Actor for PartitionReplicatorActor {
         PartitionReplicatorActorArgs {
             partition_id,
             database,
+            confirmation_ref,
             buffer_size,
             buffer_timeout,
             catchup_timeout,
@@ -84,6 +88,7 @@ impl Actor for PartitionReplicatorActor {
         Ok(PartitionReplicatorActor {
             partition_id,
             database,
+            confirmation_ref,
             buffered_writes: TimeoutOrderedQueue::new(
                 next_expected_seq,
                 buffer_size,
@@ -283,6 +288,7 @@ impl PartitionReplicatorActor {
     }
 
     async fn write_transaction(&mut self, tx: Transaction) -> Result<AppendResult, WriteError> {
+        let confirmation_count = tx.confirmation_count();
         let res = self
             .database
             .append_events(tx)
@@ -304,12 +310,29 @@ impl PartitionReplicatorActor {
             Ok(append) => {
                 debug!(
                     "successfully wrote partition {} sequences {}-{}",
+                    self.partition_id,
                     append.first_partition_sequence,
                     append.last_partition_sequence,
-                    self.partition_id
                 );
                 self.buffered_writes
                     .progress_to(append.last_partition_sequence + 1);
+
+                // Buffer events for potential broadcast when confirmed
+                let event_partition_sequences: SmallVec<[u64; 4]> =
+                    (append.first_partition_sequence..=append.last_partition_sequence).collect();
+
+                let _ = self
+                    .confirmation_ref
+                    .tell(UpdateConfirmationWithBroadcast {
+                        partition_id: self.partition_id,
+                        versions: event_partition_sequences,
+                        confirmation_count,
+                        partition_sequences: (
+                            append.first_partition_sequence,
+                            append.last_partition_sequence,
+                        ),
+                    })
+                    .await;
             }
             Err(err) => {
                 error!("failed to replicate write: {err}");
@@ -530,7 +553,7 @@ impl Message<PartitionSyncRequest> for ClusterActor {
                     error!("found commit with zero events - this should not happen");
                     continue;
                 };
-                if first_seq > watermark {
+                if first_seq >= watermark {
                     break;
                 }
 

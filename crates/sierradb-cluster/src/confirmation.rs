@@ -764,23 +764,24 @@ pub struct AtomicWatermark {
 }
 
 impl AtomicWatermark {
-    fn new(initial: u64) -> Self {
+    #[inline]
+    pub fn new(initial: u64) -> Self {
         Self {
             value: AtomicU64::new(initial),
         }
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn get(&self) -> u64 {
         self.value.load(Ordering::Acquire)
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn can_read(&self, partition_sequence: u64) -> bool {
         partition_sequence < self.get()
     }
 
-    fn advance(&self, new_value: u64) -> Option<u64> {
+    pub fn advance(&self, new_value: u64) -> Option<u64> {
         loop {
             let current = self.value.load(Ordering::Acquire);
             if new_value <= current {

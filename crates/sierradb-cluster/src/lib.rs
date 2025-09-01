@@ -186,6 +186,17 @@ impl Actor for ClusterActor {
             swarm.listen_on(addr)?;
         }
 
+        let confirmation_actor = ConfirmationActor::new(
+            database.clone(),
+            replication_factor,
+            assigned_partitions.clone(),
+        )
+        .await
+        .map_err(|err| ClusterError::ConfirmationFailure(err.to_string()))?;
+        let watermarks = confirmation_actor.manager.get_watermarks();
+        let broadcaster = confirmation_actor.broadcaster();
+        let confirmation_ref = Actor::spawn(confirmation_actor);
+
         let replicator_refs = assigned_partitions
             .iter()
             .map(|partition_id| {
@@ -195,6 +206,7 @@ impl Actor for ClusterActor {
                         PartitionReplicatorActorArgs {
                             partition_id: *partition_id,
                             database: database.clone(),
+                            confirmation_ref: confirmation_ref.clone(),
                             buffer_size: replication_buffer_size,
                             buffer_timeout: replication_buffer_timeout,
                             catchup_timeout: replication_catchup_timeout,
@@ -205,18 +217,12 @@ impl Actor for ClusterActor {
             })
             .collect();
 
-        let confirmation_actor =
-            ConfirmationActor::new(&database, replication_factor, assigned_partitions.clone())
-                .await
-                .map_err(|err| ClusterError::ConfirmationFailure(err.to_string()))?;
-        let watermarks = confirmation_actor.manager.get_watermarks();
-        let confirmation_ref = Actor::spawn(confirmation_actor);
-
         let subscription_manager = SubscriptionManager::new(
             database.clone(),
             Arc::new(assigned_partitions),
             Arc::new(watermarks.clone()),
             partition_count,
+            broadcaster,
         );
 
         let circuit_breaker = Arc::new(WriteCircuitBreaker::with_defaults());
@@ -264,6 +270,17 @@ impl Message<ResetCluster> for ClusterActor {
         let assigned_partitions = self.topology_manager().assigned_partitions.clone();
         let partition_count = self.topology_manager().num_partitions;
 
+        let confirmation_actor = ConfirmationActor::new(
+            database.clone(),
+            self.replication_factor,
+            assigned_partitions.clone(),
+        )
+        .await
+        .map_err(|err| ClusterError::ConfirmationFailure(err.to_string()))?;
+        let watermarks = confirmation_actor.manager.get_watermarks();
+        let broadcaster = confirmation_actor.broadcaster();
+        let confirmation_ref = Actor::spawn(confirmation_actor);
+
         let replicator_refs = assigned_partitions
             .iter()
             .map(|partition_id| {
@@ -273,6 +290,7 @@ impl Message<ResetCluster> for ClusterActor {
                         PartitionReplicatorActorArgs {
                             partition_id: *partition_id,
                             database: database.clone(),
+                            confirmation_ref: confirmation_ref.clone(),
                             buffer_size: 1_000,
                             buffer_timeout: Duration::from_millis(8_000),
                             catchup_timeout: Duration::from_millis(1_000),
@@ -283,20 +301,12 @@ impl Message<ResetCluster> for ClusterActor {
             })
             .collect();
 
-        let confirmation_actor = ConfirmationActor::new(
-            &database,
-            self.replication_factor,
-            assigned_partitions.clone(),
-        )
-        .await
-        .map_err(|err| ClusterError::ConfirmationFailure(err.to_string()))?;
-        let watermarks = confirmation_actor.manager.get_watermarks();
-        let confirmation_ref = Actor::spawn(confirmation_actor);
-
         let subscription_manager = SubscriptionManager::new(
             database.clone(),
             Arc::new(assigned_partitions),
+            Arc::new(watermarks.clone()),
             partition_count,
+            broadcaster,
         );
 
         let circuit_breaker = Arc::new(WriteCircuitBreaker::with_defaults());
