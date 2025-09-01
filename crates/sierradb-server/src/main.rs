@@ -10,17 +10,21 @@ use sierradb_server::server::Server;
 use tracing::{debug, error};
 use tracing_subscriber::EnvFilter;
 
+#[cfg(debug_assertions)]
+const DEFAULT_ENV_FILTER: &str = "sierradb_cluster=DEBUG,sierradb_server=DEBUG,sierradb=DEBUG,INFO";
+#[cfg(not(debug_assertions))]
+const DEFAULT_ENV_FILTER: &str = "INFO";
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     tracing_subscriber::fmt::SubscriberBuilder::default()
         .without_time()
-        .with_target(false)
-        .with_env_filter(EnvFilter::new(args.log.as_deref().unwrap_or(
-            "sierradb_cluster=DEBUG,sierradb_server=DEBUG,sierradb=DEBUG,INFO",
-        )))
-        // .with_span_events(FmtSpan::ENTER)
+        .with_target(true)
+        .with_env_filter(EnvFilter::new(
+            args.log.as_deref().unwrap_or(DEFAULT_ENV_FILTER),
+        ))
         .init();
 
     let config = AppConfig::load(args)?;

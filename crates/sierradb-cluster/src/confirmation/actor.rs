@@ -1,4 +1,4 @@
-//! Actor module for managing confirmation state in Eventus
+//! Actor module for managing confirmation state in Sierra
 //!
 //! This module provides a Kameo actor wrapper around
 //! `BucketConfirmationManager` to enable concurrent, fault-tolerant

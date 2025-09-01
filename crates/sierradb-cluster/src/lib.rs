@@ -125,7 +125,7 @@ impl Actor for ClusterActor {
         trace!(
             %local_peer_id,
             partitions = %assigned_partitions.len(),
-            "Starting swarm actor"
+            "starting swarm actor"
         );
 
         let kameo = remote::Behaviour::new(
@@ -215,6 +215,7 @@ impl Actor for ClusterActor {
         let subscription_manager = SubscriptionManager::new(
             database.clone(),
             Arc::new(assigned_partitions),
+            Arc::new(watermarks.clone()),
             partition_count,
         );
 
@@ -244,6 +245,70 @@ impl Actor for ClusterActor {
                 _event = self.swarm.select_next_some() => {},
             }
         }
+    }
+}
+
+/// For testing purposes.
+pub struct ResetCluster {
+    pub database: Database,
+}
+
+impl Message<ResetCluster> for ClusterActor {
+    type Reply = Result<(), ClusterError>;
+
+    async fn handle(
+        &mut self,
+        ResetCluster { database }: ResetCluster,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let assigned_partitions = self.topology_manager().assigned_partitions.clone();
+        let partition_count = self.topology_manager().num_partitions;
+
+        let replicator_refs = assigned_partitions
+            .iter()
+            .map(|partition_id| {
+                (
+                    *partition_id,
+                    PartitionReplicatorActor::spawn_with_mailbox(
+                        PartitionReplicatorActorArgs {
+                            partition_id: *partition_id,
+                            database: database.clone(),
+                            buffer_size: 1_000,
+                            buffer_timeout: Duration::from_millis(8_000),
+                            catchup_timeout: Duration::from_millis(1_000),
+                        },
+                        mailbox::bounded(1_000),
+                    ),
+                )
+            })
+            .collect();
+
+        let confirmation_actor = ConfirmationActor::new(
+            &database,
+            self.replication_factor,
+            assigned_partitions.clone(),
+        )
+        .await
+        .map_err(|err| ClusterError::ConfirmationFailure(err.to_string()))?;
+        let watermarks = confirmation_actor.manager.get_watermarks();
+        let confirmation_ref = Actor::spawn(confirmation_actor);
+
+        let subscription_manager = SubscriptionManager::new(
+            database.clone(),
+            Arc::new(assigned_partitions),
+            partition_count,
+        );
+
+        let circuit_breaker = Arc::new(WriteCircuitBreaker::with_defaults());
+
+        self.replicator_refs = replicator_refs;
+        self.confirmation_ref = confirmation_ref;
+        self.watermarks = watermarks;
+        self.subscription_manager = subscription_manager;
+        self.circuit_breaker = circuit_breaker;
+        self.database = database;
+
+        Ok(())
     }
 }
 

@@ -1,36 +1,31 @@
-use sierradb_protocol::{ErrorCode, ParsedError};
-use std::fmt;
+use redis::RetryMethod;
+use sierradb_protocol::ErrorCode;
+use std::{fmt, str::FromStr};
 
 /// Errors that can occur when using the SierraDB client.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum SierraError {
     /// A protocol-level error returned by the Sierra server
-    Protocol { code: ErrorCode, message: String },
+    Protocol {
+        code: ErrorCode,
+        message: Option<String>,
+    },
     /// A Redis client error (connection, parsing, etc.)
-    Redis(String),
-    /// An invalid argument was provided by the client
-    InvalidArgument(String),
-    /// A generic error with a message
-    Other(String),
+    Redis(redis::RedisError),
 }
 
 impl SierraError {
     /// Parse a Redis error response into a SierraError.
-    ///
-    /// This attempts to parse Sierra error codes from Redis error responses.
-    /// If parsing fails, it falls back to a generic Redis error.
-    pub fn from_redis_error(redis_error: &redis::RedisError) -> Self {
-        let error_msg = redis_error.to_string();
-
-        // Try to parse as a Sierra protocol error
-        if let Some(parsed) = ParsedError::parse(&error_msg) {
-            SierraError::Protocol {
-                code: parsed.code,
-                message: parsed.message,
-            }
-        } else {
-            // Fall back to generic Redis error
-            SierraError::Redis(error_msg)
+    pub fn from_redis_error(redis_error: redis::RedisError) -> Self {
+        let code = redis_error
+            .code()
+            .and_then(|code| ErrorCode::from_str(code).ok());
+        match code {
+            Some(code) => SierraError::Protocol {
+                code,
+                message: redis_error.detail().map(ToOwned::to_owned),
+            },
+            None => SierraError::Redis(redis_error),
         }
     }
 
@@ -39,9 +34,7 @@ impl SierraError {
     pub fn is_retryable(&self) -> bool {
         match self {
             SierraError::Protocol { code, .. } => code.is_retryable(),
-            SierraError::Redis(_) => false, // Conservative - don't retry unknown Redis errors
-            SierraError::InvalidArgument(_) => false,
-            SierraError::Other(_) => false,
+            SierraError::Redis(err) => !matches!(err.retry_method(), RetryMethod::NoRetry),
         }
     }
 
@@ -49,7 +42,7 @@ impl SierraError {
     pub fn is_cluster_issue(&self) -> bool {
         match self {
             SierraError::Protocol { code, .. } => code.is_cluster_issue(),
-            _ => false,
+            SierraError::Redis(err) => err.is_cluster_error(),
         }
     }
 
@@ -57,8 +50,7 @@ impl SierraError {
     pub fn is_client_error(&self) -> bool {
         match self {
             SierraError::Protocol { code, .. } => code.is_client_error(),
-            SierraError::InvalidArgument(_) => true,
-            _ => false,
+            SierraError::Redis(_) => false,
         }
     }
 
@@ -94,16 +86,15 @@ impl SierraError {
 impl fmt::Display for SierraError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SierraError::Protocol { code, message } => {
-                if message.is_empty() {
-                    write!(f, "Sierra protocol error: {code}")
-                } else {
-                    write!(f, "Sierra protocol error: {code} {message}")
+            SierraError::Protocol { code, message } => match message {
+                Some(msg) => {
+                    write!(f, "sierra protocol error: {code} {msg}")
                 }
-            }
-            SierraError::Redis(msg) => write!(f, "Redis error: {msg}"),
-            SierraError::InvalidArgument(msg) => write!(f, "Invalid argument: {msg}"),
-            SierraError::Other(msg) => write!(f, "{msg}"),
+                None => {
+                    write!(f, "sierra protocol error: {code}")
+                }
+            },
+            SierraError::Redis(err) => write!(f, "redis error: {err}"),
         }
     }
 }
@@ -111,8 +102,8 @@ impl fmt::Display for SierraError {
 impl std::error::Error for SierraError {}
 
 impl From<redis::RedisError> for SierraError {
-    fn from(error: redis::RedisError) -> Self {
-        SierraError::from_redis_error(&error)
+    fn from(err: redis::RedisError) -> Self {
+        SierraError::from_redis_error(err)
     }
 }
 
@@ -128,44 +119,24 @@ mod tests {
         // Test parsing Sierra protocol errors directly
         let sierra_err = SierraError::Protocol {
             code: ErrorCode::ClusterDown,
-            message: "No available partitions".to_string(),
+            message: Some("No available partitions".to_string()),
         };
 
         assert_eq!(sierra_err.error_code(), Some(ErrorCode::ClusterDown));
         assert!(!sierra_err.is_retryable());
         assert!(sierra_err.is_cluster_issue());
-
-        // Test parsing from error string
-        if let Some(parsed) = ParsedError::parse("CLUSTERDOWN No available partitions") {
-            assert_eq!(parsed.code, ErrorCode::ClusterDown);
-            assert_eq!(parsed.message, "No available partitions");
-        } else {
-            panic!("Failed to parse error string");
-        }
     }
 
     #[test]
     fn test_error_categorization() {
         let protocol_err = SierraError::Protocol {
             code: ErrorCode::TryAgain,
-            message: "Try again later".to_string(),
+            message: Some("Try again later".to_string()),
         };
 
         assert!(protocol_err.is_retryable());
         assert!(!protocol_err.is_client_error());
         assert!(!protocol_err.is_cluster_issue());
         assert_eq!(protocol_err.error_code(), Some(ErrorCode::TryAgain));
-    }
-
-    #[test]
-    fn test_retry_delay() {
-        let try_again_err = SierraError::Protocol {
-            code: ErrorCode::TryAgain,
-            message: "".to_string(),
-        };
-        assert_eq!(try_again_err.retry_delay_ms(), Some(100));
-
-        let client_err = SierraError::InvalidArgument("Bad arg".to_string());
-        assert_eq!(client_err.retry_delay_ms(), None);
     }
 }

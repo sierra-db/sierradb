@@ -105,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Test ESVER command
     println!("🔢 Testing ESVER command...");
     match conn.esver(test_stream).await {
-        Ok(version) => println!("✅ Stream version: {version}"),
+        Ok(version) => println!("✅ Stream version: {version:?}"),
         Err(err) => println!("❌ ESVER failed: {err}"),
     }
 
@@ -115,21 +115,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .esver_with_partition_key(test_stream, test_partition_key)
         .await
     {
-        Ok(version) => println!("✅ Stream version (partition): {version}"),
+        Ok(version) => println!("✅ Stream version (partition): {version:?}"),
         Err(err) => println!("❌ ESVER with partition failed: {err}"),
     }
 
     // Test EPSEQ by key
     println!("🔢 Testing EPSEQ by key...");
     match conn.epseq_by_key(test_partition_key).await {
-        Ok(sequence) => println!("✅ Partition sequence: {sequence}"),
+        Ok(sequence) => println!("✅ Partition sequence: {sequence:?}"),
         Err(err) => println!("❌ EPSEQ by key failed: {err}"),
     }
 
     // Test EPSEQ by ID
     println!("🔢 Testing EPSEQ by ID...");
     match conn.epseq_by_id(689).await {
-        Ok(sequence) => println!("✅ Partition 689 sequence: {sequence}"),
+        Ok(sequence) => println!("✅ Partition 689 sequence: {sequence:?}"),
         Err(err) => println!("❌ EPSEQ by ID failed: {err}"),
     }
 

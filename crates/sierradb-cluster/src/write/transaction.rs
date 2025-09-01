@@ -134,32 +134,39 @@ pub fn spawn(
 
                         // Notify subscriptions about new events
                         // partition_id already available from above
-                        let database_clone = config.database.clone();
-                        let append_clone = append.clone();
-                        let broadcast_tx = config.broadcast_tx.clone();
-                        tokio::spawn(async move {
-                            // Read the events that were just written to notify subscriptions
-                            let read_result = database_clone
-                                .read_partition(partition_id, append_clone.first_partition_sequence)
-                                .await;
-                            if let Ok(mut iter) = read_result
-                                && let Ok(Some(commit)) = iter.next().await
-                            {
-                                for event in commit {
-                                    // Only notify if the event is within the range we just wrote
-                                    if event.partition_sequence
-                                        >= append_clone.first_partition_sequence
-                                        && event.partition_sequence
-                                            <= append_clone.last_partition_sequence
-                                    {
-                                        let res = broadcast_tx.send(event);
-                                        if res.is_err() {
-                                            break;
+                        if config.broadcast_tx.receiver_count() > 0 {
+                            let database_clone = config.database.clone();
+                            let append_clone = append.clone();
+                            let broadcast_tx = config.broadcast_tx.clone();
+
+                            tokio::spawn(async move {
+                                // Read the events that were just written to notify subscriptions
+                                let read_result = database_clone
+                                    .read_partition(
+                                        partition_id,
+                                        append_clone.first_partition_sequence,
+                                    )
+                                    .await;
+                                if let Ok(mut iter) = read_result
+                                    && let Ok(Some(commit)) = iter.next().await
+                                {
+                                    for event in commit {
+                                        // Only notify if the event is within the range we just
+                                        // wrote
+                                        if event.partition_sequence
+                                            >= append_clone.first_partition_sequence
+                                            && event.partition_sequence
+                                                <= append_clone.last_partition_sequence
+                                        {
+                                            let res = broadcast_tx.send(event);
+                                            if res.is_err() {
+                                                break;
+                                            }
                                         }
                                     }
                                 }
-                            }
-                        });
+                            });
+                        }
 
                         // Confirm writes for other partitions which still succeeded
                         while let Ok(Some((cluster_ref, res))) =

@@ -1031,7 +1031,7 @@ impl Message<GetStreamVersion> for ClusterActor {
                         .map_err(|err| ClusterError::Read(err.to_string()))?
                     {
                         for event in commit.into_iter().rev() {
-                            if event.partition_sequence > watermark {
+                            if event.partition_sequence >= watermark {
                                 continue;
                             }
 

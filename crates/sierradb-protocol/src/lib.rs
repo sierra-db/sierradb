@@ -8,7 +8,7 @@ pub mod error;
 
 use std::{cmp, fmt, num::ParseIntError, ops, str};
 
-pub use error::{ErrorCode, ParsedError};
+pub use error::ErrorCode;
 use serde::{Deserialize, Serialize};
 
 /// The expected version **before** the event is inserted.
