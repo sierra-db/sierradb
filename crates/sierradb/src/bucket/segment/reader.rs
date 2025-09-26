@@ -13,6 +13,7 @@ use bincode::error::DecodeError;
 use polonius_the_crab::{exit_polonius, polonius, polonius_return, polonius_try};
 use serde::{Deserialize, Serialize};
 use smallvec::{SmallVec, smallvec};
+use tracing::{info, trace, warn};
 use uuid::Uuid;
 
 use super::{
@@ -21,10 +22,10 @@ use super::{
     SEGMENT_HEADER_SIZE, VERSION_SIZE, calculate_commit_crc32c,
     calculate_confirmation_count_crc32c, calculate_event_crc32c,
 };
-use crate::StreamId;
 use crate::bucket::{BucketId, PartitionId};
 use crate::error::{ReadError, WriteError};
 use crate::id::{get_uuid_flag, uuid_to_partition_hash};
+use crate::{MAX_REPLICATION_FACTOR, STREAM_ID_SIZE, StreamId};
 
 const HEADER_BUF_SIZE: usize = EVENT_HEADER_SIZE - RECORD_HEADER_SIZE;
 const PAGE_SIZE: usize = 4096; // Usually a page is 4KB on Linux
@@ -86,7 +87,7 @@ impl CommittedEvents {
             CommittedEvents::Transaction { events, .. } => events.len(),
         }
     }
-    
+
     pub fn is_empty(&self) -> bool {
         match self {
             CommittedEvents::Single(_) => false,
@@ -556,6 +557,100 @@ impl BucketSegmentReader {
         let start = (offset - self.read_ahead_offset) as usize;
         Ok(&self.read_ahead_buf[start..start + length])
     }
+
+    // Recovery related methods
+    fn read_u64_at(&mut self, offset: u64) -> Result<u64, ReadError> {
+        let mut bytes = [0u8; 8];
+        self.file.read_exact_at(&mut bytes, offset)?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn try_read_record_header(&mut self, offset: u64) -> Result<RecordHeader, ReadError> {
+        // Check if we have enough bytes for at least a record header
+        if offset + RECORD_HEADER_SIZE as u64 > self.flushed_offset.load() {
+            return Err(ReadError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "requested data exceeds available read-ahead buffer",
+            )));
+        }
+
+        let mut header_buf = [0u8; RECORD_HEADER_SIZE];
+        self.file.read_exact_at(&mut header_buf, offset)?;
+
+        let (record_header, _) =
+            bincode::decode_from_slice::<RecordHeader, _>(&header_buf, BINCODE_CONFIG)?;
+
+        Ok(record_header)
+    }
+
+    fn peek_bytes_at(&mut self, offset: u64, len: usize) -> Result<Vec<u8>, ReadError> {
+        let mut bytes = vec![0u8; len];
+        self.file.read_exact_at(&mut bytes, offset)?;
+        Ok(bytes)
+    }
+
+    fn try_read_event_header(&mut self, offset: u64) -> Result<EventHeader, ReadError> {
+        // Check if we have enough bytes for event header
+        let header_size = EVENT_HEADER_SIZE - RECORD_HEADER_SIZE;
+        if offset + header_size as u64 > self.flushed_offset.load() {
+            return Err(ReadError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "insufficient bytes for event header",
+            )));
+        }
+
+        let mut header_buf = vec![0u8; header_size];
+        self.file.read_exact_at(&mut header_buf, offset)?;
+
+        let (event_header, _) =
+            bincode::decode_from_slice::<EventHeader, _>(&header_buf, BINCODE_CONFIG)?;
+        Ok(event_header)
+    }
+}
+
+#[derive(Debug, Clone)]
+enum CorruptionPattern {
+    /// Valid record found
+    ValidRecord { offset: u64, size: u64 },
+    /// Zero padding (likely from incomplete write)
+    ZeroPadding { start: u64, end: u64 },
+    /// Random corruption with non-zero data
+    Corruption { start: u64, end: u64 },
+    /// End of file reached
+    EndOfFile { offset: u64 },
+}
+
+struct CorruptionAnalysis {
+    patterns: Vec<CorruptionPattern>,
+    last_valid_offset: Option<u64>,
+    safe_to_truncate_at: Option<u64>,
+}
+
+impl CorruptionAnalysis {
+    fn new() -> Self {
+        Self {
+            patterns: Vec::new(),
+            last_valid_offset: None,
+            safe_to_truncate_at: None,
+        }
+    }
+
+    fn should_truncate(&self) -> bool {
+        // Only truncate if we have a clear truncation point and it's safe
+        if let Some(truncate_at) = self.safe_to_truncate_at {
+            // Check if everything after truncation point is zero padding or corruption
+            // with no valid records
+            let has_valid_after_truncation = self.patterns.iter().any(|pattern| {
+                match pattern {
+                    CorruptionPattern::ValidRecord { offset, .. } => *offset >= truncate_at,
+                    _ => false,
+                }
+            });
+            !has_valid_after_truncation
+        } else {
+            false
+        }
+    }
 }
 
 pub struct BucketSegmentIter<'a> {
@@ -595,14 +690,394 @@ impl BucketSegmentIter<'_> {
     }
 
     pub fn next_record(&mut self) -> Result<Option<Record>, ReadError> {
-        match self.reader.read_record(self.offset, ReadHint::Sequential) {
-            Ok(Some(record)) => {
-                self.offset = record.offset() + record.len();
-                Ok(Some(record))
+        loop {
+            match self.reader.read_record(self.offset, ReadHint::Sequential) {
+                Ok(Some(record)) => {
+                    // Validate the record makes sense
+                    if let Err(validation_error) = self.validate_record(&record) {
+                        warn!("record validation failed: {validation_error}, attempting recovery");
+
+                        if let Some(recovered_offset) = self.find_next_valid_record()? {
+                            trace!("recovered at offset {recovered_offset}, continuing");
+                            continue; // Try reading from the recovered position
+                        } else {
+                            return Ok(None); // No more recoverable records
+                        }
+                    }
+
+                    self.offset = record.offset() + record.len();
+                    return Ok(Some(record));
+                }
+                Ok(None) => return Ok(None),
+                Err(err) => {
+                    // Check if this looks like end-of-file (zeros) vs corruption
+                    let file_size = self.reader.file.metadata()?.len();
+                    if self.offset > file_size.saturating_sub(1024) {
+                        // within 1KB of end
+                        if let Ok(peek) = self.reader.peek_bytes_at(self.offset, 32)
+                            && peek.iter().all(|&b| b == 0)
+                        {
+                            trace!(
+                                "reached end of data with zero padding at offset {}",
+                                self.offset
+                            );
+                            return Ok(None);
+                        }
+                    }
+
+                    warn!(
+                        "read error at offset {}: {err}, attempting recovery",
+                        self.offset
+                    );
+
+                    if let Some(recovered_offset) = self.find_next_valid_record()? {
+                        info!("recovered at offset {recovered_offset}, continuing");
+                        continue; // Try reading from the recovered position
+                    } else {
+                        return Err(err);
+                    }
+                }
             }
-            Ok(None) => Ok(None),
-            Err(err) => Err(err),
         }
+    }
+
+    fn validate_record(&self, record: &Record) -> Result<(), String> {
+        match record {
+            Record::Event(event) => {
+                // Check stream_id length - this is the most common corruption we see
+                if event.stream_id.is_empty() {
+                    return Err(format!(
+                        "stream id must be between 1 and {STREAM_ID_SIZE} characters in length, but got 0 for ''"
+                    ));
+                }
+
+                if event.stream_id.len() > STREAM_ID_SIZE {
+                    return Err(format!(
+                        "stream id must be between 1 and 64 characters in length, but got {} for '{}'",
+                        event.stream_id.len(),
+                        event.stream_id
+                    ));
+                }
+
+                // Check event name is not empty
+                if event.event_name.is_empty() {
+                    return Err(format!(
+                        "event name cannot be empty at offset {}",
+                        event.offset
+                    ));
+                }
+
+                // Check payload sizes are reasonable
+                if event.metadata.len() > 10_000_000 || event.payload.len() > 10_000_000 {
+                    return Err(format!(
+                        "suspiciously large payload at offset {}: metadata={}, payload={}",
+                        event.offset,
+                        event.metadata.len(),
+                        event.payload.len()
+                    ));
+                }
+            }
+            Record::Commit(_) => {}
+        }
+
+        Ok(())
+    }
+
+    fn find_next_valid_record(&mut self) -> Result<Option<u64>, ReadError> {
+        let start_offset = self.offset;
+        let file_size = self.reader.file.metadata()?.len();
+        
+        // Phase 1: Analyze corruption patterns
+        let analysis = self.analyze_corruption_patterns(start_offset, file_size)?;
+        
+        // Phase 2: Make recovery decision based on analysis
+        if analysis.should_truncate() {
+            if let Some(truncate_at) = analysis.safe_to_truncate_at {
+                warn!("detected incomplete write corruption, truncating file at offset {truncate_at}");
+                self.truncate_to_offset(truncate_at)?;
+                return Ok(None);
+            }
+        }
+
+        // If we have a valid record, jump to it
+        if let Some(valid_offset) = analysis.last_valid_offset {
+            trace!("found valid record at offset {valid_offset} after corruption");
+            self.offset = valid_offset;
+            return Ok(Some(valid_offset));
+        }
+
+        // No recovery possible
+        warn!("no valid record found and no safe truncation point identified");
+        Ok(None)
+    }
+
+    fn analyze_corruption_patterns(&mut self, start_offset: u64, file_size: u64) -> Result<CorruptionAnalysis, ReadError> {
+        let mut analysis = CorruptionAnalysis::new();
+        let remaining_file = file_size.saturating_sub(start_offset);
+        
+        // Use adaptive scan distance
+        let max_scan_distance = if remaining_file < 64 * 1024 {
+            remaining_file
+        } else {
+            (remaining_file / 10).min(500_000) // Increased for thorough analysis
+        };
+
+        trace!("analyzing corruption patterns from offset {start_offset}, distance: {max_scan_distance}");
+
+        let mut current_offset = start_offset;
+        let end_offset = start_offset + max_scan_distance;
+
+        while current_offset < end_offset {
+            if let Some(pattern) = self.identify_pattern_at_offset(current_offset, end_offset)? {
+                match &pattern {
+                    CorruptionPattern::ValidRecord { offset, size } => {
+                        analysis.last_valid_offset = Some(*offset);
+                        current_offset = offset + size;
+                    }
+                    CorruptionPattern::ZeroPadding { start, end } => {
+                        // Zero padding at end of file is safe to truncate
+                        if analysis.safe_to_truncate_at.is_none() && *end >= file_size.saturating_sub(1024) {
+                            analysis.safe_to_truncate_at = Some(*start);
+                        }
+                        current_offset = *end;
+                    }
+                    CorruptionPattern::Corruption { end, .. } => {
+                        current_offset = *end;
+                    }
+                    CorruptionPattern::EndOfFile { .. } => {
+                        break;
+                    }
+                }
+                analysis.patterns.push(pattern);
+            } else {
+                current_offset += 1;
+            }
+        }
+
+        // If we only found zero padding after the last valid record, it's safe to truncate
+        if analysis.safe_to_truncate_at.is_none() {
+            if let Some(last_valid) = analysis.last_valid_offset {
+                let only_padding_after = analysis.patterns.iter().all(|pattern| {
+                    match pattern {
+                        CorruptionPattern::ValidRecord { offset, .. } => *offset <= last_valid,
+                        CorruptionPattern::ZeroPadding { .. } => true,
+                        CorruptionPattern::Corruption { .. } => false,
+                        CorruptionPattern::EndOfFile { .. } => true,
+                    }
+                });
+                
+                if only_padding_after {
+                    analysis.safe_to_truncate_at = Some(last_valid);
+                }
+            }
+        }
+
+        // Log the analysis results for debugging
+        trace!("corruption analysis complete: {} patterns found", analysis.patterns.len());
+        for (i, pattern) in analysis.patterns.iter().enumerate() {
+            match pattern {
+                CorruptionPattern::ValidRecord { offset, size } => {
+                    trace!("  pattern[{i}]: valid record at offset {offset}, size {size}");
+                }
+                CorruptionPattern::ZeroPadding { start, end } => {
+                    trace!("  pattern[{i}]: zero padding from {start} to {end} ({} bytes)", end - start);
+                }
+                CorruptionPattern::Corruption { start, end } => {
+                    trace!("  pattern[{i}]: corruption from {start} to {end} ({} bytes)", end - start);
+                }
+                CorruptionPattern::EndOfFile { offset } => {
+                    trace!("  pattern[{i}]: end of file at {offset}");
+                }
+            }
+        }
+        
+        if let Some(truncate_at) = analysis.safe_to_truncate_at {
+            trace!("safe truncation point identified at offset {truncate_at}");
+        }
+
+        Ok(analysis)
+    }
+
+    fn identify_pattern_at_offset(&mut self, offset: u64, max_offset: u64) -> Result<Option<CorruptionPattern>, ReadError> {
+        let remaining = max_offset - offset;
+        if remaining < 8 {
+            return Ok(Some(CorruptionPattern::EndOfFile { offset }));
+        }
+
+        // Try to read as a valid record first
+        if let Ok(candidate_timestamp) = self.reader.read_u64_at(offset) {
+            if self.is_valid_timestamp(candidate_timestamp) {
+                if let Ok(header) = self.reader.try_read_record_header(offset) {
+                    if self.validate_record_header(&header) {
+                        if let Ok(()) = self.validate_record_structure(offset, &header) {
+                            // Calculate record size
+                            let record_size = if header.record_kind == 0 {
+                                // Event record - need to read header to get size
+                                if let Ok(event_header) = self.reader.try_read_event_header(offset + RECORD_HEADER_SIZE as u64) {
+                                    EVENT_HEADER_SIZE as u64 + event_header.body_len() as u64
+                                } else {
+                                    RECORD_HEADER_SIZE as u64 // Fallback
+                                }
+                            } else {
+                                COMMIT_SIZE as u64
+                            };
+                            
+                            return Ok(Some(CorruptionPattern::ValidRecord { offset, size: record_size }));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check for zero padding
+        let check_size = 64.min(remaining as usize);
+        if let Ok(bytes) = self.reader.peek_bytes_at(offset, check_size) {
+            if bytes.iter().all(|&b| b == 0) {
+                // Found zero padding, find the end of it
+                let mut padding_end = offset + check_size as u64;
+                while padding_end < max_offset {
+                    let peek_size = 64.min((max_offset - padding_end) as usize);
+                    if let Ok(next_bytes) = self.reader.peek_bytes_at(padding_end, peek_size) {
+                        if next_bytes.iter().all(|&b| b == 0) {
+                            padding_end += peek_size as u64;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                
+                return Ok(Some(CorruptionPattern::ZeroPadding { 
+                    start: offset, 
+                    end: padding_end 
+                }));
+            } else {
+                // Found corruption (non-zero, non-valid data)
+                return Ok(Some(CorruptionPattern::Corruption { 
+                    start: offset, 
+                    end: offset + check_size as u64 
+                }));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn truncate_to_offset(&mut self, offset: u64) -> Result<(), ReadError> {
+        let original_size = self.reader.file.metadata()?.len();
+        let bytes_removed = original_size.saturating_sub(offset);
+        
+        info!("truncating file from {original_size} to {offset} bytes (removing {bytes_removed} bytes)");
+        
+        // Get mutable access to the file through the reader
+        if let Err(e) = self.reader.file.set_len(offset) {
+            warn!("failed to truncate file to offset {offset}: {e}");
+            return Err(ReadError::Io(e));
+        }
+
+        // Sync the truncation to disk
+        if let Err(e) = self.reader.file.sync_data() {
+            warn!("failed to sync truncation to disk: {e}");
+            return Err(ReadError::Io(e));
+        }
+
+        // Note: flushed_offset will be updated by the writer on next flush
+        // The truncation is immediately synced to disk above
+        
+        info!("successfully truncated file to offset {offset}");
+        Ok(())
+    }
+
+    fn is_valid_timestamp(&self, timestamp: u64) -> bool {
+        const MIN_TIMESTAMP: u64 = 1_600_000_000_000_000_000; // ~2020 in nanoseconds  
+        const MAX_TIMESTAMP: u64 = 2_000_000_000_000_000_000; // ~2033 in nanoseconds
+
+        // Check if it's an event (bit 63 = 0) or commit (bit 63 = 1)
+        let actual_timestamp = timestamp & !(1u64 << 63);
+        (MIN_TIMESTAMP..=MAX_TIMESTAMP).contains(&actual_timestamp)
+    }
+
+    fn validate_record_header(&self, header: &RecordHeader) -> bool {
+        // Confirmation count should be reasonable
+        if header.confirmation_count > MAX_REPLICATION_FACTOR as u8 {
+            return false;
+        }
+
+        // Transaction ID shouldn't be all zeros (though it can be nil UUID)
+        // This helps filter out regions of zero-padding
+        let tx_bytes = header.transaction_id.as_bytes();
+        if tx_bytes.iter().all(|&b| b == 0) && header.crc32c == 0 {
+            return false;
+        }
+
+        // Record kind should be valid (0 = event, 1 = commit)
+        header.record_kind <= 1
+    }
+
+    fn validate_record_structure(
+        &mut self,
+        offset: u64,
+        header: &RecordHeader,
+    ) -> Result<(), ReadError> {
+        // For events, we need to validate the structure more thoroughly
+        if header.record_kind == 0 {
+            // Try to read the event header to validate lengths make sense
+            let event_header_offset = offset + RECORD_HEADER_SIZE as u64;
+
+            // Check we have enough bytes for event header
+            if event_header_offset + (EVENT_HEADER_SIZE - RECORD_HEADER_SIZE) as u64
+                > self.reader.flushed_offset.load()
+            {
+                return Err(ReadError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "insufficient bytes for event header",
+                )));
+            }
+
+            // Try to decode the event header
+            if let Ok(event_header) = self.reader.try_read_event_header(event_header_offset) {
+                // Validate field lengths are reasonable
+                if event_header.stream_id_len == 0 || event_header.stream_id_len > STREAM_ID_SIZE {
+                    return Err(ReadError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid stream_id_len: {}", event_header.stream_id_len),
+                    )));
+                }
+
+                if event_header.event_name_len == 0 || event_header.event_name_len > 255 {
+                    return Err(ReadError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid event_name_len: {}", event_header.event_name_len),
+                    )));
+                }
+
+                // Check total body length is reasonable
+                let total_body_len = event_header.body_len();
+                if total_body_len > 10_000_000 {
+                    return Err(ReadError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("event body too large: {} bytes", total_body_len),
+                    )));
+                }
+
+                // Check we have enough remaining bytes for the complete record
+                let total_record_size = EVENT_HEADER_SIZE as u64 + total_body_len as u64;
+                if offset + total_record_size > self.reader.flushed_offset.load() {
+                    return Err(ReadError::Io(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "insufficient bytes for complete event record",
+                    )));
+                }
+            } else {
+                return Err(ReadError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "failed to decode event header",
+                )));
+            }
+        }
+
+        Ok(())
     }
 }
 

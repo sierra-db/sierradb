@@ -253,10 +253,13 @@ impl BucketSegmentWriter {
 
     pub fn set_len(&mut self, offset: u64) -> Result<(), WriteError> {
         if offset < self.file_size {
+            self.flush()?;
             self.writer.get_ref().set_len(offset)?;
+            self.writer.get_ref().sync_data()?;
+            self.writer.seek(SeekFrom::End(0))?; // Reposition to end
             self.file_size = self.writer.stream_position()?;
+            self.flushed_offset.store(self.file_size, Ordering::Release);
         }
-
         Ok(())
     }
 
@@ -265,6 +268,7 @@ impl BucketSegmentWriter {
         if self.dirty {
             trace!("flushing writer");
             self.writer.flush()?;
+            self.writer.get_ref().sync_data()?;
             self.file_size = self.writer.stream_position()?;
             self.flushed_offset.store(self.file_size, Ordering::Release);
             self.dirty = false;
