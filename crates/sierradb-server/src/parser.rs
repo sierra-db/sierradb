@@ -123,8 +123,7 @@ fn display_info<'a>(
 
 impl<'a> fmt::Display for FrameStreamErrors<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        dbg!(self);
-        write!(f, "{}: ", ErrorCode::InvalidArg)?;
+        write!(f, "{} ", ErrorCode::InvalidArg)?;
 
         // First print the token that we did not expect
         // There should really just be one unexpected message at this point though we

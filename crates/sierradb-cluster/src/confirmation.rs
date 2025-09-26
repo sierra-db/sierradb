@@ -137,7 +137,7 @@ impl PartitionConfirmationState {
 
         // Update watermark if it advanced
         if watermark_advanced {
-            if self.confirmed_watermark.advance(new_watermark) {
+            if let Some(_prev_watermark) = self.confirmed_watermark.advance(new_watermark) {
                 info!(
                     "partition {} advanced watermark to {new_watermark}",
                     self.partition_id
@@ -764,21 +764,28 @@ pub struct AtomicWatermark {
 }
 
 impl AtomicWatermark {
-    fn new(initial: u64) -> Self {
+    #[inline]
+    pub fn new(initial: u64) -> Self {
         Self {
             value: AtomicU64::new(initial),
         }
     }
 
+    #[inline]
     pub fn get(&self) -> u64 {
         self.value.load(Ordering::Acquire)
     }
 
-    fn advance(&self, new_value: u64) -> bool {
+    #[inline]
+    pub fn can_read(&self, partition_sequence: u64) -> bool {
+        partition_sequence < self.get()
+    }
+
+    pub fn advance(&self, new_value: u64) -> Option<u64> {
         loop {
             let current = self.value.load(Ordering::Acquire);
             if new_value <= current {
-                return false;
+                return None;
             }
 
             match self.value.compare_exchange(
@@ -787,7 +794,7 @@ impl AtomicWatermark {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return true,
+                Ok(prev) => return Some(prev),
                 Err(_) => continue, // Another thread updated, try again
             }
         }

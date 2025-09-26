@@ -1,4 +1,4 @@
-//! Actor module for managing confirmation state in Eventus
+//! Actor module for managing confirmation state in Sierra
 //!
 //! This module provides a Kameo actor wrapper around
 //! `BucketConfirmationManager` to enable concurrent, fault-tolerant
@@ -37,13 +37,14 @@
 //! }
 //! ```
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use kameo::prelude::*;
 use serde::{Deserialize, Serialize};
-use sierradb::database::Database;
+use sierradb::{bucket::segment::EventRecord, database::Database};
 use smallvec::SmallVec;
+use tokio::sync::broadcast;
 
 use super::{
     BucketConfirmationManager, BucketId, ConfirmationError, ConfirmationStats, PartitionId,
@@ -66,11 +67,14 @@ use super::{
 #[derive(Actor)]
 pub struct ConfirmationActor {
     pub manager: BucketConfirmationManager,
+    pub database: Database,
+    pub broadcast_tx: broadcast::Sender<EventRecord>,
+    pub pending_events: HashMap<PartitionId, BTreeMap<u64, EventRecord>>,
 }
 
 impl ConfirmationActor {
     pub async fn new(
-        database: &Database,
+        database: Database,
         replication_factor: u8,
         assigned_partitions: HashSet<PartitionId>,
     ) -> Result<Self, ConfirmationError> {
@@ -80,13 +84,149 @@ impl ConfirmationActor {
             replication_factor,
             assigned_partitions,
         );
-        manager.initialize(database).await?;
+        manager.initialize(&database).await?;
 
-        Ok(Self { manager })
+        let (broadcast_tx, _) = broadcast::channel(1_000);
+
+        Ok(Self {
+            manager,
+            database,
+            broadcast_tx,
+            pending_events: HashMap::new(),
+        })
+    }
+
+    pub fn broadcaster(&self) -> broadcast::Sender<EventRecord> {
+        self.broadcast_tx.clone()
+    }
+
+    fn broadcast_confirmed_events(
+        &mut self,
+        partition_id: PartitionId,
+        old_watermark: u64,
+        new_watermark: u64,
+    ) {
+        let Some(partition_events) = self.pending_events.get_mut(&partition_id) else {
+            return;
+        };
+
+        // Broadcast events in sequence order from old_watermark+1 to new_watermark
+        let mut events_to_broadcast = Vec::new();
+        let mut sequences_to_remove = Vec::new();
+
+        for sequence in (old_watermark + 1)..=new_watermark {
+            if let Some(event) = partition_events.get(&sequence) {
+                events_to_broadcast.push(event.clone());
+                sequences_to_remove.push(sequence);
+            }
+        }
+
+        // Broadcast events in order
+        for event in events_to_broadcast {
+            if self.broadcast_tx.send(event).is_err() {
+                break; // No active subscribers
+            }
+        }
+
+        // Clean up broadcast events from buffer
+        for sequence in sequences_to_remove {
+            partition_events.remove(&sequence);
+        }
+
+        // Clean up empty partition entries
+        if partition_events.is_empty() {
+            self.pending_events.remove(&partition_id);
+        }
     }
 }
 
 // Message types for different operations
+
+/// Buffer events for later broadcast when confirmed
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BufferEvents {
+    pub events: SmallVec<[EventRecord; 4]>,
+}
+
+/// Update confirmation and broadcast confirmed events atomically
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateConfirmationWithBroadcast {
+    pub partition_id: PartitionId,
+    pub versions: SmallVec<[u64; 4]>,
+    pub confirmation_count: u8,
+    pub partition_sequences: (u64, u64), // (first, last)
+}
+
+impl Message<BufferEvents> for ConfirmationActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: BufferEvents,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        for event in msg.events {
+            self.pending_events
+                .entry(event.partition_id)
+                .or_default()
+                .insert(event.partition_sequence, event);
+        }
+    }
+}
+
+impl Message<UpdateConfirmationWithBroadcast> for ConfirmationActor {
+    type Reply = Result<SmallVec<[bool; 4]>, ConfirmationError>;
+
+    async fn handle(
+        &mut self,
+        msg: UpdateConfirmationWithBroadcast,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        // Update confirmations first (for immediate progress)
+        let mut results = SmallVec::new();
+        for version in &msg.versions {
+            let advanced = self
+                .manager
+                .update_confirmation(msg.partition_id, version + 1, msg.confirmation_count)
+                .await?;
+            results.push(advanced);
+        }
+
+        // If watermark advanced, read and broadcast events immediately (synchronously)
+        if results.iter().any(|&advanced| advanced) {
+            let new_watermark = self
+                .manager
+                .get_watermark(msg.partition_id)
+                .map(|w| w.get())
+                .unwrap_or(0);
+
+            let (first_seq, last_seq) = msg.partition_sequences;
+
+            // Read events synchronously to maintain ordering
+            let read_result = self
+                .database
+                .read_partition(msg.partition_id, first_seq)
+                .await;
+            if let Ok(mut iter) = read_result
+                && let Ok(Some(commit)) = iter.next().await
+            {
+                // Broadcast events in sequence order within the confirmed range
+                for event in commit {
+                    // Only broadcast if within range and confirmed
+                    if event.partition_sequence >= first_seq
+                        && event.partition_sequence <= last_seq
+                        && event.partition_sequence < new_watermark
+                        && self.broadcast_tx.send(event).is_err()
+                    {
+                        break; // No active subscribers
+                    }
+                }
+            }
+        }
+
+        Ok(results)
+    }
+}
 
 /// Update confirmation count for an event
 ///
@@ -109,12 +249,29 @@ impl Message<UpdateConfirmation> for ConfirmationActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let mut results = SmallVec::new();
+        let old_watermark = self
+            .manager
+            .get_watermark(msg.partition_id)
+            .map(|w| w.get())
+            .unwrap_or(0);
+
         for version in msg.versions {
             let advanced = self
                 .manager
                 .update_confirmation(msg.partition_id, version + 1, msg.confirmation_count)
                 .await?;
             results.push(advanced);
+        }
+
+        // If watermark advanced, broadcast newly confirmed events
+        if results.iter().any(|&advanced| advanced) {
+            let new_watermark = self
+                .manager
+                .get_watermark(msg.partition_id)
+                .map(|w| w.get())
+                .unwrap_or(0);
+
+            self.broadcast_confirmed_events(msg.partition_id, old_watermark, new_watermark);
         }
 
         Ok(results)
@@ -353,7 +510,7 @@ impl Message<GetMultipleWatermarks> for ConfirmationActor {
 impl ConfirmationActor {
     /// Spawn a new confirmation actor
     pub async fn spawn(
-        database: &Database,
+        database: Database,
         replication_factor: u8,
         assigned_partitions: HashSet<PartitionId>,
     ) -> Result<ActorRef<Self>, ConfirmationError> {
@@ -365,6 +522,12 @@ impl ConfirmationActor {
 /// Extension trait for ConfirmationActor ActorRef to provide convenient methods
 #[allow(async_fn_in_trait)]
 pub trait ConfirmationActorExt {
+    /// Buffer events for later broadcast when confirmed
+    async fn buffer_events(
+        &self,
+        events: SmallVec<[EventRecord; 4]>,
+    ) -> Result<(), SendError<BufferEvents>>;
+
     /// Update confirmation for a single event
     async fn update_event_confirmation(
         &self,
@@ -390,6 +553,14 @@ pub trait ConfirmationActorExt {
 }
 
 impl ConfirmationActorExt for ActorRef<ConfirmationActor> {
+    async fn buffer_events(
+        &self,
+        events: SmallVec<[EventRecord; 4]>,
+    ) -> Result<(), SendError<BufferEvents>> {
+        let msg = BufferEvents { events };
+        self.tell(msg).await
+    }
+
     async fn update_event_confirmation(
         &self,
         partition_id: PartitionId,
@@ -456,7 +627,7 @@ mod tests {
     #[tokio::test]
     async fn test_confirmation_actor_basic_operations() -> Result<(), Box<dyn std::error::Error>> {
         let (_temp_dir, db) = create_temp_db().await;
-        let actor_ref = ConfirmationActor::spawn(&db, 3, HashSet::from_iter([0, 1, 2, 3])).await?;
+        let actor_ref = ConfirmationActor::spawn(db, 3, HashSet::from_iter([0, 1, 2, 3])).await?;
 
         // Test update confirmation using extension trait
         let watermark_advanced = actor_ref
@@ -488,7 +659,7 @@ mod tests {
     #[tokio::test]
     async fn test_health_check() -> Result<(), Box<dyn std::error::Error>> {
         let (_temp_dir, db) = create_temp_db().await;
-        let actor_ref = ConfirmationActor::spawn(&db, 3, HashSet::from_iter([0, 1, 2, 3])).await?;
+        let actor_ref = ConfirmationActor::spawn(db, 3, HashSet::from_iter([0, 1, 2, 3])).await?;
 
         // Add some confirmations
         actor_ref
@@ -521,7 +692,7 @@ mod tests {
     #[tokio::test]
     async fn test_extension_trait_methods() -> Result<(), Box<dyn std::error::Error>> {
         let (_temp_dir, db) = create_temp_db().await;
-        let actor_ref = ConfirmationActor::spawn(&db, 3, HashSet::from_iter([0, 1, 2, 3])).await?;
+        let actor_ref = ConfirmationActor::spawn(db, 3, HashSet::from_iter([0, 1, 2, 3])).await?;
 
         // Test convenience methods from extension trait
         let watermark_advanced = actor_ref
@@ -541,7 +712,7 @@ mod tests {
     #[tokio::test]
     async fn test_admin_operations() -> Result<(), Box<dyn std::error::Error>> {
         let (_temp_dir, db) = create_temp_db().await;
-        let actor_ref = ConfirmationActor::spawn(&db, 3, HashSet::from_iter([0, 1, 2, 3])).await?;
+        let actor_ref = ConfirmationActor::spawn(db, 3, HashSet::from_iter([0, 1, 2, 3])).await?;
 
         // Set up some initial state
         actor_ref

@@ -638,11 +638,14 @@ impl SubscriptionManager {
         })
     }
 
-    /// Subscribe to events from all partitions with custom starting sequences for specific partitions and a fallback.
+    /// Subscribe to events from all partitions with custom starting sequences
+    /// for specific partitions and a fallback.
     ///
     /// # Arguments
-    /// * `partition_sequences` - Map of partition_id -> starting_sequence for specific partitions
-    /// * `fallback_sequence` - Starting sequence for all other partitions not specified in the map
+    /// * `partition_sequences` - Map of partition_id -> starting_sequence for
+    ///   specific partitions
+    /// * `fallback_sequence` - Starting sequence for all other partitions not
+    ///   specified in the map
     /// * `window_size` - Optional window size for flow control
     ///
     /// # Example
@@ -659,15 +662,22 @@ impl SubscriptionManager {
         fallback_sequence: u64,
         window_size: Option<u32>,
     ) -> RedisResult<EventSubscription> {
-        self.subscribe_to_all_partitions_flexible(partition_sequences, Some(fallback_sequence), window_size)
-            .await
+        self.subscribe_to_all_partitions_flexible(
+            partition_sequences,
+            Some(fallback_sequence),
+            window_size,
+        )
+        .await
     }
 
-    /// Subscribe to events from all partitions with flexible starting position options.
+    /// Subscribe to events from all partitions with flexible starting position
+    /// options.
     ///
     /// # Arguments
-    /// * `from_map` - Map of partition_id -> starting_sequence for specific partitions (empty map means no overrides)
-    /// * `fallback_sequence` - Optional fallback sequence for partitions not in the map
+    /// * `from_map` - Map of partition_id -> starting_sequence for specific
+    ///   partitions (empty map means no overrides)
+    /// * `fallback_sequence` - Optional fallback sequence for partitions not in
+    ///   the map
     /// * `window_size` - Optional window size for flow control
     ///
     /// # Examples
@@ -716,7 +726,7 @@ impl SubscriptionManager {
 
             // Send partition=sequence pairs
             for (partition_id, sequence) in &from_map {
-                cmd.arg(format!("{}={}", partition_id, sequence));
+                cmd.arg(format!("{partition_id}={sequence}"));
             }
 
             // Add fallback sequence if provided
@@ -826,10 +836,11 @@ impl SubscriptionManagerInner {
                     }
                 }
             }
-            _ => {
+            kind => {
                 return Err(RedisError::from((
                     redis::ErrorKind::TypeError,
                     "Unknown push kind",
+                    kind.to_string(),
                 )));
             }
         }

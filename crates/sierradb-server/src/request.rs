@@ -25,7 +25,7 @@ use sierradb::id::uuid_to_partition_hash;
 use sierradb_cluster::subscription::{FromSequences, SubscriptionMatcher};
 use sierradb_protocol::ErrorCode;
 use tokio::io;
-use tracing::warn;
+use tracing::debug;
 use uuid::Uuid;
 
 use crate::parser::frame_stream;
@@ -120,7 +120,7 @@ impl TryFrom<&BytesFrame> for Command {
                     "HELLO" => Ok(Command::Hello),
                     "PING" => Ok(Command::Ping),
                     cmd => {
-                        warn!("received unknown command {cmd}");
+                        debug!("received unknown command {cmd}");
                         Err(ErrorCode::InvalidArg.with_message(format!("unknown command '{cmd}'")))
                     }
                 }

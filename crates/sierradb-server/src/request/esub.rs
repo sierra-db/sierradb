@@ -219,18 +219,10 @@ impl HandleRequest for ESub {
                 window_size: self.window_size.unwrap_or(1_000),
             })
             .await
-            .map_err(|err|
-                //match err {
-                // SendError::HandlerError(replicas) => ErrorCode::Redirect.with_message(
-                //     replicas
-                //         .into_iter()
-                //         .map(|(replica, _)| replica.id().peer_id().unwrap().to_base58())
-                //         .collect::<Vec<_>>()
-                //         .join(" "),
-                // ),
-                err
-                    .map_err::<&'static str, _>(|_| "error")
-                    .as_redis_error())?;
+            .map_err(|err| {
+                err.map_err::<&'static str, _>(|_| unreachable!("infallible error"))
+                    .as_redis_error()
+            })?;
 
         conn.subscriptions.insert(subscription_id, last_ack_tx);
 

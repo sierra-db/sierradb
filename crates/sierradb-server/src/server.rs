@@ -117,6 +117,10 @@ impl Conn {
                                     warn!(%subscription_id, "subscription error: {error}");
                                 }
                                 Some(SubscriptionEvent::Closed { subscription_id }) => {
+                                    debug!(
+                                        subscription_id = %subscription_id,
+                                        "closed subscription"
+                                    );
                                     self.subscriptions.remove(&subscription_id);
                                     if self.subscriptions.is_empty() {
                                         self.cleanup_subscriptions();
@@ -199,7 +203,6 @@ impl Conn {
                 let cmd = match Command::try_from(&data[0]) {
                     Ok(cmd) => cmd,
                     Err(err) => {
-                        debug!(?data, "received error from command");
                         return Ok(Some(BytesFrame::SimpleError {
                             data: err.into(),
                             attributes: None,

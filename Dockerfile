@@ -22,6 +22,9 @@ RUN cargo build --release --package sierradb-server
 # Runtime stage with minimal base image
 FROM debian:bookworm-slim AS runtime
 
+# Install gosu for user switching
+RUN apt-get update && apt-get install -y gosu && rm -rf /var/lib/apt/lists/*
+
 # Create non-root user with home directory
 RUN useradd -r -m -s /bin/false sierradb
 
@@ -31,17 +34,26 @@ RUN mkdir -p /app/data && chown -R sierradb:sierradb /app
 # Copy the binary from builder stage
 COPY --from=builder /app/target/release/sierradb /usr/local/bin/sierradb
 
+# Create entrypoint script
+RUN cat > /entrypoint.sh << 'EOF'
+#!/bin/bash
+# Fix permissions for mounted volumes if running as root
+if [ "$(id -u)" = "0" ]; then
+    chown -R sierradb:sierradb /app/data
+    exec gosu sierradb "$@"
+else
+    exec "$@"
+fi
+EOF
+
+RUN chmod +x /entrypoint.sh
+
 # Change ownership and make executable
 RUN chown sierradb:sierradb /usr/local/bin/sierradb
-
-# Switch to non-root user
-USER sierradb
 
 # Expose port 9090 (default for sierradb)
 EXPOSE 9090
 
-# Set default directory for data
-ENV DIR=/app/data
-
 # Set the entrypoint
-ENTRYPOINT ["/usr/local/bin/sierradb"]
+ENTRYPOINT ["/entrypoint.sh", "/usr/local/bin/sierradb"]
+CMD ["--dir", "/app/data"]

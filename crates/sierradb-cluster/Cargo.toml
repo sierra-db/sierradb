@@ -18,7 +18,6 @@ libp2p.features = [
   "cbor",
   "identify",
   "gossipsub",
-  "kad",
   "macros",
   "mdns",
   "ping",
@@ -31,7 +30,6 @@ rand.workspace = true
 serde = { workspace = true, features = ["derive"] }
 smallvec = { workspace = true, features = ["serde"] }
 thiserror.workspace = true
-# tokio = { workspace = true, features = ["fs", "sync"] }
 tokio = { workspace = true, features = [
   "fs",
   "io-std",

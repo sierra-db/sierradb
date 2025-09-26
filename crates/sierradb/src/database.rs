@@ -779,6 +779,10 @@ impl Transaction {
         self.transaction_id
     }
 
+    pub fn confirmation_count(&self) -> u8 {
+        self.confirmation_count
+    }
+
     pub fn events(&self) -> &SmallVec<[NewEvent; 4]> {
         &self.events
     }

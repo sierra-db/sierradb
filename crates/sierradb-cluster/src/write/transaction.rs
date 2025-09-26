@@ -5,19 +5,18 @@ use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use kameo::prelude::*;
 use sierradb::{
     MAX_REPLICATION_FACTOR,
-    bucket::{PartitionId, segment::EventRecord},
+    bucket::PartitionId,
     database::{Database, ExpectedVersion, Transaction},
     writer_thread_pool::AppendResult,
 };
 use smallvec::SmallVec;
-use tokio::sync::broadcast;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use crate::{
     ClusterActor, ReplicaRefs,
     circuit_breaker::WriteCircuitBreaker,
-    confirmation::actor::{ConfirmationActor, UpdateConfirmation},
+    confirmation::actor::{ConfirmationActor, UpdateConfirmationWithBroadcast},
     write::confirm::ConfirmTransaction,
 };
 
@@ -35,7 +34,6 @@ pub struct WriteConfig {
     pub replicas: ReplicaRefs,
     pub replication_factor: u8,
     pub circuit_breaker: Arc<WriteCircuitBreaker>,
-    pub broadcast_tx: broadcast::Sender<EventRecord>,
 }
 
 pub fn spawn(
@@ -97,10 +95,14 @@ pub fn spawn(
 
                         let _ = config
                             .confirmation_ref
-                            .tell(UpdateConfirmation {
+                            .tell(UpdateConfirmationWithBroadcast {
                                 partition_id,
                                 versions: event_partition_sequences.clone(),
                                 confirmation_count,
+                                partition_sequences: (
+                                    append.first_partition_sequence,
+                                    append.last_partition_sequence,
+                                ),
                             })
                             .await;
 
@@ -131,35 +133,6 @@ pub fn spawn(
                         if let Some(tx) = reply_sender {
                             tx.send(Ok(append.clone()));
                         }
-
-                        // Notify subscriptions about new events
-                        // partition_id already available from above
-                        let database_clone = config.database.clone();
-                        let append_clone = append.clone();
-                        let broadcast_tx = config.broadcast_tx.clone();
-                        tokio::spawn(async move {
-                            // Read the events that were just written to notify subscriptions
-                            let read_result = database_clone
-                                .read_partition(partition_id, append_clone.first_partition_sequence)
-                                .await;
-                            if let Ok(mut iter) = read_result
-                                && let Ok(Some(commit)) = iter.next().await
-                            {
-                                for event in commit {
-                                    // Only notify if the event is within the range we just wrote
-                                    if event.partition_sequence
-                                        >= append_clone.first_partition_sequence
-                                        && event.partition_sequence
-                                            <= append_clone.last_partition_sequence
-                                    {
-                                        let res = broadcast_tx.send(event);
-                                        if res.is_err() {
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        });
 
                         // Confirm writes for other partitions which still succeeded
                         while let Ok(Some((cluster_ref, res))) =
