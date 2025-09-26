@@ -640,11 +640,9 @@ impl CorruptionAnalysis {
         if let Some(truncate_at) = self.safe_to_truncate_at {
             // Check if everything after truncation point is zero padding or corruption
             // with no valid records
-            let has_valid_after_truncation = self.patterns.iter().any(|pattern| {
-                match pattern {
-                    CorruptionPattern::ValidRecord { offset, .. } => *offset >= truncate_at,
-                    _ => false,
-                }
+            let has_valid_after_truncation = self.patterns.iter().any(|pattern| match pattern {
+                CorruptionPattern::ValidRecord { offset, .. } => *offset >= truncate_at,
+                _ => false,
             });
             !has_valid_after_truncation
         } else {
@@ -693,36 +691,26 @@ impl BucketSegmentIter<'_> {
         loop {
             match self.reader.read_record(self.offset, ReadHint::Sequential) {
                 Ok(Some(record)) => {
-                    // Validate the record makes sense
-                    if let Err(validation_error) = self.validate_record(&record) {
-                        warn!("record validation failed: {validation_error}, attempting recovery");
-
-                        if let Some(recovered_offset) = self.find_next_valid_record()? {
-                            trace!("recovered at offset {recovered_offset}, continuing");
-                            continue; // Try reading from the recovered position
-                        } else {
-                            return Ok(None); // No more recoverable records
-                        }
-                    }
-
+                    // Record successfully parsed and CRC32C validated - it's good
                     self.offset = record.offset() + record.len();
                     return Ok(Some(record));
                 }
                 Ok(None) => return Ok(None),
                 Err(err) => {
-                    // Check if this looks like end-of-file (zeros) vs corruption
+                    // Check if this looks like end-of-file zero padding vs corruption
                     let file_size = self.reader.file.metadata()?.len();
-                    if self.offset > file_size.saturating_sub(1024) {
-                        // within 1KB of end
-                        if let Ok(peek) = self.reader.peek_bytes_at(self.offset, 32)
-                            && peek.iter().all(|&b| b == 0)
-                        {
-                            trace!(
-                                "reached end of data with zero padding at offset {}",
-                                self.offset
-                            );
-                            return Ok(None);
-                        }
+                    // Based on analysis of real corrupted files, we see 64KB of zero padding
+                    if self.offset > file_size.saturating_sub(65536)
+                        && let Ok(peek) = self.reader.peek_bytes_at(self.offset, 64)
+                        && peek.iter().all(|&b| b == 0)
+                    {
+                        // Detected zero padding at end of file - truncate it
+                        warn!(
+                            "detected zero padding at offset {}, truncating file",
+                            self.offset
+                        );
+                        self.truncate_to_offset(self.offset)?;
+                        return Ok(None);
                     }
 
                     warn!(
@@ -741,62 +729,20 @@ impl BucketSegmentIter<'_> {
         }
     }
 
-    fn validate_record(&self, record: &Record) -> Result<(), String> {
-        match record {
-            Record::Event(event) => {
-                // Check stream_id length - this is the most common corruption we see
-                if event.stream_id.is_empty() {
-                    return Err(format!(
-                        "stream id must be between 1 and {STREAM_ID_SIZE} characters in length, but got 0 for ''"
-                    ));
-                }
-
-                if event.stream_id.len() > STREAM_ID_SIZE {
-                    return Err(format!(
-                        "stream id must be between 1 and 64 characters in length, but got {} for '{}'",
-                        event.stream_id.len(),
-                        event.stream_id
-                    ));
-                }
-
-                // Check event name is not empty
-                if event.event_name.is_empty() {
-                    return Err(format!(
-                        "event name cannot be empty at offset {}",
-                        event.offset
-                    ));
-                }
-
-                // Check payload sizes are reasonable
-                if event.metadata.len() > 10_000_000 || event.payload.len() > 10_000_000 {
-                    return Err(format!(
-                        "suspiciously large payload at offset {}: metadata={}, payload={}",
-                        event.offset,
-                        event.metadata.len(),
-                        event.payload.len()
-                    ));
-                }
-            }
-            Record::Commit(_) => {}
-        }
-
-        Ok(())
-    }
-
     fn find_next_valid_record(&mut self) -> Result<Option<u64>, ReadError> {
         let start_offset = self.offset;
         let file_size = self.reader.file.metadata()?.len();
-        
+
         // Phase 1: Analyze corruption patterns
         let analysis = self.analyze_corruption_patterns(start_offset, file_size)?;
-        
+
         // Phase 2: Make recovery decision based on analysis
-        if analysis.should_truncate() {
-            if let Some(truncate_at) = analysis.safe_to_truncate_at {
-                warn!("detected incomplete write corruption, truncating file at offset {truncate_at}");
-                self.truncate_to_offset(truncate_at)?;
-                return Ok(None);
-            }
+        if analysis.should_truncate()
+            && let Some(truncate_at) = analysis.safe_to_truncate_at
+        {
+            warn!("detected incomplete write corruption, truncating file at offset {truncate_at}");
+            self.truncate_to_offset(truncate_at)?;
+            return Ok(None);
         }
 
         // If we have a valid record, jump to it
@@ -811,10 +757,14 @@ impl BucketSegmentIter<'_> {
         Ok(None)
     }
 
-    fn analyze_corruption_patterns(&mut self, start_offset: u64, file_size: u64) -> Result<CorruptionAnalysis, ReadError> {
+    fn analyze_corruption_patterns(
+        &mut self,
+        start_offset: u64,
+        file_size: u64,
+    ) -> Result<CorruptionAnalysis, ReadError> {
         let mut analysis = CorruptionAnalysis::new();
         let remaining_file = file_size.saturating_sub(start_offset);
-        
+
         // Use adaptive scan distance
         let max_scan_distance = if remaining_file < 64 * 1024 {
             remaining_file
@@ -822,7 +772,9 @@ impl BucketSegmentIter<'_> {
             (remaining_file / 10).min(500_000) // Increased for thorough analysis
         };
 
-        trace!("analyzing corruption patterns from offset {start_offset}, distance: {max_scan_distance}");
+        trace!(
+            "analyzing corruption patterns from offset {start_offset}, distance: {max_scan_distance}"
+        );
 
         let mut current_offset = start_offset;
         let end_offset = start_offset + max_scan_distance;
@@ -835,8 +787,10 @@ impl BucketSegmentIter<'_> {
                         current_offset = offset + size;
                     }
                     CorruptionPattern::ZeroPadding { start, end } => {
-                        // Zero padding at end of file is safe to truncate
-                        if analysis.safe_to_truncate_at.is_none() && *end >= file_size.saturating_sub(1024) {
+                        // Zero padding at end of file is safe to truncate (we see 64KB blocks)
+                        if analysis.safe_to_truncate_at.is_none()
+                            && *end >= file_size.saturating_sub(65536)
+                        {
                             analysis.safe_to_truncate_at = Some(*start);
                         }
                         current_offset = *end;
@@ -854,18 +808,17 @@ impl BucketSegmentIter<'_> {
             }
         }
 
-        // If we only found zero padding after the last valid record, it's safe to truncate
+        // If we only found zero padding after the last valid record, it's safe to
+        // truncate
         if analysis.safe_to_truncate_at.is_none() {
             if let Some(last_valid) = analysis.last_valid_offset {
-                let only_padding_after = analysis.patterns.iter().all(|pattern| {
-                    match pattern {
-                        CorruptionPattern::ValidRecord { offset, .. } => *offset <= last_valid,
-                        CorruptionPattern::ZeroPadding { .. } => true,
-                        CorruptionPattern::Corruption { .. } => false,
-                        CorruptionPattern::EndOfFile { .. } => true,
-                    }
+                let only_padding_after = analysis.patterns.iter().all(|pattern| match pattern {
+                    CorruptionPattern::ValidRecord { offset, .. } => *offset <= last_valid,
+                    CorruptionPattern::ZeroPadding { .. } => true,
+                    CorruptionPattern::Corruption { .. } => false,
+                    CorruptionPattern::EndOfFile { .. } => true,
                 });
-                
+
                 if only_padding_after {
                     analysis.safe_to_truncate_at = Some(last_valid);
                 }
@@ -873,24 +826,33 @@ impl BucketSegmentIter<'_> {
         }
 
         // Log the analysis results for debugging
-        trace!("corruption analysis complete: {} patterns found", analysis.patterns.len());
+        trace!(
+            "corruption analysis complete: {} patterns found",
+            analysis.patterns.len()
+        );
         for (i, pattern) in analysis.patterns.iter().enumerate() {
             match pattern {
                 CorruptionPattern::ValidRecord { offset, size } => {
                     trace!("  pattern[{i}]: valid record at offset {offset}, size {size}");
                 }
                 CorruptionPattern::ZeroPadding { start, end } => {
-                    trace!("  pattern[{i}]: zero padding from {start} to {end} ({} bytes)", end - start);
+                    trace!(
+                        "  pattern[{i}]: zero padding from {start} to {end} ({} bytes)",
+                        end - start
+                    );
                 }
                 CorruptionPattern::Corruption { start, end } => {
-                    trace!("  pattern[{i}]: corruption from {start} to {end} ({} bytes)", end - start);
+                    trace!(
+                        "  pattern[{i}]: corruption from {start} to {end} ({} bytes)",
+                        end - start
+                    );
                 }
                 CorruptionPattern::EndOfFile { offset } => {
                     trace!("  pattern[{i}]: end of file at {offset}");
                 }
             }
         }
-        
+
         if let Some(truncate_at) = analysis.safe_to_truncate_at {
             trace!("safe truncation point identified at offset {truncate_at}");
         }
@@ -898,7 +860,11 @@ impl BucketSegmentIter<'_> {
         Ok(analysis)
     }
 
-    fn identify_pattern_at_offset(&mut self, offset: u64, max_offset: u64) -> Result<Option<CorruptionPattern>, ReadError> {
+    fn identify_pattern_at_offset(
+        &mut self,
+        offset: u64,
+        max_offset: u64,
+    ) -> Result<Option<CorruptionPattern>, ReadError> {
         let remaining = max_offset - offset;
         if remaining < 8 {
             return Ok(Some(CorruptionPattern::EndOfFile { offset }));
@@ -913,7 +879,10 @@ impl BucketSegmentIter<'_> {
                             // Calculate record size
                             let record_size = if header.record_kind == 0 {
                                 // Event record - need to read header to get size
-                                if let Ok(event_header) = self.reader.try_read_event_header(offset + RECORD_HEADER_SIZE as u64) {
+                                if let Ok(event_header) = self
+                                    .reader
+                                    .try_read_event_header(offset + RECORD_HEADER_SIZE as u64)
+                                {
                                     EVENT_HEADER_SIZE as u64 + event_header.body_len() as u64
                                 } else {
                                     RECORD_HEADER_SIZE as u64 // Fallback
@@ -921,22 +890,25 @@ impl BucketSegmentIter<'_> {
                             } else {
                                 COMMIT_SIZE as u64
                             };
-                            
-                            return Ok(Some(CorruptionPattern::ValidRecord { offset, size: record_size }));
+
+                            return Ok(Some(CorruptionPattern::ValidRecord {
+                                offset,
+                                size: record_size,
+                            }));
                         }
                     }
                 }
             }
         }
 
-        // Check for zero padding
-        let check_size = 64.min(remaining as usize);
+        // Check for zero padding (we typically see 64KB blocks from shutdown corruption)
+        let check_size = 128.min(remaining as usize); // Check larger initial block
         if let Ok(bytes) = self.reader.peek_bytes_at(offset, check_size) {
             if bytes.iter().all(|&b| b == 0) {
                 // Found zero padding, find the end of it
                 let mut padding_end = offset + check_size as u64;
                 while padding_end < max_offset {
-                    let peek_size = 64.min((max_offset - padding_end) as usize);
+                    let peek_size = 128.min((max_offset - padding_end) as usize);
                     if let Ok(next_bytes) = self.reader.peek_bytes_at(padding_end, peek_size) {
                         if next_bytes.iter().all(|&b| b == 0) {
                             padding_end += peek_size as u64;
@@ -947,16 +919,16 @@ impl BucketSegmentIter<'_> {
                         break;
                     }
                 }
-                
-                return Ok(Some(CorruptionPattern::ZeroPadding { 
-                    start: offset, 
-                    end: padding_end 
+
+                return Ok(Some(CorruptionPattern::ZeroPadding {
+                    start: offset,
+                    end: padding_end,
                 }));
             } else {
                 // Found corruption (non-zero, non-valid data)
-                return Ok(Some(CorruptionPattern::Corruption { 
-                    start: offset, 
-                    end: offset + check_size as u64 
+                return Ok(Some(CorruptionPattern::Corruption {
+                    start: offset,
+                    end: offset + check_size as u64,
                 }));
             }
         }
@@ -967,9 +939,11 @@ impl BucketSegmentIter<'_> {
     fn truncate_to_offset(&mut self, offset: u64) -> Result<(), ReadError> {
         let original_size = self.reader.file.metadata()?.len();
         let bytes_removed = original_size.saturating_sub(offset);
-        
-        info!("truncating file from {original_size} to {offset} bytes (removing {bytes_removed} bytes)");
-        
+
+        info!(
+            "truncating file from {original_size} to {offset} bytes (removing {bytes_removed} bytes)"
+        );
+
         // Get mutable access to the file through the reader
         if let Err(e) = self.reader.file.set_len(offset) {
             warn!("failed to truncate file to offset {offset}: {e}");
@@ -984,7 +958,7 @@ impl BucketSegmentIter<'_> {
 
         // Note: flushed_offset will be updated by the writer on next flush
         // The truncation is immediately synced to disk above
-        
+
         info!("successfully truncated file to offset {offset}");
         Ok(())
     }
