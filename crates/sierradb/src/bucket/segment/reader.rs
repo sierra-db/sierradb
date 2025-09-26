@@ -197,7 +197,7 @@ impl BucketSegmentReader {
             }
         };
 
-        Ok(BucketSegmentReader {
+        let mut reader = BucketSegmentReader {
             file,
             header_buf,
             body_buf,
@@ -206,7 +206,12 @@ impl BucketSegmentReader {
             read_ahead_offset: 0,
             read_ahead_pos: 0,
             read_ahead_valid_len: 0,
-        })
+        };
+
+        // Perform startup recovery to handle any corruption from improper shutdowns
+        reader.recover_file_corruption()?;
+
+        Ok(reader)
     }
 
     pub fn try_clone(&self) -> Result<Self, ReadError> {
@@ -559,10 +564,140 @@ impl BucketSegmentReader {
     }
 
     // Recovery related methods
-    fn read_u64_at(&mut self, offset: u64) -> Result<u64, ReadError> {
-        let mut bytes = [0u8; 8];
-        self.file.read_exact_at(&mut bytes, offset)?;
-        Ok(u64::from_le_bytes(bytes))
+
+    /// Performs startup recovery using efficient chunked backward scanning
+    fn recover_file_corruption(&mut self) -> Result<(), ReadError> {
+        let file_size = self.file.metadata()?.len();
+
+        // If file is just the header, nothing to recover
+        if file_size <= SEGMENT_HEADER_SIZE as u64 {
+            return Ok(());
+        }
+
+        info!("checking file integrity at startup, size: {file_size} bytes");
+
+        // Try to read from the end to see if we need recovery
+        if self.is_file_corrupted(file_size)? {
+            warn!("corruption detected, starting recovery");
+            if let Some(truncate_offset) = self.find_last_valid_record_chunked(file_size)? {
+                self.truncate_file_to(truncate_offset)?;
+                info!("recovery completed, file truncated to {truncate_offset} bytes");
+            } else {
+                warn!("no valid records found, truncating to header only");
+                self.truncate_file_to(SEGMENT_HEADER_SIZE as u64)?;
+            }
+        } else {
+            trace!("file integrity check passed");
+        }
+
+        Ok(())
+    }
+
+    /// Quick check if file appears corrupted by testing a few positions near
+    /// the end
+    fn is_file_corrupted(&mut self, file_size: u64) -> Result<bool, ReadError> {
+        // Check the last few KB for obvious signs of corruption (all zeros)
+        let check_size = 1024.min(file_size - SEGMENT_HEADER_SIZE as u64);
+        if check_size == 0 {
+            return Ok(false);
+        }
+
+        let check_offset = file_size - check_size;
+        let mut buffer = vec![0u8; check_size as usize];
+
+        if self.file.read_exact_at(&mut buffer, check_offset).is_err() {
+            return Ok(true); // Can't read, assume corrupted
+        }
+
+        // If the end is all zeros, likely corrupted
+        let all_zeros = buffer.iter().all(|&b| b == 0);
+        if all_zeros && check_size >= 64 {
+            trace!("detected zero padding at end of file, corruption likely");
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    /// Efficient chunked backward scanning to find the last valid record
+    fn find_last_valid_record_chunked(&mut self, file_size: u64) -> Result<Option<u64>, ReadError> {
+        const CHUNK_SIZE: u64 = 4096; // 4KB chunks for efficient I/O
+
+        let mut current_offset = file_size;
+
+        while current_offset > SEGMENT_HEADER_SIZE as u64 {
+            // Calculate chunk boundaries
+            let chunk_start =
+                (current_offset.saturating_sub(CHUNK_SIZE)).max(SEGMENT_HEADER_SIZE as u64);
+            let chunk_size = current_offset - chunk_start;
+
+            if chunk_size == 0 {
+                break;
+            }
+
+            trace!("scanning chunk from {chunk_start} to {current_offset} ({chunk_size} bytes)");
+
+            // Read the entire chunk at once
+            let mut chunk = vec![0u8; chunk_size as usize];
+            self.file.read_exact_at(&mut chunk, chunk_start)?;
+
+            // Scan backwards through every byte in the chunk
+            for byte_offset in (0..chunk_size).rev() {
+                let file_offset = chunk_start + byte_offset;
+
+                // Quick check: does this look like a timestamp?
+                if byte_offset + 8 <= chunk_size {
+                    let timestamp_bytes = &chunk[byte_offset as usize..byte_offset as usize + 8];
+                    let candidate_timestamp =
+                        u64::from_le_bytes(timestamp_bytes.try_into().unwrap());
+
+                    if self.is_valid_timestamp(candidate_timestamp) {
+                        // Try to parse the full record at this position
+                        if let Ok(Some(record)) = self.read_record(file_offset, ReadHint::Random) {
+                            let truncate_offset = file_offset + record.len();
+                            trace!(
+                                "found valid record at {file_offset}, truncating at {truncate_offset}"
+                            );
+                            return Ok(Some(truncate_offset));
+                        }
+                    }
+                }
+            }
+
+            current_offset = chunk_start;
+        }
+
+        // No valid record found
+        Ok(None)
+    }
+
+    fn truncate_file_to(&mut self, offset: u64) -> Result<(), ReadError> {
+        let original_size = self.file.metadata()?.len();
+        let bytes_removed = original_size.saturating_sub(offset);
+
+        info!(
+            "truncating file from {original_size} to {offset} bytes (removing {bytes_removed} bytes)"
+        );
+
+        if let Err(e) = self.file.set_len(offset) {
+            return Err(ReadError::Io(e));
+        }
+
+        if let Err(e) = self.file.sync_data() {
+            return Err(ReadError::Io(e));
+        }
+
+        info!("successfully truncated file to {offset} bytes");
+        Ok(())
+    }
+
+    fn is_valid_timestamp(&self, timestamp: u64) -> bool {
+        const MIN_TIMESTAMP: u64 = 1_600_000_000_000_000_000; // ~2020 in nanoseconds  
+        const MAX_TIMESTAMP: u64 = 2_000_000_000_000_000_000; // ~2033 in nanoseconds
+
+        // Check if it's an event (bit 63 = 0) or commit (bit 63 = 1)
+        let actual_timestamp = timestamp & !(1u64 << 63);
+        (MIN_TIMESTAMP..=MAX_TIMESTAMP).contains(&actual_timestamp)
     }
 }
 
@@ -605,127 +740,15 @@ impl BucketSegmentIter<'_> {
     pub fn next_record(&mut self) -> Result<Option<Record>, ReadError> {
         match self.reader.read_record(self.offset, ReadHint::Sequential) {
             Ok(Some(record)) => {
-                // Record successfully parsed and CRC32C validated - it's good
                 self.offset = record.offset() + record.len();
                 Ok(Some(record))
             }
             Ok(None) => Ok(None),
             Err(err) => {
-                warn!(
-                    "read error at offset {}: {err}, attempting backward recovery",
-                    self.offset
-                );
-
-                if let Some(truncate_offset) = self.find_last_valid_record()? {
-                    info!("found last valid record, truncating at offset {truncate_offset}");
-                    self.truncate_to_offset(truncate_offset)?;
-                    Ok(None)
-                } else {
-                    Err(err)
-                }
+                warn!("unexpected read error at offset {}: {err}", self.offset);
+                Err(err)
             }
         }
-    }
-
-    fn find_last_valid_record(&mut self) -> Result<Option<u64>, ReadError> {
-        let error_offset = self.offset;
-        let step_size = 64; // Step backward in 64-byte increments
-
-        trace!(
-            "scanning backward from offset {} to find last valid record",
-            error_offset
-        );
-
-        // Start from the error offset and scan backward
-        let mut scan_offset = error_offset;
-
-        while scan_offset >= SEGMENT_HEADER_SIZE as u64 + step_size {
-            scan_offset = scan_offset.saturating_sub(step_size);
-
-            // Try to find a record starting at this offset
-            if let Some(record_offset) = self.find_record_start_near(scan_offset)? {
-                // Try to read and validate the complete record
-                if let Ok(Some(record)) = self.reader.read_record(record_offset, ReadHint::Random) {
-                    // Successfully parsed and validated - this is our truncation point
-                    let truncate_offset = record_offset + record.len();
-                    trace!(
-                        "found last valid record at offset {}, truncating at {}",
-                        record_offset, truncate_offset
-                    );
-                    return Ok(Some(truncate_offset));
-                }
-            }
-        }
-
-        // If we couldn't find any valid record, truncate at segment header end
-        warn!("no valid records found during backward scan, truncating to segment header");
-        Ok(Some(SEGMENT_HEADER_SIZE as u64))
-    }
-
-    fn find_record_start_near(&mut self, near_offset: u64) -> Result<Option<u64>, ReadError> {
-        // Try the exact offset first
-        if self.looks_like_record_start(near_offset)? {
-            return Ok(Some(near_offset));
-        }
-
-        // Search in a small range around the offset (±32 bytes)
-        let search_range = 32;
-        let start = near_offset.saturating_sub(search_range);
-        let end = near_offset + search_range;
-
-        for offset in start..=end {
-            if offset >= SEGMENT_HEADER_SIZE as u64 && self.looks_like_record_start(offset)? {
-                return Ok(Some(offset));
-            }
-        }
-
-        Ok(None)
-    }
-
-    fn looks_like_record_start(&mut self, offset: u64) -> Result<bool, ReadError> {
-        // Try to read what looks like a timestamp at this position
-        if let Ok(candidate_timestamp) = self.reader.read_u64_at(offset) {
-            // Check if this could be a valid timestamp
-            Ok(self.is_valid_timestamp(candidate_timestamp))
-        } else {
-            Ok(false)
-        }
-    }
-
-    fn truncate_to_offset(&mut self, offset: u64) -> Result<(), ReadError> {
-        let original_size = self.reader.file.metadata()?.len();
-        let bytes_removed = original_size.saturating_sub(offset);
-
-        info!(
-            "truncating file from {original_size} to {offset} bytes (removing {bytes_removed} bytes)"
-        );
-
-        // Get mutable access to the file through the reader
-        if let Err(e) = self.reader.file.set_len(offset) {
-            warn!("failed to truncate file to offset {offset}: {e}");
-            return Err(ReadError::Io(e));
-        }
-
-        // Sync the truncation to disk
-        if let Err(e) = self.reader.file.sync_data() {
-            warn!("failed to sync truncation to disk: {e}");
-            return Err(ReadError::Io(e));
-        }
-
-        // Note: flushed_offset will be updated by the writer on next flush
-        // The truncation is immediately synced to disk above
-
-        info!("successfully truncated file to offset {offset}");
-        Ok(())
-    }
-
-    fn is_valid_timestamp(&self, timestamp: u64) -> bool {
-        const MIN_TIMESTAMP: u64 = 1_600_000_000_000_000_000; // ~2020 in nanoseconds  
-        const MAX_TIMESTAMP: u64 = 2_000_000_000_000_000_000; // ~2033 in nanoseconds
-
-        // Check if it's an event (bit 63 = 0) or commit (bit 63 = 1)
-        let actual_timestamp = timestamp & !(1u64 << 63);
-        (MIN_TIMESTAMP..=MAX_TIMESTAMP).contains(&actual_timestamp)
     }
 }
 
