@@ -21,7 +21,7 @@ use crate::bucket::segment::BINCODE_CONFIG;
 use crate::bucket::{BucketId, BucketSegmentId, PartitionId, SegmentId, SegmentKind};
 use crate::error::WriteError;
 
-const WRITE_BUF_SIZE: usize = 16 * 1024; // 16 KB buffer
+pub const WRITE_BUF_SIZE: usize = 16 * 1024; // 16 KB buffer
 
 #[derive(Debug)]
 pub struct BucketSegmentWriter {
