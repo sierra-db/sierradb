@@ -256,7 +256,7 @@ impl BucketSegmentWriter {
             self.flush()?;
             self.writer.get_ref().set_len(offset)?;
             self.writer.get_ref().sync_data()?;
-            self.writer.seek(SeekFrom::End(0))?; // Reposition to end
+            self.writer.seek(SeekFrom::End(0))?;
             self.file_size = self.writer.stream_position()?;
             self.flushed_offset.store(self.file_size, Ordering::Release);
         }
