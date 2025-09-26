@@ -22,10 +22,10 @@ use super::{
     SEGMENT_HEADER_SIZE, VERSION_SIZE, calculate_commit_crc32c,
     calculate_confirmation_count_crc32c, calculate_event_crc32c,
 };
+use crate::StreamId;
 use crate::bucket::{BucketId, PartitionId};
 use crate::error::{ReadError, WriteError};
 use crate::id::{get_uuid_flag, uuid_to_partition_hash};
-use crate::{StreamId};
 
 const HEADER_BUF_SIZE: usize = EVENT_HEADER_SIZE - RECORD_HEADER_SIZE;
 const PAGE_SIZE: usize = 4096; // Usually a page is 4KB on Linux
@@ -564,9 +564,7 @@ impl BucketSegmentReader {
         self.file.read_exact_at(&mut bytes, offset)?;
         Ok(u64::from_le_bytes(bytes))
     }
-
 }
-
 
 pub struct BucketSegmentIter<'a> {
     reader: &'a mut BucketSegmentReader,
@@ -605,27 +603,25 @@ impl BucketSegmentIter<'_> {
     }
 
     pub fn next_record(&mut self) -> Result<Option<Record>, ReadError> {
-        loop {
-            match self.reader.read_record(self.offset, ReadHint::Sequential) {
-                Ok(Some(record)) => {
-                    // Record successfully parsed and CRC32C validated - it's good
-                    self.offset = record.offset() + record.len();
-                    return Ok(Some(record));
-                }
-                Ok(None) => return Ok(None),
-                Err(err) => {
-                    warn!(
-                        "read error at offset {}: {err}, attempting backward recovery",
-                        self.offset
-                    );
+        match self.reader.read_record(self.offset, ReadHint::Sequential) {
+            Ok(Some(record)) => {
+                // Record successfully parsed and CRC32C validated - it's good
+                self.offset = record.offset() + record.len();
+                Ok(Some(record))
+            }
+            Ok(None) => Ok(None),
+            Err(err) => {
+                warn!(
+                    "read error at offset {}: {err}, attempting backward recovery",
+                    self.offset
+                );
 
-                    if let Some(truncate_offset) = self.find_last_valid_record()? {
-                        info!("found last valid record, truncating at offset {truncate_offset}");
-                        self.truncate_to_offset(truncate_offset)?;
-                        return Ok(None);
-                    } else {
-                        return Err(err);
-                    }
+                if let Some(truncate_offset) = self.find_last_valid_record()? {
+                    info!("found last valid record, truncating at offset {truncate_offset}");
+                    self.truncate_to_offset(truncate_offset)?;
+                    Ok(None)
+                } else {
+                    Err(err)
                 }
             }
         }
@@ -634,27 +630,33 @@ impl BucketSegmentIter<'_> {
     fn find_last_valid_record(&mut self) -> Result<Option<u64>, ReadError> {
         let error_offset = self.offset;
         let step_size = 64; // Step backward in 64-byte increments
-        
-        trace!("scanning backward from offset {} to find last valid record", error_offset);
-        
+
+        trace!(
+            "scanning backward from offset {} to find last valid record",
+            error_offset
+        );
+
         // Start from the error offset and scan backward
         let mut scan_offset = error_offset;
-        
+
         while scan_offset >= SEGMENT_HEADER_SIZE as u64 + step_size {
             scan_offset = scan_offset.saturating_sub(step_size);
-            
+
             // Try to find a record starting at this offset
             if let Some(record_offset) = self.find_record_start_near(scan_offset)? {
                 // Try to read and validate the complete record
                 if let Ok(Some(record)) = self.reader.read_record(record_offset, ReadHint::Random) {
                     // Successfully parsed and validated - this is our truncation point
                     let truncate_offset = record_offset + record.len();
-                    trace!("found last valid record at offset {}, truncating at {}", record_offset, truncate_offset);
+                    trace!(
+                        "found last valid record at offset {}, truncating at {}",
+                        record_offset, truncate_offset
+                    );
                     return Ok(Some(truncate_offset));
                 }
             }
         }
-        
+
         // If we couldn't find any valid record, truncate at segment header end
         warn!("no valid records found during backward scan, truncating to segment header");
         Ok(Some(SEGMENT_HEADER_SIZE as u64))
@@ -665,18 +667,18 @@ impl BucketSegmentIter<'_> {
         if self.looks_like_record_start(near_offset)? {
             return Ok(Some(near_offset));
         }
-        
+
         // Search in a small range around the offset (±32 bytes)
         let search_range = 32;
         let start = near_offset.saturating_sub(search_range);
         let end = near_offset + search_range;
-        
+
         for offset in start..=end {
             if offset >= SEGMENT_HEADER_SIZE as u64 && self.looks_like_record_start(offset)? {
                 return Ok(Some(offset));
             }
         }
-        
+
         Ok(None)
     }
 
@@ -689,8 +691,6 @@ impl BucketSegmentIter<'_> {
             Ok(false)
         }
     }
-
-
 
     fn truncate_to_offset(&mut self, offset: u64) -> Result<(), ReadError> {
         let original_size = self.reader.file.metadata()?.len();
