@@ -7,7 +7,6 @@ use redis::{
     Value, cmd,
 };
 use tokio::sync::{Mutex, mpsc};
-use tokio::task::JoinHandle;
 use tracing::error;
 use uuid::Uuid;
 
@@ -22,9 +21,10 @@ enum PartitionSelector {
 
 /// A manager for SierraDB subscriptions that handles a shared push channel
 /// and demultiplexes messages to individual subscriptions.
+#[derive(Clone)]
 pub struct SubscriptionManager {
     inner: Arc<Mutex<SubscriptionManagerInner>>,
-    _background_task: JoinHandle<()>,
+    // _background_task: JoinHandle<()>,
 }
 
 struct SubscriptionManagerInner {
@@ -53,7 +53,7 @@ impl SubscriptionManager {
 
         // Spawn background task to handle push messages
         let inner_clone = inner.clone();
-        let background_task = tokio::spawn(async move {
+        let _background_task = tokio::spawn(async move {
             while let Some(push_info) = rx.recv().await {
                 let mut inner_guard = inner_clone.lock().await;
                 if let Err(err) = inner_guard.handle_push_message(push_info).await {
@@ -64,7 +64,7 @@ impl SubscriptionManager {
 
         Ok(SubscriptionManager {
             inner,
-            _background_task: background_task,
+            // _background_task: background_task,
         })
     }
 
@@ -836,6 +836,7 @@ impl SubscriptionManagerInner {
                     }
                 }
             }
+            PushKind::Disconnection => {}
             kind => {
                 return Err(RedisError::from((
                     redis::ErrorKind::TypeError,

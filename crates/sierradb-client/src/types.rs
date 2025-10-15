@@ -55,6 +55,102 @@ pub enum SierraMessage {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HelloResp {
+    pub server: String,
+    pub version: String,
+    pub peer_id: String,
+    pub num_partitions: u16,
+}
+
+impl FromRedisValue for HelloResp {
+    fn from_redis_value(value: &Value) -> RedisResult<Self> {
+        match value {
+            Value::Map(fields) => {
+                let mut server = None;
+                let mut version = None;
+                let mut peer_id = None;
+                let mut num_partitions = None;
+
+                // Extract fields from map
+                for (key, val) in fields {
+                    let field_name = match key {
+                        Value::SimpleString(s) => s.as_str(),
+                        Value::BulkString(s) => std::str::from_utf8(s).map_err(|_| {
+                            RedisError::from((
+                                redis::ErrorKind::TypeError,
+                                "Invalid string for hello resp map key",
+                            ))
+                        })?,
+                        _ => continue,
+                    };
+
+                    match field_name {
+                        "server" => {
+                            server = Some(parse_value!(String, val, "server")?);
+                        }
+                        "version" => {
+                            version = Some(parse_value!(String, val, "version")?);
+                        }
+                        "peer_id" => {
+                            peer_id = Some(parse_value!(String, val, "peer_id")?);
+                        }
+                        "num_partitions" => {
+                            num_partitions = Some(match val {
+                                Value::Int(n) => *n as u16,
+                                _ => {
+                                    return Err(RedisError::from((
+                                        redis::ErrorKind::TypeError,
+                                        "num_partitions must be an integer",
+                                    )));
+                                }
+                            });
+                        }
+                        _ => {} // Ignore unknown fields
+                    }
+                }
+
+                // Ensure all required fields are present
+                let server = server.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: server",
+                    ))
+                })?;
+                let version = version.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: version",
+                    ))
+                })?;
+                let peer_id = peer_id.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: peer_id",
+                    ))
+                })?;
+                let num_partitions = num_partitions.ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "Missing required field: num_partitions",
+                    ))
+                })?;
+
+                Ok(HelloResp {
+                    server,
+                    version,
+                    peer_id,
+                    num_partitions,
+                })
+            }
+            _ => Err(RedisError::from((
+                redis::ErrorKind::TypeError,
+                "Hello resp must be a Redis map",
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppendInfo {
     pub event_id: Uuid,
     pub partition_key: Uuid,
