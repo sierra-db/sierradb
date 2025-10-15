@@ -1,0 +1,6 @@
+version = "Two"
+reorder_imports = true
+wrap_comments = true
+unstable_features = true
+condense_wildcard_suffixes = true
+edition = "2018"

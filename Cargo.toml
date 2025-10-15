@@ -1,0 +1,79 @@
+[package]
+authors = ["Ari Seyhun <ariseyhun@live.com.au>", "Zack Owens <zowens2009@gmail.com>"]
+homepage = "https://github.com/tqwewe/eventus"
+license = "MIT"
+name = "eventus"
+readme = "README.md"
+repository = "https://github.com/tqwewe/eventus"
+description = "Sequential, disk-backed event log library."
+version = "0.2.0"
+edition = "2021"
+
+[features]
+# Enable benchmark of the private api. This flag should be used only
+# for benchmarking purposes!
+internals = []
+
+[dependencies]
+async-stream = "0.3.5"
+bytes = "1"
+chrono = { version = "0.4.38", features = ["serde"] }
+clap = { version = "4.5.7", features = ["derive", "env"] }
+console-subscriber = "0.3.0"
+crc32c = "0.6"
+duration-human = "0.1.10"
+fslock = "0.2.1"
+futures = "0.3.30"
+itertools = "0.13.0"
+kameo = "0.12.0"
+memmap2 = "0.9"
+page_size = "0.6"
+prost = "0.13.1"
+prost-types = "0.13.1"
+rmp-serde = "1.3.0"
+rusqlite = { version = "0.31.0", features = ["bundled"] }
+serde = { version = "1.0.202", features = ["derive"] }
+thiserror = "1.0.61"
+tokio = { version = "1.0", features = ["fs", "macros", "rt-multi-thread", "signal"] }
+tokio-stream = { version = "0.1.15", features = ["sync"] }
+tonic = "0.12"
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+twox-hash = "1.6.3"
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[dev-dependencies]
+criterion = "0.5"
+env_logger = "0.11"
+rand = "0.8"
+
+[[bench]]
+name = "index"
+harness = false
+required-features = ["internals"]
+
+[[bench]]
+name = "stream_index"
+harness = false
+required-features = ["internals"]
+
+[[bench]]
+name = "log_append"
+harness = false
+
+[[bench]]
+name = "message"
+harness = false
+
+[[bench]]
+name = "segment"
+harness = false
+required-features = ["internals"]
+
+[workspace]
+members = [".", "eventus_v2", "monitus"]
+
+[workspace.dependencies]
+eventus = { path = "." }
