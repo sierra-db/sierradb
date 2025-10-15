@@ -43,6 +43,10 @@ pub struct Args {
     /// Index of this node in the cluster (0-based)
     #[arg(short = 'i', long)]
     pub node_index: Option<u32>,
+
+    /// If mdns auto discovery is enabled
+    #[arg(long)]
+    pub mdns: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,6 +62,8 @@ pub struct AppConfig {
     pub segment: SegmentConfig,
     #[serde(default)]
     pub threads: Threads,
+    #[serde(default)]
+    pub mdns: bool,
 
     pub nodes: Option<Vec<Value>>,
 }
@@ -162,6 +168,7 @@ impl AppConfig {
         let overrides = builder.build_cloned()?;
 
         builder = builder
+            .set_default("mdns", false)?
             .set_default("bucket.count", 4)?
             .set_default("flush.events_threshold", 1)?
             .set_default("flush.interval_ms", 0)?
@@ -205,6 +212,7 @@ impl AppConfig {
         // Override with CLI arguments if provided
         builder = builder
             .set_override_option("dir", args.dir)?
+            .set_override_option("mdns", args.mdns)?
             .set_override_option("network.cluster_address", args.cluster_address)?
             .set_override_option("network.client_address", args.client_address)?
             .set_override_option("node.index", args.node_index)?
@@ -402,39 +410,6 @@ impl AppConfig {
         Ok(errs)
     }
 
-    // pub fn assigned_buckets(&self) -> Result<HashSet<BucketId>, ConfigError> {
-    //     match &self.bucket.ids {
-    //         Some(ids) => Ok(ids.iter().copied().collect()),
-    //         None => {
-    //             let node_count = self.node_count()?;
-    //             let replication_factor = self.replication.factor as usize;
-    //             let current_node_index = self.node.index as usize;
-
-    //             // Cap replication factor at node count (every node owns
-    // everything if RF >=             // node count)
-    //             let effective_replication_factor =
-    // replication_factor.min(node_count);
-
-    //             let mut assigned = HashSet::new();
-
-    //             for bucket_id in 0..self.bucket.count {
-    //                 let primary_node = bucket_id as usize % node_count;
-
-    //                 // Check if current node is one of the replica nodes for this
-    // bucket                 for replica_offset in
-    // 0..effective_replication_factor {                     let replica_node =
-    // (primary_node + replica_offset) % node_count;                     if
-    // replica_node == current_node_index {
-    // assigned.insert(bucket_id);                         break;
-    //                     }
-    //                 }
-    //             }
-
-    //             Ok(assigned)
-    //         }
-    //     }
-    // }
-
     pub fn assigned_buckets(&self) -> Result<HashSet<BucketId>, ConfigError> {
         match &self.bucket.ids {
             Some(ids) => Ok(ids.iter().copied().collect()),
@@ -503,6 +478,7 @@ impl fmt::Display for AppConfig {
         }
 
         writeln!(f, "dir = {}", self.dir.to_string_lossy())?;
+        writeln!(f, "mdns = {}", self.mdns)?;
 
         writeln!(
             f,
