@@ -247,10 +247,10 @@ pub enum EventValidationError {
     EmptyTransaction,
 }
 
-#[derive(Clone, Copy, Debug, Error)]
+#[derive(Clone, Debug, Error)]
 pub enum StreamIdError {
-    #[error("stream id must be between 1 and 64 characters in length")]
-    InvalidLength,
+    #[error("stream id must be between 1 and 64 characters in length, but got {len} for '{input}'")]
+    InvalidLength { input: String, len: usize },
     #[error("stream id cannot contain null bytes")]
     ContainsNullByte,
 }

@@ -13,6 +13,7 @@ use bincode::error::DecodeError;
 use polonius_the_crab::{exit_polonius, polonius, polonius_return, polonius_try};
 use serde::{Deserialize, Serialize};
 use smallvec::{SmallVec, smallvec};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::{
@@ -86,7 +87,7 @@ impl CommittedEvents {
             CommittedEvents::Transaction { events, .. } => events.len(),
         }
     }
-    
+
     pub fn is_empty(&self) -> bool {
         match self {
             CommittedEvents::Single(_) => false,
@@ -174,7 +175,7 @@ impl BucketSegmentReader {
         flushed_offset: Option<FlushedOffset>,
     ) -> Result<Self, ReadError> {
         let mut opts = OpenOptions::new();
-        opts.read(true).write(false);
+        opts.read(true).write(true); // Write access needed for lazy recovery truncation
 
         #[cfg(target_os = "macos")]
         {
@@ -196,7 +197,7 @@ impl BucketSegmentReader {
             }
         };
 
-        Ok(BucketSegmentReader {
+        let mut reader = BucketSegmentReader {
             file,
             header_buf,
             body_buf,
@@ -205,7 +206,15 @@ impl BucketSegmentReader {
             read_ahead_offset: 0,
             read_ahead_pos: 0,
             read_ahead_valid_len: 0,
-        })
+        };
+
+        // Check for zero corruption from improper shutdowns
+        let file_size = reader.file.metadata()?.len();
+        if file_size > SEGMENT_HEADER_SIZE as u64 {
+            reader.check_and_recover_zero_corruption(file_size)?;
+        }
+
+        Ok(reader)
     }
 
     pub fn try_clone(&self) -> Result<Self, ReadError> {
@@ -215,9 +224,9 @@ impl BucketSegmentReader {
             body_buf: self.body_buf,
             flushed_offset: self.flushed_offset.clone(),
             read_ahead_buf: Vec::with_capacity(READ_AHEAD_SIZE),
-            read_ahead_offset: self.read_ahead_offset,
-            read_ahead_pos: self.read_ahead_pos,
-            read_ahead_valid_len: self.read_ahead_valid_len,
+            read_ahead_offset: 0,
+            read_ahead_pos: 0,
+            read_ahead_valid_len: 0,
         })
     }
 
@@ -556,6 +565,114 @@ impl BucketSegmentReader {
         let start = (offset - self.read_ahead_offset) as usize;
         Ok(&self.read_ahead_buf[start..start + length])
     }
+
+    fn check_and_recover_zero_corruption(&mut self, file_size: u64) -> Result<(), ReadError> {
+        let check_size = 1024.min(file_size - SEGMENT_HEADER_SIZE as u64);
+        if check_size == 0 {
+            return Ok(());
+        }
+
+        let check_offset = file_size - check_size;
+        let mut buffer = vec![0u8; check_size as usize];
+
+        if self.file.read_exact_at(&mut buffer, check_offset).is_err() {
+            return Ok(());
+        }
+
+        let all_zeros = buffer.iter().all(|&b| b == 0);
+        if all_zeros && check_size >= 64 {
+            info!("detected zero corruption, performing recovery");
+            self.find_corruption_boundary_forward()?;
+        }
+
+        Ok(())
+    }
+
+    fn find_corruption_boundary_forward(&mut self) -> Result<(), ReadError> {
+        let mut current_offset = SEGMENT_HEADER_SIZE as u64;
+
+        loop {
+            match self.read_record(current_offset, ReadHint::Sequential) {
+                Ok(Some(record)) => {
+                    current_offset = record.offset() + record.len();
+                    continue;
+                }
+                Ok(None) => {
+                    return Ok(());
+                }
+                Err(_) => {
+                    if self.is_zero_header_at_offset(current_offset)?
+                        && self.is_remaining_content_zeros(current_offset)?
+                    {
+                        info!("truncating zero corruption at offset {current_offset}");
+                        self.truncate_file_to(current_offset)?;
+                        return Ok(());
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    fn is_zero_header_at_offset(&mut self, offset: u64) -> Result<bool, ReadError> {
+        let mut header_buf = vec![0u8; COMMIT_SIZE];
+
+        match self.file.read_exact_at(&mut header_buf, offset) {
+            Ok(()) => Ok(header_buf.iter().all(|&b| b == 0)),
+            Err(_) => Ok(false),
+        }
+    }
+
+    fn is_remaining_content_zeros(&mut self, start_offset: u64) -> Result<bool, ReadError> {
+        let file_size = self.file.metadata()?.len();
+        if start_offset >= file_size {
+            return Ok(true);
+        }
+
+        const CHECK_CHUNK_SIZE: usize = 4096;
+        let mut buffer = vec![0u8; CHECK_CHUNK_SIZE];
+        let mut current_offset = start_offset;
+
+        while current_offset < file_size {
+            let remaining = (file_size - current_offset) as usize;
+            let read_size = remaining.min(CHECK_CHUNK_SIZE);
+
+            match self
+                .file
+                .read_exact_at(&mut buffer[..read_size], current_offset)
+            {
+                Ok(()) => {
+                    if !buffer[..read_size].iter().all(|&b| b == 0) {
+                        return Ok(false);
+                    }
+                }
+                Err(_) => return Ok(false),
+            }
+
+            current_offset += read_size as u64;
+        }
+
+        Ok(true)
+    }
+
+    fn truncate_file_to(&mut self, offset: u64) -> Result<(), ReadError> {
+        let original_size = self.file.metadata()?.len();
+        let bytes_removed = original_size.saturating_sub(offset);
+
+        info!(
+            "truncating file from {original_size} to {offset} bytes (removing {bytes_removed} bytes)"
+        );
+
+        if let Err(err) = self.file.set_len(offset) {
+            return Err(ReadError::Io(err));
+        }
+
+        if let Err(err) = self.file.sync_data() {
+            return Err(ReadError::Io(err));
+        }
+
+        Ok(())
+    }
 }
 
 pub struct BucketSegmentIter<'a> {
@@ -601,7 +718,10 @@ impl BucketSegmentIter<'_> {
                 Ok(Some(record))
             }
             Ok(None) => Ok(None),
-            Err(err) => Err(err),
+            Err(err) => {
+                warn!("unexpected read error at offset {}: {err}", self.offset);
+                Err(err)
+            }
         }
     }
 }
@@ -1000,42 +1120,3 @@ impl<'c> Decode<&'c EventHeader> for EventBody {
         })
     }
 }
-
-// impl<'a, 'c> BorrowDecode<'a, &'c EventHeader> for EventBody<'a> {
-//     fn borrow_decode<D: BorrowDecoder<'a, Context = &'c EventHeader>>(
-//         decoder: &mut D,
-//     ) -> Result<Self, DecodeError> {
-//         let EventHeader {
-//             stream_id_len,
-//             event_name_len,
-//             metadata_len,
-//             payload_len,
-//             ..
-//         } = decoder.context();
-
-//         decoder.claim_bytes_read(*stream_id_len)?;
-//         let stream_id_bytes =
-// decoder.borrow_reader().take_bytes(*stream_id_len)?;         let stream_id =
-//             std::str::from_utf8(stream_id_bytes).map_err(|err|
-// DecodeError::Utf8 { inner: err })?;
-
-//         decoder.claim_bytes_read(*event_name_len)?;
-//         let event_name_bytes =
-// decoder.borrow_reader().take_bytes(*event_name_len)?;         let event_name
-// = std::str::from_utf8(event_name_bytes)             .map_err(|err|
-// DecodeError::Utf8 { inner: err })?;
-
-//         decoder.claim_bytes_read(*metadata_len)?;
-//         let metadata = decoder.borrow_reader().take_bytes(*metadata_len)?;
-
-//         decoder.claim_bytes_read(*payload_len)?;
-//         let payload = decoder.borrow_reader().take_bytes(*payload_len)?;
-
-//         Ok(EventBody {
-//             stream_id: Cow::Borrowed(stream_id),
-//             event_name: Cow::Borrowed(event_name),
-//             metadata: Cow::Borrowed(metadata),
-//             payload: Cow::Borrowed(payload),
-//         })
-//     }
-// }
