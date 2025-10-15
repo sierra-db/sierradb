@@ -1,7 +1,14 @@
 [package]
 name = "sierradb-topology"
-version = "0.1.0"
-edition = "2024"
+authors.workspace = true
+categories.workspace = true
+description = "SierraDB network topology management and peer discovery"
+edition.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
 
 [dependencies]
 sierradb.workspace = true

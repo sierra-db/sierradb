@@ -1,7 +1,14 @@
 [package]
 name = "sierradb-client"
-version = "0.1.0"
-edition = "2021"
+authors.workspace = true
+categories.workspace = true
+description = "SierraDB Rust client - type-safe client library for SierraDB event store"
+edition = "2021" # Redis client only supports up to 2021
+homepage.workspace = true
+keywords.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
 
 [dependencies]
 sierradb-protocol.workspace = true

@@ -1,7 +1,14 @@
 [package]
 name = "sierradb-server"
-version = "0.1.0"
-edition = "2024"
+authors.workspace = true
+categories.workspace = true
+description = "SierraDB server - distributed event store server with Redis RESP3 protocol"
+edition.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
 
 [[bin]]
 name = "sierradb"
