@@ -13,7 +13,7 @@ use bincode::error::DecodeError;
 use polonius_the_crab::{exit_polonius, polonius, polonius_return, polonius_try};
 use serde::{Deserialize, Serialize};
 use smallvec::{SmallVec, smallvec};
-use tracing::{info, trace, warn};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::{
@@ -175,7 +175,7 @@ impl BucketSegmentReader {
         flushed_offset: Option<FlushedOffset>,
     ) -> Result<Self, ReadError> {
         let mut opts = OpenOptions::new();
-        opts.read(true).write(false);
+        opts.read(true).write(true); // Write access needed for lazy recovery truncation
 
         #[cfg(target_os = "macos")]
         {
@@ -208,8 +208,11 @@ impl BucketSegmentReader {
             read_ahead_valid_len: 0,
         };
 
-        // Perform startup recovery to handle any corruption from improper shutdowns
-        reader.recover_file_corruption()?;
+        // Check for zero corruption from improper shutdowns
+        let file_size = reader.file.metadata()?.len();
+        if file_size > SEGMENT_HEADER_SIZE as u64 {
+            reader.check_and_recover_zero_corruption(file_size)?;
+        }
 
         Ok(reader)
     }
@@ -221,9 +224,9 @@ impl BucketSegmentReader {
             body_buf: self.body_buf,
             flushed_offset: self.flushed_offset.clone(),
             read_ahead_buf: Vec::with_capacity(READ_AHEAD_SIZE),
-            read_ahead_offset: self.read_ahead_offset,
-            read_ahead_pos: self.read_ahead_pos,
-            read_ahead_valid_len: self.read_ahead_valid_len,
+            read_ahead_offset: 0,
+            read_ahead_pos: 0,
+            read_ahead_valid_len: 0,
         })
     }
 
@@ -563,112 +566,93 @@ impl BucketSegmentReader {
         Ok(&self.read_ahead_buf[start..start + length])
     }
 
-    // Recovery related methods
-
-    /// Performs startup recovery using efficient chunked backward scanning
-    fn recover_file_corruption(&mut self) -> Result<(), ReadError> {
-        let file_size = self.file.metadata()?.len();
-
-        // If file is just the header, nothing to recover
-        if file_size <= SEGMENT_HEADER_SIZE as u64 {
-            return Ok(());
-        }
-
-        info!("checking file integrity at startup, size: {file_size} bytes");
-
-        // Try to read from the end to see if we need recovery
-        if self.is_file_corrupted(file_size)? {
-            warn!("corruption detected, starting recovery");
-            if let Some(truncate_offset) = self.find_last_valid_record_chunked(file_size)? {
-                self.truncate_file_to(truncate_offset)?;
-                info!("recovery completed, file truncated to {truncate_offset} bytes");
-            } else {
-                warn!("no valid records found, truncating to header only");
-                self.truncate_file_to(SEGMENT_HEADER_SIZE as u64)?;
-            }
-        } else {
-            trace!("file integrity check passed");
-        }
-
-        Ok(())
-    }
-
-    /// Quick check if file appears corrupted by testing a few positions near
-    /// the end
-    fn is_file_corrupted(&mut self, file_size: u64) -> Result<bool, ReadError> {
-        // Check the last few KB for obvious signs of corruption (all zeros)
+    fn check_and_recover_zero_corruption(&mut self, file_size: u64) -> Result<(), ReadError> {
         let check_size = 1024.min(file_size - SEGMENT_HEADER_SIZE as u64);
         if check_size == 0 {
-            return Ok(false);
+            return Ok(());
         }
 
         let check_offset = file_size - check_size;
         let mut buffer = vec![0u8; check_size as usize];
 
         if self.file.read_exact_at(&mut buffer, check_offset).is_err() {
-            return Ok(true); // Can't read, assume corrupted
+            return Ok(());
         }
 
-        // If the end is all zeros, likely corrupted
         let all_zeros = buffer.iter().all(|&b| b == 0);
         if all_zeros && check_size >= 64 {
-            trace!("detected zero padding at end of file, corruption likely");
+            info!("detected zero corruption, performing recovery");
+            self.find_corruption_boundary_forward()?;
+        }
+
+        Ok(())
+    }
+
+    fn find_corruption_boundary_forward(&mut self) -> Result<(), ReadError> {
+        let mut current_offset = SEGMENT_HEADER_SIZE as u64;
+
+        loop {
+            match self.read_record(current_offset, ReadHint::Sequential) {
+                Ok(Some(record)) => {
+                    current_offset = record.offset() + record.len();
+                    continue;
+                }
+                Ok(None) => {
+                    return Ok(());
+                }
+                Err(_) => {
+                    if self.is_zero_header_at_offset(current_offset)?
+                        && self.is_remaining_content_zeros(current_offset)?
+                    {
+                        info!("truncating zero corruption at offset {current_offset}");
+                        self.truncate_file_to(current_offset)?;
+                        return Ok(());
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    fn is_zero_header_at_offset(&mut self, offset: u64) -> Result<bool, ReadError> {
+        let mut header_buf = vec![0u8; COMMIT_SIZE];
+
+        match self.file.read_exact_at(&mut header_buf, offset) {
+            Ok(()) => Ok(header_buf.iter().all(|&b| b == 0)),
+            Err(_) => Ok(false),
+        }
+    }
+
+    fn is_remaining_content_zeros(&mut self, start_offset: u64) -> Result<bool, ReadError> {
+        let file_size = self.file.metadata()?.len();
+        if start_offset >= file_size {
             return Ok(true);
         }
 
-        Ok(false)
-    }
+        const CHECK_CHUNK_SIZE: usize = 4096;
+        let mut buffer = vec![0u8; CHECK_CHUNK_SIZE];
+        let mut current_offset = start_offset;
 
-    /// Efficient chunked backward scanning to find the last valid record
-    fn find_last_valid_record_chunked(&mut self, file_size: u64) -> Result<Option<u64>, ReadError> {
-        const CHUNK_SIZE: u64 = 4096; // 4KB chunks for efficient I/O
+        while current_offset < file_size {
+            let remaining = (file_size - current_offset) as usize;
+            let read_size = remaining.min(CHECK_CHUNK_SIZE);
 
-        let mut current_offset = file_size;
-
-        while current_offset > SEGMENT_HEADER_SIZE as u64 {
-            // Calculate chunk boundaries
-            let chunk_start =
-                (current_offset.saturating_sub(CHUNK_SIZE)).max(SEGMENT_HEADER_SIZE as u64);
-            let chunk_size = current_offset - chunk_start;
-
-            if chunk_size == 0 {
-                break;
-            }
-
-            trace!("scanning chunk from {chunk_start} to {current_offset} ({chunk_size} bytes)");
-
-            // Read the entire chunk at once
-            let mut chunk = vec![0u8; chunk_size as usize];
-            self.file.read_exact_at(&mut chunk, chunk_start)?;
-
-            // Scan backwards through every byte in the chunk
-            for byte_offset in (0..chunk_size).rev() {
-                let file_offset = chunk_start + byte_offset;
-
-                // Quick check: does this look like a timestamp?
-                if byte_offset + 8 <= chunk_size {
-                    let timestamp_bytes = &chunk[byte_offset as usize..byte_offset as usize + 8];
-                    let candidate_timestamp =
-                        u64::from_le_bytes(timestamp_bytes.try_into().unwrap());
-
-                    if self.is_valid_timestamp(candidate_timestamp) {
-                        // Try to parse the full record at this position
-                        if let Ok(Some(record)) = self.read_record(file_offset, ReadHint::Random) {
-                            let truncate_offset = file_offset + record.len();
-                            trace!(
-                                "found valid record at {file_offset}, truncating at {truncate_offset}"
-                            );
-                            return Ok(Some(truncate_offset));
-                        }
+            match self
+                .file
+                .read_exact_at(&mut buffer[..read_size], current_offset)
+            {
+                Ok(()) => {
+                    if !buffer[..read_size].iter().all(|&b| b == 0) {
+                        return Ok(false);
                     }
                 }
+                Err(_) => return Ok(false),
             }
 
-            current_offset = chunk_start;
+            current_offset += read_size as u64;
         }
 
-        // No valid record found
-        Ok(None)
+        Ok(true)
     }
 
     fn truncate_file_to(&mut self, offset: u64) -> Result<(), ReadError> {
@@ -679,25 +663,15 @@ impl BucketSegmentReader {
             "truncating file from {original_size} to {offset} bytes (removing {bytes_removed} bytes)"
         );
 
-        if let Err(e) = self.file.set_len(offset) {
-            return Err(ReadError::Io(e));
+        if let Err(err) = self.file.set_len(offset) {
+            return Err(ReadError::Io(err));
         }
 
-        if let Err(e) = self.file.sync_data() {
-            return Err(ReadError::Io(e));
+        if let Err(err) = self.file.sync_data() {
+            return Err(ReadError::Io(err));
         }
 
-        info!("successfully truncated file to {offset} bytes");
         Ok(())
-    }
-
-    fn is_valid_timestamp(&self, timestamp: u64) -> bool {
-        const MIN_TIMESTAMP: u64 = 1_600_000_000_000_000_000; // ~2020 in nanoseconds  
-        const MAX_TIMESTAMP: u64 = 2_000_000_000_000_000_000; // ~2033 in nanoseconds
-
-        // Check if it's an event (bit 63 = 0) or commit (bit 63 = 1)
-        let actual_timestamp = timestamp & !(1u64 << 63);
-        (MIN_TIMESTAMP..=MAX_TIMESTAMP).contains(&actual_timestamp)
     }
 }
 
