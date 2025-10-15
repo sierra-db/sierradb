@@ -1,9 +1,15 @@
 [package]
 name = "sierradb-protocol"
-version = "0.1.0" 
-edition = "2024"
+authors.workspace = true
+categories.workspace = true
 description = "Shared protocol types and utilities for SierraDB"
+edition.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
 
 [dependencies]
-serde.workspace = true
+serde = { workspace = true, features = ["derive"] }
 strum.workspace = true

@@ -1,7 +1,14 @@
 [package]
 name = "sierradb"
-version = "0.0.0"
-edition = "2024"
+authors.workspace = true
+categories.workspace = true
+description = "Core SierraDB event store library - embeddable high-performance event sourcing database"
+edition.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
 
 [dependencies]
 sierradb-protocol.workspace = true
@@ -30,6 +37,7 @@ proptest = "1.7"
 tempfile = "3.16"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+uuid = { workspace = true, features = ["v5"] }
 
 [lints.rust]
 elided_lifetimes_in_paths = "deny"
