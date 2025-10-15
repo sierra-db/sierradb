@@ -22,7 +22,7 @@ pub use types::*;
 pub use sierradb_protocol::{CurrentVersion, ErrorCode, ExpectedVersion, VersionGap};
 
 // Uuid::new_v5(&Uuid::NAMESPACE_DNS, b"sierradb.tqwewe.com")
-const NAMESPACE_PARTITION_KEY: Uuid = uuid!("219bd637-e279-53e9-9e2b-eabe5d9120cc");
+pub const NAMESPACE_PARTITION_KEY: Uuid = uuid!("219bd637-e279-53e9-9e2b-eabe5d9120cc");
 
 pub fn stream_partition_key(stream_id: &str) -> Uuid {
     Uuid::new_v5(&NAMESPACE_PARTITION_KEY, stream_id.as_bytes())

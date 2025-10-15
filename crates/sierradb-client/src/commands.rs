@@ -1,6 +1,7 @@
 use redis::{Client, ConnectionLike, RedisResult, ToRedisArgs, cmd};
 use uuid::Uuid;
 
+use crate::HelloResp;
 use crate::options::{EAppendOptions, EMAppendEvent};
 use crate::subscription::SubscriptionManager;
 use crate::types::{AppendInfo, Event, EventBatch, MultiAppendInfo, RangeValue, SubscriptionInfo};
@@ -379,7 +380,7 @@ implement_commands! {
     ///
     /// # Returns
     /// Returns server information including name, version, peer_id, and num_partitions.
-    fn hello<>(version: u32) -> (redis::Value) {
+    fn hello<>(version: u32) -> (HelloResp) {
         cmd("HELLO").arg(version)
     }
 
