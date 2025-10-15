@@ -133,22 +133,36 @@ SierraDB ensures data reliability through multiple mechanisms:
 
 ## Getting Started
 
+### Installation
+
+**Using Cargo:**
+```bash
+cargo install sierradb-server
+sierradb --dir ./data --client-address 0.0.0.0:9090
+```
+
+**Using Docker:**
+```bash
+docker build -t sierradb .
+docker run -p 9090:9090 -v ./data:/data sierradb --dir /data --client-address 0.0.0.0:9090
+```
+
 ### Single Node Setup
 ```bash
 # Start SierraDB with default configuration
-sierradb-server --dir ./data --client-address 0.0.0.0:9090
+sierradb --dir ./data --client-address 0.0.0.0:9090
 ```
 
 ### Cluster Setup
 ```bash
 # Node 1
-sierradb-server --dir ./data1 --node-index 0 --node-count 3 --client-address 0.0.0.0:9090
+sierradb --dir ./data1 --node-index 0 --node-count 3 --client-address 0.0.0.0:9090
 
 # Node 2  
-sierradb-server --dir ./data2 --node-index 1 --node-count 3 --client-address 0.0.0.0:9091
+sierradb --dir ./data2 --node-index 1 --node-count 3 --client-address 0.0.0.0:9091
 
 # Node 3
-sierradb-server --dir ./data3 --node-index 2 --node-count 3 --client-address 0.0.0.0:9092
+sierradb --dir ./data3 --node-index 2 --node-count 3 --client-address 0.0.0.0:9092
 ```
 
 ### Embedded Usage
