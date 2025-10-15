@@ -29,7 +29,10 @@ impl StreamId {
     pub fn new(s: impl Into<Arc<str>>) -> Result<Self, StreamIdError> {
         let inner = s.into();
         if !(1..=STREAM_ID_SIZE).contains(&inner.len()) {
-            return Err(StreamIdError::InvalidLength);
+            return Err(StreamIdError::InvalidLength {
+                input: inner.to_string(),
+                len: inner.len(),
+            });
         }
 
         if inner.contains('\0') {

@@ -390,7 +390,7 @@ impl<'a> Arbitrary<'a> for ArbitraryStreamId {
             .collect::<Result<String, _>>()?;
         Ok(ArbitraryStreamId(StreamId::new(s).map_err(
             |err| match err {
-                StreamIdError::InvalidLength => arbitrary::Error::NotEnoughData,
+                StreamIdError::InvalidLength { .. } => arbitrary::Error::NotEnoughData,
                 StreamIdError::ContainsNullByte => arbitrary::Error::IncorrectFormat,
             },
         )?))
