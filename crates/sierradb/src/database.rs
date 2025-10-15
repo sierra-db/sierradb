@@ -155,6 +155,18 @@ impl Database {
         }
     }
 
+    // pub async fn read_bucket(
+    //     &self,
+    //     bucket_id: BucketId,
+    //     from_sequence: u64,
+    // ) -> Result<BucketEventIter, BucketError> {
+    //     // TODO: from sequence would be the min sequence of all the partitions
+    //     // in the bucket I guess. Can we binary search the file to find
+    //     // where the from sequence starts? Or.. we can query the partition
+    //     // indexes to find this actually BucketEventIter::new(bucket_id,
+    //     // self.reader_pool.clone(), )
+    // }
+
     pub async fn read_partition(
         &self,
         partition_id: PartitionId,

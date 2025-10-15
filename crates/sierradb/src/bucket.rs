@@ -166,3 +166,13 @@ impl str::FromStr for SegmentKind {
         }
     }
 }
+
+// pub struct BucketEventIter {
+//     reader_pool: ReaderThreadPool,
+// }
+
+// impl BucketEventIter {
+//     pub fn new() -> Self {}
+
+//     pub fn next(&mut self) -> Result<Option<CommittedEvents>,
+// PartitionIndexError> {} }

@@ -206,3 +206,56 @@ impl ReaderThreadPool {
     //     });
     // }
 }
+
+pub struct SequentialReaderContext {
+    readers: HashMap<BucketId, BTreeMap<SegmentId, ReaderSet>>,
+}
+
+impl SequentialReaderContext {
+    /// Creates a snapshot of current readers for sequential access
+    pub fn from_pool(pool: &ReaderThreadPool) -> Self {
+        // Get current state from one worker in the pool
+        pool.install(|with_reader| {
+            let snapshot = with_reader(|readers| {
+                // Clone all readers for sequential access
+                readers
+                    .iter()
+                    .map(|(bucket_id, segments)| {
+                        let cloned_segments = segments
+                            .iter()
+                            .map(|(seg_id, reader_set)| {
+                                (
+                                    *seg_id,
+                                    ReaderSet {
+                                        reader: reader_set.reader.try_clone().unwrap(),
+                                        event_index: reader_set
+                                            .event_index
+                                            .as_ref()
+                                            .map(|i| i.try_clone().unwrap()),
+                                        partition_index: reader_set
+                                            .partition_index
+                                            .as_ref()
+                                            .map(|i| i.try_clone().unwrap()),
+                                        stream_index: reader_set
+                                            .stream_index
+                                            .as_ref()
+                                            .map(|i| i.try_clone().unwrap()),
+                                    },
+                                )
+                            })
+                            .collect();
+                        (*bucket_id, cloned_segments)
+                    })
+                    .collect()
+            });
+
+            SequentialReaderContext { readers: snapshot }
+        })
+    }
+
+    pub fn get_reader(&mut self, bucket_segment_id: BucketSegmentId) -> Option<&mut ReaderSet> {
+        self.readers
+            .get_mut(&bucket_segment_id.bucket_id)?
+            .get_mut(&bucket_segment_id.segment_id)
+    }
+}

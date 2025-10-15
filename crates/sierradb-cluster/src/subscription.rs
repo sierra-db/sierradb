@@ -589,37 +589,39 @@ impl Subscription {
                     while let Some((partition_id, (iter, from_sequence))) =
                         partition_iters.iter_mut().choose(&mut rng)
                     {
-                        let Some(commit) = iter.next().await? else {
-                            let partition_id = *partition_id;
-                            partition_iters.remove(&partition_id);
-                            continue;
-                        };
+                        for _ in 0..256 {
+                            let Some(commit) = iter.next().await? else {
+                                let partition_id = *partition_id;
+                                partition_iters.remove(&partition_id);
+                                break;
+                            };
 
-                        let Some(first_partition_sequence) = commit.first_partition_sequence()
-                        else {
-                            continue;
-                        };
+                            let Some(first_partition_sequence) = commit.first_partition_sequence()
+                            else {
+                                break;
+                            };
 
-                        let watermark = self
-                            .watermarks
-                            .get(partition_id)
-                            .ok_or(SubscriptionError::PartitionWatermarkNotFound {
-                                partition_id: *partition_id,
-                            })?
-                            .clone();
-                        if !watermark.can_read(first_partition_sequence) {
-                            let partition_id = *partition_id;
-                            partition_iters.remove(&partition_id);
-                            continue;
-                        }
+                            let watermark = self
+                                .watermarks
+                                .get(partition_id)
+                                .ok_or(SubscriptionError::PartitionWatermarkNotFound {
+                                    partition_id: *partition_id,
+                                })?
+                                .clone();
+                            if !watermark.can_read(first_partition_sequence) {
+                                let partition_id = *partition_id;
+                                partition_iters.remove(&partition_id);
+                                break;
+                            }
 
-                        for event in commit {
-                            debug_assert!(watermark.can_read(event.partition_sequence));
+                            for event in commit {
+                                debug_assert!(watermark.can_read(event.partition_sequence));
 
-                            let sequence = event.partition_sequence;
-                            self.send_record(event).await?;
+                                let sequence = event.partition_sequence;
+                                self.send_record(event).await?;
 
-                            **from_sequence = sequence + 1;
+                                **from_sequence = sequence + 1;
+                            }
                         }
                     }
                 }
