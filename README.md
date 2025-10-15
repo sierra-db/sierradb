@@ -101,26 +101,264 @@ See `crates/sierradb-server/src/config.rs` for the complete configuration refere
 SierraDB implements a comprehensive set of RESP3 commands for event operations:
 
 ### Core Event Operations
-- **`EAPPEND`** - Append event to a stream with optional expected version
-- **`EMAPPEND`** - Transactionally append multiple events across streams within same partition
-- **`EGET`** - Retrieve event by UUID
-- **`ESCAN`** - Scan events in a stream by version range
 
-### Stream Operations  
-- **`ESVER`** - Get current version of a stream
-- **`ESUB`** - Subscribe to real-time events from one or more streams
+#### `EAPPEND` - Append Event to Stream
+Append an event to a stream with optional expected version control.
+
+**Syntax:**
+```
+EAPPEND <stream_id> <event_name> [EVENT_ID <event_id>] [PARTITION_KEY <partition_key>] [EXPECTED_VERSION <version>] [TIMESTAMP <timestamp>] [PAYLOAD <payload>] [METADATA <metadata>]
+```
+
+**Parameters:**
+- `stream_id` - Stream identifier to append the event to
+- `event_name` - Name/type of the event  
+- `event_id` (optional) - UUID for the event (auto-generated if not provided)
+- `partition_key` (optional) - UUID to determine event partitioning
+- `expected_version` (optional) - Expected stream version (number, "any", "exists", "empty")
+- `timestamp` (optional) - Event timestamp in milliseconds
+- `payload` (optional) - Event payload data
+- `metadata` (optional) - Event metadata
+
+**Examples:**
+```
+EAPPEND my-stream UserCreated PAYLOAD '{"name":"john"}' METADATA '{"source":"api"}'
+EAPPEND orders OrderPlaced EVENT_ID 550e8400-e29b-41d4-a716-446655440000 EXPECTED_VERSION empty
+```
+
+#### `EMAPPEND` - Multi-Stream Transactional Append
+Append multiple events across different streams within the same partition atomically.
+
+**Syntax:**
+```
+EMAPPEND <partition_key> <stream_id1> <event_name1> [EVENT_ID <event_id1>] [EXPECTED_VERSION <version1>] [TIMESTAMP <timestamp>] [PAYLOAD <payload1>] [METADATA <metadata1>] [<stream_id2> <event_name2> ...]
+```
+
+**Parameters:**
+- `partition_key` - UUID that determines which partition all events will be written to
+- For each event: `stream_id`, `event_name`, and optional `EVENT_ID`, `EXPECTED_VERSION`, `TIMESTAMP`, `PAYLOAD`, `METADATA`
+
+**Examples:**
+```
+EMAPPEND 550e8400-e29b-41d4-a716-446655440000 stream1 EventA PAYLOAD '{"data":"value1"}' stream2 EventB PAYLOAD '{"data":"value2"}'
+```
+
+**Note:** All events succeed or fail together as a single atomic transaction.
+
+#### `EGET` - Get Event by ID
+Retrieve an event by its unique identifier.
+
+**Syntax:**
+```
+EGET <event_id>
+```
+
+**Parameters:**
+- `event_id` - UUID of the event to retrieve
+
+**Examples:**
+```
+EGET 550e8400-e29b-41d4-a716-446655440000
+```
+
+#### `ESCAN` - Scan Stream Events
+Scan events in a stream by version range.
+
+**Syntax:**
+```
+ESCAN <stream_id> <start_version> <end_version> [PARTITION_KEY <partition_key>] [COUNT <count>]
+```
+
+**Parameters:**
+- `stream_id` - Stream identifier to scan
+- `start_version` - Starting version number (use "-" for beginning)
+- `end_version` - Ending version number (use "+" for end, or specific number)  
+- `partition_key` (optional) - UUID to scan specific partition
+- `count` (optional) - Maximum number of events to return
+
+**Examples:**
+```
+ESCAN my-stream 0 100 COUNT 50
+ESCAN my-stream - + PARTITION_KEY 550e8400-e29b-41d4-a716-446655440000
+```
+
+### Stream Operations
+
+#### `ESVER` - Get Stream Version
+Get the current version number for a stream.
+
+**Syntax:**
+```
+ESVER <stream_id> [PARTITION_KEY <partition_key>]
+```
+
+**Parameters:**
+- `stream_id` - Stream identifier to get version for
+- `partition_key` (optional) - UUID to check specific partition
+
+**Examples:**
+```
+ESVER my-stream
+ESVER my-stream PARTITION_KEY 550e8400-e29b-41d4-a716-446655440000
+```
+
+#### `ESUB` - Subscribe to Stream Events
+Subscribe to events from one or more streams with real-time delivery.
+
+**Syntax:**
+```
+# Single stream
+ESUB <stream_id> [PARTITION_KEY <partition_key>] [FROM <version>] [WINDOW <size>]
+
+# Multiple streams  
+ESUB <stream_id_1> [PARTITION_KEY <pk_1>] <stream_id_2> [PARTITION_KEY <pk_2>] ... [FROM LATEST | FROM <version> | FROM MAP <stream>=<ver>...] [WINDOW <size>]
+```
+
+**Parameters:**
+- `stream_id` - Stream identifier(s) to subscribe to
+- `partition_key` (optional) - UUID for specific partition
+- `FROM` (optional) - Starting position (LATEST, version number, or MAP for per-stream positions)
+- `WINDOW` (optional) - Maximum number of unacknowledged events
+
+**Examples:**
+```
+ESUB user-123                                         # Single stream, latest, no window
+ESUB user-123 WINDOW 100                              # Single stream, latest, window 100  
+ESUB user-123 FROM 50 WINDOW 100                      # Single stream, from version 50
+ESUB user-1 user-2 user-3 FROM MAP user-1=10 user-2=20 user-3=30 WINDOW 50
+```
+
+**Note:** Establishes a persistent connection for real-time event delivery.
 
 ### Partition Operations
-- **`EPSCAN`** - Scan events in a partition by sequence range
-- **`EPSEQ`** - Get current sequence number of a partition
-- **`EPSUB`** - Subscribe to real-time events from one or more partitions
+
+#### `EPSCAN` - Scan Partition Events
+Scan events in a partition by sequence number range.
+
+**Syntax:**
+```
+EPSCAN <partition> <start_sequence> <end_sequence> [COUNT <count>]
+```
+
+**Parameters:**
+- `partition` - Partition selector (partition ID 0-65535 or UUID key)
+- `start_sequence` - Starting sequence number (use "-" for beginning)
+- `end_sequence` - Ending sequence number (use "+" for end, or specific number)
+- `count` (optional) - Maximum number of events to return
+
+**Examples:**
+```
+EPSCAN 42 100 200 COUNT 50
+EPSCAN 550e8400-e29b-41d4-a716-446655440000 - + COUNT 100
+```
+
+#### `EPSEQ` - Get Partition Sequence
+Get the current sequence number for a partition.
+
+**Syntax:**
+```
+EPSEQ <partition>
+```
+
+**Parameters:**
+- `partition` - Partition selector (partition ID 0-65535 or UUID key)
+
+**Examples:**
+```
+EPSEQ 42
+EPSEQ 550e8400-e29b-41d4-a716-446655440000
+```
+
+#### `EPSUB` - Subscribe to Partition Events
+Subscribe to events from one or more partitions with real-time delivery.
+
+**Syntax:**
+```
+# All partitions
+EPSUB * [FROM LATEST | FROM <sequence> | FROM MAP <p1>=<s1> <p2>=<s2>... [DEFAULT <seq>]] [WINDOW <size>]
+
+# Single partition
+EPSUB <partition_id> [FROM <sequence>] [WINDOW <size>]
+
+# Multiple partitions
+EPSUB <p1>,<p2>,<p3> [FROM LATEST | FROM <sequence> | FROM MAP <p1>=<s1> <p2>=<s2>... [DEFAULT <seq>]] [WINDOW <size>]
+```
+
+**Parameters:**
+- `partition_id` - Partition identifier(s) (* for all, comma-separated list for multiple)
+- `FROM` (optional) - Starting position (LATEST, sequence number, or MAP for per-partition positions)  
+- `WINDOW` (optional) - Maximum number of unacknowledged events
+
+**Examples:**
+```
+EPSUB *                                               # All partitions, latest
+EPSUB * WINDOW 100                                    # All partitions, latest, window 100
+EPSUB * FROM 1000 WINDOW 100                          # All partitions, from seq 1000  
+EPSUB 5 FROM 100 WINDOW 50                            # Partition 5, from seq 100
+EPSUB 1,2,3 FROM MAP 1=100 2=200 DEFAULT 0 WINDOW 500
+```
+
+**Note:** Establishes a persistent connection for real-time event delivery.
 
 ### Subscription Management
-- **`EACK`** - Acknowledge processed events for subscription tracking
+
+#### `EACK` - Acknowledge Events
+Acknowledge events up to a cursor for a subscription.
+
+**Syntax:**
+```
+EACK <subscription_id> <sequence_or_version>
+```
+
+**Parameters:**
+- `subscription_id` - UUID of the subscription
+- `sequence_or_version` - Sequence or version number to acknowledge up to
+
+**Examples:**
+```
+EACK 550e8400-e29b-41d4-a716-446655440000 1000
+```
+
+**Note:** Tells SierraDB that events up to the specified position have been processed successfully.
 
 ### System Operations
-- **`HELLO`** - Protocol handshake and server information
-- **`PING`** - Health check and connectivity test
+
+#### `HELLO` - Protocol Handshake
+Perform protocol handshake and retrieve server information.
+
+**Syntax:**
+```
+HELLO <version>
+```
+
+**Parameters:**
+- `version` - Protocol version (currently only 3 is supported)
+
+**Examples:**
+```
+HELLO 3
+```
+
+**Returns:**
+- `server` - Server name ("sierradb")
+- `version` - Server version
+- `peer_id` - Cluster peer ID
+- `num_partitions` - Number of partitions
+
+#### `PING` - Health Check
+Simple health check and connectivity test.
+
+**Syntax:**
+```
+PING
+```
+
+**Returns:** `PONG`
+
+**Examples:**
+```
+PING
+```
 
 ## Data Integrity & Transactions
 
