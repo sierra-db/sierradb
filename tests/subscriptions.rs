@@ -49,6 +49,7 @@ async fn test_subscriptions() -> Result<(), Box<dyn std::error::Error>> {
         replication_buffer_size: 1_000,
         replication_buffer_timeout: Duration::from_millis(8_000),
         replication_catchup_timeout: Duration::from_millis(2_000),
+        mdns: false,
     });
 
     for window_size in [10_000, 100, 10] {
