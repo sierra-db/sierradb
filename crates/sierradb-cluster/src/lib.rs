@@ -13,8 +13,11 @@ use confirmation::{AtomicWatermark, actor::ConfirmationActor};
 use futures::StreamExt;
 use kameo::{mailbox::Signal, prelude::*};
 use libp2p::{
-    BehaviourBuilderError, Multiaddr, PeerId, Swarm, TransportError, gossipsub, identity::Keypair,
-    mdns, noise, swarm::NetworkBehaviour, tcp, yamux,
+    BehaviourBuilderError, Multiaddr, PeerId, Swarm, TransportError, gossipsub,
+    identity::Keypair,
+    mdns, noise,
+    swarm::{NetworkBehaviour, behaviour::toggle::Toggle},
+    tcp, yamux,
 };
 use serde::{Deserialize, Serialize};
 use sierradb::{
@@ -44,7 +47,7 @@ const MAX_FORWARDS: u8 = 3;
 pub struct Behaviour {
     pub kameo: remote::Behaviour,
     pub topology: sierradb_topology::Behaviour<RemoteActorRef<ClusterActor>>,
-    pub mdns: mdns::tokio::Behaviour,
+    pub mdns: Toggle<mdns::tokio::Behaviour>,
 }
 
 #[derive(RemoteActor)]
@@ -96,6 +99,8 @@ pub struct ClusterArgs {
     pub replication_buffer_timeout: Duration,
     /// Maximum time before requesting a catchup
     pub replication_catchup_timeout: Duration,
+    /// Whether mdns is enabled
+    pub mdns: bool,
 }
 
 impl Actor for ClusterActor {
@@ -118,6 +123,7 @@ impl Actor for ClusterActor {
             replication_buffer_size,
             replication_buffer_timeout,
             replication_catchup_timeout,
+            mdns: mdns_enabled,
         }: Self::Args,
         actor_ref: ActorRef<Self>,
     ) -> Result<Self, Self::Error> {
@@ -157,7 +163,9 @@ impl Actor for ClusterActor {
                 )?;
 
                 // Configure mDNS for peer discovery
-                let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?;
+                let mdns = mdns_enabled
+                    .then(|| mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id))
+                    .transpose()?;
 
                 // Create partition manager to track partition ownership
                 let manager = TopologyManager::new(
@@ -177,7 +185,7 @@ impl Actor for ClusterActor {
                 Ok(Behaviour {
                     kameo,
                     topology,
-                    mdns,
+                    mdns: Toggle::from(mdns),
                 })
             })?
             .build();
