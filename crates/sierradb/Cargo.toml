@@ -18,7 +18,7 @@ bincode = { workspace = true, features = ["serde"] }
 bloomfilter = "3.0.1"
 boomphf = { workspace = true, features = ["serde"] }
 crc32fast.workspace = true
-libc = "0.2.170"
+libc = "0.2.177"
 num_cpus = "1.16.0"
 polonius-the-crab = "0.4.1"
 rand.workspace = true
