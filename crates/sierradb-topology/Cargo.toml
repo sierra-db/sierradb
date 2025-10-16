@@ -12,15 +12,10 @@ version.workspace = true
 
 [dependencies]
 sierradb.workspace = true
-
 arrayvec = { workspace = true, features = ["serde"] }
 bincode.workspace = true
 kameo = { workspace = true, features = ["remote"] }
-libp2p.workspace = true
-libp2p.features = [
-  "gossipsub",
-  "serde",
-]
+libp2p = { workspace = true, features = ["gossipsub", "serde"] }
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["time"] }
 tracing.workspace = true
