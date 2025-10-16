@@ -12,10 +12,7 @@ version.workspace = true
 
 [dependencies]
 sierradb-protocol.workspace = true
-
-clap = { workspace = true, features = ["derive"] }
 futures-util = { workspace = true }
-pin-project-lite = { workspace = true }
 redis = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["sync"], optional = true }

@@ -24,7 +24,6 @@ clap = { workspace = true, features = ["derive"] }
 combine = { workspace = true }
 config.workspace = true
 directories.workspace = true
-futures.workspace = true
 kameo.workspace = true
 libp2p.workspace = true
 redis-protocol = { workspace = true, features = ["std", "resp3", "bytes", ], default-features = false }
