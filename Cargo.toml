@@ -19,20 +19,20 @@ sierradb-cluster = { path = "crates/sierradb-cluster", version = "0.1.0" }
 sierradb-protocol = { path = "crates/sierradb-protocol", version = "0.1.0" }
 sierradb-topology = { path = "crates/sierradb-topology", version = "0.1.0" }
 
-arc-swap = 1.7.1
+arc-swap = "1.7.1"
 arrayvec = "0.7"
 bloomfilter = "3.0.1"
 bincode = "2.0"
 boomphf = "0.6"
 bytes = "1.10"
 config = { version = "0.15", default-features = false, features = [
-  "convert-case",
-  "ini",
-  "json",
-  "json5",
-  "ron",
-  "toml",
-  "yaml",
+    "convert-case",
+    "ini",
+    "json",
+    "json5",
+    "ron",
+    "toml",
+    "yaml",
 ] }
 ciborium = "0.2.2"
 clap = "4.5"
