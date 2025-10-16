@@ -26,7 +26,7 @@ rayon = "1.11.0"
 serde = { workspace = true, features = ["derive", "rc"] }
 smallvec = { workspace = true, features = ["serde"] }
 thiserror.workspace = true
-thread-priority = "2.1.0"
+thread-priority = "3.0.0"
 tokio = { workspace = true, features = ["fs", "sync"] }
 tracing.workspace = true
 uuid = { workspace = true, features = ["serde", "v4", "v8"] }
