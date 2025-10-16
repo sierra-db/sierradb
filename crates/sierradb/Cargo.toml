@@ -22,7 +22,7 @@ libc = "0.2.170"
 num_cpus = "1.16.0"
 polonius-the-crab = "0.4.1"
 rand.workspace = true
-rayon = "1.10.0"
+rayon = "1.11.0"
 serde = { workspace = true, features = ["derive", "rc"] }
 smallvec = { workspace = true, features = ["serde"] }
 thiserror.workspace = true
