@@ -8,7 +8,6 @@ use sierradb::{
     database::{CurrentVersion, ExpectedVersion},
 };
 use thiserror::Error;
-use tracing::error;
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Error, Serialize, Deserialize)]

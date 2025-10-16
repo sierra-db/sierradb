@@ -1,5 +1,3 @@
-#![feature(btree_extract_if)]
-
 use std::{
     collections::{HashMap, HashSet},
     io,
@@ -9,23 +7,23 @@ use std::{
 
 use arrayvec::ArrayVec;
 use circuit_breaker::WriteCircuitBreaker;
-use confirmation::{AtomicWatermark, actor::ConfirmationActor};
+use confirmation::{actor::ConfirmationActor, AtomicWatermark};
 use futures::StreamExt;
 use kameo::{mailbox::Signal, prelude::*};
 use libp2p::{
-    BehaviourBuilderError, Multiaddr, PeerId, Swarm, TransportError, gossipsub,
-    identity::Keypair,
-    mdns, noise,
-    swarm::{NetworkBehaviour, behaviour::toggle::Toggle},
-    tcp, yamux,
+    gossipsub, identity::Keypair, mdns, noise, swarm::{behaviour::toggle::Toggle, NetworkBehaviour}, tcp,
+    yamux,
+    BehaviourBuilderError, Multiaddr,
+    PeerId,
+    Swarm, TransportError,
 };
 use serde::{Deserialize, Serialize};
 use sierradb::{
-    MAX_REPLICATION_FACTOR, bucket::PartitionId, database::Database, error::WriteError,
+    bucket::PartitionId, database::Database, error::WriteError, MAX_REPLICATION_FACTOR,
 };
 use sierradb_topology::TopologyManager;
 use thiserror::Error;
-use tracing::{error, trace};
+use tracing::trace;
 
 use crate::{
     subscription::SubscriptionManager,
