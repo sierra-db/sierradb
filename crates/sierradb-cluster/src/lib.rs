@@ -7,19 +7,19 @@ use std::{
 
 use arrayvec::ArrayVec;
 use circuit_breaker::WriteCircuitBreaker;
-use confirmation::{actor::ConfirmationActor, AtomicWatermark};
+use confirmation::{AtomicWatermark, actor::ConfirmationActor};
 use futures::StreamExt;
 use kameo::{mailbox::Signal, prelude::*};
 use libp2p::{
-    gossipsub, identity::Keypair, mdns, noise, swarm::{behaviour::toggle::Toggle, NetworkBehaviour}, tcp,
-    yamux,
-    BehaviourBuilderError, Multiaddr,
-    PeerId,
-    Swarm, TransportError,
+    BehaviourBuilderError, Multiaddr, PeerId, Swarm, TransportError, gossipsub,
+    identity::Keypair,
+    mdns, noise,
+    swarm::{NetworkBehaviour, behaviour::toggle::Toggle},
+    tcp, yamux,
 };
 use serde::{Deserialize, Serialize};
 use sierradb::{
-    bucket::PartitionId, database::Database, error::WriteError, MAX_REPLICATION_FACTOR,
+    MAX_REPLICATION_FACTOR, bucket::PartitionId, database::Database, error::WriteError,
 };
 use sierradb_topology::TopologyManager;
 use thiserror::Error;

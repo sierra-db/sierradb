@@ -205,7 +205,8 @@ pub fn verify_cluster_health(
     verify_consistent_state(managers);
     validate_replication_invariants(managers, expected_replication_factor);
 
-    // Check that all partitions have the expected number of replicas in the global view
+    // Check that all partitions have the expected number of replicas in the global
+    // view
     if !managers.is_empty() {
         let first_manager = &managers[0].0;
         let effective_rf = expected_replication_factor.min(expected_node_count);
@@ -226,7 +227,8 @@ pub fn verify_cluster_health(
 }
 
 /// Helper function for testing cluster health with potentially reduced replicas
-/// This is more realistic for failure scenarios where some nodes are unavailable
+/// This is more realistic for failure scenarios where some nodes are
+/// unavailable
 pub fn verify_cluster_health_with_reduced_replicas(
     managers: &[(TopologyManager<ActorId>, PeerId)],
     expected_node_count: usize,
