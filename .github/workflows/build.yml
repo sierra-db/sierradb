@@ -68,7 +68,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
       - name: Check code formatting
         run: cargo fmt --all --check
   clippy:
@@ -78,7 +80,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
         with:
           components: clippy
       - name: Run clippy lints
