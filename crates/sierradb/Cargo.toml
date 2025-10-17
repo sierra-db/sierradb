@@ -33,7 +33,7 @@ uuid = { workspace = true, features = ["serde", "v4", "v8"] }
 
 [dev-dependencies]
 criterion = "0.7"
-proptest = "1.7"
+proptest = "1.8"
 tempfile = "3.23"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
