@@ -381,6 +381,10 @@ sierradb --dir ./data --client-address 0.0.0.0:9090
 
 **Using Docker:**
 ```bash
+# From Docker Hub
+docker run -p 9090:9090 -v ./data:/data tqwewe/sierradb --dir /data --client-address 0.0.0.0:9090
+
+# Or build from source
 docker build -t sierradb .
 docker run -p 9090:9090 -v ./data:/data sierradb --dir /data --client-address 0.0.0.0:9090
 ```
