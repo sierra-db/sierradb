@@ -1,5 +1,3 @@
-#![feature(btree_extract_if)]
-
 use std::{
     collections::{HashMap, HashSet},
     io,
@@ -25,7 +23,7 @@ use sierradb::{
 };
 use sierradb_topology::TopologyManager;
 use thiserror::Error;
-use tracing::{error, trace};
+use tracing::trace;
 
 use crate::{
     subscription::SubscriptionManager,

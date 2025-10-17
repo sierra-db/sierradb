@@ -138,7 +138,8 @@ async fn test_network_partition_recovery() {
     }
 
     // Use the helper to verify reduced availability
-    // During network partition, we expect at least 1 replica available for most partitions
+    // During network partition, we expect at least 1 replica available for most
+    // partitions
     verify_reduced_availability(&managers[0..3], 1);
     verify_reduced_availability(&managers[3..6], 1);
 
@@ -180,14 +181,16 @@ async fn test_rolling_restarts() {
             assert_eq!(manager.active_nodes.len(), 4);
         }
 
-        // Verify partitions are still available (though potentially with reduced replication)
+        // Verify partitions are still available (though potentially with reduced
+        // replication)
         for partition_id in 0..10u16 {
             let available_count = active_managers
                 .iter()
                 .filter(|(manager, _)| manager.is_partition_available(partition_id))
                 .count();
 
-            // During rolling restart, at least some nodes should still have the partition available
+            // During rolling restart, at least some nodes should still have the partition
+            // available
             assert!(
                 available_count > 0,
                 "Partition {partition_id} should be available on at least some nodes during rolling restart"

@@ -13,28 +13,28 @@ version.workspace = true
 [dependencies]
 sierradb-protocol.workspace = true
 
-arc-swap = "1.7.1"
+arc-swap.workspace = true
 bincode = { workspace = true, features = ["serde"] }
-bloomfilter = "3.0.1"
+bloomfilter.workspace = true
 boomphf = { workspace = true, features = ["serde"] }
 crc32fast.workspace = true
-libc = "0.2.177"
-num_cpus = "1.16.0"
-polonius-the-crab = "0.4.1"
+libc.workspace = true
+num_cpus.workspace = true
+polonius-the-crab.workspace = true
 rand.workspace = true
-rayon = "1.11.0"
+rayon.workspace = true
 serde = { workspace = true, features = ["derive", "rc"] }
 smallvec = { workspace = true, features = ["serde"] }
 thiserror.workspace = true
-thread-priority = "3.0.0"
+thread-priority.workspace = true
 tokio = { workspace = true, features = ["fs", "sync"] }
 tracing.workspace = true
 uuid = { workspace = true, features = ["serde", "v4", "v8"] }
 
 [dev-dependencies]
-criterion = "0.7"
-proptest = "1.8"
-tempfile = "3.23"
+criterion.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 uuid = { workspace = true, features = ["v5"] }

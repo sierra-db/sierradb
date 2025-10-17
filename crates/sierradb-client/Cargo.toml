@@ -13,18 +13,16 @@ version.workspace = true
 [dependencies]
 sierradb-protocol.workspace = true
 
-clap = { workspace = true, features = ["derive"] }
-futures-util = "0.3.31"
-pin-project-lite = "0.2.16"
-redis = "0.32.7"
+futures-util.workspace = true
+redis.workspace = true
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["sync"], optional = true }
 tracing.workspace = true
 uuid = { workspace = true, features = ["serde", "v5"] }
 
 [dev-dependencies]
-ciborium = "0.2.2"
-redis = { version = "0.32.7", features = ["cluster"] }
+ciborium.workspace = true
+redis = { workspace = true, features = ["cluster"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 uuid = { workspace = true, features = ["serde", "v4", "v5"] }
