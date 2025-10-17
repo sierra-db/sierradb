@@ -21,30 +21,30 @@ failsafe.workspace = true
 futures.workspace = true
 kameo = { workspace = true, features = ["remote"] }
 libp2p = { workspace = true, features = [
-    "cbor",
-    "identify",
-    "gossipsub",
-    "macros",
-    "mdns",
-    "ping",
-    "quic",
-    "request-response",
-    "serde",
-    "tokio",
+  "cbor",
+  "identify",
+  "gossipsub",
+  "macros",
+  "mdns",
+  "ping",
+  "quic",
+  "request-response",
+  "serde",
+  "tokio",
 ] }
 rand.workspace = true
 serde = { workspace = true, features = ["derive"] }
 smallvec = { workspace = true, features = ["serde"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = [
-    "fs",
-    "io-std",
-    "io-util",
-    "net",
-    "signal",
-    "sync",
-    "macros",
-    "rt-multi-thread",
+  "fs",
+  "io-std",
+  "io-util",
+  "net",
+  "signal",
+  "sync",
+  "macros",
+  "rt-multi-thread",
 ] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }

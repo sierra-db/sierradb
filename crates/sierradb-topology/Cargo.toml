@@ -12,6 +12,7 @@ version.workspace = true
 
 [dependencies]
 sierradb.workspace = true
+
 arrayvec = { workspace = true, features = ["serde"] }
 bincode.workspace = true
 kameo = { workspace = true, features = ["remote"] }

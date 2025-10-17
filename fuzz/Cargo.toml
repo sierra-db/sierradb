@@ -11,19 +11,19 @@ cargo-fuzz = true
 sierradb.workspace = true
 
 arbitrary = { workspace = true, features = ["derive"] }
-libfuzzer-sys = { workspace = true }
-once_cell = { workspace = true }
+libfuzzer-sys.workspace = true
+once_cell.workspace = true
 serde = { workspace = true, features = ["derive"] }
 smallvec.workspace = true
-tempfile = { workspace = true }
+tempfile.workspace = true
 tokio = { workspace = true, features = [
-    "fs",
-    "io-std",
-    "io-util",
-    "signal",
-    "sync",
-    "macros",
-    "rt-multi-thread",
+  "fs",
+  "io-std",
+  "io-util",
+  "signal",
+  "sync",
+  "macros",
+  "rt-multi-thread",
 ] }
 uuid = { workspace = true, features = ["v5"] }
 
