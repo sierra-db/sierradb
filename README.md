@@ -4,6 +4,81 @@
 
 SierraDB is a modern, horizontally-scalable database specifically built for event sourcing workloads. It combines the simplicity of Redis protocol compatibility with the distributed architecture principles of Cassandra/ScyllaDB, providing developers with a powerful foundation for building event-driven systems.
 
+## 🚀 Try it in 30 seconds
+
+Get SierraDB running with Docker and start storing events immediately:
+
+```bash
+# Start SierraDB
+docker run -p 9090:9090 tqwewe/sierradb
+
+# In another terminal, use redis-cli to interact with SierraDB
+redis-cli -p 9090
+
+# Append some events to a user stream
+EAPPEND user-123 UserRegistered PAYLOAD '{"email":"alice@example.com","name":"Alice"}'
+EAPPEND user-123 EmailVerified PAYLOAD '{"timestamp":"2024-10-18T10:30:00Z"}'
+EAPPEND user-123 ProfileUpdated PAYLOAD '{"bio":"Software engineer"}'
+
+# Read all events from the stream
+ESCAN user-123 - +
+
+# Get the current version of the stream
+ESVER user-123
+
+# Subscribe to new events (will stream in real-time)
+ESUB user-123 FROM LATEST
+```
+
+That's it! You're now running a distributed event store and can append/read events using any Redis client.
+
+## Quick Start
+
+### Using Docker (Recommended)
+```bash
+# Run with persistent data
+docker run -p 9090:9090 -v ./data:/app/data tqwewe/sierradb
+```
+
+### Install with Cargo
+```bash
+cargo install sierradb-server
+sierradb --dir ./data --client-address 0.0.0.0:9090
+```
+
+### Basic Event Operations
+```bash
+# Connect with any Redis client
+redis-cli -p 9090
+
+# Append events to streams
+EAPPEND orders order-456 OrderCreated PAYLOAD '{"total":99.99,"items":["laptop"]}'
+
+# Read events back
+ESCAN orders - + COUNT 100
+
+# Subscribe to real-time events
+ESUB orders FROM LATEST
+```
+
+### Using with Redis Clients
+
+Since SierraDB uses the RESP3 protocol, you can also connect with any Redis-compatible client:
+
+```python
+import redis
+
+# Connect to SierraDB
+client = redis.Redis(host='localhost', port=9090, protocol=3)
+
+# Append an event
+result = client.execute_command('EAPPEND', 'user-123', 'UserCreated', 
+                               'PAYLOAD', '{"name":"John","email":"john@example.com"}')
+
+# Read events from stream
+events = client.execute_command('ESCAN', 'user-123', '-', '+', 'COUNT', '100')
+```
+
 ## Key Features
 
 - **Redis Protocol Compatible** - Uses RESP3 protocol, making it compatible with existing Redis clients and tools
@@ -369,33 +444,10 @@ SierraDB ensures data reliability through multiple mechanisms:
 - **Corruption Recovery**: Automatic detection and recovery from data corruption scenarios
 - **Graceful Shutdown Handling**: Proper recovery even after sudden system shutdowns
 
-## Getting Started
+## Cluster Setup
 
-### Installation
+For distributed deployments across multiple nodes:
 
-**Using Cargo:**
-```bash
-cargo install sierradb-server
-sierradb --dir ./data --client-address 0.0.0.0:9090
-```
-
-**Using Docker:**
-```bash
-# From Docker Hub
-docker run -p 9090:9090 -v ./data:/data tqwewe/sierradb --dir /data --client-address 0.0.0.0:9090
-
-# Or build from source
-docker build -t sierradb .
-docker run -p 9090:9090 -v ./data:/data sierradb --dir /data --client-address 0.0.0.0:9090
-```
-
-### Single Node Setup
-```bash
-# Start SierraDB with default configuration
-sierradb --dir ./data --client-address 0.0.0.0:9090
-```
-
-### Cluster Setup
 ```bash
 # Node 1
 sierradb --dir ./data1 --node-index 0 --node-count 3 --client-address 0.0.0.0:9090
@@ -486,24 +538,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     Ok(())
 }
-```
-
-### Using with Redis Clients
-
-Since SierraDB uses the RESP3 protocol, you can also connect with any Redis-compatible client:
-
-```python
-import redis
-
-# Connect to SierraDB
-client = redis.Redis(host='localhost', port=9090, protocol=3)
-
-# Append an event
-result = client.execute_command('EAPPEND', 'user-123', 'UserCreated', 
-                               'PAYLOAD', '{"name":"John","email":"john@example.com"}')
-
-# Read events from stream
-events = client.execute_command('ESCAN', 'user-123', '-', '+', 'COUNT', '100')
 ```
 
 ## Development Status
