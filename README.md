@@ -4,6 +4,12 @@
 
 SierraDB is a modern, horizontally-scalable database specifically built for event sourcing workloads. It combines the simplicity of Redis protocol compatibility with the distributed architecture principles of Cassandra/ScyllaDB, providing developers with a powerful foundation for building event-driven systems.
 
+## 📖 Learn More
+
+Want to understand how SierraDB works under the hood? Read the detailed blog post: [Building SierraDB: A Distributed Event Store Built in Rust](https://tqwewe.com/blog/building-sierradb/)
+
+The post covers the architecture decisions, watermark system for consistency, distributed consensus, and the journey of building an event store from scratch.
+
 ## 🚀 Try it in 30 seconds
 
 Get SierraDB running with Docker and start storing events immediately:
