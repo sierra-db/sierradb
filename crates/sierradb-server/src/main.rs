@@ -7,7 +7,7 @@ use sierradb::database::DatabaseBuilder;
 use sierradb_cluster::{ClusterActor, ClusterArgs};
 use sierradb_server::config::{AppConfig, Args};
 use sierradb_server::server::Server;
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 use tracing_subscriber::EnvFilter;
 
 #[cfg(debug_assertions)]
@@ -85,23 +85,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mdns: config.mdns,
     });
 
-    tokio::spawn(async move {
+    let server_handle = tokio::spawn(async move {
         if let Err(err) = Server::new(cluster_ref, config.partition.count)
             .listen(config.network.client_address)
             .await
         {
             error!("server failed: {err}");
             std::process::exit(1);
-        } else {
-            std::process::exit(0);
         }
     });
 
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to listen ctrl c signal");
+    // Listen for both SIGTERM (Docker) and SIGINT (Ctrl+C)
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            info!("received SIGINT, shutting down gracefully");
+        }
+        _ = async {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut sigterm = signal(SignalKind::terminate()).expect("failed to setup SIGTERM handler");
+                sigterm.recv().await
+            }
+            #[cfg(not(unix))]
+            {
+                std::future::pending::<()>().await
+            }
+        } => {
+            info!("received SIGTERM, shutting down gracefully");
+        }
+        _ = server_handle => {
+            error!("server task exited unexpectedly");
+        }
+    }
 
-    println!("goodbye :)");
+    info!("goodbye :)");
 
     Ok(())
 }

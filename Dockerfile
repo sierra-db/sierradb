@@ -1,8 +1,6 @@
 # Multi-stage build for efficient Docker image
 FROM rustlang/rust:nightly AS builder
 
-# No additional build dependencies needed
-
 # Set working directory
 WORKDIR /app
 
@@ -10,7 +8,6 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 
 # Copy all workspace members' Cargo.toml files if you have a workspace
-# Adjust this based on your project structure
 COPY */Cargo.toml ./*/
 
 # Copy source code
@@ -22,8 +19,8 @@ RUN cargo build --release --package sierradb-server
 # Runtime stage with minimal base image
 FROM debian:bookworm-slim AS runtime
 
-# Install gosu for user switching
-RUN apt-get update && apt-get install -y gosu && rm -rf /var/lib/apt/lists/*
+# Install gosu and tini for proper signal handling
+RUN apt-get update && apt-get install -y gosu tini && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user with home directory
 RUN useradd -r -m -s /bin/false sierradb
@@ -34,12 +31,15 @@ RUN mkdir -p /app/data && chown -R sierradb:sierradb /app
 # Copy the binary from builder stage
 COPY --from=builder /app/target/release/sierradb /usr/local/bin/sierradb
 
-# Create entrypoint script
+# Create entrypoint script with proper signal handling
 RUN cat > /entrypoint.sh << 'EOF'
 #!/bin/bash
+set -e
+
 # Fix permissions for mounted volumes if running as root
 if [ "$(id -u)" = "0" ]; then
     chown -R sierradb:sierradb /app/data
+    # Use exec to replace shell process and preserve signals
     exec gosu sierradb "$@"
 else
     exec "$@"
@@ -54,6 +54,9 @@ RUN chown sierradb:sierradb /usr/local/bin/sierradb
 # Expose port 9090 (default for sierradb)
 EXPOSE 9090
 
-# Set the entrypoint
-ENTRYPOINT ["/entrypoint.sh", "/usr/local/bin/sierradb"]
+# Use tini as init system to properly handle signals
+ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh", "/usr/local/bin/sierradb"]
 CMD ["--dir", "/app/data"]
+
+# Add stop signal and grace period
+STOPSIGNAL SIGTERM
