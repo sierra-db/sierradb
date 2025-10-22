@@ -27,8 +27,6 @@ async fn test_subscriptions() -> Result<(), Box<dyn std::error::Error>> {
         .segment_size(256_000_000)
         .total_buckets(4)
         .bucket_ids_from_range(0..4)
-        .flush_interval_duration(Duration::ZERO)
-        .flush_interval_events(1)
         .open(dir.path())?;
     let mut tempdirs = vec![dir];
 
@@ -174,8 +172,6 @@ async fn test_subscriptions() -> Result<(), Box<dyn std::error::Error>> {
             .segment_size(256_000_000)
             .total_buckets(4)
             .bucket_ids_from_range(0..4)
-            .flush_interval_duration(Duration::ZERO)
-            .flush_interval_events(1)
             .open(dir.path())?;
         tempdirs.push(dir);
         cluster_ref.ask(ResetCluster { database }).await?;

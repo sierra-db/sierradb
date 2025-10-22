@@ -7,10 +7,6 @@ replication_factor = 3
 count = 64
 # ids = [0, 1, 2, ...]
 
-[flush]
-interval_ms = 0
-events_threshold = 1
-
 [heartbeat]
 interval_ms = 1000
 timeout_ms = 6000
@@ -29,6 +25,11 @@ count = 1024
 
 [segment]
 size_bytes = 256_000_000
+
+[sync]
+interval_ms = 5
+max_batch_size = 50
+min_bytes = 4096
 
 [threads]
 read = 8

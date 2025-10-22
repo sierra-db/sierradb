@@ -2,8 +2,6 @@
 
 extern crate arbitrary;
 
-use std::time::Duration;
-
 use arbitrary::{Arbitrary, Unstructured};
 use libfuzzer_sys::fuzz_target;
 use once_cell::sync::OnceCell;
@@ -44,8 +42,6 @@ fn init() -> (&'static Runtime, &'static Database) {
                 .bucket_ids_from_range(0..TOTAL_BUCKETS)
                 .writer_threads(TOTAL_BUCKETS)
                 .reader_threads(TOTAL_BUCKETS)
-                .flush_interval_duration(Duration::MAX)
-                .flush_interval_events(1) // Flush every event written
                 .open(db_path)
                 .unwrap()
         });

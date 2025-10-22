@@ -169,14 +169,41 @@ pub struct BucketSegmentReader {
 }
 
 impl BucketSegmentReader {
-    /// Opens a segment as read only.
+    /// Opens a segment, recovering from zero corruption at the end of the file.
+    ///
+    /// TODO: Do we still need recovery with fallocation? I think no.
     pub fn open(
         path: impl AsRef<Path>,
         flushed_offset: Option<FlushedOffset>,
     ) -> Result<Self, ReadError> {
         let mut opts = OpenOptions::new();
         opts.read(true).write(true); // Write access needed for lazy recovery truncation
+        let mut reader = Self::open_inner(path, flushed_offset, opts)?;
 
+        // Check for zero corruption from improper shutdowns
+        let file_size = reader.file.metadata()?.len();
+        if file_size > SEGMENT_HEADER_SIZE as u64 {
+            reader.check_and_recover_zero_corruption(file_size)?;
+        }
+
+        Ok(reader)
+    }
+
+    /// Opens a segment as read only, without attempting recovery.
+    pub fn open_without_recovery(
+        path: impl AsRef<Path>,
+        flushed_offset: Option<FlushedOffset>,
+    ) -> Result<Self, io::Error> {
+        let mut opts = OpenOptions::new();
+        opts.read(true);
+        Self::open_inner(path, flushed_offset, opts)
+    }
+
+    pub fn open_inner(
+        path: impl AsRef<Path>,
+        flushed_offset: Option<FlushedOffset>,
+        opts: OpenOptions,
+    ) -> Result<Self, io::Error> {
         #[cfg(target_os = "macos")]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -197,7 +224,7 @@ impl BucketSegmentReader {
             }
         };
 
-        let mut reader = BucketSegmentReader {
+        let reader = BucketSegmentReader {
             file,
             header_buf,
             body_buf,
@@ -207,12 +234,6 @@ impl BucketSegmentReader {
             read_ahead_pos: 0,
             read_ahead_valid_len: 0,
         };
-
-        // Check for zero corruption from improper shutdowns
-        let file_size = reader.file.metadata()?.len();
-        if file_size > SEGMENT_HEADER_SIZE as u64 {
-            reader.check_and_recover_zero_corruption(file_size)?;
-        }
 
         Ok(reader)
     }
@@ -437,8 +458,12 @@ impl BucketSegmentReader {
         };
         offset += COMMIT_SIZE as u64;
 
+        if is_truncation_marker(&header_buf[..RECORD_HEADER_SIZE]) {
+            return Ok(None);
+        }
+
         let (record_header, _) = bincode::decode_from_slice::<RecordHeader, _>(
-            &header_buf[..COMMIT_SIZE],
+            &header_buf[..RECORD_HEADER_SIZE],
             BINCODE_CONFIG,
         )?;
 
@@ -1119,4 +1144,9 @@ impl<'c> Decode<&'c EventHeader> for EventBody {
             payload,
         })
     }
+}
+
+#[inline]
+fn is_truncation_marker(header: &[u8]) -> bool {
+    header.iter().all(|&b| b == 0)
 }

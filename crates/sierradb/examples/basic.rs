@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use sierradb::StreamId;
 use sierradb::database::{DatabaseBuilder, ExpectedVersion, NewEvent, Transaction};
 use sierradb::id::{uuid_to_partition_hash, uuid_v7_with_partition_hash};
@@ -14,8 +12,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .bucket_ids_from_range(0..64)
         .writer_threads(8)
         .reader_threads(3)
-        .flush_interval_duration(Duration::MAX)
-        .flush_interval_events(1)
         .open("./target/db-debug")?;
 
     struct AppendEvent {

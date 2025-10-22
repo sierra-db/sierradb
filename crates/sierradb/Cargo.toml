@@ -19,6 +19,7 @@ bloomfilter.workspace = true
 boomphf = { workspace = true, features = ["serde"] }
 crc32fast.workspace = true
 libc.workspace = true
+nix = { workspace = true, features = ["fs"] }
 num_cpus.workspace = true
 polonius-the-crab.workspace = true
 rand.workspace = true

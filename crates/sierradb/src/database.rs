@@ -353,8 +353,9 @@ pub struct DatabaseBuilder {
     total_buckets: u16,
     reader_threads: u16,
     writer_threads: Option<u16>,
-    flush_interval_duration: Duration,
-    flush_interval_events: u32,
+    sync_interval: Duration,
+    max_batch_size: usize,
+    min_sync_bytes: usize,
 }
 
 impl DatabaseBuilder {
@@ -369,8 +370,9 @@ impl DatabaseBuilder {
             total_buckets,
             reader_threads,
             writer_threads: None,
-            flush_interval_duration: Duration::from_millis(100),
-            flush_interval_events: 1_000,
+            sync_interval: Duration::from_millis(5),
+            max_batch_size: 50,
+            min_sync_bytes: 4096,
         }
     }
 
@@ -438,8 +440,9 @@ impl DatabaseBuilder {
             self.segment_size,
             self.bucket_ids.clone(),
             writer_threads,
-            self.flush_interval_duration,
-            self.flush_interval_events,
+            self.sync_interval,
+            self.max_batch_size,
+            self.min_sync_bytes,
             &reader_pool,
             &thread_pool,
         )?;
@@ -625,13 +628,18 @@ impl DatabaseBuilder {
         self
     }
 
-    pub fn flush_interval_duration(&mut self, interval: Duration) -> &mut Self {
-        self.flush_interval_duration = interval;
+    pub fn sync_interval(&mut self, interval: Duration) -> &mut Self {
+        self.sync_interval = interval;
         self
     }
 
-    pub fn flush_interval_events(&mut self, events: u32) -> &mut Self {
-        self.flush_interval_events = events;
+    pub fn max_batch_size(&mut self, events: usize) -> &mut Self {
+        self.max_batch_size = events;
+        self
+    }
+
+    pub fn min_sync_bytes(&mut self, bytes: usize) -> &mut Self {
+        self.min_sync_bytes = bytes;
         self
     }
 }
@@ -814,7 +822,6 @@ mod tests {
     async fn create_temp_db() -> (tempfile::TempDir, Database) {
         let temp_dir = tempdir().expect("Failed to create temp directory");
         let db = DatabaseBuilder::new()
-            .flush_interval_events(1)
             .total_buckets(4)
             .bucket_ids_from_range(0..4)
             .open(temp_dir.path())
@@ -926,8 +933,6 @@ mod tests {
             .bucket_ids_from_range(0..32)
             .reader_threads(4)
             .writer_threads(4)
-            .flush_interval_duration(Duration::from_millis(50))
-            .flush_interval_events(500)
             .open(temp_dir.path());
 
         assert!(db.is_ok(), "Failed to open database with custom options");
@@ -1483,7 +1488,6 @@ mod tests {
         let db = DatabaseBuilder::new()
             .total_buckets(4)
             .bucket_ids_from_range(0..4)
-            .flush_interval_events(1)
             .open(temp_dir.path())
             .expect("Failed to open database");
 

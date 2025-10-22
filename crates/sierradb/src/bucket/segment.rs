@@ -198,7 +198,7 @@ mod tests {
     fn test_write_and_read_segment_header() {
         let path = temp_file_path();
 
-        BucketSegmentWriter::create(&path, 62).unwrap();
+        BucketSegmentWriter::create(&path, 62, 256 * 1024).unwrap();
 
         let mut reader = BucketSegmentReader::open(&path, None).unwrap();
         let read_header = reader.read_segment_header().unwrap();
@@ -218,7 +218,7 @@ mod tests {
         };
 
         {
-            let mut writer = BucketSegmentWriter::create(&path, 0).unwrap();
+            let mut writer = BucketSegmentWriter::create(&path, 0, 256 * 1024).unwrap();
             writer.write_segment_header(&header).unwrap();
             writer.flush().unwrap();
         }
@@ -247,7 +247,7 @@ mod tests {
         let flushed_offset;
 
         {
-            let mut writer = BucketSegmentWriter::create(&path, 0).unwrap();
+            let mut writer = BucketSegmentWriter::create(&path, 0, 256 * 1024).unwrap();
 
             for i in 0..10_000 {
                 if i % 5 == 0 {
@@ -364,7 +364,7 @@ mod tests {
 
             // First create a valid file with records
             {
-                let mut writer = BucketSegmentWriter::create(&path, 0).unwrap();
+                let mut writer = BucketSegmentWriter::create(&path, 0, 256 * 1024).unwrap();
 
                 for i in 0..record_count {
                     let event_id = Uuid::new_v4();
@@ -508,7 +508,7 @@ mod tests {
         #[test]
         fn test_recovery_header_only_file() {
             let path = temp_file_path();
-            BucketSegmentWriter::create(&path, 0).unwrap(); // Just header, no records
+            BucketSegmentWriter::create(&path, 0, 256 * 1024).unwrap(); // Just header, no records
 
             let records_read = verify_file_integrity_after_recovery(&path);
             assert_eq!(
@@ -639,7 +639,7 @@ mod tests {
 
             // Create file with only header, then corrupt even the header area
             {
-                let mut writer = BucketSegmentWriter::create(&path, 0).unwrap();
+                let mut writer = BucketSegmentWriter::create(&path, 0, 256 * 1024).unwrap();
                 writer.flush().unwrap();
             }
 

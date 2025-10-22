@@ -53,13 +53,13 @@ pub struct Args {
 pub struct AppConfig {
     pub bucket: BucketConfig,
     pub dir: PathBuf,
-    pub flush: FlushConfig,
     pub heartbeat: HeartbeatConfig,
     pub network: NetworkConfig,
     pub node: NodeConfig,
     pub partition: PartitionConfig,
     pub replication: ReplicationConfig,
     pub segment: SegmentConfig,
+    pub sync: SyncConfig,
     #[serde(default)]
     pub threads: Threads,
     #[serde(default)]
@@ -72,12 +72,6 @@ pub struct AppConfig {
 pub struct BucketConfig {
     pub count: u16,
     pub ids: Option<Vec<BucketId>>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct FlushConfig {
-    pub events_threshold: u32,
-    pub interval_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,6 +110,16 @@ pub struct ReplicationConfig {
 #[derive(Debug, Deserialize)]
 pub struct SegmentConfig {
     pub size_bytes: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SyncConfig {
+    /// Maximum time to wait before syncing to disk (milliseconds)
+    pub interval_ms: u64,
+    /// Maximum number of events to batch before syncing
+    pub max_batch_size: usize,
+    /// Minimum bytes to accumulate before syncing
+    pub min_bytes: usize,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -170,8 +174,6 @@ impl AppConfig {
         builder = builder
             .set_default("mdns", false)?
             .set_default("bucket.count", 4)?
-            .set_default("flush.events_threshold", 1)?
-            .set_default("flush.interval_ms", 0)?
             .set_default("heartbeat.interval_ms", 1000)?
             .set_default("heartbeat.timeout_ms", 6000)?
             .set_default("network.cluster_enabled", true)?
@@ -181,7 +183,10 @@ impl AppConfig {
             .set_default("replication.buffer_size", 1000)?
             .set_default("replication.buffer_timeout_ms", 8000)?
             .set_default("replication.catchup_timeout_ms", 2000)?
-            .set_default("segment.size_bytes", 256_000_000)?;
+            .set_default("segment.size_bytes", 256_000_000)?
+            .set_default("sync.interval_ms", 5)?
+            .set_default("sync.max_batch_size", 50)?
+            .set_default("sync.min_bytes", 4096)?;
 
         // Apply any overrides from the node config
         {
@@ -480,13 +485,6 @@ impl fmt::Display for AppConfig {
         writeln!(f, "dir = {}", self.dir.to_string_lossy())?;
         writeln!(f, "mdns = {}", self.mdns)?;
 
-        writeln!(
-            f,
-            "flush.events_threshold = {}",
-            self.flush.events_threshold
-        )?;
-        writeln!(f, "flush.interval_ms = {}", self.flush.interval_ms)?;
-
         writeln!(f, "heartbeat.interval_ms = {}", self.heartbeat.interval_ms)?;
         writeln!(f, "heartbeat.timeout_ms = {}", self.heartbeat.timeout_ms)?;
 
@@ -543,6 +541,10 @@ impl fmt::Display for AppConfig {
         writeln!(f, "replication.factor = {}", self.replication.factor)?;
 
         writeln!(f, "segment.size_bytes = {}", self.segment.size_bytes)?;
+
+        writeln!(f, "sync.interval_ms = {}", self.sync.interval_ms)?;
+        writeln!(f, "sync.max_batch_size = {}", self.sync.max_batch_size)?;
+        writeln!(f, "sync.min_bytes = {}", self.sync.min_bytes)?;
 
         match self.threads.read {
             Some(count) => writeln!(f, "threads.read = {count}")?,
