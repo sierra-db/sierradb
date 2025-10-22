@@ -16,9 +16,6 @@ rustPlatform.buildRustPackage {
   version = "0.1";
   cargoLock = {
     lockFile = ./Cargo.lock;
-    outputHashes = {
-      "kameo-0.17.2" = "sha256-bTEUl84bTUEinFGroAvhHYnwzzGhMeOhGoPpo+r8oAI=";
-    };
   };
   src = pkgs.lib.cleanSource ./.;
 
