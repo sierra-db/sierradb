@@ -3,7 +3,6 @@
 extern crate arbitrary;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::time::Duration;
 
 use arbitrary::{Arbitrary, Unstructured, size_hint};
 libfuzzer_sys::fuzz_target!(|commands: Commands| -> libfuzzer_sys::Corpus { run(commands) });
@@ -270,8 +269,6 @@ impl TestState {
             .bucket_ids_from_range(0..init_args.total_buckets)
             .writer_threads(init_args.writer_threads)
             .reader_threads(init_args.reader_threads)
-            .flush_interval_duration(Duration::MAX)
-            .flush_interval_events(1)
             .open(temp_dir.path())
             .unwrap();
 
@@ -292,8 +289,6 @@ impl TestState {
             .bucket_ids_from_range(0..self.init_args.total_buckets)
             .writer_threads(self.init_args.writer_threads)
             .reader_threads(self.init_args.reader_threads)
-            .flush_interval_duration(Duration::MAX)
-            .flush_interval_events(1)
             .open(self.temp_dir.path())
             .unwrap();
     }

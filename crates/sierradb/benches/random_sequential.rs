@@ -13,7 +13,8 @@ const FILE_PATH: &str = "test_segment.db";
 
 fn setup_test_file() -> (BucketSegmentWriter, Vec<u64>) {
     let _ = fs::remove_file(FILE_PATH);
-    let mut writer = BucketSegmentWriter::create(FILE_PATH, 0).expect("Failed to open writer");
+    let mut writer =
+        BucketSegmentWriter::create(FILE_PATH, 0, 256 * 1024).expect("Failed to open writer");
     let mut offsets = Vec::with_capacity(NUM_EVENTS);
 
     for i in 0..NUM_EVENTS {

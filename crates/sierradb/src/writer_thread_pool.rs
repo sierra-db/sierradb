@@ -13,7 +13,7 @@ use smallvec::SmallVec;
 use thread_priority::ThreadBuilderExt;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{self};
-use tokio::sync::{RwLock, oneshot};
+use tokio::sync::{RwLock, oneshot, watch};
 use tracing::{error, trace};
 use uuid::Uuid;
 
@@ -64,8 +64,9 @@ impl WriterThreadPool {
         segment_size: usize,
         bucket_ids: Arc<[BucketId]>,
         num_threads: u16,
-        flush_interval_duration: Duration,
-        flush_interval_events: u32,
+        sync_interval: Duration,
+        max_batch_size: usize,
+        min_sync_bytes: usize,
         reader_pool: &ReaderThreadPool,
         thread_pool: &Arc<ThreadPool>,
     ) -> Result<Self, WriteError> {
@@ -86,8 +87,9 @@ impl WriterThreadPool {
                 thread_id,
                 &bucket_ids,
                 num_threads,
-                flush_interval_duration,
-                flush_interval_events,
+                sync_interval,
+                max_batch_size,
+                min_sync_bytes,
                 reader_pool,
                 thread_pool,
             )?;
@@ -113,19 +115,17 @@ impl WriterThreadPool {
                 )?;
         }
 
-        // Spawn flusher thread
-        if flush_interval_duration > Duration::ZERO && flush_interval_duration < Duration::MAX {
+        // Spawn syncer thread
+        if sync_interval > Duration::ZERO && sync_interval < Duration::MAX {
             thread::Builder::new()
-                .name("writer-pool-flusher".to_string())
+                .name("writer-pool-syncer".to_string())
                 .spawn({
                     let mut senders: Vec<_> =
                         senders.iter().map(|sender| sender.downgrade()).collect();
                     move || {
                         let mut last_ran = Instant::now();
                         loop {
-                            thread::sleep(
-                                flush_interval_duration.saturating_sub(last_ran.elapsed()),
-                            );
+                            thread::sleep(sync_interval.saturating_sub(last_ran.elapsed()));
                             last_ran = Instant::now();
 
                             senders.retain(|sender| {
@@ -141,7 +141,7 @@ impl WriterThreadPool {
 
                             if senders.is_empty() {
                                 trace!(
-                                    "writer pool flusher stopping due to all workers being stopped"
+                                    "writer pool syncer stopping due to all workers being stopped"
                                 );
                                 break;
                             }
@@ -184,7 +184,15 @@ impl WriterThreadPool {
             })
             .await
             .map_err(|_| WriteError::WriterThreadNotRunning { bucket_id })?;
-        reply_rx.await.map_err(|_| WriteError::NoThreadReply)?
+        let mut full_append = reply_rx.await.map_err(|_| WriteError::NoThreadReply)??;
+
+        full_append
+            .sync_rx
+            .wait_for(|write_offset| *write_offset >= full_append.write_offset)
+            .await
+            .map_err(|_| WriteError::NoThreadReply)?;
+
+        Ok(full_append.append)
     }
 
     /// Marks an event/events as confirmed by `confirmation_count` partitions,
@@ -257,11 +265,17 @@ pub struct AppendResult {
     pub stream_versions: HashMap<StreamId, u64>,
 }
 
+struct FullAppendResult {
+    append: AppendResult,
+    write_offset: u64,
+    sync_rx: watch::Receiver<u64>,
+}
+
 enum WriteRequest {
     AppendEvents {
         bucket_id: BucketId,
         batch: Box<Transaction>,
-        reply_tx: oneshot::Sender<Result<AppendResult, WriteError>>,
+        reply_tx: oneshot::Sender<Result<FullAppendResult, WriteError>>,
     },
     SetConfirmations {
         bucket_id: BucketId,
@@ -286,8 +300,9 @@ impl Worker {
         thread_id: u16,
         bucket_ids: &[BucketId],
         num_threads: u16,
-        flush_interval_duration: Duration,
-        flush_interval_events: u32,
+        sync_interval: Duration,
+        max_batch_size: usize,
+        min_sync_bytes: usize,
         reader_pool: &ReaderThreadPool,
         thread_pool: &Arc<ThreadPool>,
     ) -> Result<Self, WriteError> {
@@ -295,7 +310,8 @@ impl Worker {
         let now = Instant::now();
         for &bucket_id in bucket_ids.iter() {
             if bucket_id_to_thread_id(bucket_id, bucket_ids, num_threads) == Some(thread_id) {
-                let (bucket_segment_id, writer) = BucketSegmentWriter::latest(bucket_id, &dir)?;
+                let (bucket_segment_id, writer) =
+                    BucketSegmentWriter::latest(bucket_id, &dir, segment_size)?;
                 let mut reader = BucketSegmentReader::open(
                     SegmentKind::Events.get_path(&dir, bucket_segment_id),
                     Some(writer.flushed_offset()),
@@ -333,6 +349,7 @@ impl Worker {
                     stream_index,
                 }));
 
+                let (sync_tx, _) = watch::channel(writer.write_offset());
                 let writer_set = WriterSet {
                     dir: dir.clone(),
                     reader,
@@ -344,10 +361,13 @@ impl Worker {
                     index_segment_id: Arc::new(AtomicU32::new(bucket_segment_id.segment_id)),
                     indexes,
                     pending_indexes: Vec::with_capacity(128),
-                    last_flushed: now,
+                    sync_tx,
+                    last_synced: now,
                     unflushed_events: 0,
-                    flush_interval_duration,
-                    flush_interval_events,
+                    bytes_since_sync: 0,
+                    sync_interval,
+                    max_batch_size,
+                    min_sync_bytes,
                     thread_pool: Arc::clone(thread_pool),
                 };
 
@@ -401,7 +421,7 @@ impl Worker {
         &mut self,
         bucket_id: BucketId,
         batch: Transaction,
-        reply_tx: oneshot::Sender<Result<AppendResult, WriteError>>,
+        reply_tx: oneshot::Sender<Result<FullAppendResult, WriteError>>,
     ) {
         let Transaction {
             partition_key,
@@ -420,8 +440,6 @@ impl Worker {
             let _ = reply_tx.send(Err(WriteError::BucketWriterNotFound));
             return;
         };
-
-        writer_set.flush_if_necessary();
 
         let event_versions = match writer_set.validate_event_versions(partition_key, &events) {
             Ok(event_versions) => event_versions,
@@ -442,7 +460,7 @@ impl Worker {
             },
         );
 
-        let file_size = writer_set.writer.file_size();
+        let write_offset = writer_set.writer.write_offset();
         let events_size = events
             .iter()
             .map(|event| {
@@ -464,13 +482,14 @@ impl Worker {
             return;
         }
 
-        if file_size as usize + writer_set.writer.buf_len() + events_size > writer_set.segment_size
+        if write_offset as usize + events_size > writer_set.segment_size
             && let Err(err) = writer_set.rollover()
         {
             let _ = reply_tx.send(Err(err));
             return;
         }
 
+        let bytes_since_sync = writer_set.bytes_since_sync;
         let res = writer_set.handle_write(WriteOperation {
             partition_key,
             partition_id,
@@ -482,12 +501,17 @@ impl Worker {
             confirmation_count: batch.confirmation_count,
         });
         if res.is_err()
-            && let Err(err) = writer_set.writer.set_len(file_size)
+            && let Err(err) = writer_set.writer.set_len(write_offset)
         {
+            writer_set.bytes_since_sync = bytes_since_sync;
             error!("failed to set segment file length after write error: {err}");
         }
 
-        let _ = reply_tx.send(res);
+        let _ = reply_tx.send(res.map(|append| FullAppendResult {
+            append,
+            write_offset: writer_set.writer.write_offset(),
+            sync_rx: writer_set.sync_tx.subscribe(),
+        }));
     }
 
     fn handle_set_confirmations(
@@ -507,8 +531,6 @@ impl Worker {
             return;
         };
 
-        writer_set.flush_if_necessary();
-
         for offset in offsets {
             let res =
                 writer_set
@@ -525,7 +547,7 @@ impl Worker {
 
     fn handle_flush_poll(&mut self) {
         for writer_set in self.writers.values_mut() {
-            writer_set.flush_if_necessary();
+            writer_set.sync_if_necessary();
         }
     }
 }
@@ -541,6 +563,7 @@ pub struct WriteOperation<'a> {
     pub unique_streams: usize,
     pub confirmation_count: u8,
 }
+
 struct WriterSet {
     dir: PathBuf,
     reader: BucketSegmentReader,
@@ -552,10 +575,13 @@ struct WriterSet {
     index_segment_id: Arc<AtomicU32>,
     indexes: LiveIndexes,
     pending_indexes: Vec<PendingIndex>,
-    last_flushed: Instant,
+    sync_tx: watch::Sender<u64>,
+    last_synced: Instant,
     unflushed_events: u32,
-    flush_interval_duration: Duration,
-    flush_interval_events: u32,
+    bytes_since_sync: usize,
+    sync_interval: Duration,
+    max_batch_size: usize,
+    min_sync_bytes: usize,
     thread_pool: Arc<ThreadPool>,
 }
 
@@ -571,6 +597,7 @@ impl WriterSet {
             req.expected_partition_sequence,
             next_partition_sequence,
         )?;
+
         let first_partition_sequence = next_partition_sequence;
         let mut new_pending_indexes: Vec<PendingIndex> = Vec::with_capacity(req.events.len());
         let mut offsets = SmallVec::with_capacity(req.events.len());
@@ -593,13 +620,14 @@ impl WriterSet {
                 metadata: &event.metadata,
                 payload: &event.payload,
             };
-            let (offset, _) = self.writer.append_event(
+            let (offset, len) = self.writer.append_event(
                 &req.transaction_id,
                 event.timestamp,
                 req.confirmation_count,
                 append,
             )?;
             offsets.push(offset);
+            self.bytes_since_sync += len;
             // We need to guarantee:
             // - partition key is the same as previous event partition keys in the stream
             // - partition sequence doesn't reach u64::MAX
@@ -621,20 +649,18 @@ impl WriterSet {
                 .duration_since(UNIX_EPOCH)
                 .map_err(|_| WriteError::BadSystemTime)?
                 .as_nanos() as u64;
-            self.writer
-                .append_commit(&req.transaction_id, timestamp, event_count as u32, 0)?;
+            let (_, len) =
+                self.writer
+                    .append_commit(&req.transaction_id, timestamp, event_count as u32, 0)?;
+            self.bytes_since_sync += len;
         }
 
         self.next_partition_sequences
             .insert(req.partition_id, next_partition_sequence);
         self.pending_indexes.extend(new_pending_indexes);
 
-        self.unflushed_events += event_count as u32;
-        if self.unflushed_events >= self.flush_interval_events
-            && let Err(err) = self.flush()
-        {
-            error!("failed to flush writer: {err}");
-        }
+        self.writer.flush_writer()?;
+        self.sync_if_necessary();
 
         Ok(AppendResult {
             offsets,
@@ -646,11 +672,12 @@ impl WriterSet {
         })
     }
 
-    fn flush(&mut self) -> Result<(), WriteError> {
-        self.last_flushed = Instant::now();
-        self.writer.flush()?;
-        let mut indexes = self.indexes.blocking_write();
+    fn sync(&mut self) -> Result<(), WriteError> {
+        let write_offset = self.writer.flush()?;
+        self.last_synced = Instant::now();
         self.unflushed_events = 0;
+        self.bytes_since_sync = 0;
+        let mut indexes = self.indexes.blocking_write();
         for PendingIndex {
             event_id,
             partition_key,
@@ -677,21 +704,27 @@ impl WriterSet {
                 panic!("failed to insert stream index: {err}");
             }
         }
+        self.sync_tx.send_replace(write_offset);
 
         Ok(())
     }
 
-    fn flush_if_necessary(&mut self) {
-        if self.last_flushed.elapsed() >= self.flush_interval_duration
-            && let Err(err) = self.flush()
+    fn should_sync(&self) -> bool {
+        self.bytes_since_sync >= self.min_sync_bytes
+            || self.unflushed_events as usize >= self.max_batch_size
+            || self.last_synced.elapsed() >= self.sync_interval
+    }
+
+    fn sync_if_necessary(&mut self) {
+        if self.should_sync()
+            && let Err(err) = self.sync()
         {
-            error!("failed to flush writer: {err}");
+            error!("failed to sync writer: {err}");
         }
     }
 
     fn rollover(&mut self) -> Result<(), WriteError> {
-        self.last_flushed = Instant::now();
-        self.writer.flush()?;
+        self.sync()?;
 
         // Open new segment
         let old_bucket_segment_id = self.bucket_segment_id;
@@ -702,6 +735,7 @@ impl WriterSet {
         self.writer = BucketSegmentWriter::create(
             SegmentKind::Events.get_path(&self.dir, self.bucket_segment_id),
             self.bucket_segment_id.bucket_id,
+            self.segment_size,
         )?;
         let old_reader = mem::replace(
             &mut self.reader,
@@ -1314,7 +1348,7 @@ mod tests {
     use rayon::ThreadPoolBuilder;
     use sierradb_protocol::{CurrentVersion, ExpectedVersion};
     use tempfile::{TempDir, tempdir};
-    use tokio::sync::RwLock;
+    use tokio::sync::{RwLock, watch};
     use uuid::Uuid;
 
     use crate::StreamId;
@@ -1334,13 +1368,12 @@ mod tests {
         let segment_size = 1024 * 1024;
         let reader_threads = 1;
         let now = Instant::now();
-        let flush_interval_duration = Duration::MAX;
-        let flush_interval_events = 1;
 
         let thread_pool = Arc::new(ThreadPoolBuilder::new().build().unwrap());
         let reader_pool = ReaderThreadPool::new(reader_threads);
 
-        let (bucket_segment_id, writer) = BucketSegmentWriter::latest(bucket_id, &dir).unwrap();
+        let (bucket_segment_id, writer) =
+            BucketSegmentWriter::latest(bucket_id, &dir, segment_size).unwrap();
         let mut reader = BucketSegmentReader::open(
             SegmentKind::Events.get_path(&dir, bucket_segment_id),
             Some(writer.flushed_offset()),
@@ -1382,6 +1415,7 @@ mod tests {
             stream_index,
         }));
 
+        let (sync_tx, _) = watch::channel(writer.write_offset());
         let writer_set = WriterSet {
             dir: dir.path().to_owned(),
             reader,
@@ -1389,14 +1423,17 @@ mod tests {
             bucket_segment_id,
             segment_size,
             writer,
+            bytes_since_sync: 0,
             next_partition_sequences: HashMap::new(),
             index_segment_id: Arc::new(AtomicU32::new(bucket_segment_id.segment_id)),
             indexes,
             pending_indexes: Vec::with_capacity(128),
-            last_flushed: now,
+            sync_tx,
+            last_synced: now,
             unflushed_events: 0,
-            flush_interval_duration,
-            flush_interval_events,
+            sync_interval: Duration::from_millis(5),
+            max_batch_size: 50,
+            min_sync_bytes: 4096,
             thread_pool,
         };
 

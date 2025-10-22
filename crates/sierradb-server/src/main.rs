@@ -46,8 +46,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .segment_size(config.segment.size_bytes)
         .total_buckets(config.bucket.count)
         .bucket_ids(assigned_buckets.into_iter().collect::<Vec<_>>())
-        .flush_interval_duration(Duration::from_millis(config.flush.interval_ms))
-        .flush_interval_events(config.flush.events_threshold);
+        .sync_interval(Duration::from_millis(config.sync.interval_ms))
+        .max_batch_size(config.sync.max_batch_size)
+        .min_sync_bytes(config.sync.min_bytes);
 
     if let Some(count) = config.threads.read {
         builder.reader_threads(count);

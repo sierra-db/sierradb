@@ -65,10 +65,6 @@ pub enum ReadError {
     Crc32cMismatch { offset: u64 },
     #[error("confirmation count crc32c hash mismatch")]
     ConfirmationCountCrc32cMismatch { offset: u64 },
-    #[error("invalid stream id: {0}")]
-    InvalidStreamIdUtf8(Utf8Error),
-    #[error("invalid event name: {0}")]
-    InvalidEventNameUtf8(Utf8Error),
     #[error("unknown record type: {0}")]
     UnknownRecordType(u8),
     #[error("no reply from the reader thread")]
@@ -140,6 +136,9 @@ pub enum WriteError {
     PartitionIndex(#[from] PartitionIndexError),
     #[error(transparent)]
     Io(#[from] io::Error),
+    #[cfg(target_os = "linux")]
+    #[error(transparent)]
+    Nix(#[from] nix::errno::Errno),
 }
 
 impl From<SystemTimeError> for WriteError {

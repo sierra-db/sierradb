@@ -1,5 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -9,66 +10,117 @@ use bincode::Encode;
 use bincode::enc::Encoder;
 use bincode::enc::write::Writer;
 use bincode::error::EncodeError;
-use tracing::trace;
+use tracing::{trace, warn};
 use uuid::Uuid;
 
 use super::{
-    BucketSegmentHeader, FlushedOffset, MAGIC_BYTES, PADDING_SIZE, SEGMENT_HEADER_SIZE,
-    calculate_commit_crc32c, calculate_confirmation_count_crc32c, calculate_event_crc32c,
+    BucketSegmentHeader, FlushedOffset, MAGIC_BYTES, PADDING_SIZE, RECORD_HEADER_SIZE,
+    SEGMENT_HEADER_SIZE, calculate_commit_crc32c, calculate_confirmation_count_crc32c,
+    calculate_event_crc32c,
 };
 use crate::StreamId;
-use crate::bucket::segment::BINCODE_CONFIG;
+use crate::bucket::segment::{BINCODE_CONFIG, BucketSegmentReader};
 use crate::bucket::{BucketId, BucketSegmentId, PartitionId, SegmentId, SegmentKind};
-use crate::error::WriteError;
+use crate::error::{ReadError, WriteError};
 
 const WRITE_BUF_SIZE: usize = 16 * 1024; // 16 KB buffer
 
 #[derive(Debug)]
 pub struct BucketSegmentWriter {
     writer: BufWriter<File>,
-    file_size: u64,
+    write_offset: u64,
     flushed_offset: Arc<AtomicU64>,
     dirty: bool,
 }
 
 impl BucketSegmentWriter {
     /// Creates a new segment for writing.
-    pub fn create(path: impl AsRef<Path>, bucket_id: BucketId) -> Result<Self, WriteError> {
+    pub fn create(
+        path: impl AsRef<Path>,
+        bucket_id: BucketId,
+        segment_size: usize,
+    ) -> Result<Self, WriteError> {
         let file = OpenOptions::new()
             .read(false)
             .write(true)
             .create_new(true)
             .open(path)?;
-        let file_size = 0;
-        let flushed_offset = Arc::new(AtomicU64::new(file_size));
 
-        let mut writer = BucketSegmentWriter {
-            writer: BufWriter::with_capacity(WRITE_BUF_SIZE, file),
-            file_size,
+        // Pre-allocate on Linux
+        #[cfg(target_os = "linux")]
+        {
+            nix::fcntl::fallocate(
+                &file,
+                nix::fcntl::FallocateFlags::empty(),
+                0,
+                segment_size as i64,
+            )?;
+        }
+
+        let write_offset = SEGMENT_HEADER_SIZE as u64;
+        let flushed_offset = Arc::new(AtomicU64::new(write_offset));
+
+        let mut writer = BufWriter::with_capacity(WRITE_BUF_SIZE, file);
+        writer.seek(SeekFrom::Start(write_offset))?;
+
+        let mut segment = BucketSegmentWriter {
+            writer,
+            write_offset,
             flushed_offset,
             dirty: false,
         };
 
         let created_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
-        writer.write_segment_header(&BucketSegmentHeader {
+        segment.write_segment_header(&BucketSegmentHeader {
             version: 0,
             bucket_id,
             created_at,
         })?;
-        writer.flush()?;
+        segment.flush()?;
 
-        Ok(writer)
+        Ok(segment)
     }
 
     /// Opens a segment for writing.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, WriteError> {
-        let mut file = OpenOptions::new().read(false).write(true).open(path)?;
-        let file_size = file.seek(SeekFrom::End(0))?;
-        let flushed_offset = Arc::new(AtomicU64::new(file_size));
+        let file = OpenOptions::new().read(false).write(true).open(&path)?;
+        let mut write_offset = SEGMENT_HEADER_SIZE as u64;
+
+        // We need to scan forward to find the latest valid record, and consider that to
+        // be the write offset
+        let mut reader = BucketSegmentReader::open(path, None)?;
+        let mut iter = reader.iter();
+        while let Some(res) = iter.next_record().transpose() {
+            match res {
+                Ok(record) => {
+                    write_offset = record.offset() + record.len();
+                }
+                Err(err) => match err {
+                    ReadError::Crc32cMismatch { .. }
+                    | ReadError::ConfirmationCountCrc32cMismatch { .. }
+                    | ReadError::UnknownRecordType(_)
+                    | ReadError::Bincode(_) => {
+                        warn!(
+                            "corruption found at {write_offset}: {err} - all data after this point will be considered invalid"
+                        );
+                        break;
+                    }
+                    ReadError::Io(err) => return Err(WriteError::Io(err)),
+                    ReadError::NoThreadReply | ReadError::EventIndex(_) => {
+                        unreachable!("not using reader thread pool or event index")
+                    }
+                },
+            }
+        }
+
+        let mut writer = BufWriter::with_capacity(WRITE_BUF_SIZE, file);
+        writer.seek(SeekFrom::Start(write_offset))?;
+
+        let flushed_offset = Arc::new(AtomicU64::new(write_offset));
 
         Ok(BucketSegmentWriter {
-            writer: BufWriter::with_capacity(WRITE_BUF_SIZE, file),
-            file_size,
+            writer,
+            write_offset,
             flushed_offset,
             dirty: false,
         })
@@ -77,6 +129,7 @@ impl BucketSegmentWriter {
     pub fn latest(
         bucket_id: BucketId,
         dir: impl AsRef<Path>,
+        segment_size: usize,
     ) -> Result<(BucketSegmentId, Self), WriteError> {
         let dir = dir.as_ref();
         let bucket_dir = dir.join("buckets").join(format!("{bucket_id:05}"));
@@ -132,7 +185,8 @@ impl BucketSegmentWriter {
             fs::create_dir_all(&segment_dir)?;
 
             let events_path = segment_dir.join(SegmentKind::Events.file_name());
-            Self::create(events_path, bucket_id).map(|writer| (bucket_segment_id, writer))
+            Self::create(events_path, bucket_id, segment_size)
+                .map(|writer| (bucket_segment_id, writer))
         }
     }
 
@@ -147,6 +201,11 @@ impl BucketSegmentWriter {
 
     /// Writes the segment's header.
     pub fn write_segment_header(&mut self, header: &BucketSegmentHeader) -> Result<(), WriteError> {
+        assert!(
+            self.write_offset >= SEGMENT_HEADER_SIZE as u64,
+            "write offset cannot be smaller than segment header size"
+        );
+
         let mut buf = [0u8; SEGMENT_HEADER_SIZE];
         let mut pos = 0;
 
@@ -161,12 +220,12 @@ impl BucketSegmentWriter {
             pos += field.len();
         }
 
-        self.writer.seek(SeekFrom::Start(0))?;
-        self.writer.write_all(&buf)?;
-        self.writer.seek(SeekFrom::End(0))?;
-        self.file_size = self.writer.stream_position()?;
-        assert_eq!(self.file_size, SEGMENT_HEADER_SIZE as u64);
-        self.dirty = true;
+        // This should do nothing, since we're only writing the segment header on file
+        // creation, but it doesn't hurt to flush for safety
+        self.flush()?;
+
+        self.writer.get_ref().write_all_at(&buf, 0)?;
+        self.writer.get_ref().sync_data()?;
 
         Ok(())
     }
@@ -179,8 +238,7 @@ impl BucketSegmentWriter {
         confirmation_count: u8,
         event: AppendEvent<'_>,
     ) -> Result<(u64, usize), WriteError> {
-        let offset = self.writer.stream_position()? + self.writer.buffer().len() as u64;
-
+        let offset = self.write_offset;
         let len = bincode::encode_into_std_write(
             AppendRecord {
                 timestamp,
@@ -192,6 +250,7 @@ impl BucketSegmentWriter {
             BINCODE_CONFIG,
         )?;
 
+        self.write_offset += len as u64;
         self.dirty = true;
 
         Ok((offset, len))
@@ -205,8 +264,7 @@ impl BucketSegmentWriter {
         event_count: u32,
         confirmation_count: u8,
     ) -> Result<(u64, usize), WriteError> {
-        let offset = self.writer.stream_position()? + self.writer.buffer().len() as u64;
-
+        let offset = self.write_offset;
         let len = bincode::encode_into_std_write(
             AppendRecord {
                 timestamp,
@@ -218,6 +276,7 @@ impl BucketSegmentWriter {
             BINCODE_CONFIG,
         )?;
 
+        self.write_offset += len as u64;
         self.dirty = true;
 
         Ok((offset, len))
@@ -229,10 +288,10 @@ impl BucketSegmentWriter {
         transaction_id: &Uuid,
         confirmation_count: u8,
     ) -> Result<(), WriteError> {
-        if offset > self.file_size {
+        if offset > self.write_offset {
             return Err(WriteError::OffsetExceedsFileSize {
                 offset,
-                size: self.file_size,
+                size: self.write_offset,
             });
         }
         super::set_confirmations(
@@ -243,38 +302,42 @@ impl BucketSegmentWriter {
         )
     }
 
-    pub fn file_size(&self) -> u64 {
-        self.file_size
-    }
-
-    pub fn buf_len(&self) -> usize {
-        self.writer.buffer().len()
+    pub fn write_offset(&self) -> u64 {
+        self.write_offset
     }
 
     pub fn set_len(&mut self, offset: u64) -> Result<(), WriteError> {
-        if offset < self.file_size {
+        if offset < self.write_offset {
             self.flush()?;
-            self.writer.get_ref().set_len(offset)?;
+
+            // Write full zero header as clear truncation marker
+            let zero_header = [0u8; RECORD_HEADER_SIZE];
+            self.writer.get_ref().write_all_at(&zero_header, offset)?;
             self.writer.get_ref().sync_data()?;
-            self.writer.seek(SeekFrom::End(0))?;
-            self.file_size = self.writer.stream_position()?;
-            self.flushed_offset.store(self.file_size, Ordering::Release);
+
+            self.write_offset = offset;
+            self.flushed_offset.store(offset, Ordering::Release);
         }
+        Ok(())
+    }
+
+    pub fn flush_writer(&mut self) -> Result<(), WriteError> {
+        self.writer.flush()?;
         Ok(())
     }
 
     /// Flushes the segment, ensuring all data is persisted to disk.
-    pub fn flush(&mut self) -> Result<(), WriteError> {
+    pub fn flush(&mut self) -> Result<u64, WriteError> {
         if self.dirty {
             trace!("flushing writer");
             self.writer.flush()?;
             self.writer.get_ref().sync_data()?;
-            self.file_size = self.writer.stream_position()?;
-            self.flushed_offset.store(self.file_size, Ordering::Release);
+            self.flushed_offset
+                .store(self.write_offset, Ordering::Release);
             self.dirty = false;
         }
 
-        Ok(())
+        Ok(self.write_offset)
     }
 }
 
