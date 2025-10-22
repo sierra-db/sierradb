@@ -13,7 +13,7 @@ use bincode::error::DecodeError;
 use polonius_the_crab::{exit_polonius, polonius, polonius_return, polonius_try};
 use serde::{Deserialize, Serialize};
 use smallvec::{SmallVec, smallvec};
-use tracing::{info, warn};
+use tracing::warn;
 use uuid::Uuid;
 
 use super::{
@@ -169,41 +169,14 @@ pub struct BucketSegmentReader {
 }
 
 impl BucketSegmentReader {
-    /// Opens a segment, recovering from zero corruption at the end of the file.
-    ///
-    /// TODO: Do we still need recovery with fallocation? I think no.
+    /// Opens a segment as read only.
     pub fn open(
         path: impl AsRef<Path>,
         flushed_offset: Option<FlushedOffset>,
     ) -> Result<Self, ReadError> {
         let mut opts = OpenOptions::new();
-        opts.read(true).write(true); // Write access needed for lazy recovery truncation
-        let mut reader = Self::open_inner(path, flushed_offset, opts)?;
+        opts.read(true).write(false);
 
-        // Check for zero corruption from improper shutdowns
-        let file_size = reader.file.metadata()?.len();
-        if file_size > SEGMENT_HEADER_SIZE as u64 {
-            reader.check_and_recover_zero_corruption(file_size)?;
-        }
-
-        Ok(reader)
-    }
-
-    /// Opens a segment as read only, without attempting recovery.
-    pub fn open_without_recovery(
-        path: impl AsRef<Path>,
-        flushed_offset: Option<FlushedOffset>,
-    ) -> Result<Self, io::Error> {
-        let mut opts = OpenOptions::new();
-        opts.read(true);
-        Self::open_inner(path, flushed_offset, opts)
-    }
-
-    pub fn open_inner(
-        path: impl AsRef<Path>,
-        flushed_offset: Option<FlushedOffset>,
-        opts: OpenOptions,
-    ) -> Result<Self, io::Error> {
         #[cfg(target_os = "macos")]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -589,114 +562,6 @@ impl BucketSegmentReader {
 
         let start = (offset - self.read_ahead_offset) as usize;
         Ok(&self.read_ahead_buf[start..start + length])
-    }
-
-    fn check_and_recover_zero_corruption(&mut self, file_size: u64) -> Result<(), ReadError> {
-        let check_size = 1024.min(file_size - SEGMENT_HEADER_SIZE as u64);
-        if check_size == 0 {
-            return Ok(());
-        }
-
-        let check_offset = file_size - check_size;
-        let mut buffer = vec![0u8; check_size as usize];
-
-        if self.file.read_exact_at(&mut buffer, check_offset).is_err() {
-            return Ok(());
-        }
-
-        let all_zeros = buffer.iter().all(|&b| b == 0);
-        if all_zeros && check_size >= 64 {
-            info!("detected zero corruption, performing recovery");
-            self.find_corruption_boundary_forward()?;
-        }
-
-        Ok(())
-    }
-
-    fn find_corruption_boundary_forward(&mut self) -> Result<(), ReadError> {
-        let mut current_offset = SEGMENT_HEADER_SIZE as u64;
-
-        loop {
-            match self.read_record(current_offset, ReadHint::Sequential) {
-                Ok(Some(record)) => {
-                    current_offset = record.offset() + record.len();
-                    continue;
-                }
-                Ok(None) => {
-                    return Ok(());
-                }
-                Err(_) => {
-                    if self.is_zero_header_at_offset(current_offset)?
-                        && self.is_remaining_content_zeros(current_offset)?
-                    {
-                        info!("truncating zero corruption at offset {current_offset}");
-                        self.truncate_file_to(current_offset)?;
-                        return Ok(());
-                    }
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    fn is_zero_header_at_offset(&mut self, offset: u64) -> Result<bool, ReadError> {
-        let mut header_buf = vec![0u8; COMMIT_SIZE];
-
-        match self.file.read_exact_at(&mut header_buf, offset) {
-            Ok(()) => Ok(header_buf.iter().all(|&b| b == 0)),
-            Err(_) => Ok(false),
-        }
-    }
-
-    fn is_remaining_content_zeros(&mut self, start_offset: u64) -> Result<bool, ReadError> {
-        let file_size = self.file.metadata()?.len();
-        if start_offset >= file_size {
-            return Ok(true);
-        }
-
-        const CHECK_CHUNK_SIZE: usize = 4096;
-        let mut buffer = vec![0u8; CHECK_CHUNK_SIZE];
-        let mut current_offset = start_offset;
-
-        while current_offset < file_size {
-            let remaining = (file_size - current_offset) as usize;
-            let read_size = remaining.min(CHECK_CHUNK_SIZE);
-
-            match self
-                .file
-                .read_exact_at(&mut buffer[..read_size], current_offset)
-            {
-                Ok(()) => {
-                    if !buffer[..read_size].iter().all(|&b| b == 0) {
-                        return Ok(false);
-                    }
-                }
-                Err(_) => return Ok(false),
-            }
-
-            current_offset += read_size as u64;
-        }
-
-        Ok(true)
-    }
-
-    fn truncate_file_to(&mut self, offset: u64) -> Result<(), ReadError> {
-        let original_size = self.file.metadata()?.len();
-        let bytes_removed = original_size.saturating_sub(offset);
-
-        info!(
-            "truncating file from {original_size} to {offset} bytes (removing {bytes_removed} bytes)"
-        );
-
-        if let Err(err) = self.file.set_len(offset) {
-            return Err(ReadError::Io(err));
-        }
-
-        if let Err(err) = self.file.sync_data() {
-            return Err(ReadError::Io(err));
-        }
-
-        Ok(())
     }
 }
 

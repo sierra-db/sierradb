@@ -88,7 +88,7 @@ impl BucketSegmentWriter {
 
         // We need to scan forward to find the latest valid record, and consider that to
         // be the write offset
-        let mut reader = BucketSegmentReader::open_without_recovery(path, None)?;
+        let mut reader = BucketSegmentReader::open(path, None)?;
         let mut iter = reader.iter();
         while let Some(res) = iter.next_record().transpose() {
             match res {

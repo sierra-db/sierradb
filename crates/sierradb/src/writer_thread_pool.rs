@@ -184,14 +184,15 @@ impl WriterThreadPool {
             })
             .await
             .map_err(|_| WriteError::WriterThreadNotRunning { bucket_id })?;
-        let (append, offset_after_write, mut rx) =
-            reply_rx.await.map_err(|_| WriteError::NoThreadReply)??;
+        let mut full_append = reply_rx.await.map_err(|_| WriteError::NoThreadReply)??;
 
-        rx.wait_for(|write_offset| *write_offset >= offset_after_write)
+        full_append
+            .sync_rx
+            .wait_for(|write_offset| *write_offset >= full_append.write_offset)
             .await
             .map_err(|_| WriteError::NoThreadReply)?;
 
-        Ok(append)
+        Ok(full_append.append)
     }
 
     /// Marks an event/events as confirmed by `confirmation_count` partitions,
@@ -264,11 +265,17 @@ pub struct AppendResult {
     pub stream_versions: HashMap<StreamId, u64>,
 }
 
+struct FullAppendResult {
+    append: AppendResult,
+    write_offset: u64,
+    sync_rx: watch::Receiver<u64>,
+}
+
 enum WriteRequest {
     AppendEvents {
         bucket_id: BucketId,
         batch: Box<Transaction>,
-        reply_tx: oneshot::Sender<Result<(AppendResult, u64, watch::Receiver<u64>), WriteError>>,
+        reply_tx: oneshot::Sender<Result<FullAppendResult, WriteError>>,
     },
     SetConfirmations {
         bucket_id: BucketId,
@@ -414,7 +421,7 @@ impl Worker {
         &mut self,
         bucket_id: BucketId,
         batch: Transaction,
-        reply_tx: oneshot::Sender<Result<(AppendResult, u64, watch::Receiver<u64>), WriteError>>,
+        reply_tx: oneshot::Sender<Result<FullAppendResult, WriteError>>,
     ) {
         let Transaction {
             partition_key,
@@ -500,12 +507,10 @@ impl Worker {
             error!("failed to set segment file length after write error: {err}");
         }
 
-        let _ = reply_tx.send(res.map(|append| {
-            (
-                append,
-                writer_set.writer.write_offset(),
-                writer_set.sync_tx.subscribe(),
-            )
+        let _ = reply_tx.send(res.map(|append| FullAppendResult {
+            append,
+            write_offset: writer_set.writer.write_offset(),
+            sync_rx: writer_set.sync_tx.subscribe(),
         }));
     }
 
