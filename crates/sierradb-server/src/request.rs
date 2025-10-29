@@ -16,6 +16,7 @@ use std::num::{ParseIntError, TryFromIntError};
 
 use bytes::Bytes;
 use combine::{Parser, eof};
+use indexmap::{IndexMap, indexmap};
 use redis_protocol::resp3::types::{BytesFrame, VerbatimStringFormat};
 use sierradb::StreamId;
 use sierradb::bucket::PartitionId;
@@ -765,7 +766,7 @@ pub fn number(n: i64) -> BytesFrame {
 }
 
 #[inline(always)]
-pub fn map(items: HashMap<BytesFrame, BytesFrame>) -> BytesFrame {
+pub fn map(items: IndexMap<BytesFrame, BytesFrame>) -> BytesFrame {
     BytesFrame::Map {
         data: items,
         attributes: None,
@@ -782,41 +783,17 @@ pub fn array(items: Vec<BytesFrame>) -> BytesFrame {
 
 #[inline(always)]
 pub fn encode_event(record: EventRecord) -> BytesFrame {
-    map(HashMap::from_iter([
-        (
-            simple_str("event_id"),
-            simple_str(record.event_id.to_string()),
-        ),
-        (
-            simple_str("partition_key"),
-            simple_str(record.partition_key.to_string()),
-        ),
-        (
-            simple_str("partition_id"),
-            number(record.partition_id as i64),
-        ),
-        (
-            simple_str("transaction_id"),
-            simple_str(record.transaction_id.to_string()),
-        ),
-        (
-            simple_str("partition_sequence"),
-            number(record.partition_sequence as i64),
-        ),
-        (
-            simple_str("stream_version"),
-            number(record.stream_version as i64),
-        ),
-        (
-            simple_str("timestamp"),
-            number((record.timestamp / 1_000_000) as i64),
-        ),
-        (
-            simple_str("stream_id"),
-            blob_str(record.stream_id.to_string()),
-        ),
-        (simple_str("event_name"), blob_str(record.event_name)),
-        (simple_str("metadata"), blob_str(record.metadata)),
-        (simple_str("payload"), blob_str(record.payload)),
-    ]))
+    map(indexmap! {
+        simple_str("event_id") => simple_str(record.event_id.to_string()),
+        simple_str("partition_key") => simple_str(record.partition_key.to_string()),
+        simple_str("partition_id") => number(record.partition_id as i64),
+        simple_str("transaction_id") => simple_str(record.transaction_id.to_string()),
+        simple_str("partition_sequence") => number(record.partition_sequence as i64),
+        simple_str("stream_version") => number(record.stream_version as i64),
+        simple_str("timestamp") => number((record.timestamp / 1_000_000) as i64),
+        simple_str("stream_id") => blob_str(record.stream_id.to_string()),
+        simple_str("event_name") => blob_str(record.event_name),
+        simple_str("metadata") => blob_str(record.metadata),
+        simple_str("payload") => blob_str(record.payload),
+    })
 }

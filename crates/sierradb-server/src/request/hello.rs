@@ -1,6 +1,5 @@
-use std::collections::HashMap;
-
 use combine::Parser;
+use indexmap::indexmap;
 use libp2p::PeerId;
 use redis_protocol::resp3::types::BytesFrame;
 
@@ -48,14 +47,11 @@ pub struct HelloResp {
 
 impl From<HelloResp> for BytesFrame {
     fn from(resp: HelloResp) -> Self {
-        map(HashMap::from_iter([
-            (blob_str("server"), blob_str(resp.server)),
-            (blob_str("version"), blob_str(resp.version)),
-            (blob_str("peer_id"), blob_str(resp.peer_id.to_base58())),
-            (
-                blob_str("num_partitions"),
-                number(resp.num_partitions.into()),
-            ),
-        ]))
+        map(indexmap! {
+            blob_str("server") => blob_str(resp.server),
+            blob_str("version") => blob_str(resp.version),
+            blob_str("peer_id") => blob_str(resp.peer_id.to_base58()),
+            blob_str("num_partitions") => number(resp.num_partitions.into()),
+        })
     }
 }
