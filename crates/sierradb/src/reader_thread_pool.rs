@@ -3,12 +3,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use rayon::{ThreadPool, ThreadPoolBuilder};
+use tracing::warn;
 
 use crate::bucket::event_index::ClosedEventIndex;
 use crate::bucket::partition_index::ClosedPartitionIndex;
 use crate::bucket::segment::BucketSegmentReader;
 use crate::bucket::stream_index::ClosedStreamIndex;
 use crate::bucket::{BucketId, BucketSegmentId, SegmentId};
+use crate::cache::{BLOCK_SIZE, SegmentBlockCache};
 
 thread_local! {
     static READERS: RefCell<HashMap<BucketId, BTreeMap<SegmentId, ReaderSet>>> = RefCell::new(HashMap::new());
@@ -19,34 +21,73 @@ pub struct ReaderSet {
     pub event_index: Option<ClosedEventIndex>,
     pub partition_index: Option<ClosedPartitionIndex>,
     pub stream_index: Option<ClosedStreamIndex>,
+    pub cache: Arc<SegmentBlockCache>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ReaderThreadPool {
     pool: Arc<ThreadPool>,
+    caches: HashMap<BucketId, Arc<SegmentBlockCache>>,
 }
 
 impl ReaderThreadPool {
     /// Spawns threads to process read requests in a thread pool.
-    pub fn new(num_workers: usize) -> Self {
+    pub fn new(num_workers: usize, bucket_ids: &[BucketId], total_cache_size: usize) -> Self {
+        assert!(!bucket_ids.is_empty());
+
         let pool = ThreadPoolBuilder::new()
             .num_threads(num_workers)
             .build()
             .unwrap();
 
-        ReaderThreadPool {
-            pool: Arc::new(pool),
+        // Calculate blocks per bucket
+        let num_buckets = bucket_ids.len();
+        let cache_size_per_bucket = total_cache_size / num_buckets;
+        let bucket_segment_cache_capacity = cache_size_per_bucket / BLOCK_SIZE;
+        if bucket_segment_cache_capacity == 0 {
+            warn!(
+                "cache size per bucket too small: {cache_size_per_bucket}B per bucket results in 0 blocks: consider increasing total_cache_size or reducing number of buckets"
+            );
         }
+
+        let mut reader_pool = ReaderThreadPool {
+            pool: Arc::new(pool),
+            caches: HashMap::new(),
+        };
+
+        reader_pool.caches = bucket_ids
+            .iter()
+            .map(|bucket_id| {
+                (
+                    *bucket_id,
+                    Arc::new(SegmentBlockCache::new(
+                        *bucket_id,
+                        bucket_segment_cache_capacity,
+                        reader_pool.clone(),
+                    )),
+                )
+            })
+            .collect();
+
+        reader_pool
     }
 
-    pub fn spawn<OP, IN>(&self, op: OP)
+    pub fn get_cache(&self, bucket_id: BucketId) -> Option<&Arc<SegmentBlockCache>> {
+        self.caches.get(&bucket_id)
+    }
+
+    /// Spawns an asynchronous task in this thread pool. This task will
+    /// run in the implicit, global scope, which means that it may outlast
+    /// the current stack frame -- therefore, it cannot capture any references
+    /// onto the stack (you will likely need a `move` closure).
+    pub fn spawn<OP, IN, R>(&self, op: OP)
     where
-        OP: FnOnce(fn(IN)) + Send + 'static,
-        IN: FnOnce(&mut HashMap<BucketId, BTreeMap<SegmentId, ReaderSet>>),
+        OP: FnOnce(fn(IN) -> R) + Send + 'static,
+        IN: FnOnce(&mut HashMap<BucketId, BTreeMap<SegmentId, ReaderSet>>) -> R,
     {
         self.pool.spawn(|| {
             let with_reader = |op: IN| READERS.with_borrow_mut(op);
-            op(with_reader as fn(_))
+            op(with_reader)
         })
     }
 
@@ -62,6 +103,9 @@ impl ReaderThreadPool {
     //     })
     // }
 
+    /// Executes `op` within the thread pool. Any attempts to use
+    /// `join`, `scope`, or parallel iterators will then operate
+    /// within that thread pool.
     pub fn install<OP, R, IN, RR>(&self, op: OP) -> R
     where
         OP: FnOnce(fn(IN) -> RR) -> R + Send,
@@ -83,12 +127,18 @@ impl ReaderThreadPool {
         partition_index: Option<&ClosedPartitionIndex>,
         stream_index: Option<&ClosedStreamIndex>,
     ) {
+        let cache = self
+            .caches
+            .get(&bucket_segment_id.bucket_id)
+            .unwrap()
+            .clone();
         self.pool.broadcast(|_| {
             let reader_set = ReaderSet {
                 reader: reader.try_clone().unwrap(),
                 event_index: event_index.map(|index| index.try_clone().unwrap()),
                 partition_index: partition_index.map(|index| index.try_clone().unwrap()),
                 stream_index: stream_index.map(|index| index.try_clone().unwrap()),
+                cache: cache.clone(),
             };
             READERS.with_borrow_mut(|readers| {
                 readers

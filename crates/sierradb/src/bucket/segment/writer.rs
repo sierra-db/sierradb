@@ -106,8 +106,10 @@ impl BucketSegmentWriter {
                         break;
                     }
                     ReadError::Io(err) => return Err(WriteError::Io(err)),
-                    ReadError::NoThreadReply | ReadError::EventIndex(_) => {
-                        unreachable!("not using reader thread pool or event index")
+                    ReadError::OutOfBounds
+                    | ReadError::NoThreadReply
+                    | ReadError::EventIndex(_) => {
+                        unreachable!("not using cache, reader thread pool, or event index")
                     }
                 },
             }

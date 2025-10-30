@@ -634,48 +634,66 @@ impl ClusterActor {
             let mut events = Vec::new();
             let mut has_more = false;
             let mut events_collected = 0;
+            let mut last_read_version = 0;
 
-            while let Some(commit) = match iter.next().await {
-                Ok(commit) => commit,
-                Err(err) => {
-                    reply_sender.send(Err(ClusterError::Read(err.to_string())));
-                    return;
+            'iter: loop {
+                let commits = match iter
+                    .next_batch({
+                        end_version
+                            .map(|end| end.saturating_sub(last_read_version).clamp(1, 20))
+                            .unwrap_or(20) as usize
+                    })
+                    .await
+                {
+                    Ok(commit) => commit,
+                    Err(err) => {
+                        reply_sender.send(Err(ClusterError::Read(err.to_string())));
+                        return;
+                    }
+                };
+
+                if commits.is_empty() {
+                    break;
                 }
-            } {
-                for event in commit {
-                    // Check if we've reached the count limit
+
+                for commit in commits {
+                    for event in commit {
+                        // Check if we've reached the count limit
+                        if events_collected >= count {
+                            has_more = true;
+                            break 'iter;
+                        }
+
+                        // Check if event is beyond watermark (safety check - uses
+                        // partition_sequence)
+                        if event.partition_sequence > watermark {
+                            break 'iter;
+                        }
+
+                        // Check if event is beyond end_version (uses stream_version)
+                        if let Some(end_ver) = end_version
+                            && event.stream_version > end_ver
+                        {
+                            has_more = true;
+                            break;
+                        }
+
+                        last_read_version = event.stream_version;
+                        events.push(event);
+                        events_collected += 1;
+                    }
+
+                    // Break if we hit limits
                     if events_collected >= count {
                         has_more = true;
-                        break;
+                        break 'iter;
                     }
 
-                    // Check if event is beyond watermark (safety check - uses partition_sequence)
-                    if event.partition_sequence > watermark {
-                        break;
-                    }
-
-                    // Check if event is beyond end_version (uses stream_version)
                     if let Some(end_ver) = end_version
-                        && event.stream_version > end_ver
+                        && events.last().map(|e| e.stream_version).unwrap_or(0) >= end_ver
                     {
-                        has_more = true;
-                        break;
+                        break 'iter;
                     }
-
-                    events.push(event);
-                    events_collected += 1;
-                }
-
-                // Break if we hit limits
-                if events_collected >= count {
-                    has_more = true;
-                    break;
-                }
-
-                if let Some(end_ver) = end_version
-                    && events.last().map(|e| e.stream_version).unwrap_or(0) >= end_ver
-                {
-                    break;
                 }
             }
 
