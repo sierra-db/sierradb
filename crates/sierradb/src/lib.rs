@@ -6,6 +6,7 @@ use error::StreamIdError;
 use serde::{Deserialize, Serialize};
 
 pub mod bucket;
+pub mod cache;
 pub mod database;
 pub mod error;
 pub mod id;

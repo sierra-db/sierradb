@@ -1370,7 +1370,7 @@ mod tests {
         let now = Instant::now();
 
         let thread_pool = Arc::new(ThreadPoolBuilder::new().build().unwrap());
-        let reader_pool = ReaderThreadPool::new(reader_threads);
+        let reader_pool = ReaderThreadPool::new(reader_threads, &[0, 1, 2, 3], segment_size);
 
         let (bucket_segment_id, writer) =
             BucketSegmentWriter::latest(bucket_id, &dir, segment_size).unwrap();

@@ -18,7 +18,9 @@ bincode = { workspace = true, features = ["serde"] }
 bloomfilter.workspace = true
 boomphf = { workspace = true, features = ["serde"] }
 crc32fast.workspace = true
+futures.workspace = true
 libc.workspace = true
+moka = { workspace = true, features = ["sync"] }
 nix = { workspace = true, features = ["fs"] }
 num_cpus.workspace = true
 polonius-the-crab.workspace = true
