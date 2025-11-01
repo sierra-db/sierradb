@@ -64,8 +64,9 @@ impl StreamIter {
                     && let StreamOffsets::Offsets(offsets) = stream_index.offsets.clone()
                     && stream_index.version_min <= from_version
                 {
-                    let offsets_index =
-                        ((from_version - stream_index.version_min) as usize).min(offsets.len());
+                    let offsets_index = (from_version.saturating_sub(stream_index.version_min)
+                        as usize)
+                        .min(offsets.len());
                     drop(index_guard);
 
                     let segment_iter = SegmentStreamIter::new(
@@ -120,9 +121,9 @@ impl StreamIter {
                                     let version_min = key.version_min;
                                     match stream_index.get_from_key(key) {
                                         Ok(StreamOffsets::Offsets(offsets)) => {
-                                            let offsets_index = ((from_version - version_min)
-                                                as usize)
-                                                .min(offsets.len());
+                                            let offsets_index =
+                                                (from_version.saturating_sub(version_min) as usize)
+                                                    .min(offsets.len());
 
                                             debug_assert!(segments_len > 0);
                                             let has_next_segment = segments_len - 1 > i;
@@ -196,7 +197,7 @@ impl StreamIter {
                     self.last_version,
                     segment_iter.reader_pool,
                     self.live_indexes.clone(),
-                    segment_iter.bucket_segment_id.segment_id,
+                    segment_iter.bucket_segment_id.segment_id + 1,
                     self.has_next_segment,
                 )
                 .await?;

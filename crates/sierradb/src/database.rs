@@ -25,6 +25,7 @@ use crate::bucket::stream_index::{
     ClosedStreamIndex, StreamIndexRecord, StreamIter, StreamOffsets,
 };
 use crate::bucket::{BucketId, BucketSegmentId, PartitionId, SegmentId};
+use crate::cache::BLOCK_SIZE;
 use crate::error::{
     DatabaseError, EventValidationError, PartitionIndexError, ReadError, StreamIndexError,
     ThreadPoolError, WriteError,
@@ -594,6 +595,13 @@ impl DatabaseBuilder {
     }
 
     pub fn segment_size(&mut self, n: usize) -> &mut Self {
+        // This minimum is somewhat arbitrary, but it ensures our cache is actually used
+        // and segment sizes should never be this small anyway
+        assert!(
+            n >= BLOCK_SIZE * 2,
+            "segment size must be at least {} bytes",
+            BLOCK_SIZE * 2
+        );
         self.segment_size = n;
         self
     }
