@@ -348,7 +348,7 @@ impl Database {
 }
 
 pub struct DatabaseBuilder {
-    segment_size: usize,
+    segment_size_bytes: usize,
     bucket_ids: Arc<[BucketId]>,
     total_buckets: u16,
     reader_threads: u16,
@@ -365,7 +365,7 @@ impl DatabaseBuilder {
         let reader_threads = (cores * 2).clamp(4, 32);
 
         DatabaseBuilder {
-            segment_size: 256_000_000,
+            segment_size_bytes: 256 * 1024 * 1024,
             bucket_ids: Arc::from((0..total_buckets).collect::<Vec<_>>()),
             total_buckets,
             reader_threads,
@@ -437,7 +437,7 @@ impl DatabaseBuilder {
         let reader_pool = ReaderThreadPool::new(self.reader_threads as usize);
         let writer_pool = WriterThreadPool::new(
             &dir,
-            self.segment_size,
+            self.segment_size_bytes,
             self.bucket_ids.clone(),
             writer_threads,
             self.sync_interval,
@@ -588,8 +588,15 @@ impl DatabaseBuilder {
         })
     }
 
-    pub fn segment_size(&mut self, n: usize) -> &mut Self {
-        self.segment_size = n;
+    pub fn segment_size_bytes(&mut self, n: usize) -> &mut Self {
+        // This minimum is somewhat arbitrary, but it ensures our cache is actually used
+        // and segment sizes shouldn't be this small anyway
+        assert!(
+            n >= BLOCK_SIZE * 2,
+            "segment size must be at least {} bytes",
+            BLOCK_SIZE * 2
+        );
+        self.segment_size_bytes = n;
         self
     }
 
@@ -928,7 +935,7 @@ mod tests {
         let temp_dir = tempdir().expect("Failed to create temp directory");
 
         let db = DatabaseBuilder::new()
-            .segment_size(1_000_000)
+            .segment_size_bytes(1_000_000)
             .total_buckets(32)
             .bucket_ids_from_range(0..32)
             .reader_threads(4)

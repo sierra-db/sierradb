@@ -264,7 +264,7 @@ impl TestState {
     async fn new(init_args: InitArgs) -> Self {
         let temp_dir = tempfile::tempdir().unwrap();
         let database = DatabaseBuilder::new()
-            .segment_size(init_args.segment_size)
+            .segment_size_bytes(init_args.segment_size)
             .total_buckets(init_args.total_buckets)
             .bucket_ids_from_range(0..init_args.total_buckets)
             .writer_threads(init_args.writer_threads)
@@ -284,7 +284,7 @@ impl TestState {
 
     async fn reopen_database(&mut self) {
         self.database = DatabaseBuilder::new()
-            .segment_size(self.init_args.segment_size)
+            .segment_size_bytes(self.init_args.segment_size)
             .total_buckets(self.init_args.total_buckets)
             .bucket_ids_from_range(0..self.init_args.total_buckets)
             .writer_threads(self.init_args.writer_threads)
