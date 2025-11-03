@@ -88,10 +88,10 @@ mod tests {
 
     /// Create a test database with configurable segment size for forcing
     /// multiple segments
-    async fn create_test_database(segment_size: usize) -> Database {
+    async fn create_test_database(segment_size_bytes: usize) -> Database {
         let dir = temp_dir();
         DatabaseBuilder::new()
-            .segment_size(segment_size)
+            .segment_size_bytes(segment_size_bytes)
             .total_buckets(1) // Use single bucket for predictable testing
             .bucket_ids(Arc::from(vec![0])) // Single bucket with ID 0
             .reader_threads(1)
