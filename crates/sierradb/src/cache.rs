@@ -1,7 +1,9 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use moka::sync::Cache;
 use tokio::sync::oneshot;
+use tracing::trace;
 
 use crate::bucket::segment::SegmentBlock;
 use crate::bucket::{BucketId, SegmentId};
@@ -10,6 +12,10 @@ use crate::reader_thread_pool::ReaderThreadPool;
 
 const KB: usize = 1024;
 pub const BLOCK_SIZE: usize = KB * 64;
+
+static CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+static BLOCKS_EVICTED: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
 pub struct SegmentBlockCache {
@@ -21,10 +27,30 @@ pub struct SegmentBlockCache {
 }
 
 impl SegmentBlockCache {
+    #[inline]
+    pub fn cache_hits() -> u64 {
+        CACHE_HITS.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn cache_misses() -> u64 {
+        CACHE_MISSES.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn blocks_evicted() -> u64 {
+        BLOCKS_EVICTED.load(Ordering::Relaxed)
+    }
+
     pub fn new(bucket_id: BucketId, capacity: usize, reader_pool: ReaderThreadPool) -> Self {
         Self {
             bucket_id,
-            cache: Cache::new(capacity.try_into().unwrap()),
+            cache: Cache::builder()
+                .max_capacity(capacity.try_into().unwrap())
+                .eviction_listener(|_key, _val, _cause| {
+                    BLOCKS_EVICTED.fetch_add(1, Ordering::Relaxed);
+                })
+                .build(),
             reader_pool,
         }
     }
@@ -53,10 +79,12 @@ impl SegmentBlockCache {
         let key = (segment_id, block_offset);
 
         if let Some(block) = self.cache.get(&key) {
+            CACHE_HITS.fetch_add(1, Ordering::Relaxed);
             return Ok(Some(block));
         }
 
         // Cache miss - read from disk
+        CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
         let bucket_id = self.bucket_id;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.reader_pool.spawn(move |with_readers| {
@@ -79,6 +107,7 @@ impl SegmentBlockCache {
                     }
                     Ok(None) => {
                         // Block not fully flushed yet
+                        trace!("could not read block as it was not fully flushed yet");
                         let _ = reply_tx.send(Ok(None));
                     }
                     Err(err) => {

@@ -13,7 +13,7 @@ use bincode::error::DecodeError;
 use polonius_the_crab::{exit_polonius, polonius, polonius_return, polonius_try};
 use serde::{Deserialize, Serialize};
 use smallvec::{SmallVec, smallvec};
-use tracing::warn;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::{
@@ -578,6 +578,7 @@ impl BucketSegmentReader {
 
         if block_end > flushed {
             // Block not fully flushed - not an error, just not ready yet
+            debug!("block end is {block_end}, but only flushed up to {flushed}");
             return Ok(None);
         }
 
