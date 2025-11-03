@@ -32,7 +32,11 @@ jobs:
       - name: Build
         run: cargo build --verbose
       - name: Run tests
-        run: cargo test --verbose
+        run: |
+          echo "Setting ulimit..."
+          ulimit -n 65535
+          echo "ulimit after change: $(ulimit -n)"
+          cargo test --verbose
   
   fmt:
     name: Format
