@@ -811,6 +811,7 @@ mod tests {
     async fn create_temp_db() -> (TempDir, Database) {
         let temp_dir = tempdir().expect("Failed to create temp directory");
         let db = DatabaseBuilder::new()
+            .segment_size_bytes(1024 * 128)
             .total_buckets(4)
             .bucket_ids_from_range(0..4)
             .open(temp_dir.path())
