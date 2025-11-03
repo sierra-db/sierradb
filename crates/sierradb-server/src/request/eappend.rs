@@ -1,8 +1,8 @@
-use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use combine::error::StreamError;
 use combine::{Parser, attempt, choice, easy, many};
+use indexmap::indexmap;
 use redis_protocol::resp3::types::BytesFrame;
 use sierradb::StreamId;
 use sierradb::bucket::PartitionId;
@@ -255,28 +255,13 @@ pub struct EAppendResp {
 
 impl From<EAppendResp> for BytesFrame {
     fn from(resp: EAppendResp) -> Self {
-        map(HashMap::from_iter([
-            (
-                simple_str("event_id"),
-                simple_str(resp.event_id.to_string()),
-            ),
-            (
-                simple_str("partition_key"),
-                simple_str(resp.partition_key.to_string()),
-            ),
-            (simple_str("partition_id"), number(resp.partition_id as i64)),
-            (
-                simple_str("partition_sequence"),
-                number(resp.partition_sequence as i64),
-            ),
-            (
-                simple_str("stream_version"),
-                number(resp.stream_version as i64),
-            ),
-            (
-                simple_str("timestamp"),
-                number((resp.timestamp / 1_000_000) as i64),
-            ),
-        ]))
+        map(indexmap! {
+            simple_str("event_id") => simple_str(resp.event_id.to_string()),
+            simple_str("partition_key") => simple_str(resp.partition_key.to_string()),
+            simple_str("partition_id") => number(resp.partition_id as i64),
+            simple_str("partition_sequence") => number(resp.partition_sequence as i64),
+            simple_str("stream_version") => number(resp.stream_version as i64),
+            simple_str("timestamp") => number((resp.timestamp / 1_000_000) as i64),
+        })
     }
 }

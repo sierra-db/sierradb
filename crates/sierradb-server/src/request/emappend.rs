@@ -1,8 +1,8 @@
-use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use combine::error::StreamError;
 use combine::{Parser, attempt, choice, easy, many, many1};
+use indexmap::indexmap;
 use redis_protocol::resp3::types::BytesFrame;
 use sierradb::StreamId;
 use sierradb::bucket::PartitionId;
@@ -275,47 +275,23 @@ struct EventInfo {
 
 impl From<EMAppendResp> for BytesFrame {
     fn from(resp: EMAppendResp) -> Self {
-        map(HashMap::from_iter([
-            (
-                simple_str("partition_key"),
-                simple_str(resp.partition_key.to_string()),
-            ),
-            (simple_str("partition_id"), number(resp.partition_id as i64)),
-            (
-                simple_str("first_partition_sequence"),
-                number(resp.first_partition_sequence as i64),
-            ),
-            (
-                simple_str("last_partition_sequence"),
-                number(resp.last_partition_sequence as i64),
-            ),
-            (
-                simple_str("events"),
-                array(resp.events.into_iter().map(BytesFrame::from).collect()),
-            ),
-        ]))
+        map(indexmap! {
+            simple_str("partition_key") => simple_str(resp.partition_key.to_string()),
+            simple_str("partition_id") => number(resp.partition_id as i64),
+            simple_str("first_partition_sequence") => number(resp.first_partition_sequence as i64),
+            simple_str("last_partition_sequence") => number(resp.last_partition_sequence as i64),
+            simple_str("events") => array(resp.events.into_iter().map(BytesFrame::from).collect()),
+        })
     }
 }
 
 impl From<EventInfo> for BytesFrame {
     fn from(info: EventInfo) -> Self {
-        map(HashMap::from_iter([
-            (
-                simple_str("event_id"),
-                simple_str(info.event_id.to_string()),
-            ),
-            (
-                simple_str("stream_id"),
-                simple_str(info.stream_id.to_string()),
-            ),
-            (
-                simple_str("stream_version"),
-                number(info.stream_version as i64),
-            ),
-            (
-                simple_str("timestamp"),
-                number((info.timestamp / 1_000_000) as i64),
-            ),
-        ]))
+        map(indexmap! {
+            simple_str("event_id") => simple_str(info.event_id.to_string()),
+            simple_str("stream_id") => simple_str(info.stream_id.to_string()),
+            simple_str("stream_version") => number(info.stream_version as i64),
+            simple_str("timestamp") => number((info.timestamp / 1_000_000) as i64),
+        })
     }
 }

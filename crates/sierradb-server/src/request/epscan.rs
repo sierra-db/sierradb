@@ -1,7 +1,6 @@
-use std::collections::HashMap;
-
 use combine::error::StreamError;
 use combine::{Parser, easy, many};
+use indexmap::indexmap;
 use redis_protocol::resp3::types::BytesFrame;
 use sierradb::bucket::segment::EventRecord;
 use sierradb_cluster::read::ReadPartition;
@@ -129,12 +128,9 @@ pub struct EPScanResp {
 
 impl From<EPScanResp> for BytesFrame {
     fn from(resp: EPScanResp) -> Self {
-        map(HashMap::from_iter([
-            (simple_str("has_more"), resp.has_more.into()),
-            (
-                simple_str("events"),
-                array(resp.events.into_iter().map(encode_event).collect()),
-            ),
-        ]))
+        map(indexmap! {
+            simple_str("has_more") => resp.has_more.into(),
+            simple_str("events") => array(resp.events.into_iter().map(encode_event).collect()),
+        })
     }
 }
