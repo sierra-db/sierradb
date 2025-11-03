@@ -672,22 +672,24 @@ impl Subscription {
             .database
             .read_stream(partition_id, stream_id, *from_version, false)
             .await?;
-        while let Some(commit) = iter.next().await? {
-            let Some(first_partition_sequence) = commit.first_partition_sequence() else {
-                continue;
-            };
+        while let Some(commits) = iter.next_batch(50).await? {
+            for commit in commits {
+                let Some(first_partition_sequence) = commit.first_partition_sequence() else {
+                    continue;
+                };
 
-            if !watermark.can_read(first_partition_sequence) {
-                break;
-            }
+                if !watermark.can_read(first_partition_sequence) {
+                    break;
+                }
 
-            for event in commit {
-                debug_assert!(watermark.can_read(event.partition_sequence));
+                for event in commit {
+                    debug_assert!(watermark.can_read(event.partition_sequence));
 
-                let version = event.stream_version;
-                self.send_record(event).await?;
+                    let version = event.stream_version;
+                    self.send_record(event).await?;
 
-                *from_version = version + 1;
+                    *from_version = version + 1;
+                }
             }
         }
 

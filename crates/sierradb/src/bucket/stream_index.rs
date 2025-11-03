@@ -394,6 +394,7 @@ mod tests {
 
         let mut collected_events = Vec::new();
         while let Some(committed_events) = stream_iter.next().await.expect("read err") {
+            assert!(!committed_events.is_empty());
             match committed_events {
                 CommittedEvents::Single(event) => {
                     collected_events.push(event.stream_version);
@@ -440,6 +441,7 @@ mod tests {
 
         let mut collected_events = Vec::new();
         while let Some(committed_events) = stream_iter.next().await.expect("read err") {
+            assert!(!committed_events.is_empty());
             match committed_events {
                 CommittedEvents::Single(event) => {
                     if event.stream_id.as_ref() == stream_id {
@@ -487,12 +489,8 @@ mod tests {
         let mut all_events = Vec::new();
         let batch_size = 5;
 
-        loop {
-            let batch = stream_iter.next_batch(batch_size).await.expect("read err");
-            if batch.is_empty() {
-                break;
-            }
-
+        while let Some(batch) = stream_iter.next_batch(batch_size).await.expect("read err") {
+            assert!(!batch.is_empty());
             for committed_events in batch {
                 match committed_events {
                     CommittedEvents::Single(event) => {
@@ -541,6 +539,7 @@ mod tests {
 
         let mut collected_events = Vec::new();
         while let Some(committed_events) = stream_iter.next().await.expect("read err") {
+            assert!(!committed_events.is_empty());
             match committed_events {
                 CommittedEvents::Single(event) => {
                     collected_events.push(event.stream_version);
@@ -592,6 +591,7 @@ mod tests {
 
         let mut collected_events = Vec::new();
         while let Some(committed_events) = stream_iter.next().await.expect("read err") {
+            assert!(!committed_events.is_empty());
             match committed_events {
                 CommittedEvents::Single(event) => {
                     collected_events.push(event.stream_version);
@@ -643,6 +643,7 @@ mod tests {
         let mut single_event_count = 0;
 
         while let Some(committed_events) = stream_iter.next().await.expect("read err") {
+            assert!(!committed_events.is_empty());
             match committed_events {
                 CommittedEvents::Single(event) => {
                     single_event_count += 1;
@@ -710,6 +711,7 @@ mod tests {
 
         let mut collected_events = Vec::new();
         while let Some(committed_events) = stream_iter.next().await.expect("read err") {
+            assert!(!committed_events.is_empty());
             match committed_events {
                 CommittedEvents::Single(event) => {
                     collected_events.push(event.stream_version);
@@ -762,6 +764,7 @@ mod tests {
 
         let mut collected_events = Vec::new();
         while let Some(committed_events) = stream_iter.next().await.expect("read err") {
+            assert!(!committed_events.is_empty());
             match committed_events {
                 CommittedEvents::Single(event) => {
                     collected_events.push(event.stream_version);
@@ -813,6 +816,7 @@ mod tests {
 
         let mut collected_events = Vec::new();
         while let Some(committed_events) = stream_iter.next().await.expect("read err") {
+            assert!(!committed_events.is_empty());
             match committed_events {
                 CommittedEvents::Single(event) => {
                     collected_events.push(event.stream_version);
@@ -859,6 +863,7 @@ mod tests {
 
         let mut collected_events = Vec::new();
         while let Some(committed_events) = stream_iter.next().await.expect("read err") {
+            assert!(!committed_events.is_empty());
             match committed_events {
                 CommittedEvents::Single(event) => {
                     collected_events.push(event.stream_version);
@@ -929,6 +934,7 @@ mod tests {
 
         let mut collected_events = Vec::new();
         while let Some(committed_events) = stream_iter.next().await.expect("read err") {
+            assert!(!committed_events.is_empty());
             match committed_events {
                 CommittedEvents::Single(event) => {
                     collected_events.push(event.stream_version);
@@ -976,6 +982,7 @@ mod tests {
 
         let mut single_read_events = Vec::new();
         while let Some(committed_events) = stream_iter1.next().await.expect("read err") {
+            assert!(!committed_events.is_empty());
             match committed_events {
                 CommittedEvents::Single(event) => {
                     single_read_events.push(event.stream_version);
@@ -997,12 +1004,8 @@ mod tests {
             .expect("failed to create stream iterator");
 
         let mut batch_read_events = Vec::new();
-        loop {
-            let batch = stream_iter2.next_batch(5).await.expect("read err");
-            if batch.is_empty() {
-                break;
-            }
-
+        while let Some(batch) = stream_iter2.next_batch(5).await.expect("read err") {
+            assert!(!batch.is_empty());
             for committed_events in batch {
                 match committed_events {
                     CommittedEvents::Single(event) => {
@@ -1045,6 +1048,7 @@ mod tests {
 
         let mut first_pass_events = Vec::new();
         while let Some(committed_events) = stream_iter1.next().await.expect("read err") {
+            assert!(!committed_events.is_empty());
             match committed_events {
                 CommittedEvents::Single(event) => {
                     first_pass_events.push(event.stream_version);
@@ -1067,6 +1071,7 @@ mod tests {
 
         let mut second_pass_events = Vec::new();
         while let Some(committed_events) = stream_iter2.next().await.expect("read err") {
+            assert!(!committed_events.is_empty());
             match committed_events {
                 CommittedEvents::Single(event) => {
                     second_pass_events.push(event.stream_version);
@@ -1148,7 +1153,7 @@ mod tests {
 
         // Test batch reading on empty stream
         let batch = stream_iter.next_batch(10).await.expect("read err");
-        assert!(batch.is_empty(), "empty stream should return empty batch");
+        assert!(batch.is_none(), "empty stream should return empty batch");
     }
 
     #[tokio::test]
@@ -1221,6 +1226,7 @@ mod tests {
 
         // Continue reading
         while let Some(committed_events) = stream_iter.next().await.expect("read err") {
+            assert!(!committed_events.is_empty());
             match committed_events {
                 CommittedEvents::Single(event) => {
                     collected_events.push(event.stream_version);
@@ -1275,7 +1281,11 @@ mod tests {
             .expect("failed to create stream iterator");
 
         // Request more events than available
-        let batch = stream_iter.next_batch(100).await.expect("read err");
+        let batch = stream_iter
+            .next_batch(100)
+            .await
+            .expect("read err")
+            .expect("not empty batch");
 
         let mut collected_events = Vec::new();
         for committed_events in batch {
@@ -1301,7 +1311,7 @@ mod tests {
 
         // Subsequent batch should be empty
         let empty_batch = stream_iter.next_batch(10).await.expect("read err");
-        assert!(empty_batch.is_empty());
+        assert!(empty_batch.is_none());
     }
 
     #[tokio::test]
@@ -1329,6 +1339,7 @@ mod tests {
 
         let mut collected_events = Vec::new();
         while let Some(committed_events) = stream_iter.next().await.expect("read err") {
+            assert!(!committed_events.is_empty());
             match committed_events {
                 CommittedEvents::Single(event) => {
                     collected_events.push(event.stream_version);
@@ -1384,6 +1395,7 @@ mod tests {
 
         let mut collected_events = Vec::new();
         while let Some(committed_events) = stream_iter.next().await.expect("read err") {
+            assert!(!committed_events.is_empty());
             match committed_events {
                 CommittedEvents::Single(event) => {
                     if event.stream_id.as_ref() == stream_id {
@@ -1438,6 +1450,7 @@ mod tests {
 
         let mut collected_events = Vec::new();
         while let Some(committed_events) = stream_iter.next().await.expect("read err") {
+            assert!(!committed_events.is_empty());
             match committed_events {
                 CommittedEvents::Single(event) => {
                     collected_events.push(event.stream_version);
@@ -1490,12 +1503,8 @@ mod tests {
         let mut all_events = Vec::new();
         let batch_size = 5;
 
-        loop {
-            let batch = stream_iter.next_batch(batch_size).await.expect("read err");
-            if batch.is_empty() {
-                break;
-            }
-
+        while let Some(batch) = stream_iter.next_batch(batch_size).await.expect("read err") {
+            assert!(!batch.is_empty());
             for committed_events in batch {
                 match committed_events {
                     CommittedEvents::Single(event) => {
@@ -1557,6 +1566,7 @@ mod tests {
         let mut unique_events = HashSet::new();
 
         while let Some(committed_events) = stream_iter.next().await.expect("read err") {
+            assert!(!committed_events.is_empty());
             match committed_events {
                 CommittedEvents::Single(event) => {
                     if unique_events.insert(event.stream_version) {
@@ -1622,6 +1632,7 @@ mod tests {
 
         let mut collected_events = Vec::new();
         while let Some(committed_events) = stream_iter.next().await.expect("read err") {
+            assert!(!committed_events.is_empty());
             match committed_events {
                 CommittedEvents::Single(event) => {
                     collected_events.push(event.stream_version);
@@ -1693,6 +1704,7 @@ mod tests {
 
         let mut collected_events = Vec::new();
         while let Some(committed_events) = stream_iter.next().await.expect("read err") {
+            assert!(!committed_events.is_empty());
             match committed_events {
                 CommittedEvents::Single(event) => {
                     collected_events.push(event.stream_version);
@@ -1752,6 +1764,7 @@ mod tests {
 
         let mut single_read_events = Vec::new();
         while let Some(committed_events) = stream_iter1.next().await.expect("read err") {
+            assert!(!committed_events.is_empty());
             match committed_events {
                 CommittedEvents::Single(event) => {
                     single_read_events.push(event.stream_version);
@@ -1778,12 +1791,8 @@ mod tests {
             .expect("failed to create reverse stream iterator");
 
         let mut batch_read_events = Vec::new();
-        loop {
-            let batch = stream_iter2.next_batch(5).await.expect("read err");
-            if batch.is_empty() {
-                break;
-            }
-
+        while let Some(batch) = stream_iter2.next_batch(5).await.expect("read err") {
+            assert!(!batch.is_empty());
             for committed_events in batch {
                 match committed_events {
                     CommittedEvents::Single(event) => {
@@ -1834,7 +1843,7 @@ mod tests {
         // Test batch reading on empty stream in reverse
         let batch = stream_iter.next_batch(10).await.expect("read err");
         assert!(
-            batch.is_empty(),
+            batch.is_none(),
             "empty stream should return empty batch in reverse"
         );
     }
@@ -1861,6 +1870,7 @@ mod tests {
 
         let mut collected_events = Vec::new();
         while let Some(committed_events) = stream_iter.next().await.expect("read err") {
+            assert!(!committed_events.is_empty());
             match committed_events {
                 CommittedEvents::Single(event) => {
                     collected_events.push(event.stream_version);
@@ -1913,7 +1923,11 @@ mod tests {
             .expect("failed to create reverse stream iterator");
 
         // Request more events than available
-        let batch = stream_iter.next_batch(100).await.expect("read err");
+        let batch = stream_iter
+            .next_batch(100)
+            .await
+            .expect("read err")
+            .expect("non empty batch");
 
         let mut collected_events = Vec::new();
         for committed_events in batch {
@@ -1940,7 +1954,7 @@ mod tests {
 
         // Subsequent batch should be empty
         let empty_batch = stream_iter.next_batch(10).await.expect("read err");
-        assert!(empty_batch.is_empty());
+        assert!(empty_batch.is_none());
     }
 
     #[tokio::test]
@@ -1969,6 +1983,7 @@ mod tests {
 
         let mut first_pass_events = Vec::new();
         while let Some(committed_events) = stream_iter1.next().await.expect("read err") {
+            assert!(!committed_events.is_empty());
             match committed_events {
                 CommittedEvents::Single(event) => {
                     first_pass_events.push(event.stream_version);
@@ -1996,6 +2011,7 @@ mod tests {
 
         let mut second_pass_events = Vec::new();
         while let Some(committed_events) = stream_iter2.next().await.expect("read err") {
+            assert!(!committed_events.is_empty());
             match committed_events {
                 CommittedEvents::Single(event) => {
                     second_pass_events.push(event.stream_version);
@@ -2053,6 +2069,7 @@ mod tests {
 
         let mut collected_events = Vec::new();
         while let Some(committed_events) = stream_iter.next().await.expect("read err") {
+            assert!(!committed_events.is_empty());
             match committed_events {
                 CommittedEvents::Single(event) => {
                     collected_events.push(event.stream_version);

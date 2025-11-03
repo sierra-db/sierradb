@@ -64,8 +64,6 @@ impl StreamIter {
         // Check live indexes first
         if let Some((segment_id, index)) = live_indexes.get(&bucket_id) {
             let segment_id = segment_id.load(Ordering::Acquire);
-            // For reverse iteration, min_segment_id acts as max_segment_id (<=)
-            // For forward iteration, min_segment_id acts as min_segment_id (>=)
             let matches = if reverse {
                 segment_id <= next_segment_id
             } else {
@@ -150,7 +148,6 @@ impl StreamIter {
                         // backwards
                         segments.iter_mut().enumerate().rev().find_map(
                             |(i, (segment_id, reader_set)): (usize, (&u32, &mut ReaderSet))| {
-                                // For reverse iteration, min_segment_id acts as max_segment_id
                                 if *segment_id > next_segment_id {
                                     return None;
                                 }
@@ -308,84 +305,83 @@ impl StreamIter {
     pub fn next_batch(
         &mut self,
         limit: usize,
-    ) -> BoxFuture<'_, Result<Vec<CommittedEvents>, StreamIndexError>> {
+    ) -> BoxFuture<'_, Result<Option<Vec<CommittedEvents>>, StreamIndexError>> {
         async move {
             if let Some(batch_back) = self.batch.back() {
-                self.last_version = if self.reverse {
-                    batch_back
-                        .first_stream_version()
-                        .map(|v| v.saturating_sub(1))
-                        .unwrap_or(self.last_version)
-                } else {
-                    batch_back
-                        .last_stream_version()
-                        .map(|v| v + 1)
-                        .unwrap_or(self.last_version)
-                };
-                return Ok(mem::take(&mut self.batch).into());
+                self.last_version = batch_back
+                    .last_stream_version()
+                    .map(|v| {
+                        if self.reverse {
+                            v.saturating_sub(1)
+                        } else {
+                            v + 1
+                        }
+                    })
+                    .unwrap_or(self.last_version);
+                return Ok(Some(mem::take(&mut self.batch).into()));
             }
 
             let Some(segment_iter) = &mut self.segment_iter else {
-                return Ok(Vec::new());
+                return Ok(None);
             };
 
             let commits = segment_iter.next(limit).await?;
 
-            if commits.is_empty()
-                && segment_iter.is_finished()
-                && (!self.is_live || self.has_next_segment)
-            {
-                // Rollover to next segment
-                let segment_iter = self.segment_iter.take().unwrap();
-                let current_segment_id = segment_iter.bucket_segment_id.segment_id;
+            if commits.is_empty() {
+                if segment_iter.is_finished() && (!self.is_live || self.has_next_segment) {
+                    // Rollover to next segment
+                    let segment_iter = self.segment_iter.take().unwrap();
+                    let current_segment_id = segment_iter.bucket_segment_id.segment_id;
 
-                // For reverse iteration, stop if we've reached segment 0
-                if self.reverse && current_segment_id == 0 {
-                    return Ok(Vec::new());
+                    // For reverse iteration, stop if we've reached segment 0
+                    if self.reverse && current_segment_id == 0 {
+                        return Ok(None);
+                    }
+
+                    let next_segment_id = if self.reverse {
+                        // For reverse iteration, go to previous (lower numbered) segment
+                        current_segment_id.saturating_sub(1)
+                    } else {
+                        // For forward iteration, go to next (higher numbered) segment
+                        current_segment_id + 1
+                    };
+
+                    let from_version = self.last_version;
+
+                    let min_segment_id = next_segment_id;
+
+                    *self = Self::new_inner(
+                        segment_iter.stream_id,
+                        segment_iter.bucket_segment_id.bucket_id,
+                        from_version,
+                        segment_iter.reader_pool,
+                        self.live_indexes.clone(),
+                        self.reverse,
+                        min_segment_id,
+                        self.has_next_segment,
+                    )
+                    .await?;
+
+                    return self.next_batch(limit).await;
                 }
 
-                let next_segment_id = if self.reverse {
-                    // For reverse iteration, go to previous (lower numbered) segment
-                    current_segment_id.saturating_sub(1)
-                } else {
-                    // For forward iteration, go to next (higher numbered) segment
-                    current_segment_id + 1
-                };
-
-                let from_version = self.last_version;
-
-                let min_segment_id = next_segment_id;
-
-                *self = Self::new_inner(
-                    segment_iter.stream_id,
-                    segment_iter.bucket_segment_id.bucket_id,
-                    from_version,
-                    segment_iter.reader_pool,
-                    self.live_indexes.clone(),
-                    self.reverse,
-                    min_segment_id,
-                    self.has_next_segment,
-                )
-                .await?;
-
-                return self.next_batch(limit).await;
+                return Ok(None);
             } else {
-                self.last_version = if self.reverse {
-                    commits
-                        .last()
-                        .and_then(|commit| {
-                            commit.first_stream_version().map(|v| v.saturating_sub(1))
+                self.last_version = commits
+                    .last()
+                    .and_then(|commit| {
+                        commit.last_stream_version().map(|v| {
+                            if self.reverse {
+                                v.saturating_sub(1)
+                            } else {
+                                v + 1
+                            }
                         })
-                        .unwrap_or(self.last_version)
-                } else {
-                    commits
-                        .last()
-                        .and_then(|commit| commit.last_stream_version().map(|v| v + 1))
-                        .unwrap_or(self.last_version)
-                };
+                    })
+                    .unwrap_or(self.last_version);
             }
 
-            Ok(commits)
+            Ok(Some(commits))
         }
         .boxed()
     }
@@ -394,7 +390,9 @@ impl StreamIter {
     /// Reads a single event by calling next_batch(1).
     pub async fn next(&mut self) -> Result<Option<CommittedEvents>, StreamIndexError> {
         if self.batch.is_empty() {
-            let batch = self.next_batch(10).await?;
+            let Some(batch) = self.next_batch(50).await? else {
+                return Ok(None);
+            };
             self.batch = batch.into_iter().collect();
         }
 
