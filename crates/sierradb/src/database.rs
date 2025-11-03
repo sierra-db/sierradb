@@ -262,6 +262,7 @@ impl Database {
             from_version,
             self.reader_pool.clone(),
             self.writer_pool.indexes().clone(),
+            reverse,
         )
         .await
     }

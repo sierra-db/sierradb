@@ -281,6 +281,24 @@ impl CommittedEvents {
         }
     }
 
+    pub fn first_stream_version(&self) -> Option<u64> {
+        match self {
+            CommittedEvents::Single(event) => Some(event.stream_version),
+            CommittedEvents::Transaction { events, .. } => {
+                events.first().map(|event| event.stream_version)
+            }
+        }
+    }
+
+    pub fn last_stream_version(&self) -> Option<u64> {
+        match self {
+            CommittedEvents::Single(event) => Some(event.stream_version),
+            CommittedEvents::Transaction { events, .. } => {
+                events.last().map(|event| event.stream_version)
+            }
+        }
+    }
+
     pub fn first(&self) -> Option<&EventRecord> {
         match self {
             CommittedEvents::Single(event) => Some(event),
