@@ -10,6 +10,7 @@ use directories::ProjectDirs;
 use libp2p::Multiaddr;
 use serde::Deserialize;
 use sierradb::bucket::{BucketId, PartitionId};
+use sierradb::cache::BLOCK_SIZE;
 use thiserror::Error;
 
 /// A distributed, partitioned event store with configurable replication
@@ -52,6 +53,7 @@ pub struct Args {
 #[derive(Debug, Deserialize)]
 pub struct AppConfig {
     pub bucket: BucketConfig,
+    pub cache: CacheConfig,
     pub dir: PathBuf,
     pub heartbeat: HeartbeatConfig,
     pub network: NetworkConfig,
@@ -72,6 +74,11 @@ pub struct AppConfig {
 pub struct BucketConfig {
     pub count: u16,
     pub ids: Option<Vec<BucketId>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CacheConfig {
+    pub capacity_bytes: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,6 +181,7 @@ impl AppConfig {
         builder = builder
             .set_default("mdns", false)?
             .set_default("bucket.count", 4)?
+            .set_default("cache.capacity_bytes", 256 * 1024 * 1024)?
             .set_default("heartbeat.interval_ms", 1000)?
             .set_default("heartbeat.timeout_ms", 6000)?
             .set_default("network.cluster_enabled", true)?
@@ -357,7 +365,7 @@ impl AppConfig {
         if self.segment.size_bytes == 0 {
             errs.push(ValidationError::SegmentSizeZero);
         }
-        const MIN_SEGMENT_SIZE: usize = 1024; // 1KB
+        const MIN_SEGMENT_SIZE: usize = BLOCK_SIZE * 2; // 128KB
         const MAX_SEGMENT_SIZE: usize = 1024 * 1024 * 1024 * 10; // 10GB
         if self.segment.size_bytes < MIN_SEGMENT_SIZE {
             errs.push(ValidationError::SegmentSizeTooSmall {
@@ -481,6 +489,8 @@ impl fmt::Display for AppConfig {
             )?,
             None => writeln!(f, "bucket.ids = <none>")?,
         }
+
+        writeln!(f, "cache.capacity_bytes = {}", self.cache.capacity_bytes)?;
 
         writeln!(f, "dir = {}", self.dir.to_string_lossy())?;
         writeln!(f, "mdns = {}", self.mdns)?;

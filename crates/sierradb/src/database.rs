@@ -357,7 +357,7 @@ pub struct DatabaseBuilder {
     sync_interval: Duration,
     max_batch_size: usize,
     min_sync_bytes: usize,
-    cache_size: usize,
+    cache_capacity_bytes: usize,
 }
 
 impl DatabaseBuilder {
@@ -375,7 +375,7 @@ impl DatabaseBuilder {
             sync_interval: Duration::from_millis(5),
             max_batch_size: 50,
             min_sync_bytes: 4096,
-            cache_size: 256 * 1024 * 1024,
+            cache_capacity_bytes: 256 * 1024 * 1024,
         }
     }
 
@@ -440,7 +440,7 @@ impl DatabaseBuilder {
         let reader_pool = ReaderThreadPool::new(
             self.reader_threads as usize,
             &self.bucket_ids,
-            self.cache_size,
+            self.cache_capacity_bytes,
         );
         let writer_pool = WriterThreadPool::new(
             &dir,
@@ -575,7 +575,9 @@ impl DatabaseBuilder {
                 .map(|path| ClosedPartitionIndex::open(bucket_segment_id, path))
                 .transpose()?;
             let stream_index = stream_index
-                .map(|path| ClosedStreamIndex::open(bucket_segment_id, path, self.segment_size))
+                .map(|path| {
+                    ClosedStreamIndex::open(bucket_segment_id, path, self.segment_size_bytes)
+                })
                 .transpose()?;
 
             reader_pool.add_bucket_segment(
@@ -657,8 +659,8 @@ impl DatabaseBuilder {
         self
     }
 
-    pub fn cache_size(mut self, bytes: usize) -> Self {
-        self.cache_size = bytes;
+    pub fn cache_capacity_bytes(&mut self, bytes: usize) -> &mut Self {
+        self.cache_capacity_bytes = bytes;
         self
     }
 }
