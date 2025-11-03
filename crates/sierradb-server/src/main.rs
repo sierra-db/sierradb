@@ -43,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut builder = DatabaseBuilder::new();
     builder
-        .segment_size(config.segment.size_bytes)
+        .segment_size_bytes(config.segment.size_bytes)
         .total_buckets(config.bucket.count)
         .bucket_ids(assigned_buckets.into_iter().collect::<Vec<_>>())
         .sync_interval(Duration::from_millis(config.sync.interval_ms))

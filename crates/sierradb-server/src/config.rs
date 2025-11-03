@@ -191,7 +191,7 @@ impl AppConfig {
             .set_default("replication.buffer_size", 1000)?
             .set_default("replication.buffer_timeout_ms", 8000)?
             .set_default("replication.catchup_timeout_ms", 2000)?
-            .set_default("segment.size_bytes", 256_000_000)?
+            .set_default("segment.size_bytes", 256 * 1024 * 1024)?
             .set_default("sync.interval_ms", 5)?
             .set_default("sync.max_batch_size", 50)?
             .set_default("sync.min_bytes", 4096)?;

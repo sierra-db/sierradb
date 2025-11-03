@@ -7,7 +7,7 @@ use uuid::Uuid;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = std::fs::remove_dir_all("./target/db-debug");
     let db = DatabaseBuilder::new()
-        .segment_size(33304748)
+        .segment_size_bytes(33304748)
         .total_buckets(64)
         .bucket_ids_from_range(0..64)
         .writer_threads(8)

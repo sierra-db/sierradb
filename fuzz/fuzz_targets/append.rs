@@ -37,7 +37,7 @@ fn init() -> (&'static Runtime, &'static Database) {
         // Create the database using the runtime
         let db = runtime.block_on(async {
             DatabaseBuilder::new()
-                .segment_size(64 * 1024 * 1024)
+                .segment_size_bytes(64 * 1024 * 1024)
                 .total_buckets(TOTAL_BUCKETS)
                 .bucket_ids_from_range(0..TOTAL_BUCKETS)
                 .writer_threads(TOTAL_BUCKETS)

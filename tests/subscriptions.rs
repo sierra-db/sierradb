@@ -24,7 +24,6 @@ use uuid::Uuid;
 async fn test_subscriptions() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let database = DatabaseBuilder::new()
-        .segment_size(256_000_000)
         .total_buckets(4)
         .bucket_ids_from_range(0..4)
         .open(dir.path())?;
@@ -169,7 +168,7 @@ async fn test_subscriptions() -> Result<(), Box<dyn std::error::Error>> {
 
         let dir = tempfile::tempdir()?;
         let database = DatabaseBuilder::new()
-            .segment_size(256_000_000)
+            .segment_size_bytes(256_000_000)
             .total_buckets(4)
             .bucket_ids_from_range(0..4)
             .open(dir.path())?;

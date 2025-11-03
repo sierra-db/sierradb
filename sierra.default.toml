@@ -24,7 +24,7 @@ count = 1024
 # ids = [0, 1, 2, ...]
 
 [segment]
-size_bytes = 256_000_000
+size_bytes = 268_435_456
 
 [sync]
 interval_ms = 5
