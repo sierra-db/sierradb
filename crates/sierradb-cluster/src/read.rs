@@ -634,48 +634,60 @@ impl ClusterActor {
             let mut events = Vec::new();
             let mut has_more = false;
             let mut events_collected = 0;
+            let mut last_read_version = 0;
 
-            while let Some(commit) = match iter.next().await {
-                Ok(commit) => commit,
+            'iter: while let Some(commits) = match iter
+                .next_batch({
+                    end_version
+                        .map(|end| end.saturating_sub(last_read_version).clamp(1, 50))
+                        .unwrap_or(50) as usize
+                })
+                .await
+            {
+                Ok(commits) => commits,
                 Err(err) => {
                     reply_sender.send(Err(ClusterError::Read(err.to_string())));
                     return;
                 }
             } {
-                for event in commit {
-                    // Check if we've reached the count limit
+                for commit in commits {
+                    for event in commit {
+                        // Check if we've reached the count limit
+                        if events_collected >= count {
+                            has_more = true;
+                            break 'iter;
+                        }
+
+                        // Check if event is beyond watermark (safety check - uses
+                        // partition_sequence)
+                        if event.partition_sequence > watermark {
+                            break 'iter;
+                        }
+
+                        // Check if event is beyond end_version (uses stream_version)
+                        if let Some(end_ver) = end_version
+                            && event.stream_version > end_ver
+                        {
+                            has_more = true;
+                            break;
+                        }
+
+                        last_read_version = event.stream_version;
+                        events.push(event);
+                        events_collected += 1;
+                    }
+
+                    // Break if we hit limits
                     if events_collected >= count {
                         has_more = true;
-                        break;
+                        break 'iter;
                     }
 
-                    // Check if event is beyond watermark (safety check - uses partition_sequence)
-                    if event.partition_sequence > watermark {
-                        break;
-                    }
-
-                    // Check if event is beyond end_version (uses stream_version)
                     if let Some(end_ver) = end_version
-                        && event.stream_version > end_ver
+                        && events.last().map(|e| e.stream_version).unwrap_or(0) >= end_ver
                     {
-                        has_more = true;
-                        break;
+                        break 'iter;
                     }
-
-                    events.push(event);
-                    events_collected += 1;
-                }
-
-                // Break if we hit limits
-                if events_collected >= count {
-                    has_more = true;
-                    break;
-                }
-
-                if let Some(end_ver) = end_version
-                    && events.last().map(|e| e.stream_version).unwrap_or(0) >= end_ver
-                {
-                    break;
                 }
             }
 
@@ -1021,21 +1033,24 @@ impl Message<GetStreamVersion> for ClusterActor {
 
                 ctx.spawn(async move {
                     let mut iter = database
-                        .read_stream(msg.partition_id, msg.stream_id, 0, true)
+                        .read_stream(msg.partition_id, msg.stream_id, u64::MAX, true)
                         .await
                         .map_err(|err| ClusterError::Read(err.to_string()))?;
 
-                    while let Some(commit) = iter
-                        .next()
+                    while let Some(commits) = iter
+                        .next_batch(50)
                         .await
                         .map_err(|err| ClusterError::Read(err.to_string()))?
                     {
-                        for event in commit.into_iter().rev() {
-                            if event.partition_sequence >= watermark {
-                                continue;
-                            }
-
-                            return Ok(Some(event.stream_version));
+                        if let Some(stream_version) = commits
+                            .into_iter()
+                            .flat_map(|commit| commit.into_iter())
+                            .find_map(|event| {
+                                (event.partition_sequence < watermark)
+                                    .then_some(event.stream_version)
+                            })
+                        {
+                            return Ok(Some(stream_version));
                         }
                     }
 

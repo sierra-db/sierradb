@@ -7,6 +7,7 @@ use std::time::SystemTimeError;
 use arc_swap::ArcSwap;
 use rayon::ThreadPoolBuildError;
 use thiserror::Error;
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::StreamId;
@@ -65,6 +66,8 @@ pub enum ReadError {
     Crc32cMismatch { offset: u64 },
     #[error("confirmation count crc32c hash mismatch")]
     ConfirmationCountCrc32cMismatch { offset: u64 },
+    #[error("offset out of bounds of segment block")]
+    OutOfBounds,
     #[error("unknown record type: {0}")]
     UnknownRecordType(u8),
     #[error("no reply from the reader thread")]
@@ -252,4 +255,10 @@ pub enum StreamIdError {
     InvalidLength { input: String, len: usize },
     #[error("stream id cannot contain null bytes")]
     ContainsNullByte,
+}
+
+impl From<oneshot::error::RecvError> for StreamIndexError {
+    fn from(_: oneshot::error::RecvError) -> Self {
+        StreamIndexError::Read(ReadError::NoThreadReply)
+    }
 }

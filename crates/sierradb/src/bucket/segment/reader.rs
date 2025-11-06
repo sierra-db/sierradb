@@ -4,7 +4,7 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::{mem, option, vec};
+use std::{fmt, mem, ops, option, vec};
 
 use bincode::Decode;
 use bincode::de::Decoder;
@@ -13,7 +13,7 @@ use bincode::error::DecodeError;
 use polonius_the_crab::{exit_polonius, polonius, polonius_return, polonius_try};
 use serde::{Deserialize, Serialize};
 use smallvec::{SmallVec, smallvec};
-use tracing::warn;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::{
@@ -24,6 +24,7 @@ use super::{
 };
 use crate::StreamId;
 use crate::bucket::{BucketId, PartitionId};
+use crate::cache::BLOCK_SIZE;
 use crate::error::{ReadError, WriteError};
 use crate::id::{get_uuid_flag, uuid_to_partition_hash};
 
@@ -31,6 +32,212 @@ const HEADER_BUF_SIZE: usize = EVENT_HEADER_SIZE - RECORD_HEADER_SIZE;
 const PAGE_SIZE: usize = 4096; // Usually a page is 4KB on Linux
 const READ_AHEAD_SIZE: usize = 64 * 1024; // 64 KB read ahead buffer
 const READ_BUF_SIZE: usize = PAGE_SIZE - COMMIT_SIZE;
+
+#[derive(Clone)]
+pub struct SegmentBlock {
+    offset: u64,
+    block: [u8; BLOCK_SIZE],
+}
+
+impl SegmentBlock {
+    #[inline]
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    #[inline]
+    pub fn next_segment_block_offset(&self) -> u64 {
+        self.offset + BLOCK_SIZE as u64
+    }
+
+    pub fn read_committed_events(
+        &self,
+        mut offset: u64,
+    ) -> Result<(Option<CommittedEvents>, Option<u64>), ReadError> {
+        let mut events = SmallVec::new();
+        let mut pending_transaction_id = Uuid::nil();
+        loop {
+            let record = self.read_record(offset)?;
+            match record {
+                Some(Record::Event(
+                    event @ EventRecord {
+                        offset: event_offset,
+                        transaction_id,
+                        ..
+                    },
+                )) => {
+                    let next_offset = event_offset + event.size;
+
+                    if get_uuid_flag(&transaction_id) {
+                        // Events with a true transaction id flag are always approved
+                        if events.is_empty() {
+                            // If its the first event we encountered, then return it alone
+                            return Ok((Some(CommittedEvents::Single(event)), Some(next_offset)));
+                        }
+
+                        events.push(event);
+                    } else if transaction_id != pending_transaction_id {
+                        // Unexpected transaction, we'll start a new pending transaction
+                        events = smallvec![event];
+                        pending_transaction_id = transaction_id;
+                    } else {
+                        // Event belongs to the transaction
+                        events.push(event);
+                    }
+
+                    offset = next_offset;
+                }
+                Some(Record::Commit(commit)) => {
+                    let next_offset = commit.offset + COMMIT_SIZE as u64;
+                    if commit.transaction_id == pending_transaction_id && !events.is_empty() {
+                        return Ok((
+                            Some(CommittedEvents::Transaction {
+                                events: Box::new(events),
+                                commit,
+                            }),
+                            Some(next_offset),
+                        ));
+                    }
+
+                    return Ok((None, Some(next_offset)));
+                }
+                None => return Ok((None, None)),
+            }
+        }
+    }
+
+    pub fn read_record(&self, start_offset: u64) -> Result<Option<Record>, ReadError> {
+        if start_offset < self.offset
+            || start_offset + RECORD_HEADER_SIZE as u64 - self.offset > BLOCK_SIZE as u64
+        {
+            return Err(ReadError::OutOfBounds);
+        }
+
+        let mut offset = (start_offset - self.offset) as usize;
+        let header_buf = &self.block[offset..offset + RECORD_HEADER_SIZE];
+        offset += RECORD_HEADER_SIZE;
+
+        if is_truncation_marker(&header_buf[..RECORD_HEADER_SIZE]) {
+            return Ok(None);
+        }
+
+        let (record_header, _) = bincode::decode_from_slice::<RecordHeader, _>(
+            &header_buf[..RECORD_HEADER_SIZE],
+            BINCODE_CONFIG,
+        )?;
+
+        if record_header.record_kind == 0 {
+            self.read_event_body(start_offset, record_header, offset)
+                .map(|event| Some(Record::Event(event)))
+        } else if record_header.record_kind == 1 {
+            if offset + 4 > BLOCK_SIZE {
+                return Err(ReadError::OutOfBounds);
+            }
+
+            let event_count =
+                u32::from_le_bytes(self.block[offset..offset + 4].try_into().unwrap());
+            Ok(Some(Record::Commit(CommitRecord::from_parts(
+                start_offset,
+                record_header,
+                event_count,
+            )?)))
+        } else {
+            Err(ReadError::UnknownRecordType(record_header.record_kind))
+        }
+    }
+
+    fn read_event_body(
+        &self,
+        start_offset: u64,
+        record_header: RecordHeader,
+        mut offset: usize,
+    ) -> Result<EventRecord, ReadError> {
+        let length = EVENT_HEADER_SIZE - RECORD_HEADER_SIZE;
+
+        if offset + length > BLOCK_SIZE {
+            return Err(ReadError::OutOfBounds);
+        }
+
+        let header_buf = &self.block[offset..offset + length];
+        offset += length;
+
+        let (event_header, _) =
+            bincode::decode_from_slice::<EventHeader, _>(header_buf, BINCODE_CONFIG)?;
+
+        let body_len = event_header.body_len();
+
+        if offset + body_len > BLOCK_SIZE {
+            return Err(ReadError::OutOfBounds);
+        }
+
+        let body_buf = &self.block[offset..offset + body_len];
+        let body =
+            bincode::decode_from_slice_with_context(body_buf, BINCODE_CONFIG, &event_header)?.0;
+
+        EventRecord::from_parts(start_offset, record_header, event_header, body)
+    }
+}
+
+impl fmt::Debug for SegmentBlock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SegmentBlock")
+            .field("offset", &self.offset)
+            .field("block", &format_args!("[{BLOCK_SIZE}b]"))
+            .finish()
+    }
+}
+
+impl ops::Deref for SegmentBlock {
+    type Target = [u8; BLOCK_SIZE];
+
+    fn deref(&self) -> &Self::Target {
+        &self.block
+    }
+}
+
+pub struct SegmentBlockIter {
+    reader: SegmentBlock,
+    offset: u64,
+}
+
+impl SegmentBlockIter {
+    pub fn next_committed_events(&mut self) -> Result<Option<CommittedEvents>, ReadError> {
+        loop {
+            match self.reader.read_committed_events(self.offset) {
+                Ok((Some(events), _)) => {
+                    match &events {
+                        CommittedEvents::Single(event) => {
+                            self.offset = event.offset + event.size;
+                        }
+                        CommittedEvents::Transaction { commit, .. } => {
+                            self.offset = commit.offset + COMMIT_SIZE as u64;
+                        }
+                    }
+                    return Ok(Some(events));
+                }
+                Ok((None, Some(next_offset))) => {
+                    self.offset = next_offset;
+                }
+                Ok((None, None)) => return Ok(None),
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    pub fn next_record(&mut self) -> Result<Option<Record>, ReadError> {
+        match self.reader.read_record(self.offset) {
+            Ok(Some(record)) => {
+                self.offset = record.offset() + record.len();
+                Ok(Some(record))
+            }
+            Ok(None) => Ok(None),
+            Err(err) => {
+                warn!("unexpected read error at offset {}: {err}", self.offset);
+                Err(err)
+            }
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommittedEvents {
@@ -70,6 +277,24 @@ impl CommittedEvents {
             CommittedEvents::Single(event) => Some(event.partition_sequence),
             CommittedEvents::Transaction { events, .. } => {
                 events.last().map(|event| event.partition_sequence)
+            }
+        }
+    }
+
+    pub fn first_stream_version(&self) -> Option<u64> {
+        match self {
+            CommittedEvents::Single(event) => Some(event.stream_version),
+            CommittedEvents::Transaction { events, .. } => {
+                events.first().map(|event| event.stream_version)
+            }
+        }
+    }
+
+    pub fn last_stream_version(&self) -> Option<u64> {
+        match self {
+            CommittedEvents::Single(event) => Some(event.stream_version),
+            CommittedEvents::Transaction { events, .. } => {
+                events.last().map(|event| event.stream_version)
             }
         }
     }
@@ -224,6 +449,10 @@ impl BucketSegmentReader {
         })
     }
 
+    pub fn flushed_offset(&self) -> &FlushedOffset {
+        &self.flushed_offset
+    }
+
     /// Reads the segments header.
     pub fn read_segment_header(&mut self) -> Result<BucketSegmentHeader, ReadError> {
         let mut header_bytes = [0u8; VERSION_SIZE + BUCKET_ID_SIZE + CREATED_AT_SIZE];
@@ -283,6 +512,8 @@ impl BucketSegmentReader {
     pub fn prefetch(&self, _offset: u64) {}
 
     /// Validates the segments magic bytes.
+    ///
+    /// TODO: We're not using this... we should use it on startup?
     pub fn validate_magic_bytes(&mut self) -> Result<bool, ReadError> {
         let mut magic_bytes = [0u8; MAGIC_BYTES_SIZE];
 
@@ -332,6 +563,46 @@ impl BucketSegmentReader {
         confirmation_count: u8,
     ) -> Result<(), WriteError> {
         super::set_confirmations(&self.file, offset, transaction_id, confirmation_count)
+    }
+
+    pub fn read_block(&self, offset: u64) -> Result<Option<SegmentBlock>, ReadError> {
+        // Check that the entire block is within the flushed region
+        let block_end = offset.checked_add(BLOCK_SIZE as u64).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("block offset {offset} + size {BLOCK_SIZE} overflows u64"),
+            )
+        })?;
+
+        let flushed = self.flushed_offset.load();
+
+        if block_end > flushed {
+            // Block not fully flushed - not an error, just not ready yet
+            debug!("block end is {block_end}, but only flushed up to {flushed}");
+            return Ok(None);
+        }
+
+        let mut buf = [0; BLOCK_SIZE];
+
+        // Perform positioned read
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            self.file.read_exact_at(&mut buf, offset)?;
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileExt;
+            self.file.seek_read(&mut buf, offset)?;
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            compile_error!("Unsupported platform for positioned file I/O");
+        }
+
+        Ok(Some(SegmentBlock { offset, block: buf }))
     }
 
     pub fn read_committed_events(

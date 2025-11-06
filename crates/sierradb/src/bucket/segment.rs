@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 pub use self::reader::{
     BucketSegmentIter, BucketSegmentReader, CommitRecord, CommittedEvents, CommittedEventsIntoIter,
-    EventRecord, ReadHint, Record,
+    EventRecord, ReadHint, Record, SegmentBlock, SegmentBlockIter,
 };
 pub use self::writer::{AppendEvent, BucketSegmentWriter};
 use crate::error::WriteError;

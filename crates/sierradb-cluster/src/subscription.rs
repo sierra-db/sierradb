@@ -672,22 +672,24 @@ impl Subscription {
             .database
             .read_stream(partition_id, stream_id, *from_version, false)
             .await?;
-        while let Some(commit) = iter.next().await? {
-            let Some(first_partition_sequence) = commit.first_partition_sequence() else {
-                continue;
-            };
+        while let Some(commits) = iter.next_batch(50).await? {
+            for commit in commits {
+                let Some(first_partition_sequence) = commit.first_partition_sequence() else {
+                    continue;
+                };
 
-            if !watermark.can_read(first_partition_sequence) {
-                break;
-            }
+                if !watermark.can_read(first_partition_sequence) {
+                    break;
+                }
 
-            for event in commit {
-                debug_assert!(watermark.can_read(event.partition_sequence));
+                for event in commit {
+                    debug_assert!(watermark.can_read(event.partition_sequence));
 
-                let version = event.stream_version;
-                self.send_record(event).await?;
+                    let version = event.stream_version;
+                    self.send_record(event).await?;
 
-                *from_version = version + 1;
+                    *from_version = version + 1;
+                }
             }
         }
 
@@ -766,6 +768,7 @@ mod tests {
     async fn create_temp_db() -> (TempDir, Database) {
         let temp_dir = tempdir().expect("Failed to create temp directory");
         let db = DatabaseBuilder::new()
+            .segment_size_bytes(1024 * 128)
             .total_buckets(4)
             .bucket_ids_from_range(0..4)
             .open(temp_dir.path())

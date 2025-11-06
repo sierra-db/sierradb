@@ -1362,15 +1362,14 @@ mod tests {
     use crate::reader_thread_pool::ReaderThreadPool;
     use crate::writer_thread_pool::{LiveIndexSet, WriteOperation, WriterSet};
 
-    fn setup_writer_set() -> (WriterSet, TempDir) {
+    fn setup_writer_set(segment_size: usize) -> (WriterSet, TempDir) {
         let dir = tempdir().unwrap();
         let bucket_id = 0;
-        let segment_size = 1024 * 1024;
         let reader_threads = 1;
         let now = Instant::now();
 
         let thread_pool = Arc::new(ThreadPoolBuilder::new().build().unwrap());
-        let reader_pool = ReaderThreadPool::new(reader_threads);
+        let reader_pool = ReaderThreadPool::new(reader_threads, &[0, 1, 2, 3], segment_size);
 
         let (bucket_segment_id, writer) =
             BucketSegmentWriter::latest(bucket_id, &dir, segment_size).unwrap();
@@ -1465,7 +1464,7 @@ mod tests {
         from_four: [ExpectedVersion; 3],
         random_from_one: [ExpectedVersion; 3],
     ) {
-        let (mut writer_set, _dir) = setup_writer_set();
+        let (mut writer_set, _dir) = setup_writer_set(1024 * 128);
 
         let stream_id = StreamId::new("my-stream").unwrap();
         let random_stream_id = StreamId::new("random").unwrap();
@@ -1685,7 +1684,7 @@ mod tests {
         fn prop_validate_returns_correct_number_of_versions(
             (_, partition_key, events) in arb_events_same_partition(20)
         ) {
-            let (writer_set, _dir) = setup_writer_set();
+            let (writer_set, _dir) = setup_writer_set(128);
 
             match writer_set.validate_event_versions(partition_key, &events) {
                 Ok(versions) => {
@@ -1702,7 +1701,7 @@ mod tests {
             stream_ids in vec(arb_stream_id(), 1..=5),
             num_events in 1usize..=10
         ) {
-            let (writer_set, _dir) = setup_writer_set();
+            let (writer_set, _dir) = setup_writer_set(128);
             let partition_key = Uuid::new_v4();
             let partition_hash = uuid_to_partition_hash(partition_key);
 
@@ -1724,7 +1723,7 @@ mod tests {
         fn prop_empty_version_fails_after_events_written(
             stream_id in arb_stream_id()
         ) {
-            let (mut writer_set, _dir) = setup_writer_set();
+            let (mut writer_set, _dir) = setup_writer_set(1024 * 128);
             let partition_key = Uuid::new_v5(&NAMESPACE_PARTITION_KEY, stream_id.as_bytes());
             let partition_hash = uuid_to_partition_hash(partition_key);
 
@@ -1753,7 +1752,7 @@ mod tests {
         fn prop_exists_version_fails_on_nonexistent_stream(
             stream_id in arb_stream_id()
         ) {
-            let (writer_set, _dir) = setup_writer_set();
+            let (writer_set, _dir) = setup_writer_set(1024 * 128);
             let partition_key = Uuid::new_v5(&NAMESPACE_PARTITION_KEY, stream_id.as_bytes());
             let partition_hash = uuid_to_partition_hash(partition_key);
 
@@ -1767,7 +1766,7 @@ mod tests {
             stream_id in arb_stream_id(),
             wrong_version in 1u64..10
         ) {
-            let (mut writer_set, _dir) = setup_writer_set();
+            let (mut writer_set, _dir) = setup_writer_set(1024 * 128);
             let partition_key = Uuid::new_v5(&NAMESPACE_PARTITION_KEY, stream_id.as_bytes());
             let partition_hash = uuid_to_partition_hash(partition_key);
 
@@ -1797,7 +1796,7 @@ mod tests {
             stream_id in arb_stream_id(),
             num_events in 2usize..=10
         ) {
-            let (writer_set, _dir) = setup_writer_set();
+            let (writer_set, _dir) = setup_writer_set(128);
             let partition_key = Uuid::new_v5(&NAMESPACE_PARTITION_KEY, stream_id.as_bytes());
             let partition_hash = uuid_to_partition_hash(partition_key);
 
@@ -1832,7 +1831,7 @@ mod tests {
             stream_ids in vec(arb_stream_id(), 2..=4),
             events_per_stream in 1usize..=5
         ) {
-            let (writer_set, _dir) = setup_writer_set();
+            let (writer_set, _dir) = setup_writer_set(128);
             let partition_key = Uuid::new_v4();
             let partition_hash = uuid_to_partition_hash(partition_key);
 
@@ -1855,7 +1854,7 @@ mod tests {
             prop_assert_eq!(versions.len(), all_events.len());
 
             // Track actual stream positions as we go through versions
-            let mut actual_stream_positions: std::collections::HashMap<StreamId, u64> = std::collections::HashMap::new();
+            let mut actual_stream_positions: HashMap<StreamId, u64> = HashMap::new();
 
             for (i, event) in all_events.iter().enumerate() {
                 let expected_pos = *actual_stream_positions.get(&event.stream_id).unwrap_or(&0);
@@ -1877,7 +1876,7 @@ mod tests {
         fn prop_batch_consistency_maintained(
             (_, partition_key, events) in arb_events_same_partition(15)
         ) {
-            let (writer_set, _dir) = setup_writer_set();
+            let (writer_set, _dir) = setup_writer_set(128);
 
             // Validate twice with same input - should get same result
             let result1 = writer_set.validate_event_versions(partition_key, &events);

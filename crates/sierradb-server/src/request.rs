@@ -9,6 +9,7 @@ pub mod escan;
 pub mod esub;
 pub mod esver;
 pub mod hello;
+pub mod info;
 pub mod ping;
 
 use std::collections::HashMap;
@@ -41,6 +42,7 @@ use crate::request::escan::EScan;
 use crate::request::esub::ESub;
 use crate::request::esver::ESVer;
 use crate::request::hello::Hello;
+use crate::request::info::Info;
 use crate::request::ping::Ping;
 use crate::server::Conn;
 
@@ -56,6 +58,7 @@ pub enum Command {
     EScan,
     ESub,
     Hello,
+    Info,
     Ping,
 }
 
@@ -85,7 +88,8 @@ impl Command {
         }
 
         handle_commands![
-            EAck, EAppend, EGet, EMAppend, EPScan, EPSeq, EPSub, EScan, ESVer, ESub, Hello, Ping
+            EAck, EAppend, EGet, EMAppend, EPScan, EPSeq, EPSub, EScan, ESVer, ESub, Hello, Info,
+            Ping
         ]
     }
 }
@@ -119,6 +123,7 @@ impl TryFrom<&BytesFrame> for Command {
                     "ESCAN" => Ok(Command::EScan),
                     "ESUB" => Ok(Command::ESub),
                     "HELLO" => Ok(Command::Hello),
+                    "INFO" => Ok(Command::Info),
                     "PING" => Ok(Command::Ping),
                     cmd => {
                         debug!("received unknown command {cmd}");

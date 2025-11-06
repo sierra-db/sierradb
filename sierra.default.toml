@@ -1,17 +1,22 @@
 # Full config with their defaults
 
 dir = "db"
+mdns = false
 replication_factor = 3
 
 [bucket]
 count = 64
 # ids = [0, 1, 2, ...]
 
+[cache]
+capacity_bytes = 268_435_456
+
 [heartbeat]
 interval_ms = 1000
 timeout_ms = 6000
 
 [network]
+cluster_enabled = true
 cluster_address = "/ip4/0.0.0.0/udp/0/quic-v1"
 client_address = "0.0.0.0:9090"
 
@@ -20,8 +25,13 @@ count = 1
 index = 0
 
 [partition]
-count = 1024
-# ids = [0, 1, 2, ...]
+count = 32
+# ids = [0..=31]
+
+[replication]
+buffer_size = 1000
+buffer_timeout_ms = 8000
+catchup_timeout_ms = 2000
 
 [segment]
 size_bytes = 268_435_456
@@ -30,7 +40,3 @@ size_bytes = 268_435_456
 interval_ms = 5
 max_batch_size = 50
 min_bytes = 4096
-
-[threads]
-read = 8
-write = 16

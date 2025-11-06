@@ -22,9 +22,10 @@ use crate::bucket::partition_index::{
 };
 use crate::bucket::segment::{BucketSegmentReader, CommittedEvents, EventRecord, ReadHint};
 use crate::bucket::stream_index::{
-    ClosedStreamIndex, EventStreamIter, StreamIndexRecord, StreamOffsets,
+    ClosedStreamIndex, StreamIndexRecord, StreamIter, StreamOffsets,
 };
 use crate::bucket::{BucketId, BucketSegmentId, PartitionId, SegmentId};
+use crate::cache::BLOCK_SIZE;
 use crate::error::{
     DatabaseError, EventValidationError, PartitionIndexError, ReadError, StreamIndexError,
     ThreadPoolError, WriteError,
@@ -253,15 +254,15 @@ impl Database {
         stream_id: StreamId,
         from_version: u64,
         reverse: bool,
-    ) -> Result<EventStreamIter, StreamIndexError> {
+    ) -> Result<StreamIter, StreamIndexError> {
         let bucket_id = partition_id % self.total_buckets;
-        EventStreamIter::new(
+        StreamIter::new(
             stream_id,
             bucket_id,
             from_version,
-            reverse,
             self.reader_pool.clone(),
-            self.writer_pool.indexes(),
+            self.writer_pool.indexes().clone(),
+            reverse,
         )
         .await
     }
@@ -356,6 +357,7 @@ pub struct DatabaseBuilder {
     sync_interval: Duration,
     max_batch_size: usize,
     min_sync_bytes: usize,
+    cache_capacity_bytes: usize,
 }
 
 impl DatabaseBuilder {
@@ -373,6 +375,7 @@ impl DatabaseBuilder {
             sync_interval: Duration::from_millis(5),
             max_batch_size: 50,
             min_sync_bytes: 4096,
+            cache_capacity_bytes: 256 * 1024 * 1024,
         }
     }
 
@@ -434,7 +437,11 @@ impl DatabaseBuilder {
 
         let _ = fs::create_dir_all(&dir);
         let thread_pool = Arc::new(create_thread_pool()?);
-        let reader_pool = ReaderThreadPool::new(self.reader_threads as usize);
+        let reader_pool = ReaderThreadPool::new(
+            self.reader_threads as usize,
+            &self.bucket_ids,
+            self.cache_capacity_bytes,
+        );
         let writer_pool = WriterThreadPool::new(
             &dir,
             self.segment_size_bytes,
@@ -568,7 +575,9 @@ impl DatabaseBuilder {
                 .map(|path| ClosedPartitionIndex::open(bucket_segment_id, path))
                 .transpose()?;
             let stream_index = stream_index
-                .map(|path| ClosedStreamIndex::open(bucket_segment_id, path, self.segment_size))
+                .map(|path| {
+                    ClosedStreamIndex::open(bucket_segment_id, path, self.segment_size_bytes)
+                })
                 .transpose()?;
 
             reader_pool.add_bucket_segment(
@@ -647,6 +656,11 @@ impl DatabaseBuilder {
 
     pub fn min_sync_bytes(&mut self, bytes: usize) -> &mut Self {
         self.min_sync_bytes = bytes;
+        self
+    }
+
+    pub fn cache_capacity_bytes(&mut self, bytes: usize) -> &mut Self {
+        self.cache_capacity_bytes = bytes;
         self
     }
 }
@@ -829,6 +843,7 @@ mod tests {
     async fn create_temp_db() -> (tempfile::TempDir, Database) {
         let temp_dir = tempdir().expect("Failed to create temp directory");
         let db = DatabaseBuilder::new()
+            .segment_size_bytes(1024 * 128)
             .total_buckets(4)
             .bucket_ids_from_range(0..4)
             .open(temp_dir.path())
