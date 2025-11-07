@@ -3,10 +3,11 @@ use std::ops::{self, RangeBounds};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{fs, process};
 
 use libc::{RLIMIT_NOFILE, getrlimit, rlimit, setrlimit};
+use metrics::histogram;
 use rayon::{ThreadPool, ThreadPoolBuildError, ThreadPoolBuilder};
 use serde::{Deserialize, Serialize};
 pub use sierradb_protocol::{CurrentVersion, ExpectedVersion, VersionGap};
@@ -60,8 +61,14 @@ impl Database {
     }
 
     pub async fn append_events(&self, events: Transaction) -> Result<AppendResult, WriteError> {
+        let start = Instant::now();
+
         let bucket_id = events.partition_id % self.total_buckets;
-        self.writer_pool.append_events(bucket_id, events).await
+        let append = self.writer_pool.append_events(bucket_id, events).await?;
+
+        histogram!("stream_append_latency_seconds").record(start.elapsed().as_secs_f64());
+
+        Ok(append)
     }
 
     pub async fn set_confirmations(
@@ -82,10 +89,20 @@ impl Database {
         partition_id: PartitionId,
         event_id: Uuid,
     ) -> Result<Option<EventRecord>, ReadError> {
-        Ok(self
+        let start = Instant::now();
+
+        let event = self
             .read_transaction(partition_id, event_id)
             .await?
-            .and_then(|events| events.into_iter().next()))
+            .and_then(|events| events.into_iter().next());
+
+        histogram!(
+            "stream_read_latency_seconds",
+            "partition_id" => partition_id.to_string()
+        )
+        .record(start.elapsed().as_secs_f64());
+
+        Ok(event)
     }
 
     pub async fn read_transaction(
