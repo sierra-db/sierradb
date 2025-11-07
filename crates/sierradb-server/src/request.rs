@@ -771,6 +771,14 @@ pub fn number(n: i64) -> BytesFrame {
 }
 
 #[inline(always)]
+pub fn double(n: f64) -> BytesFrame {
+    BytesFrame::Double {
+        data: n,
+        attributes: None,
+    }
+}
+
+#[inline(always)]
 pub fn map(items: IndexMap<BytesFrame, BytesFrame>) -> BytesFrame {
     BytesFrame::Map {
         data: items,

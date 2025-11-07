@@ -1,11 +1,14 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use kameo::actor::ActorRef;
 use libp2p::bytes::BytesMut;
 use redis_protocol::resp3;
 use redis_protocol::resp3::decode::complete::decode_bytes_mut;
 use redis_protocol::resp3::types::BytesFrame;
+use sierradb::bucket::BucketId;
 use sierradb::bucket::segment::EventRecord;
+use sierradb::cache::SegmentBlockCache;
 use sierradb_cluster::ClusterActor;
 use sierradb_cluster::subscription::SubscriptionEvent;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
@@ -18,14 +21,23 @@ use crate::request::{Command, encode_event, number, simple_str};
 
 pub struct Server {
     cluster_ref: ActorRef<ClusterActor>,
+    caches: Arc<HashMap<BucketId, Arc<SegmentBlockCache>>>,
     num_partitions: u16,
+    cache_capacity_bytes: usize,
 }
 
 impl Server {
-    pub fn new(cluster_ref: ActorRef<ClusterActor>, num_partitions: u16) -> Self {
+    pub fn new(
+        cluster_ref: ActorRef<ClusterActor>,
+        caches: Arc<HashMap<BucketId, Arc<SegmentBlockCache>>>,
+        num_partitions: u16,
+        cache_capacity_bytes: usize,
+    ) -> Self {
         Server {
             cluster_ref,
+            caches,
             num_partitions,
+            cache_capacity_bytes,
         }
     }
 
@@ -35,9 +47,19 @@ impl Server {
             match listener.accept().await {
                 Ok((socket, _)) => {
                     let cluster_ref = self.cluster_ref.clone();
+                    let caches = self.caches.clone();
                     let num_partitions = self.num_partitions;
+                    let cache_capacity_bytes = self.cache_capacity_bytes;
                     tokio::spawn(async move {
-                        let res = Conn::new(cluster_ref, num_partitions, socket).run().await;
+                        let res = Conn::new(
+                            cluster_ref,
+                            caches,
+                            num_partitions,
+                            cache_capacity_bytes,
+                            socket,
+                        )
+                        .run()
+                        .await;
                         if let Err(err) = res {
                             warn!("connection error: {err}");
                         }
@@ -51,7 +73,9 @@ impl Server {
 
 pub struct Conn {
     pub cluster_ref: ActorRef<ClusterActor>,
+    pub caches: Arc<HashMap<BucketId, Arc<SegmentBlockCache>>>,
     pub num_partitions: u16,
+    pub cache_capacity_bytes: usize,
     pub socket: TcpStream,
     pub read: BytesMut,
     pub write: BytesMut,
@@ -63,16 +87,24 @@ pub struct Conn {
 }
 
 impl Conn {
-    fn new(cluster_ref: ActorRef<ClusterActor>, num_partitions: u16, socket: TcpStream) -> Self {
+    fn new(
+        cluster_ref: ActorRef<ClusterActor>,
+        caches: Arc<HashMap<BucketId, Arc<SegmentBlockCache>>>,
+        num_partitions: u16,
+        cache_capacity_bytes: usize,
+        socket: TcpStream,
+    ) -> Self {
         let read = BytesMut::new();
         let write = BytesMut::new();
 
         Conn {
             cluster_ref,
+            caches,
+            num_partitions,
+            cache_capacity_bytes,
             socket,
             read,
             write,
-            num_partitions,
             subscription_channel: None,
             subscriptions: HashMap::new(),
         }

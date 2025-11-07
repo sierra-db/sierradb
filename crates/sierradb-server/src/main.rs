@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use clap::Parser;
@@ -60,6 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let node_count = config.node_count()?;
     let database = builder.open(config.dir)?;
+    let caches = database.reader_pool().caches().clone();
 
     let keypair = Keypair::generate_ed25519();
 
@@ -87,15 +89,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mdns: config.mdns,
     });
 
+    let client_addr: SocketAddr = config.network.client_address.parse()?;
     let server_handle = tokio::spawn(async move {
-        if let Err(err) = Server::new(cluster_ref, config.partition.count)
-            .listen(config.network.client_address)
-            .await
+        if let Err(err) = Server::new(
+            cluster_ref,
+            caches,
+            config.partition.count,
+            config.cache.capacity_bytes,
+        )
+        .listen(client_addr)
+        .await
         {
             error!("server failed: {err}");
             std::process::exit(1);
         }
     });
+
+    info!("ready to receive connections on {client_addr}");
 
     // Listen for both SIGTERM (Docker) and SIGINT (Ctrl+C)
     tokio::select! {

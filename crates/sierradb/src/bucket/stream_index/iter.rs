@@ -6,7 +6,7 @@ use std::{io, mem};
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use tokio::sync::oneshot;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::StreamId;
 use crate::bucket::segment::{CommittedEvents, ReadHint, SegmentBlock};
@@ -523,7 +523,13 @@ impl SegmentStreamIter {
                     .get_or_load(self.bucket_segment_id.segment_id, offset)
                     .await?
             }
-            None => None,
+            None => {
+                debug!(
+                    "cache doesn't exist for bucket id {}",
+                    self.bucket_segment_id.bucket_id
+                );
+                None
+            }
         };
         self.last_block_offset_attempt = block_offset;
 
@@ -538,6 +544,7 @@ impl SegmentStreamIter {
     ) -> BoxFuture<'a, Result<(), ReadError>> {
         async move {
             if let Some(block) = &self.block {
+                debug!("offsets_index = {offsets_index}, offsets_len = {}, next_offset = {:?}", self.offsets.len(), self.offsets.get(*offsets_index));
                 while *offsets_index < self.offsets.len() {
                     let offset = self.offsets[*offsets_index];
                     let commit = match block.read_committed_events(offset) {
@@ -547,12 +554,14 @@ impl SegmentStreamIter {
                             break;
                         }
                         Err(ReadError::OutOfBounds) => {
-                            if offset >= block.next_segment_block_offset() {
+                            let next_segment_block_offset = block.next_segment_block_offset();
+                            if offset >= next_segment_block_offset {
                                 // Preload the next cache block and read from cache again
                                 self.hydrate_block(block.next_segment_block_offset())
                                     .await?;
                                 return self.read_from_cache(offsets_index, commits, limit).await;
                             } else {
+                                debug!("offset {offset} is before the next segment block offset {next_segment_block_offset}");
                                 self.block = None;
                             }
 

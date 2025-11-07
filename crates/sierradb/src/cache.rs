@@ -42,11 +42,17 @@ impl SegmentBlockCache {
         BLOCKS_EVICTED.load(Ordering::Relaxed)
     }
 
-    pub fn new(bucket_id: BucketId, capacity: usize, reader_pool: ReaderThreadPool) -> Self {
+    #[inline]
+    pub fn cache(&self) -> &Cache<(SegmentId, u64), Arc<SegmentBlock>> {
+        &self.cache
+    }
+
+    pub fn new(bucket_id: BucketId, capacity: u64, reader_pool: ReaderThreadPool) -> Self {
         Self {
             bucket_id,
             cache: Cache::builder()
-                .max_capacity(capacity.try_into().unwrap())
+                .max_capacity(capacity)
+                .weigher(|_, _| BLOCK_SIZE as u32)
                 .eviction_listener(|_key, _val, _cause| {
                     BLOCKS_EVICTED.fetch_add(1, Ordering::Relaxed);
                 })
@@ -90,11 +96,13 @@ impl SegmentBlockCache {
         self.reader_pool.spawn(move |with_readers| {
             with_readers(move |readers| {
                 let Some(segments) = readers.get(&bucket_id) else {
+                    trace!("bucket id doesn't exist in readers");
                     let _ = reply_tx.send(Ok(None));
                     return;
                 };
 
                 let Some(reader_set) = segments.get(&segment_id) else {
+                    trace!("segment id doesn't exist in bucket segments");
                     let _ = reply_tx.send(Ok(None));
                     return;
                 };

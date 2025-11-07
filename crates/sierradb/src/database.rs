@@ -55,6 +55,10 @@ impl Database {
         self.total_buckets
     }
 
+    pub fn reader_pool(&self) -> &ReaderThreadPool {
+        &self.reader_pool
+    }
+
     pub async fn append_events(&self, events: Transaction) -> Result<AppendResult, WriteError> {
         let bucket_id = events.partition_id % self.total_buckets;
         self.writer_pool.append_events(bucket_id, events).await

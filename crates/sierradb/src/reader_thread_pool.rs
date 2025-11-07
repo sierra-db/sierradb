@@ -10,7 +10,7 @@ use crate::bucket::partition_index::ClosedPartitionIndex;
 use crate::bucket::segment::BucketSegmentReader;
 use crate::bucket::stream_index::ClosedStreamIndex;
 use crate::bucket::{BucketId, BucketSegmentId, SegmentId};
-use crate::cache::{BLOCK_SIZE, SegmentBlockCache};
+use crate::cache::SegmentBlockCache;
 
 thread_local! {
     static READERS: RefCell<HashMap<BucketId, BTreeMap<SegmentId, ReaderSet>>> = RefCell::new(HashMap::new());
@@ -27,7 +27,7 @@ pub struct ReaderSet {
 #[derive(Clone, Debug)]
 pub struct ReaderThreadPool {
     pool: Arc<ThreadPool>,
-    caches: HashMap<BucketId, Arc<SegmentBlockCache>>,
+    caches: Arc<HashMap<BucketId, Arc<SegmentBlockCache>>>,
 }
 
 impl ReaderThreadPool {
@@ -42,9 +42,8 @@ impl ReaderThreadPool {
 
         // Calculate blocks per bucket
         let num_buckets = bucket_ids.len();
-        let cache_size_per_bucket = total_cache_size / num_buckets;
-        let bucket_segment_cache_capacity = cache_size_per_bucket / BLOCK_SIZE;
-        if bucket_segment_cache_capacity == 0 {
+        let cache_size_per_bucket = (total_cache_size / num_buckets) as u64;
+        if cache_size_per_bucket == 0 {
             warn!(
                 "cache size per bucket too small: {cache_size_per_bucket}B per bucket results in 0 blocks: consider increasing total_cache_size or reducing number of buckets"
             );
@@ -52,24 +51,30 @@ impl ReaderThreadPool {
 
         let mut reader_pool = ReaderThreadPool {
             pool: Arc::new(pool),
-            caches: HashMap::new(),
+            caches: Arc::new(HashMap::new()),
         };
 
-        reader_pool.caches = bucket_ids
-            .iter()
-            .map(|bucket_id| {
-                (
-                    *bucket_id,
-                    Arc::new(SegmentBlockCache::new(
+        reader_pool.caches = Arc::new(
+            bucket_ids
+                .iter()
+                .map(|bucket_id| {
+                    (
                         *bucket_id,
-                        bucket_segment_cache_capacity,
-                        reader_pool.clone(),
-                    )),
-                )
-            })
-            .collect();
+                        Arc::new(SegmentBlockCache::new(
+                            *bucket_id,
+                            cache_size_per_bucket,
+                            reader_pool.clone(),
+                        )),
+                    )
+                })
+                .collect(),
+        );
 
         reader_pool
+    }
+
+    pub fn caches(&self) -> &Arc<HashMap<BucketId, Arc<SegmentBlockCache>>> {
+        &self.caches
     }
 
     pub fn get_cache(&self, bucket_id: BucketId) -> Option<&Arc<SegmentBlockCache>> {
