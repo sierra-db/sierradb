@@ -3,7 +3,7 @@ use std::collections::hash_map::Entry;
 use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread::{self};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -65,6 +65,7 @@ impl WriterThreadPool {
         bucket_ids: Arc<[BucketId]>,
         num_threads: u16,
         sync_interval: Duration,
+        sync_idle_interval: Duration,
         max_batch_size: usize,
         min_sync_bytes: usize,
         reader_pool: &ReaderThreadPool,
@@ -78,6 +79,7 @@ impl WriterThreadPool {
 
         let mut senders = Vec::with_capacity(num_threads as usize);
         let mut indexes = HashMap::new();
+        let has_recent_activity = Arc::new(AtomicBool::new(false));
 
         let dir = dir.into();
         for thread_id in 0..num_threads {
@@ -92,6 +94,7 @@ impl WriterThreadPool {
                 min_sync_bytes,
                 reader_pool,
                 thread_pool,
+                &has_recent_activity,
             )?;
             for (bucket_id, writer_set) in &worker.writers {
                 indexes.insert(
@@ -125,7 +128,15 @@ impl WriterThreadPool {
                     move || {
                         let mut last_ran = Instant::now();
                         loop {
-                            thread::sleep(sync_interval.saturating_sub(last_ran.elapsed()));
+                            let any_worker_active =
+                                has_recent_activity.swap(false, Ordering::Relaxed);
+                            let sleep_duration = if any_worker_active {
+                                sync_interval
+                            } else {
+                                sync_idle_interval
+                            };
+
+                            thread::sleep(sleep_duration.saturating_sub(last_ran.elapsed()));
                             last_ran = Instant::now();
 
                             senders.retain(|sender| {
@@ -305,6 +316,7 @@ impl Worker {
         min_sync_bytes: usize,
         reader_pool: &ReaderThreadPool,
         thread_pool: &Arc<ThreadPool>,
+        has_recent_activity: &Arc<AtomicBool>,
     ) -> Result<Self, WriteError> {
         let mut writers = HashMap::new();
         let now = Instant::now();
@@ -369,6 +381,7 @@ impl Worker {
                     max_batch_size,
                     min_sync_bytes,
                     thread_pool: Arc::clone(thread_pool),
+                    has_recent_activity: Arc::clone(has_recent_activity),
                 };
 
                 writers.insert(bucket_id, writer_set);
@@ -507,6 +520,10 @@ impl Worker {
             error!("failed to set segment file length after write error: {err}");
         }
 
+        writer_set
+            .has_recent_activity
+            .store(true, Ordering::Relaxed);
+
         let _ = reply_tx.send(res.map(|append| FullAppendResult {
             append,
             write_offset: writer_set.writer.write_offset(),
@@ -583,6 +600,7 @@ struct WriterSet {
     max_batch_size: usize,
     min_sync_bytes: usize,
     thread_pool: Arc<ThreadPool>,
+    has_recent_activity: Arc<AtomicBool>,
 }
 
 impl WriterSet {
@@ -1340,7 +1358,7 @@ mod tests {
     use std::collections::HashMap;
     use std::slice;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicBool, AtomicU32};
     use std::time::{Duration, Instant};
 
     use proptest::collection::vec;
@@ -1415,6 +1433,7 @@ mod tests {
         }));
 
         let (sync_tx, _) = watch::channel(writer.write_offset());
+        let has_recent_activity = Arc::new(AtomicBool::new(false));
         let writer_set = WriterSet {
             dir: dir.path().to_owned(),
             reader,
@@ -1434,6 +1453,7 @@ mod tests {
             max_batch_size: 50,
             min_sync_bytes: 4096,
             thread_pool,
+            has_recent_activity,
         };
 
         (writer_set, dir)

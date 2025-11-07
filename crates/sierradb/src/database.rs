@@ -359,6 +359,7 @@ pub struct DatabaseBuilder {
     reader_threads: u16,
     writer_threads: Option<u16>,
     sync_interval: Duration,
+    sync_idle_interval: Duration,
     max_batch_size: usize,
     min_sync_bytes: usize,
     cache_capacity_bytes: usize,
@@ -377,6 +378,7 @@ impl DatabaseBuilder {
             reader_threads,
             writer_threads: None,
             sync_interval: Duration::from_millis(5),
+            sync_idle_interval: Duration::from_millis(50),
             max_batch_size: 50,
             min_sync_bytes: 4096,
             cache_capacity_bytes: 256 * 1024 * 1024,
@@ -452,6 +454,7 @@ impl DatabaseBuilder {
             self.bucket_ids.clone(),
             writer_threads,
             self.sync_interval,
+            self.sync_idle_interval,
             self.max_batch_size,
             self.min_sync_bytes,
             &reader_pool,
@@ -653,6 +656,11 @@ impl DatabaseBuilder {
         self
     }
 
+    pub fn sync_idle_interval(&mut self, interval: Duration) -> &mut Self {
+        self.sync_idle_interval = interval;
+        self
+    }
+
     pub fn max_batch_size(&mut self, events: usize) -> &mut Self {
         self.max_batch_size = events;
         self
@@ -702,6 +710,8 @@ pub enum StreamLatestVersion {
 
 fn create_thread_pool() -> Result<ThreadPool, ThreadPoolBuildError> {
     ThreadPoolBuilder::new()
+        .thread_name(|i| format!("flusher-{i}"))
+        .num_threads(4)
         .panic_handler(|err| match err.downcast::<ThreadPoolError>() {
             Ok(err) => {
                 error!("{err}");

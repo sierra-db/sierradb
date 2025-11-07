@@ -3,6 +3,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::Duration;
 
 use clap::Parser;
 use config::{Config, ConfigError, Environment, File, Value, ValueKind};
@@ -123,6 +124,8 @@ pub struct SegmentConfig {
 pub struct SyncConfig {
     /// Maximum time to wait before syncing to disk (milliseconds)
     pub interval_ms: u64,
+    /// Maximum time to wait before syncing to disk when idle (milliseconds)
+    pub idle_interval_ms: Option<u64>,
     /// Maximum number of events to batch before syncing
     pub max_batch_size: usize,
     /// Minimum bytes to accumulate before syncing
@@ -380,6 +383,16 @@ impl AppConfig {
             });
         }
 
+        // Sync validation
+        if let Some(idle_interval_ms) = self.sync.idle_interval_ms
+            && self.sync.interval_ms <= idle_interval_ms
+        {
+            errs.push(ValidationError::SyncIdleIntervalTooSmall {
+                interval_ms: self.sync.interval_ms,
+                idle_interval_ms,
+            });
+        }
+
         // Thread validation
         if let Some(read_threads) = self.threads.read {
             if read_threads == 0 {
@@ -473,6 +486,17 @@ impl AppConfig {
             .or(self.nodes.as_ref().map(|nodes| nodes.len()))
             .ok_or_else(|| ConfigError::Message("node.count not specified".to_string()))
     }
+
+    pub fn effective_idle_interval(&self) -> Duration {
+        let active_interval = Duration::from_millis(self.sync.interval_ms);
+        self.sync
+            .idle_interval_ms
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| {
+                // Default: 10x active interval, capped at 1 second
+                (active_interval * 10).min(Duration::from_secs(1))
+            })
+    }
 }
 
 impl fmt::Display for AppConfig {
@@ -543,16 +567,16 @@ impl fmt::Display for AppConfig {
             "replication.buffer_timeout_ms = {}",
             self.replication.buffer_timeout_ms
         )?;
-        // writeln!(
-        //     f,
-        //     "replication.catch_up_threshold = {}",
-        //     self.replication.catch_up_threshold
-        // )?;
         writeln!(f, "replication.factor = {}", self.replication.factor)?;
 
         writeln!(f, "segment.size_bytes = {}", self.segment.size_bytes)?;
 
         writeln!(f, "sync.interval_ms = {}", self.sync.interval_ms)?;
+        writeln!(
+            f,
+            "sync.idle_interval_ms = {}",
+            self.effective_idle_interval().as_millis()
+        )?;
         writeln!(f, "sync.max_batch_size = {}", self.sync.max_batch_size)?;
         writeln!(f, "sync.min_bytes = {}", self.sync.min_bytes)?;
 
@@ -660,6 +684,15 @@ pub enum ValidationError {
     SegmentSizeTooSmall { size: usize, min: usize },
     #[error("segment size {size} is too large (maximum: {max} bytes)")]
     SegmentSizeTooLarge { size: usize, max: usize },
+
+    // Sync
+    #[error(
+        "idle sync interval {idle_interval_ms} cannot be less than sync interval {interval_ms}"
+    )]
+    SyncIdleIntervalTooSmall {
+        interval_ms: u64,
+        idle_interval_ms: u64,
+    },
 
     // Thread errors
     #[error("read thread count cannot be zero")]

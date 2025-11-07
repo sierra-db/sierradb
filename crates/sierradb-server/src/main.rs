@@ -48,6 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .total_buckets(config.bucket.count)
         .bucket_ids(assigned_buckets.into_iter().collect::<Vec<_>>())
         .sync_interval(Duration::from_millis(config.sync.interval_ms))
+        .sync_idle_interval(config.effective_idle_interval())
         .max_batch_size(config.sync.max_batch_size)
         .min_sync_bytes(config.sync.min_bytes)
         .cache_capacity_bytes(config.cache.capacity_bytes);
