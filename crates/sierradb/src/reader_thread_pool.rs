@@ -132,11 +132,7 @@ impl ReaderThreadPool {
         partition_index: Option<&ClosedPartitionIndex>,
         stream_index: Option<&ClosedStreamIndex>,
     ) {
-        let cache = self
-            .caches
-            .get(&bucket_segment_id.bucket_id)
-            .unwrap()
-            .clone();
+        let cache = self.caches.get(&bucket_segment_id.bucket_id).unwrap();
         self.pool.broadcast(|_| {
             let reader_set = ReaderSet {
                 reader: reader.try_clone().unwrap(),
