@@ -119,6 +119,7 @@ impl WriterThreadPool {
         if sync_interval > Duration::ZERO && sync_interval < Duration::MAX {
             thread::Builder::new()
                 .name("writer-pool-syncer".to_string())
+                .stack_size(32 * 1024)
                 .spawn({
                     let mut senders: Vec<_> =
                         senders.iter().map(|sender| sender.downgrade()).collect();
