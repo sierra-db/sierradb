@@ -32,7 +32,7 @@ pub struct Args {
 
     /// Path to configuration file (TOML, YAML, or JSON)
     #[arg(short = 'c', long)]
-    pub config_file: Option<PathBuf>,
+    pub config: Option<PathBuf>,
 
     /// A log filter string
     #[arg(short = 'l', long)]
@@ -160,7 +160,7 @@ impl AppConfig {
         }
 
         // Add config file if specified
-        if let Some(config_path) = args.config_file {
+        if let Some(config_path) = args.config {
             builder = builder.add_source(File::from(config_path));
         } else {
             // Try standard config locations if no explicit file provided
