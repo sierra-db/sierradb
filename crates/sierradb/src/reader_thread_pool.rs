@@ -37,6 +37,7 @@ impl ReaderThreadPool {
 
         let pool = ThreadPoolBuilder::new()
             .num_threads(num_workers)
+            .thread_name(|i| format!("reader-{i}"))
             .build()
             .unwrap();
 
