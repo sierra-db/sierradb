@@ -59,6 +59,10 @@ impl Database {
         &self.reader_pool
     }
 
+    pub async fn shutdown(&self) {
+        self.writer_pool.shutdown().await;
+    }
+
     pub async fn append_events(&self, events: Transaction) -> Result<AppendResult, WriteError> {
         let bucket_id = events.partition_id % self.total_buckets;
         self.writer_pool.append_events(bucket_id, events).await
@@ -404,7 +408,7 @@ impl DatabaseBuilder {
             self.bucket_ids.len()
         );
         assert!(
-            self.bucket_ids.len() <= writer_threads as usize,
+            writer_threads as usize <= self.bucket_ids.len(),
             "number of writer threads ({writer_threads}) cannot be more than the number of buckets ({})",
             self.bucket_ids.len()
         );

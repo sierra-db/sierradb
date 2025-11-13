@@ -8,6 +8,7 @@ use sierradb::database::DatabaseBuilder;
 use sierradb_cluster::{ClusterActor, ClusterArgs};
 use sierradb_server::config::{AppConfig, Args};
 use sierradb_server::server::Server;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -74,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cluster_ref = ClusterActor::spawn(ClusterArgs {
         keypair,
-        database,
+        database: database.clone(),
         listen_addrs,
         node_count,
         node_index: config.node.index as usize,
@@ -91,48 +92,81 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let client_addr: SocketAddr = config.network.client_address.parse()?;
-    let server_handle = tokio::spawn(async move {
-        if let Err(err) = Server::new(
-            cluster_ref,
-            caches,
-            config.partition.count,
-            config.cache.capacity_bytes,
-        )
-        .listen(client_addr)
-        .await
-        {
-            error!("server failed: {err}");
-            std::process::exit(1);
+    let shutdown = CancellationToken::new();
+    let server_handle = tokio::spawn({
+        let database = database.clone();
+        let shutdown = shutdown.clone();
+        async move {
+            match Server::new(
+                cluster_ref,
+                caches,
+                config.partition.count,
+                config.cache.capacity_bytes,
+                shutdown,
+            )
+            .listen(client_addr)
+            .await
+            {
+                Ok(conns) => conns,
+                Err(err) => {
+                    error!("server failed: {err}");
+                    database.shutdown().await;
+                    std::process::abort();
+                }
+            }
         }
     });
 
     info!("ready to receive connections on {client_addr}");
 
-    // Listen for both SIGTERM (Docker) and SIGINT (Ctrl+C)
     tokio::select! {
+        // Listen for ctrl_c signal
         _ = tokio::signal::ctrl_c() => {
             info!("received SIGINT, shutting down gracefully");
+            shutdown.cancel();
         }
-        _ = async {
-            #[cfg(unix)]
-            {
-                use tokio::signal::unix::{signal, SignalKind};
-                let mut sigterm = signal(SignalKind::terminate()).expect("failed to setup SIGTERM handler");
-                sigterm.recv().await
-            }
-            #[cfg(not(unix))]
-            {
-                std::future::pending::<()>().await
-            }
-        } => {
+        // Listen for sigint signal (docker)
+        _ = sigterm() => {
             info!("received SIGTERM, shutting down gracefully");
+            shutdown.cancel();
         }
-        _ = server_handle => {
+    }
+
+    match server_handle.await {
+        Ok(conns) => {
+            // Wait for all connections to stop
+            match tokio::time::timeout(Duration::from_secs(5), conns.join_all()).await {
+                Ok(results) => {
+                    let conn_err = results.into_iter().find_map(|res| res.err());
+                    if let Some(err) = conn_err {
+                        error!("failed to gracefully stop connection(s): {err}");
+                    }
+                }
+                Err(_) => {
+                    error!("timed out waiting for connections to gracefully stop");
+                }
+            }
+        }
+        Err(_) => {
             error!("server task exited unexpectedly");
         }
     }
 
+    database.shutdown().await;
     info!("goodbye :)");
 
     Ok(())
+}
+
+async fn sigterm() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = signal(SignalKind::terminate()).expect("failed to setup SIGTERM handler");
+        sigterm.recv().await;
+    }
+    #[cfg(not(unix))]
+    {
+        std::future::pending::<()>().await
+    }
 }

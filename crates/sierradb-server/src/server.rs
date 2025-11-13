@@ -14,6 +14,8 @@ use sierradb_cluster::subscription::SubscriptionEvent;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -24,6 +26,8 @@ pub struct Server {
     caches: Arc<HashMap<BucketId, Arc<SegmentBlockCache>>>,
     num_partitions: u16,
     cache_capacity_bytes: usize,
+    shutdown: CancellationToken,
+    conns: JoinSet<io::Result<()>>,
 }
 
 impl Server {
@@ -32,40 +36,53 @@ impl Server {
         caches: Arc<HashMap<BucketId, Arc<SegmentBlockCache>>>,
         num_partitions: u16,
         cache_capacity_bytes: usize,
+        shutdown: CancellationToken,
     ) -> Self {
         Server {
             cluster_ref,
             caches,
             num_partitions,
             cache_capacity_bytes,
+            shutdown,
+            conns: JoinSet::new(),
         }
     }
 
-    pub async fn listen(&mut self, addr: impl ToSocketAddrs) -> io::Result<()> {
+    pub async fn listen(mut self, addr: impl ToSocketAddrs) -> io::Result<JoinSet<io::Result<()>>> {
         let listener = TcpListener::bind(addr).await?;
         loop {
-            match listener.accept().await {
-                Ok((socket, _)) => {
-                    let cluster_ref = self.cluster_ref.clone();
-                    let caches = self.caches.clone();
-                    let num_partitions = self.num_partitions;
-                    let cache_capacity_bytes = self.cache_capacity_bytes;
-                    tokio::spawn(async move {
-                        let res = Conn::new(
-                            cluster_ref,
-                            caches,
-                            num_partitions,
-                            cache_capacity_bytes,
-                            socket,
-                        )
-                        .run()
-                        .await;
-                        if let Err(err) = res {
-                            warn!("connection error: {err}");
+            tokio::select! {
+                res = listener.accept() => {
+                    match res {
+                        Ok((socket, _)) => {
+                            let cluster_ref = self.cluster_ref.clone();
+                            let caches = self.caches.clone();
+                            let num_partitions = self.num_partitions;
+                            let cache_capacity_bytes = self.cache_capacity_bytes;
+                            let shutdown = self.shutdown.clone();
+                            self.conns.spawn(async move {
+                                let res = Conn::new(
+                                    cluster_ref,
+                                    caches,
+                                    num_partitions,
+                                    cache_capacity_bytes,
+                                    socket,
+                                    shutdown,
+                                )
+                                .run()
+                                .await;
+                                if let Err(err) = &res {
+                                    warn!("connection error: {err}");
+                                }
+                                res
+                            });
                         }
-                    });
+                        Err(err) => warn!("failed to accept connection: {err}"),
+                    }
                 }
-                Err(err) => warn!("failed to accept connection: {err}"),
+                _ = self.shutdown.cancelled() => {
+                    return Ok(self.conns);
+                }
             }
         }
     }
@@ -77,6 +94,7 @@ pub struct Conn {
     pub num_partitions: u16,
     pub cache_capacity_bytes: usize,
     pub socket: TcpStream,
+    pub shutdown: CancellationToken,
     pub read: BytesMut,
     pub write: BytesMut,
     pub subscription_channel: Option<(
@@ -93,6 +111,7 @@ impl Conn {
         num_partitions: u16,
         cache_capacity_bytes: usize,
         socket: TcpStream,
+        shutdown: CancellationToken,
     ) -> Self {
         let read = BytesMut::new();
         let write = BytesMut::new();
@@ -103,6 +122,7 @@ impl Conn {
             num_partitions,
             cache_capacity_bytes,
             socket,
+            shutdown,
             read,
             write,
             subscription_channel: None,
@@ -161,27 +181,38 @@ impl Conn {
                                 None => self.cleanup_subscriptions(),
                             }
                         }
+                        _ = self.shutdown.cancelled() => {
+                            rx.close();
+                            return self.socket.shutdown().await;
+                        }
                     }
                 }
                 None => {
-                    // Not in subscription mode - block normally on socket reads
-                    let bytes_read = self.socket.read_buf(&mut self.read).await?;
-                    if bytes_read == 0 && self.read.is_empty() {
-                        return Ok(());
-                    }
+                    tokio::select! {
+                        res = self.socket.read_buf(&mut self.read) => {
+                            // Not in subscription mode - block normally on socket reads
+                            let bytes_read = res?;
+                            if bytes_read == 0 && self.read.is_empty() {
+                                return Ok(());
+                            }
 
-                    // Try to decode and handle requests
-                    while let Some((frame, _, _)) =
-                        decode_bytes_mut(&mut self.read).map_err(io::Error::other)?
-                    {
-                        let response = self.handle_request(frame).await?;
-                        if let Some(resp) = response {
-                            resp3::encode::complete::extend_encode(&mut self.write, &resp, false)
-                                .map_err(io::Error::other)?;
+                            // Try to decode and handle requests
+                            while let Some((frame, _, _)) =
+                                decode_bytes_mut(&mut self.read).map_err(io::Error::other)?
+                            {
+                                let response = self.handle_request(frame).await?;
+                                if let Some(resp) = response {
+                                    resp3::encode::complete::extend_encode(&mut self.write, &resp, false)
+                                        .map_err(io::Error::other)?;
 
-                            self.socket.write_all(&self.write).await?;
-                            self.socket.flush().await?;
-                            self.write.clear();
+                                    self.socket.write_all(&self.write).await?;
+                                    self.socket.flush().await?;
+                                    self.write.clear();
+                                }
+                            }
+                        }
+                        _ = self.shutdown.cancelled() => {
+                            return self.socket.shutdown().await;
                         }
                     }
                 }
