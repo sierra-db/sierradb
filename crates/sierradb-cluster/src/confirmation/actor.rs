@@ -515,7 +515,7 @@ impl ConfirmationActor {
         assigned_partitions: HashSet<PartitionId>,
     ) -> Result<ActorRef<Self>, ConfirmationError> {
         let actor = Self::new(database, replication_factor, assigned_partitions).await?;
-        Ok(Actor::spawn(actor))
+        Ok(Spawn::spawn(actor))
     }
 }
 
