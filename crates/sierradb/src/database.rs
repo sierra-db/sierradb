@@ -443,7 +443,6 @@ impl DatabaseBuilder {
             }
         }
 
-        let _ = fs::create_dir_all(&dir);
         let thread_pool = Arc::new(create_thread_pool()?);
         let reader_pool = ReaderThreadPool::new(
             self.reader_threads as usize,
