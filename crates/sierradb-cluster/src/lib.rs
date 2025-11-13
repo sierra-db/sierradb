@@ -201,7 +201,7 @@ impl Actor for ClusterActor {
         .map_err(|err| ClusterError::ConfirmationFailure(err.to_string()))?;
         let watermarks = confirmation_actor.manager.get_watermarks();
         let broadcaster = confirmation_actor.broadcaster();
-        let confirmation_ref = Actor::spawn(confirmation_actor);
+        let confirmation_ref = Spawn::spawn(confirmation_actor);
 
         let replicator_refs = assigned_partitions
             .iter()
@@ -285,7 +285,7 @@ impl Message<ResetCluster> for ClusterActor {
         .map_err(|err| ClusterError::ConfirmationFailure(err.to_string()))?;
         let watermarks = confirmation_actor.manager.get_watermarks();
         let broadcaster = confirmation_actor.broadcaster();
-        let confirmation_ref = Actor::spawn(confirmation_actor);
+        let confirmation_ref = Spawn::spawn(confirmation_actor);
 
         let replicator_refs = assigned_partitions
             .iter()

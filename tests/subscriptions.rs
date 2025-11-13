@@ -3,7 +3,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use kameo::Actor;
+use kameo::actor::Spawn;
 use libp2p::identity::Keypair;
 use sierradb::{
     StreamId,

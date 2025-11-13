@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use clap::Parser;
-use kameo::Actor;
+use kameo::actor::Spawn;
 use libp2p::identity::Keypair;
 use sierradb::database::DatabaseBuilder;
 use sierradb_cluster::{ClusterActor, ClusterArgs};
