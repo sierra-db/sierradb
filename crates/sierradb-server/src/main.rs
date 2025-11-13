@@ -87,7 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         replication_buffer_size: config.replication.buffer_size,
         replication_buffer_timeout: Duration::from_millis(config.replication.buffer_timeout_ms),
         replication_catchup_timeout: Duration::from_millis(config.replication.catchup_timeout_ms),
-        mdns: config.mdns,
+        mdns: config.network.mdns,
     });
 
     let client_addr: SocketAddr = config.network.client_address.parse()?;

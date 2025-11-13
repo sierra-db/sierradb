@@ -22,13 +22,13 @@ pub struct Args {
     #[arg(long, short = 'd')]
     pub dir: Option<String>,
 
-    /// Network address for inter-node cluster communication (QUIC/libp2p)
-    #[arg(long)]
-    pub cluster_address: Option<String>,
-
     /// Network address for client connections (e.g., "0.0.0.0:9090")
     #[arg(long)]
     pub client_address: Option<String>,
+
+    /// Network address for inter-node cluster communication (QUIC/libp2p)
+    #[arg(long)]
+    pub cluster_address: Option<String>,
 
     /// Path to configuration file (TOML, YAML, or JSON)
     #[arg(short = 'c', long)]
@@ -65,8 +65,6 @@ pub struct AppConfig {
     pub sync: SyncConfig,
     #[serde(default)]
     pub threads: Threads,
-    #[serde(default)]
-    pub mdns: bool,
 
     pub nodes: Option<Vec<Value>>,
 }
@@ -93,6 +91,7 @@ pub struct NetworkConfig {
     pub cluster_enabled: bool,
     pub cluster_address: Multiaddr, // For libp2p inter-node traffic
     pub client_address: String,     // For client connections
+    pub mdns: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -182,7 +181,6 @@ impl AppConfig {
         let overrides = builder.build_cloned()?;
 
         builder = builder
-            .set_default("mdns", false)?
             .set_default("bucket.count", 4)?
             .set_default("cache.capacity_bytes", 256 * 1024 * 1024)?
             .set_default("heartbeat.interval_ms", 1000)?
@@ -190,6 +188,7 @@ impl AppConfig {
             .set_default("network.cluster_enabled", true)?
             .set_default("network.cluster_address", "/ip4/0.0.0.0/tcp/0")?
             .set_default("network.client_address", "0.0.0.0:9090")?
+            .set_default("network.mdns", false)?
             .set_default("partition.count", 32)?
             .set_default("replication.buffer_size", 1000)?
             .set_default("replication.buffer_timeout_ms", 8000)?
@@ -228,9 +227,9 @@ impl AppConfig {
         // Override with CLI arguments if provided
         builder = builder
             .set_override_option("dir", args.dir)?
-            .set_override_option("mdns", args.mdns)?
             .set_override_option("network.cluster_address", args.cluster_address)?
             .set_override_option("network.client_address", args.client_address)?
+            .set_override_option("network.mdns", args.mdns)?
             .set_override_option("node.index", args.node_index)?
             .set_override_option("node.count", args.node_count)?;
 
@@ -517,7 +516,6 @@ impl fmt::Display for AppConfig {
         writeln!(f, "cache.capacity_bytes = {}", self.cache.capacity_bytes)?;
 
         writeln!(f, "dir = {}", self.dir.to_string_lossy())?;
-        writeln!(f, "mdns = {}", self.mdns)?;
 
         writeln!(f, "heartbeat.interval_ms = {}", self.heartbeat.interval_ms)?;
         writeln!(f, "heartbeat.timeout_ms = {}", self.heartbeat.timeout_ms)?;
@@ -537,6 +535,7 @@ impl fmt::Display for AppConfig {
             "network.client_address = {}",
             self.network.client_address
         )?;
+        writeln!(f, "network.mdns = {}", self.network.mdns)?;
 
         match self.node_count() {
             Ok(count) => writeln!(f, "node.count = {count}")?,
