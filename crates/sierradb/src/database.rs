@@ -404,9 +404,7 @@ impl DatabaseBuilder {
             self.bucket_ids.len()
         );
         assert!(
-            self.bucket_ids
-                .len()
-                .is_multiple_of(writer_threads as usize),
+            self.bucket_ids.len() <= writer_threads as usize,
             "number of writer threads ({writer_threads}) cannot be more than the number of buckets ({})",
             self.bucket_ids.len()
         );
