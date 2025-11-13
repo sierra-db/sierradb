@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread::{self};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use futures::stream::FuturesUnordered;
+use futures::{FutureExt, StreamExt, TryFutureExt};
 use rayon::ThreadPool;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -238,6 +240,18 @@ impl WriterThreadPool {
         reply_rx.await.map_err(|_| WriteError::NoThreadReply)?
     }
 
+    pub async fn shutdown(&self) {
+        let mut futs: FuturesUnordered<_> = self
+            .senders
+            .iter()
+            .map(|tx| {
+                tx.send(WriteRequest::Shutdown)
+                    .and_then(move |_| tx.closed().map(|_| Ok(())))
+            })
+            .collect();
+        while (futs.next().await).is_some() {}
+    }
+
     pub async fn with_event_index<F, R>(&self, bucket_id: BucketId, f: F) -> Option<R>
     where
         F: FnOnce(&Arc<AtomicU32>, &OpenEventIndex) -> R,
@@ -297,6 +311,7 @@ enum WriteRequest {
         reply_tx: oneshot::Sender<Result<(), WriteError>>,
     },
     FlushPoll,
+    Shutdown,
 }
 
 struct Worker {
@@ -420,15 +435,12 @@ impl Worker {
                 WriteRequest::FlushPoll => {
                     self.handle_flush_poll();
                 }
+                WriteRequest::Shutdown => break,
             }
         }
 
         // Flush any remaining data on shutdown.
-        for mut writer_set in self.writers.into_values() {
-            if let Err(err) = writer_set.writer.flush() {
-                error!("failed to flush writer during shutdown: {err}");
-            }
-        }
+        self.handle_shutdown();
     }
 
     fn handle_append_events(
@@ -566,6 +578,14 @@ impl Worker {
     fn handle_flush_poll(&mut self) {
         for writer_set in self.writers.values_mut() {
             writer_set.sync_if_necessary();
+        }
+    }
+
+    fn handle_shutdown(&mut self) {
+        for writer_set in self.writers.values_mut() {
+            if let Err(err) = writer_set.sync() {
+                error!("failed to sync writer thread during shutdown: {err}");
+            }
         }
     }
 }
