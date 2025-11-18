@@ -2,7 +2,13 @@
 # The specific node is determined by the --node-index cli argument
 
 [bucket]
-count = 64
+count = 4
+
+[network]
+mdns = true
+
+[partition]
+count = 16
 
 [replication]
 factor = 3
