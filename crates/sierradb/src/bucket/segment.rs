@@ -1,3 +1,4 @@
+mod iter;
 mod reader;
 mod writer;
 
@@ -10,6 +11,7 @@ use bincode::config::{Fixint, LittleEndian, NoLimit};
 use tracing::trace;
 use uuid::Uuid;
 
+pub use self::iter::SegmentIter;
 pub use self::reader::{
     BucketSegmentIter, BucketSegmentReader, CommitRecord, CommittedEvents, CommittedEventsIntoIter,
     EventRecord, ReadHint, Record, SegmentBlock, SegmentBlockIter,

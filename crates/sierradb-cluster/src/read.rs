@@ -465,8 +465,8 @@ impl ClusterActor {
 
         // Adjust end_sequence to respect watermark
         let effective_end_sequence = match end_sequence {
-            Some(end) => Some(end.min(watermark)),
-            None => Some(watermark),
+            Some(end) => end.min(watermark),
+            None => watermark,
         };
 
         debug!(
@@ -499,58 +499,55 @@ impl ClusterActor {
             };
 
             let mut events = Vec::new();
-            let mut has_more = false;
             let mut events_collected = 0;
+            let mut last_read_sequence = 0;
 
-            while let Some(commit) = match iter.next().await {
-                Ok(commit) => commit,
+            'iter: while let Some(commits) = match iter
+                .next_batch(
+                    (effective_end_sequence.saturating_sub(last_read_sequence)).min(50) as usize,
+                )
+                .await
+            {
+                Ok(commits) => commits,
                 Err(err) => {
                     reply_sender.send(Err(ClusterError::Read(err.to_string())));
                     return;
                 }
             } {
-                for event in commit {
-                    // Check if we've reached the count limit
-                    if events_collected >= count {
-                        has_more = true;
-                        break;
-                    }
+                for commit in commits {
+                    for event in commit {
+                        // Check if we've reached the count limit
+                        if events_collected >= count {
+                            break 'iter;
+                        }
 
-                    // Check if event is beyond effective end sequence
-                    if let Some(end_seq) = effective_end_sequence
-                        && event.partition_sequence > end_seq
-                    {
-                        has_more = true;
-                        break;
-                    }
+                        // Check if event is beyond effective end sequence
+                        if event.partition_sequence > effective_end_sequence {
+                            break 'iter;
+                        }
 
-                    // Check if event is beyond watermark (safety check)
-                    if event.partition_sequence > watermark {
-                        break;
+                        last_read_sequence = event.partition_sequence + 1;
+                        events.push(event);
+                        events_collected += 1;
                     }
-
-                    events.push(event);
-                    events_collected += 1;
                 }
 
                 // Break if we hit limits
                 if events_collected >= count {
-                    has_more = true;
                     break;
                 }
 
-                if let Some(end_seq) = effective_end_sequence
-                    && events.last().map(|e| e.partition_sequence).unwrap_or(0) >= end_seq
+                if events.last().map(|e| e.partition_sequence).unwrap_or(0)
+                    >= effective_end_sequence
                 {
                     break;
                 }
             }
 
-            // Check if there are more events beyond what we returned
-            if !has_more && effective_end_sequence.is_some() {
-                // We stopped due to watermark, but there might be more confirmed events later
-                has_more = effective_end_sequence < end_sequence;
-            }
+            let has_more = watermark
+                .checked_sub(1)
+                .map(|latest_sequence| last_read_sequence <= latest_sequence)
+                .unwrap_or(false);
 
             debug!(
                 events_returned = events.len(),

@@ -18,7 +18,7 @@ use uuid::Uuid;
 use crate::StreamId;
 use crate::bucket::event_index::ClosedEventIndex;
 use crate::bucket::partition_index::{
-    ClosedPartitionIndex, PartitionEventIter, PartitionIndexRecord, PartitionOffsets,
+    ClosedPartitionIndex, PartitionIndexRecord, PartitionIter, PartitionOffsets,
 };
 use crate::bucket::segment::{BucketSegmentReader, CommittedEvents, EventRecord, ReadHint};
 use crate::bucket::stream_index::{
@@ -168,14 +168,15 @@ impl Database {
         &self,
         partition_id: PartitionId,
         from_sequence: u64,
-    ) -> Result<PartitionEventIter, PartitionIndexError> {
+    ) -> Result<PartitionIter, PartitionIndexError> {
         let bucket_id = partition_id % self.total_buckets;
-        PartitionEventIter::new(
+        PartitionIter::new(
             partition_id,
             bucket_id,
-            self.reader_pool.clone(),
-            self.writer_pool.indexes(),
             from_sequence,
+            self.reader_pool.clone(),
+            self.writer_pool.indexes().clone(),
+            false,
         )
         .await
     }

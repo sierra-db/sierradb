@@ -543,46 +543,48 @@ impl Message<PartitionSyncRequest> for ClusterActor {
                 .read_partition(msg.partition_id, msg.from_seq)
                 .await
                 .map_err(|err| ClusterError::Read(err.to_string()))?;
-            let mut commits = Vec::new();
-            while let Some(commit) = iter
-                .next()
+            let mut all_commits = Vec::new();
+            'iter: while let Some(commits) = iter
+                .next_batch(50)
                 .await
                 .map_err(|err| ClusterError::Read(err.to_string()))?
             {
-                let Some(first_seq) = commit.first_partition_sequence() else {
-                    error!("found commit with zero events - this should not happen");
-                    continue;
-                };
-                if first_seq >= watermark {
-                    break;
-                }
-
-                debug_assert!(
-                    commit.last_partition_sequence().unwrap() <= watermark,
-                    "if the first events partition sequence is valid, then so should the last"
-                );
-
-                match commit {
-                    CommittedEvents::Single(ref event) => {
-                        if event.partition_sequence <= msg.to_seq {
-                            commits.push(commit);
-                        } else {
-                            break;
-                        }
+                for commit in commits {
+                    let Some(first_seq) = commit.first_partition_sequence() else {
+                        error!("found commit with zero events - this should not happen");
+                        continue;
+                    };
+                    if first_seq >= watermark {
+                        break 'iter;
                     }
-                    CommittedEvents::Transaction { ref events, .. } => {
-                        if let Some(first_event) = events.first() {
-                            if first_event.partition_sequence <= msg.to_seq {
-                                commits.push(commit);
+
+                    debug_assert!(
+                        commit.last_partition_sequence().unwrap() <= watermark,
+                        "if the first events partition sequence is valid, then so should the last"
+                    );
+
+                    match commit {
+                        CommittedEvents::Single(ref event) => {
+                            if event.partition_sequence <= msg.to_seq {
+                                all_commits.push(commit);
                             } else {
-                                break;
+                                break 'iter;
+                            }
+                        }
+                        CommittedEvents::Transaction { ref events, .. } => {
+                            if let Some(first_event) = events.first() {
+                                if first_event.partition_sequence <= msg.to_seq {
+                                    all_commits.push(commit);
+                                } else {
+                                    break 'iter;
+                                }
                             }
                         }
                     }
                 }
             }
 
-            Ok(commits)
+            Ok(all_commits)
         })
     }
 }

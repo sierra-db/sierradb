@@ -277,14 +277,16 @@ impl BucketConfirmationManager {
             .collect();
         for (partition_id, watermark) in watermarks {
             let mut iter = database.read_partition(partition_id, watermark).await?;
-            while let Some(commit) = iter.next().await? {
-                for event in commit {
-                    self.update_confirmation(
-                        partition_id,
-                        event.partition_sequence + 1,
-                        event.confirmation_count,
-                    )
-                    .await?;
+            while let Some(commits) = iter.next_batch(100).await? {
+                for commit in commits {
+                    for event in commit {
+                        self.update_confirmation(
+                            partition_id,
+                            event.partition_sequence + 1,
+                            event.confirmation_count,
+                        )
+                        .await?;
+                    }
                 }
             }
         }

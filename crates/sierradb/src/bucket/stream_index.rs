@@ -2096,4 +2096,329 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn test_stream_iter_multiple_mixed_transactions() {
+        let db = create_test_database(SMALL_SEGMENT_SIZE).await;
+        let partition_key = Uuid::new_v4();
+        let partition_id = 0;
+
+        // Create multiple transactions with interleaved streams
+        // Transaction 1: stream-a (v0), stream-b (v0), stream-a (v1)
+        let tx1_events = vec![
+            create_test_event("stream-a", partition_key, partition_id),
+            create_test_event("stream-b", partition_key, partition_id),
+            create_test_event("stream-a", partition_key, partition_id),
+        ];
+        append_transaction_events(&db, tx1_events, partition_key, partition_id)
+            .await
+            .expect("failed to append tx1");
+
+        // Transaction 2: stream-b (v1), stream-a (v2), stream-b (v2), stream-a (v3)
+        let tx2_events = vec![
+            create_test_event("stream-b", partition_key, partition_id),
+            create_test_event("stream-a", partition_key, partition_id),
+            create_test_event("stream-b", partition_key, partition_id),
+            create_test_event("stream-a", partition_key, partition_id),
+        ];
+        append_transaction_events(&db, tx2_events, partition_key, partition_id)
+            .await
+            .expect("failed to append tx2");
+
+        // Transaction 3: stream-a (v4) only
+        let tx3_events = vec![create_test_event("stream-a", partition_key, partition_id)];
+        append_transaction_events(&db, tx3_events, partition_key, partition_id)
+            .await
+            .expect("failed to append tx3");
+
+        // Read stream-a and verify no duplicates
+        let mut stream_iter = db
+            .read_stream(partition_id, StreamId::new("stream-a").unwrap(), 0, false)
+            .await
+            .expect("failed to create stream iterator");
+
+        let mut collected_events = Vec::new();
+        let mut event_ids = HashSet::new();
+
+        while let Some(committed_events) = stream_iter.next().await.expect("read err") {
+            match committed_events {
+                CommittedEvents::Single(event) => {
+                    assert!(
+                        event_ids.insert(event.event_id),
+                        "duplicate event detected: {:?}",
+                        event.event_id
+                    );
+                    collected_events.push(event.stream_version);
+                }
+                CommittedEvents::Transaction { events, .. } => {
+                    for event in events.iter() {
+                        if event.stream_id.as_ref() == "stream-a" {
+                            assert!(
+                                event_ids.insert(event.event_id),
+                                "duplicate event detected: {:?}",
+                                event.event_id
+                            );
+                            collected_events.push(event.stream_version);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Should have exactly 5 events for stream-a: versions 0, 1, 2, 3, 4
+        assert_eq!(collected_events, vec![0, 1, 2, 3, 4]);
+        assert_eq!(event_ids.len(), 5, "should have exactly 5 unique events");
+    }
+
+    #[tokio::test]
+    async fn test_stream_iter_large_mixed_transaction() {
+        let db = create_test_database(SMALL_SEGMENT_SIZE).await;
+        let partition_key = Uuid::new_v4();
+        let partition_id = 0;
+
+        // Create a large transaction with many interleaved streams
+        let mut large_tx_events = Vec::new();
+        let stream_a_count = 15;
+        let stream_b_count = 10;
+
+        // Interleave stream-a and stream-b events
+        for i in 0..stream_a_count {
+            large_tx_events.push(create_test_event("stream-a", partition_key, partition_id));
+            if i < stream_b_count {
+                large_tx_events.push(create_test_event("stream-b", partition_key, partition_id));
+            }
+        }
+
+        append_transaction_events(&db, large_tx_events, partition_key, partition_id)
+            .await
+            .expect("failed to append large transaction");
+
+        // Read stream-a
+        let mut stream_iter = db
+            .read_stream(partition_id, StreamId::new("stream-a").unwrap(), 0, false)
+            .await
+            .expect("failed to create stream iterator");
+
+        let mut collected_events = Vec::new();
+        let mut seen_offsets = HashSet::new();
+
+        while let Some(committed_events) = stream_iter.next().await.expect("read err") {
+            match committed_events {
+                CommittedEvents::Single(event) => {
+                    assert!(
+                        seen_offsets.insert(event.offset),
+                        "duplicate offset {} detected",
+                        event.offset
+                    );
+                    collected_events.push(event.stream_version);
+                }
+                CommittedEvents::Transaction { events, .. } => {
+                    for event in events.iter() {
+                        if event.stream_id.as_ref() == "stream-a" {
+                            assert!(
+                                seen_offsets.insert(event.offset),
+                                "duplicate offset {} detected",
+                                event.offset
+                            );
+                            collected_events.push(event.stream_version);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Should have exactly stream_a_count events, no duplicates
+        assert_eq!(collected_events.len(), stream_a_count);
+        for (i, &version) in collected_events.iter().enumerate() {
+            assert_eq!(version, i as u64);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stream_iter_adjacent_mixed_and_pure_transactions() {
+        let db = create_test_database(SMALL_SEGMENT_SIZE).await;
+        let partition_key = Uuid::new_v4();
+        let partition_id = 0;
+
+        // Pattern: pure stream-a TX, mixed TX, pure stream-a TX, mixed TX
+
+        // TX1: Pure stream-a (v0, v1)
+        append_transaction_events(
+            &db,
+            vec![
+                create_test_event("stream-a", partition_key, partition_id),
+                create_test_event("stream-a", partition_key, partition_id),
+            ],
+            partition_key,
+            partition_id,
+        )
+        .await
+        .expect("tx1");
+
+        // TX2: Mixed (stream-a v2, stream-b v0, stream-a v3)
+        append_transaction_events(
+            &db,
+            vec![
+                create_test_event("stream-a", partition_key, partition_id),
+                create_test_event("stream-b", partition_key, partition_id),
+                create_test_event("stream-a", partition_key, partition_id),
+            ],
+            partition_key,
+            partition_id,
+        )
+        .await
+        .expect("tx2");
+
+        // TX3: Pure stream-a (v4, v5, v6)
+        append_transaction_events(
+            &db,
+            vec![
+                create_test_event("stream-a", partition_key, partition_id),
+                create_test_event("stream-a", partition_key, partition_id),
+                create_test_event("stream-a", partition_key, partition_id),
+            ],
+            partition_key,
+            partition_id,
+        )
+        .await
+        .expect("tx3");
+
+        // TX4: Mixed (stream-b v1, stream-a v7, stream-b v2)
+        append_transaction_events(
+            &db,
+            vec![
+                create_test_event("stream-b", partition_key, partition_id),
+                create_test_event("stream-a", partition_key, partition_id),
+                create_test_event("stream-b", partition_key, partition_id),
+            ],
+            partition_key,
+            partition_id,
+        )
+        .await
+        .expect("tx4");
+
+        // Read stream-a
+        let mut stream_iter = db
+            .read_stream(partition_id, StreamId::new("stream-a").unwrap(), 0, false)
+            .await
+            .expect("failed to create stream iterator");
+
+        let mut collected_events = Vec::new();
+        let mut transaction_count = 0;
+
+        while let Some(committed_events) = stream_iter.next().await.expect("read err") {
+            transaction_count += 1;
+            match committed_events {
+                CommittedEvents::Single(event) => {
+                    collected_events.push(event.stream_version);
+                }
+                CommittedEvents::Transaction { events, .. } => {
+                    for event in events.iter() {
+                        if event.stream_id.as_ref() == "stream-a" {
+                            collected_events.push(event.stream_version);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Should see exactly 8 events: 0,1,2,3,4,5,6,7
+        assert_eq!(collected_events, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        // Should see 4 transactions (one per TX)
+        assert_eq!(transaction_count, 4);
+    }
+
+    #[tokio::test]
+    async fn test_stream_iter_batch_reading_mixed_transactions() {
+        let db = create_test_database(SMALL_SEGMENT_SIZE).await;
+        let partition_key = Uuid::new_v4();
+        let partition_id = 0;
+
+        // Create several mixed transactions
+        for _ in 0..5 {
+            let mixed_events = vec![
+                create_test_event("stream-a", partition_key, partition_id),
+                create_test_event("stream-b", partition_key, partition_id),
+                create_test_event("stream-a", partition_key, partition_id),
+                create_test_event("stream-c", partition_key, partition_id),
+            ];
+            append_transaction_events(&db, mixed_events, partition_key, partition_id)
+                .await
+                .expect("failed to append mixed transaction");
+        }
+
+        // Read stream-a with small batch size
+        let mut stream_iter = db
+            .read_stream(partition_id, StreamId::new("stream-a").unwrap(), 0, false)
+            .await
+            .expect("failed to create stream iterator");
+
+        let mut all_events = Vec::new();
+        let batch_size = 3;
+
+        while let Some(batch) = stream_iter.next_batch(batch_size).await.expect("read err") {
+            for committed_events in batch {
+                match committed_events {
+                    CommittedEvents::Single(event) => {
+                        all_events.push(event.stream_version);
+                    }
+                    CommittedEvents::Transaction { events, .. } => {
+                        for event in events.iter() {
+                            if event.stream_id.as_ref() == "stream-a" {
+                                all_events.push(event.stream_version);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Should have 10 events total (2 per transaction * 5 transactions)
+        assert_eq!(all_events.len(), 10);
+        for (i, &version) in all_events.iter().enumerate() {
+            assert_eq!(version, i as u64);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stream_iter_should_not_return_other_streams() {
+        let db = create_test_database(SMALL_SEGMENT_SIZE).await;
+        let partition_key = Uuid::new_v4();
+        let partition_id = 0;
+
+        // Create transaction with multiple streams
+        let events = vec![
+            create_test_event("stream-a", partition_key, partition_id),
+            create_test_event("stream-b", partition_key, partition_id),
+            create_test_event("stream-a", partition_key, partition_id),
+        ];
+        append_transaction_events(&db, events, partition_key, partition_id)
+            .await
+            .expect("failed to append");
+
+        // Read stream-a
+        let mut stream_iter = db
+            .read_stream(partition_id, StreamId::new("stream-a").unwrap(), 0, false)
+            .await
+            .expect("failed to create iterator");
+
+        while let Some(committed_events) = stream_iter.next().await.expect("read err") {
+            match &committed_events {
+                CommittedEvents::Single(event) => {
+                    // Should ONLY have stream-a events
+                    assert_eq!(event.stream_id.as_ref(), "stream-a");
+                }
+                CommittedEvents::Transaction { events, .. } => {
+                    // Should ONLY have stream-a events
+                    for event in &**events {
+                        assert_eq!(
+                            event.stream_id.as_ref(),
+                            "stream-a",
+                            "StreamIter returned event for wrong stream!"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
