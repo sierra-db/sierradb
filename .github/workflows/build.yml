@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        rust: [stable, nightly]
+        rust: [stable]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -45,7 +45,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
       - name: Check formatting
@@ -58,7 +58,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - name: Run clippy

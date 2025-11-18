@@ -1,5 +1,5 @@
 # Multi-stage build for efficient Docker image
-FROM rustlang/rust:nightly AS builder
+FROM rust:1.91 AS builder
 
 # Set working directory
 WORKDIR /app
