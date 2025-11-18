@@ -48,8 +48,21 @@ docker run -p 9090:9090 -v ./data:/app/data tqwewe/sierradb
 
 ### Install with Cargo
 ```bash
+# Setup toolchain to use nightly feature
+rustup toolchain install nightly
+rustup override set nightly
 cargo install sierradb-server
 sierradb --dir ./data --client-address 0.0.0.0:9090
+```
+
+### Server Startup
+
+```bash
+# Startup Logs
+INFO sierradb_topology::manager: recalculating partition assignments with 1 active nodes
+INFO sierradb_topology::behaviour: node 0 owns 32/32 partitions as replicas
+INFO libp2p_swarm: local_peer_id=12D3KooWDm7sMssZnyq77Dcpzg7t1xZDs2pq6N5mwR3wbMhMscbN
+WARN libp2p_kad::behaviour: Failed to trigger bootstrap: No known peers.
 ```
 
 ### Basic Event Operations
@@ -78,7 +91,7 @@ import redis
 client = redis.Redis(host='localhost', port=9090, protocol=3)
 
 # Append an event
-result = client.execute_command('EAPPEND', 'user-123', 'UserCreated', 
+result = client.execute_command('EAPPEND', 'user-123', 'UserCreated',
                                'PAYLOAD', '{"name":"John","email":"john@example.com"}')
 
 # Read events from stream
@@ -119,7 +132,7 @@ SierraDB organizes data using a three-tier hierarchy designed for optimal perfor
 SierraDB is optimized for three primary read patterns:
 
 1. **Event Lookup by ID** - Fast UUID-based event retrieval using event indexes
-2. **Stream Scanning** - Efficient sequential reading of events within a stream using stream indexes  
+2. **Stream Scanning** - Efficient sequential reading of events within a stream using stream indexes
 3. **Partition Scanning** - High-throughput scanning of events within a partition using partition indexes
 
 Each segment file is accompanied by specialized index files and bloom filters for maximum query performance.
@@ -155,7 +168,7 @@ SierraDB offers extensive configuration options. Key settings include:
 [bucket]
 count = 4                    # Number of buckets
 
-[partition] 
+[partition]
 count = 32                   # Number of partitions (8 per bucket by default)
 
 [segment]
@@ -193,7 +206,7 @@ EAPPEND <stream_id> <event_name> [EVENT_ID <event_id>] [PARTITION_KEY <partition
 
 **Parameters:**
 - `stream_id` - Stream identifier to append the event to
-- `event_name` - Name/type of the event  
+- `event_name` - Name/type of the event
 - `event_id` (optional) - UUID for the event (auto-generated if not provided)
 - `partition_key` (optional) - UUID to determine event partitioning
 - `expected_version` (optional) - Expected stream version (number, "any", "exists", "empty")
@@ -253,7 +266,7 @@ ESCAN <stream_id> <start_version> <end_version> [PARTITION_KEY <partition_key>] 
 **Parameters:**
 - `stream_id` - Stream identifier to scan
 - `start_version` - Starting version number (use "-" for beginning)
-- `end_version` - Ending version number (use "+" for end, or specific number)  
+- `end_version` - Ending version number (use "+" for end, or specific number)
 - `partition_key` (optional) - UUID to scan specific partition
 - `count` (optional) - Maximum number of events to return
 
@@ -291,7 +304,7 @@ Subscribe to events from one or more streams with real-time delivery.
 # Single stream
 ESUB <stream_id> [PARTITION_KEY <partition_key>] [FROM <version>] [WINDOW <size>]
 
-# Multiple streams  
+# Multiple streams
 ESUB <stream_id_1> [PARTITION_KEY <pk_1>] <stream_id_2> [PARTITION_KEY <pk_2>] ... [FROM LATEST | FROM <version> | FROM MAP <stream>=<ver>...] [WINDOW <size>]
 ```
 
@@ -304,7 +317,7 @@ ESUB <stream_id_1> [PARTITION_KEY <pk_1>] <stream_id_2> [PARTITION_KEY <pk_2>] .
 **Examples:**
 ```
 ESUB user-123                                         # Single stream, latest, no window
-ESUB user-123 WINDOW 100                              # Single stream, latest, window 100  
+ESUB user-123 WINDOW 100                              # Single stream, latest, window 100
 ESUB user-123 FROM 50 WINDOW 100                      # Single stream, from version 50
 ESUB user-1 user-2 user-3 FROM MAP user-1=10 user-2=20 user-3=30 WINDOW 50
 ```
@@ -367,14 +380,14 @@ EPSUB <p1>,<p2>,<p3> [FROM LATEST | FROM <sequence> | FROM MAP <p1>=<s1> <p2>=<s
 
 **Parameters:**
 - `partition_id` - Partition identifier(s) (* for all, comma-separated list for multiple)
-- `FROM` (optional) - Starting position (LATEST, sequence number, or MAP for per-partition positions)  
+- `FROM` (optional) - Starting position (LATEST, sequence number, or MAP for per-partition positions)
 - `WINDOW` (optional) - Maximum number of unacknowledged events
 
 **Examples:**
 ```
 EPSUB *                                               # All partitions, latest
 EPSUB * WINDOW 100                                    # All partitions, latest, window 100
-EPSUB * FROM 1000 WINDOW 100                          # All partitions, from seq 1000  
+EPSUB * FROM 1000 WINDOW 100                          # All partitions, from seq 1000
 EPSUB 5 FROM 100 WINDOW 50                            # Partition 5, from seq 100
 EPSUB 1,2,3 FROM MAP 1=100 2=200 DEFAULT 0 WINDOW 500
 ```
@@ -458,7 +471,7 @@ For distributed deployments across multiple nodes:
 # Node 1
 sierradb --dir ./data1 --node-index 0 --node-count 3 --client-address 0.0.0.0:9090
 
-# Node 2  
+# Node 2
 sierradb --dir ./data2 --node-index 1 --node-count 3 --client-address 0.0.0.0:9091
 
 # Node 3
@@ -480,7 +493,7 @@ use uuid::Uuid;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Open database directly
     let db = Database::open("./data")?;
-    
+
     // Create and append events
     let stream_id = StreamId::new("user-123")?;
     let partition_key = Uuid::new_v5(&NAMESPACE_PARTITION_KEY, stream_id.as_bytes());
@@ -503,10 +516,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             metadata: vec![],
         }]
     )?;
-    
+
     let result = db.append_events(transaction).await?;
     println!("Event appended with sequence: {}", result.first_partition_sequence);
-    
+
     Ok(())
 }
 ```
@@ -521,18 +534,18 @@ use sierradb_client::{SierraClient, SierraAsyncClientExt, SierraMessage};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = SierraClient::connect("redis://localhost:9090").await?;
-    
+
     // Append an event with type safety
     let options = EAppendOptions::new()
         .payload(br#"{"name":"john"}"#)
         .metadata(br#"{"source":"api"}"#);
     let result = client.eappend("user-123", "UserCreated", options)?;
-    
+
     // Scan events from stream
     let events = client.escan("user-123", "-", None, Some(50))
         .execute()
         .await?;
-    
+
     // Subscribe to real-time events
     let mut manager = client.subscription_manager().await?;
     let mut subscription = manager
@@ -541,7 +554,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(msg) = subscription.next_message().await? {
         println!("Received event: {msg:?}");
     }
-    
+
     Ok(())
 }
 ```
@@ -551,7 +564,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 SierraDB is under active development and testing:
 
 - **Stability Testing**: Extensive fuzzing campaigns ensure robustness under edge conditions
-- **Performance Validation**: Consistent performance characteristics validated across various workloads  
+- **Performance Validation**: Consistent performance characteristics validated across various workloads
 - **Current Usage**: Being used to build systems in development and testing environments
 - **Data Safety**: Comprehensive corruption detection and recovery mechanisms implemented
 
