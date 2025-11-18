@@ -5,30 +5,17 @@
 //! - `[20..20+L]` : serialized MPHF bytes (using bincode)
 //! - `[20+L..]`   : records array, exactly n records of RECORD_SIZE bytes each.
 
-use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, Write};
 use std::mem;
-use std::os::unix::fs::FileExt;
-use std::panic::panic_any;
-use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 
-use arc_swap::{ArcSwap, Cache};
-use bincode::config;
-use boomphf::Mphf;
-use rayon::ThreadPool;
-use tokio::sync::oneshot;
-use tracing::{error, warn};
+use crate::bucket::PartitionId;
 
-use super::segment::{BucketSegmentReader, EventRecord, Record};
-use super::{BucketId, BucketSegmentId, PartitionId, SegmentId};
-use crate::bucket::segment::{CommittedEvents, ReadHint};
-use crate::error::{PartitionIndexError, ThreadPoolError};
-use crate::reader_thread_pool::ReaderThreadPool;
-use crate::writer_thread_pool::LiveIndexes;
+mod closed;
+mod iter;
+mod open;
+
+pub use self::closed::{ClosedIndex, ClosedOffsetKind, ClosedPartitionIndex};
+pub use self::iter::PartitionIter;
+pub use self::open::OpenPartitionIndex;
 
 // Partition ID, sequence min, sequence max, event count, events offset, events
 // length
@@ -65,946 +52,28 @@ pub struct PartitionSequenceOffset {
     pub offset: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ClosedOffsetKind {
-    Pointer(u64, u32), // Its in the file at this location (offset, length)
-    Cached(Vec<PartitionSequenceOffset>), // Its cached
-    ExternalBucket,    // This partition lives in a different bucket
-}
-
-impl From<PartitionOffsets> for ClosedOffsetKind {
-    fn from(offsets: PartitionOffsets) -> Self {
-        match offsets {
-            PartitionOffsets::Offsets(offsets) => ClosedOffsetKind::Cached(offsets),
-            PartitionOffsets::ExternalBucket => ClosedOffsetKind::ExternalBucket,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct OpenPartitionIndex {
-    id: BucketSegmentId,
-    file: File,
-    index: BTreeMap<PartitionId, PartitionIndexRecord<PartitionOffsets>>,
-}
-
-impl OpenPartitionIndex {
-    pub fn create(
-        id: BucketSegmentId,
-        path: impl AsRef<Path>,
-    ) -> Result<Self, PartitionIndexError> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(path)?;
-        let index = BTreeMap::new();
-
-        Ok(OpenPartitionIndex { id, file, index })
-    }
-
-    pub fn open(id: BucketSegmentId, path: impl AsRef<Path>) -> Result<Self, PartitionIndexError> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
-        let index = BTreeMap::new();
-
-        Ok(OpenPartitionIndex { id, file, index })
-    }
-
-    /// Closes the partition index, flushing the index in a background thread.
-    pub fn close(self, pool: &ThreadPool) -> Result<ClosedPartitionIndex, PartitionIndexError> {
-        let id = self.id;
-        let mut file_clone = self.file.try_clone()?;
-        let index = Arc::new(ArcSwap::new(Arc::new(ClosedIndex::Cache(self.index))));
-
-        pool.spawn({
-            let index = Arc::clone(&index);
-            move || match &**index.load() {
-                ClosedIndex::Cache(map) => match Self::flush_inner(&mut file_clone, map) {
-                    Ok((mphf, records_offset)) => {
-                        index.store(Arc::new(ClosedIndex::Mphf {
-                            mphf,
-                            records_offset,
-                        }));
-                    }
-                    Err(err) => {
-                        panic_any(ThreadPoolError::FlushPartitionIndex {
-                            id,
-                            file: file_clone,
-                            index,
-                            err,
-                        });
-                    }
-                },
-                ClosedIndex::Mphf { .. } => unreachable!("no other threads write to this arc swap"),
-            }
-        });
-
-        Ok(ClosedPartitionIndex {
-            id,
-            file: self.file,
-            index: Cache::new(index),
-        })
-    }
-
-    pub fn get(
-        &self,
-        partition_id: PartitionId,
-    ) -> Option<&PartitionIndexRecord<PartitionOffsets>> {
-        self.index.get(&partition_id)
-    }
-
-    pub fn insert(
-        &mut self,
-        partition_id: PartitionId,
-        sequence: u64,
-        offset: u64,
-    ) -> Result<(), PartitionIndexError> {
-        match self.index.entry(partition_id) {
-            Entry::Vacant(entry) => {
-                entry.insert(PartitionIndexRecord {
-                    sequence_min: sequence,
-                    sequence_max: sequence,
-                    sequence: 1,
-                    offsets: PartitionOffsets::Offsets(vec![PartitionSequenceOffset {
-                        sequence,
-                        offset,
-                    }]),
-                });
-            }
-            Entry::Occupied(mut entry) => {
-                let entry = entry.get_mut();
-                entry.sequence_min = entry.sequence_min.min(sequence);
-                entry.sequence_max = entry.sequence_max.max(sequence);
-                match &mut entry.offsets {
-                    PartitionOffsets::Offsets(offsets) => {
-                        offsets.push(PartitionSequenceOffset { sequence, offset });
-                        entry.sequence = entry
-                            .sequence
-                            .checked_add(1)
-                            .ok_or(PartitionIndexError::EventCountOverflow)?;
-                    }
-                    PartitionOffsets::ExternalBucket => {
-                        return Err(PartitionIndexError::PartitionIdMappedToExternalBucket);
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn insert_external_bucket(
-        &mut self,
-        partition_id: PartitionId,
-    ) -> Result<(), PartitionIndexError> {
-        match self.index.entry(partition_id) {
-            Entry::Vacant(entry) => {
-                entry.insert(PartitionIndexRecord {
-                    sequence_min: 0,
-                    sequence_max: 0,
-                    sequence: 0,
-                    offsets: PartitionOffsets::ExternalBucket,
-                });
-            }
-            Entry::Occupied(mut entry) => {
-                let entry = entry.get_mut();
-                match &mut entry.offsets {
-                    PartitionOffsets::Offsets(_) => {
-                        return Err(PartitionIndexError::PartitionIdOffsetExists);
-                    }
-                    PartitionOffsets::ExternalBucket => {}
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn flush(&mut self) -> Result<(Mphf<PartitionId>, u64), PartitionIndexError> {
-        Self::flush_inner(&mut self.file, &self.index)
-    }
-
-    /// Hydrates the index from a reader.
-    pub fn hydrate(&mut self, reader: &mut BucketSegmentReader) -> Result<(), PartitionIndexError> {
-        let mut reader_iter = reader.iter();
-        while let Some(record) = reader_iter.next_record()? {
-            match record {
-                Record::Event(EventRecord {
-                    offset,
-                    partition_id,
-                    partition_sequence,
-                    ..
-                }) => {
-                    self.insert(partition_id, partition_sequence, offset)?;
-                }
-                Record::Commit(_) => {}
-            }
-        }
-
-        Ok(())
-    }
-
-    fn flush_inner(
-        file: &mut File,
-        index: &BTreeMap<PartitionId, PartitionIndexRecord<PartitionOffsets>>,
-    ) -> Result<(Mphf<PartitionId>, u64), PartitionIndexError> {
-        // Collect all keys from the index
-        let keys: Vec<PartitionId> = index.keys().copied().collect();
-        let n = keys.len() as u64;
-
-        // Build the MPHF over the keys
-        let mphf = Mphf::new(MPHF_GAMMA, &keys);
-
-        // Serialize the MPHF structure
-        let mphf_bytes = bincode::serde::encode_to_vec(&mphf, config::standard())
-            .map_err(PartitionIndexError::SerializeMphf)?;
-        let mphf_bytes_len = mphf_bytes.len() as u64;
-
-        // Allocate a records array for exactly n records
-        let mut records = vec![0u8; index.len() * RECORD_SIZE];
-
-        // Value data for all partition records
-        let mut value_data = Vec::new();
-
-        // Calculate the base offset for values
-        let header_size = 4 + 8 + 8 + mphf_bytes.len() as u64;
-        let records_size = (index.len() * RECORD_SIZE) as u64;
-        let values_base_offset = header_size + records_size;
-
-        // Place each record in its slot according to the MPHF
-        for (&partition_id, record) in index {
-            let slot = mphf.hash(&partition_id) as usize;
-            let pos = slot * RECORD_SIZE;
-
-            match &record.offsets {
-                PartitionOffsets::Offsets(offsets) => {
-                    let mut offsets_bytes: Vec<u8> =
-                        vec![0; (SEQUENCE_SIZE + EVENTS_OFFSET_SIZE) * offsets.len()];
-                    for (i, PartitionSequenceOffset { sequence, offset }) in
-                        offsets.iter().enumerate()
-                    {
-                        let mut i = (SEQUENCE_SIZE + EVENTS_OFFSET_SIZE) * i;
-                        offsets_bytes[i..i + SEQUENCE_SIZE]
-                            .copy_from_slice(&sequence.to_le_bytes());
-                        i += SEQUENCE_SIZE;
-                        offsets_bytes[i..i + EVENTS_OFFSET_SIZE]
-                            .copy_from_slice(&offset.to_le_bytes());
-                    }
-
-                    if offsets_bytes.is_empty() {
-                        continue;
-                    }
-
-                    // Record entry: partition_id, sequence_min, sequence_max, event_count,
-                    // events_offset, events_len
-                    let mut pos_in_record = 0;
-
-                    // Partition ID
-                    records[pos + pos_in_record..pos + pos_in_record + PARTITION_ID_SIZE]
-                        .copy_from_slice(&partition_id.to_le_bytes());
-                    pos_in_record += PARTITION_ID_SIZE;
-
-                    // Sequence min
-                    records[pos + pos_in_record..pos + pos_in_record + SEQUENCE_SIZE]
-                        .copy_from_slice(&record.sequence_min.to_le_bytes());
-                    pos_in_record += SEQUENCE_SIZE;
-
-                    // Sequence max
-                    records[pos + pos_in_record..pos + pos_in_record + SEQUENCE_SIZE]
-                        .copy_from_slice(&record.sequence_max.to_le_bytes());
-                    pos_in_record += SEQUENCE_SIZE;
-
-                    // Event count
-                    records[pos + pos_in_record..pos + pos_in_record + SEQUENCE_SIZE]
-                        .copy_from_slice(&record.sequence.to_le_bytes());
-                    pos_in_record += SEQUENCE_SIZE;
-
-                    // Current offset in values section
-                    let current_value_offset = values_base_offset + value_data.len() as u64;
-
-                    // Events offset - use the actual file offset
-                    records[pos + pos_in_record..pos + pos_in_record + EVENTS_OFFSET_SIZE]
-                        .copy_from_slice(&current_value_offset.to_le_bytes());
-                    pos_in_record += EVENTS_OFFSET_SIZE;
-
-                    // Events length
-                    records[pos + pos_in_record..pos + pos_in_record + EVENTS_LEN_SIZE]
-                        .copy_from_slice(&(offsets.len() as u32).to_le_bytes());
-
-                    // Add to value data
-                    value_data.extend(offsets_bytes);
-                }
-                PartitionOffsets::ExternalBucket => {
-                    // Record entry for external bucket
-                    let mut pos_in_record = 0;
-
-                    // Partition ID
-                    records[pos + pos_in_record..pos + pos_in_record + PARTITION_ID_SIZE]
-                        .copy_from_slice(&partition_id.to_le_bytes());
-                    pos_in_record += PARTITION_ID_SIZE;
-
-                    // Sequence min
-                    records[pos + pos_in_record..pos + pos_in_record + SEQUENCE_SIZE]
-                        .copy_from_slice(&record.sequence_min.to_le_bytes());
-                    pos_in_record += SEQUENCE_SIZE;
-
-                    // Sequence max
-                    records[pos + pos_in_record..pos + pos_in_record + SEQUENCE_SIZE]
-                        .copy_from_slice(&record.sequence_max.to_le_bytes());
-                    pos_in_record += SEQUENCE_SIZE;
-
-                    // Event count
-                    records[pos + pos_in_record..pos + pos_in_record + SEQUENCE_SIZE]
-                        .copy_from_slice(&record.sequence.to_le_bytes());
-                    pos_in_record += SEQUENCE_SIZE;
-
-                    // Special value for external bucket (u64::MAX)
-                    records[pos + pos_in_record..pos + pos_in_record + EVENTS_OFFSET_SIZE]
-                        .copy_from_slice(&u64::MAX.to_le_bytes());
-                    pos_in_record += EVENTS_OFFSET_SIZE;
-
-                    // Special value for external bucket (u32::MAX)
-                    records[pos + pos_in_record..pos + pos_in_record + EVENTS_LEN_SIZE]
-                        .copy_from_slice(&u32::MAX.to_le_bytes());
-                }
-            }
-        }
-
-        // Build the file header
-        // Magic marker ("PIDX"), number of keys, length of mph_bytes, then the
-        // mph_bytes
-        let mut file_data = Vec::with_capacity(4 + 8 + 8 + mphf_bytes.len() + records.len());
-        file_data.extend_from_slice(b"PIDX"); // magic: 4 bytes
-        file_data.extend_from_slice(&n.to_le_bytes()); // number of keys: 8 bytes
-        file_data.extend_from_slice(&mphf_bytes_len.to_le_bytes()); // length of mph_bytes: 8 bytes
-        file_data.extend_from_slice(&mphf_bytes); // serialized MPHF
-        file_data.extend_from_slice(&records); // records array
-
-        // Calculate records offset
-        let records_offset = 4 + 8 + 8 + mphf_bytes.len() as u64;
-
-        // Write the file data and values data
-        file.seek(std::io::SeekFrom::Start(0))?;
-        file.write_all(&file_data)?;
-        file.write_all(&value_data)?;
-        file.flush()?;
-
-        Ok((mphf, records_offset))
-    }
-}
-
-#[derive(Debug)]
-pub enum ClosedIndex {
-    Cache(BTreeMap<PartitionId, PartitionIndexRecord<PartitionOffsets>>),
-    Mphf {
-        mphf: Mphf<PartitionId>,
-        records_offset: u64,
-    },
-}
-
-pub struct ClosedPartitionIndex {
-    id: BucketSegmentId,
-    file: File,
-    index: Cache<Arc<ArcSwap<ClosedIndex>>, Arc<ClosedIndex>>,
-}
-
-impl ClosedPartitionIndex {
-    pub fn open(id: BucketSegmentId, path: impl AsRef<Path>) -> Result<Self, PartitionIndexError> {
-        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-
-        // Read the magic marker
-        let mut magic = [0u8; 4];
-        file.read_exact(&mut magic)?;
-
-        if &magic != b"PIDX" {
-            return Err(PartitionIndexError::CorruptHeader);
-        }
-
-        // File is positioned after magic bytes
-        let (mphf, _, records_offset) = load_index_from_file(&mut file)?;
-
-        Ok(ClosedPartitionIndex {
-            id,
-            file,
-            index: Cache::new(Arc::new(ArcSwap::new(Arc::new(ClosedIndex::Mphf {
-                mphf,
-                records_offset,
-            })))),
-        })
-    }
-
-    pub fn try_clone(&self) -> Result<Self, PartitionIndexError> {
-        Ok(ClosedPartitionIndex {
-            id: self.id,
-            file: self.file.try_clone()?,
-            index: self.index.clone(),
-        })
-    }
-
-    pub fn get_key(
-        &mut self,
-        partition_id: PartitionId,
-    ) -> Result<Option<PartitionIndexRecord<ClosedOffsetKind>>, PartitionIndexError> {
-        match self.index.load().as_ref() {
-            // Cache mode - this is used during transitions or legacy format
-            ClosedIndex::Cache(cache) => {
-                Ok(cache
-                    .get(&partition_id)
-                    .cloned()
-                    .map(|record| PartitionIndexRecord {
-                        sequence_min: record.sequence_min,
-                        sequence_max: record.sequence_max,
-                        sequence: record.sequence,
-                        offsets: record.offsets.into(),
-                    }))
-            }
-            // New MPHF-based lookup
-            ClosedIndex::Mphf {
-                mphf,
-                records_offset,
-            } => {
-                // Try to compute the slot using the MPHF
-                let Some(slot) = mphf.try_hash(&partition_id) else {
-                    return Ok(None);
-                };
-
-                // Calculate the position in the file
-                let pos = records_offset + (slot * RECORD_SIZE as u64);
-
-                let file_size = self.file.metadata()?.len();
-                if pos + RECORD_SIZE as u64 > file_size {
-                    return Ok(None); // Position is out of bounds, treat as "not found"
-                }
-
-                // Read the record
-                let mut buf = vec![0u8; RECORD_SIZE];
-                self.file.read_exact_at(&mut buf, pos)?;
-
-                // Extract the partition ID and verify it matches
-                let stored_partition_id = PartitionId::from_le_bytes([buf[0], buf[1]]);
-
-                // Double-check the partition ID - this is an important safety check
-                // because the MPHF is defined only for keys that existed when it was built
-                if stored_partition_id != partition_id {
-                    return Ok(None);
-                }
-
-                // Extract the record fields
-                let sequence_min = u64::from_le_bytes(buf[2..10].try_into().unwrap());
-                let sequence_max = u64::from_le_bytes(buf[10..18].try_into().unwrap());
-                let sequence = u64::from_le_bytes(buf[18..26].try_into().unwrap());
-                let events_offset = u64::from_le_bytes(buf[26..34].try_into().unwrap());
-                let events_len = u32::from_le_bytes(buf[34..38].try_into().unwrap());
-
-                // Determine the type of offset
-                let offsets = if events_offset == u64::MAX && events_len == u32::MAX {
-                    ClosedOffsetKind::ExternalBucket
-                } else {
-                    ClosedOffsetKind::Pointer(events_offset, events_len)
-                };
-
-                // Return the record
-                Ok(Some(PartitionIndexRecord {
-                    sequence_min,
-                    sequence_max,
-                    sequence,
-                    offsets,
-                }))
-            }
-        }
-    }
-
-    pub fn get_from_key(
-        &self,
-        key: PartitionIndexRecord<ClosedOffsetKind>,
-    ) -> Result<PartitionOffsets, PartitionIndexError> {
-        match key.offsets {
-            ClosedOffsetKind::Pointer(offset, len) => {
-                // Read values from the file
-                let mut values_buf = vec![0u8; len as usize * (SEQUENCE_SIZE + EVENTS_OFFSET_SIZE)];
-                match self.file.read_exact_at(&mut values_buf, offset) {
-                    Ok(_) => {
-                        // Successfully read the values
-                        let offsets = values_buf
-                            .chunks_exact(SEQUENCE_SIZE + EVENTS_OFFSET_SIZE)
-                            .map(|b| {
-                                let sequence =
-                                    u64::from_le_bytes(b[0..SEQUENCE_SIZE].try_into().unwrap());
-                                let offset = u64::from_le_bytes(
-                                    b[SEQUENCE_SIZE..SEQUENCE_SIZE + EVENTS_OFFSET_SIZE]
-                                        .try_into()
-                                        .unwrap(),
-                                );
-                                PartitionSequenceOffset { sequence, offset }
-                            })
-                            .collect();
-                        Ok(PartitionOffsets::Offsets(offsets))
-                    }
-                    Err(err) => {
-                        // If we can't read the values, use the offset and len for diagnostic info
-                        Err(PartitionIndexError::Io(err))
-                    }
-                }
-            }
-            ClosedOffsetKind::Cached(offsets) => Ok(PartitionOffsets::Offsets(offsets)),
-            ClosedOffsetKind::ExternalBucket => Ok(PartitionOffsets::ExternalBucket),
-        }
-    }
-
-    pub fn get(
-        &mut self,
-        partition_id: PartitionId,
-    ) -> Result<Option<PartitionOffsets>, PartitionIndexError> {
-        self.get_key(partition_id)
-            .and_then(|key| key.map(|key| self.get_from_key(key)).transpose())
-    }
-}
-
-#[derive(Debug)]
-pub struct PartitionEventIter {
-    partition_id: PartitionId,
-    bucket_id: BucketId,
-    reader_pool: ReaderThreadPool,
-    from_sequence: u64,
-    segment_id: SegmentId,
-    segment_offsets: VecDeque<PartitionSequenceOffset>,
-    live_segment_id: SegmentId,
-    live_segment_offsets: VecDeque<PartitionSequenceOffset>,
-    next_offset: Option<NextOffset>,
-    next_live_offset: Option<NextOffset>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct NextOffset {
-    offset: u64,
-    segment_id: SegmentId,
-}
-
-impl PartitionEventIter {
-    #[allow(clippy::type_complexity)]
-    pub(crate) async fn new(
-        partition_id: PartitionId,
-        bucket_id: BucketId,
-        reader_pool: ReaderThreadPool,
-        live_indexes: &HashMap<BucketId, (Arc<AtomicU32>, LiveIndexes)>,
-        from_sequence: u64,
-    ) -> Result<Self, PartitionIndexError> {
-        let mut live_segment_id = 0;
-        let mut live_segment_offsets: Vec<_> = match live_indexes.get(&bucket_id) {
-            Some((current_live_segment_id, live_indexes)) => {
-                let current_live_segment_id = current_live_segment_id.load(Ordering::Acquire);
-                live_segment_id = current_live_segment_id;
-                match live_indexes
-                    .read()
-                    .await
-                    .partition_index
-                    .get(partition_id)
-                    .cloned()
-                {
-                    Some(PartitionIndexRecord {
-                        sequence_min,
-                        offsets: PartitionOffsets::Offsets(mut offsets),
-                        ..
-                    }) if sequence_min <= from_sequence => {
-                        if from_sequence > 0 {
-                            let split_point =
-                                offsets.partition_point(|x| x.sequence < from_sequence);
-                            offsets.drain(0..split_point); // Remove items before the from_sequence
-                        }
-
-                        let mut live_segment_offsets: VecDeque<_> = offsets.into();
-                        let next_live_offset = live_segment_offsets.pop_front().map(
-                            |PartitionSequenceOffset { offset, .. }| NextOffset {
-                                offset,
-                                segment_id: current_live_segment_id,
-                            },
-                        );
-                        return Ok(PartitionEventIter {
-                            partition_id,
-                            bucket_id,
-                            reader_pool,
-                            from_sequence,
-                            segment_id: current_live_segment_id,
-                            segment_offsets: VecDeque::new(),
-                            live_segment_id: current_live_segment_id,
-                            live_segment_offsets,
-                            next_offset: None,
-                            next_live_offset,
-                        });
-                    }
-                    Some(PartitionIndexRecord {
-                        offsets: PartitionOffsets::Offsets(offsets),
-                        ..
-                    }) => Some(offsets),
-                    Some(PartitionIndexRecord {
-                        offsets: PartitionOffsets::ExternalBucket,
-                        ..
-                    }) => None,
-                    None => None,
-                }
-            }
-            None => {
-                warn!("live index doesn't contain this bucket");
-                None
-            }
-        }
-        .unwrap_or_default();
-
-        if from_sequence > 0 {
-            let split_point = live_segment_offsets.partition_point(|x| x.sequence < from_sequence);
-            live_segment_offsets.drain(0..split_point); // Remove items before the from_sequence
-        }
-
-        let mut live_segment_offsets: VecDeque<_> = live_segment_offsets.into();
-
-        // Find the earliest segment and offsets
-        let (reply_tx, reply_rx) = oneshot::channel();
-        reader_pool.spawn({
-            move |with_readers| {
-                with_readers(move |readers| {
-                    let res = readers
-                        .get_mut(&bucket_id)
-                        .and_then(|segments| {
-                            segments.iter_mut().enumerate().rev().find_map(
-                                |(i, (segment_id, reader_set))| {
-                                    let partition_index = reader_set.partition_index.as_mut()?;
-
-                                    match partition_index.get_key(partition_id) {
-                                        Ok(Some(key))
-                                            if key.sequence_min <= from_sequence || i == 0 =>
-                                        {
-                                            match partition_index.get_from_key(key) {
-                                                Ok(mut offsets) => {
-                                                    if let PartitionOffsets::Offsets(offsets) =
-                                                        &mut offsets
-                                                    {
-                                                        if from_sequence > 0 {
-                                                            let split_point = offsets
-                                                                .partition_point(|x| {
-                                                                    x.sequence < from_sequence
-                                                                });
-                                                            offsets.drain(0..split_point); // Remove items before the from_sequence
-                                                        }
-                                                        if let Some(PartitionSequenceOffset {
-                                                            offset,
-                                                            ..
-                                                        }) = offsets.first()
-                                                        {
-                                                            reader_set.reader.prefetch(*offset);
-                                                        }
-                                                    }
-                                                    Some(Ok((*segment_id, offsets)))
-                                                }
-                                                Err(err) => Some(Err(err)),
-                                            }
-                                        }
-                                        Ok(_) => None,
-                                        Err(err) => Some(Err(err)),
-                                    }
-                                },
-                            )
-                        })
-                        .transpose();
-                    let _ = reply_tx.send(res);
-                });
-            }
-        });
-
-        match reply_rx.await {
-            Ok(Ok(Some((segment_id, PartitionOffsets::Offsets(segment_offsets))))) => {
-                let mut segment_offsets: VecDeque<_> = segment_offsets.into();
-                let next_offset = segment_offsets.pop_front().map(
-                    |PartitionSequenceOffset { offset, .. }| NextOffset { offset, segment_id },
-                );
-                let next_live_offset = live_segment_offsets.pop_front().map(
-                    |PartitionSequenceOffset { offset, .. }| NextOffset {
-                        offset,
-                        segment_id: live_segment_id,
-                    },
-                );
-
-                Ok(PartitionEventIter {
-                    partition_id,
-                    bucket_id,
-                    reader_pool,
-                    from_sequence,
-                    segment_id,
-                    segment_offsets,
-                    live_segment_id,
-                    live_segment_offsets,
-                    next_offset,
-                    next_live_offset,
-                })
-            }
-            Ok(Ok(Some((_, PartitionOffsets::ExternalBucket)))) | Ok(Ok(None)) | Err(_) => {
-                let next_live_offset = live_segment_offsets.pop_front().map(
-                    |PartitionSequenceOffset { offset, .. }| NextOffset {
-                        offset,
-                        segment_id: live_segment_id,
-                    },
-                );
-
-                Ok(PartitionEventIter {
-                    partition_id,
-                    bucket_id,
-                    reader_pool,
-                    from_sequence,
-                    segment_id: 0,
-                    segment_offsets: VecDeque::new(),
-                    live_segment_id,
-                    live_segment_offsets,
-                    next_offset: None,
-                    next_live_offset,
-                })
-            }
-            Ok(Err(err)) => Err(err),
-        }
-    }
-
-    pub async fn next(&mut self) -> Result<Option<CommittedEvents>, PartitionIndexError> {
-        struct ReadResult {
-            events: Option<CommittedEvents>,
-            new_offsets: Option<(SegmentId, VecDeque<PartitionSequenceOffset>)>,
-            is_live: bool,
-        }
-
-        let partition_id = self.partition_id;
-        let bucket_id = self.bucket_id;
-        let segment_id = self.segment_id;
-        let from_sequence = self.from_sequence;
-        let live_segment_id = self.live_segment_id;
-        let next_offset = self.next_offset;
-        let next_live_offset = self.next_live_offset;
-
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.reader_pool.spawn(move |with_readers| {
-            with_readers(move |readers| {
-                let res = readers
-                    .get_mut(&bucket_id)
-                    .map(|segments| {
-                        match next_offset {
-                            Some(NextOffset {
-                                offset, segment_id, ..
-                            }) => {
-                                // We have an offset from the last batch
-                                match segments.get_mut(&segment_id) {
-                                    Some(reader_set) => {
-                                        let (events, _) = reader_set
-                                            .reader
-                                            .read_committed_events(offset, ReadHint::Random)?;
-
-                                        Ok(ReadResult {
-                                            events,
-                                            new_offsets: None,
-                                            is_live: false,
-                                        })
-                                    }
-                                    None => Err(PartitionIndexError::SegmentNotFound {
-                                        bucket_segment_id: BucketSegmentId::new(
-                                            bucket_id, segment_id,
-                                        ),
-                                    }),
-                                }
-                            }
-                            None => {
-                                // There's no more offsets in this batch, progress forwards finding
-                                // the next batch
-                                for i in segment_id.saturating_add(1)
-                                    ..(segments.len() as SegmentId).min(live_segment_id)
-                                {
-                                    let Some(reader_set) = segments.get_mut(&i) else {
-                                        continue;
-                                    };
-
-                                    let Some(partition_index) = &mut reader_set.partition_index
-                                    else {
-                                        continue;
-                                    };
-
-                                    let mut new_offsets: VecDeque<_> = match partition_index
-                                        .get(partition_id)?
-                                    {
-                                        Some(PartitionOffsets::Offsets(mut offsets)) => {
-                                            if from_sequence > 0 {
-                                                let split_point = offsets.partition_point(|x| {
-                                                    x.sequence < from_sequence
-                                                });
-                                                offsets.drain(0..split_point); // Remove items before the from_sequence
-                                            }
-
-                                            offsets.into()
-                                        }
-                                        Some(PartitionOffsets::ExternalBucket) => {
-                                            return Ok(ReadResult {
-                                                events: None,
-                                                new_offsets: None,
-                                                is_live: false,
-                                            });
-                                        }
-                                        None => {
-                                            continue;
-                                        }
-                                    };
-
-                                    let Some(next_offset) = new_offsets.pop_front() else {
-                                        continue;
-                                    };
-
-                                    let (events, _) = reader_set.reader.read_committed_events(
-                                        next_offset.offset,
-                                        ReadHint::Random,
-                                    )?;
-
-                                    return Ok(ReadResult {
-                                        events,
-                                        new_offsets: Some((i, new_offsets)),
-                                        is_live: false,
-                                    });
-                                }
-
-                                // No more batches found, we'll process the live offsets
-                                match next_live_offset {
-                                    Some(NextOffset {
-                                        offset, segment_id, ..
-                                    }) => {
-                                        let Some(reader_set) = segments.get_mut(&segment_id) else {
-                                            return Ok(ReadResult {
-                                                events: None,
-                                                new_offsets: None,
-                                                is_live: true,
-                                            });
-                                        };
-
-                                        let (events, _) = reader_set
-                                            .reader
-                                            .read_committed_events(offset, ReadHint::Random)?;
-
-                                        Ok(ReadResult {
-                                            events,
-                                            new_offsets: None,
-                                            is_live: true,
-                                        })
-                                    }
-                                    None => Ok(ReadResult {
-                                        events: None,
-                                        new_offsets: None,
-                                        is_live: true,
-                                    }),
-                                }
-                            }
-                        }
-                    })
-                    .transpose();
-                let _ = reply_tx.send(res);
-            });
-        });
-
-        match reply_rx.await {
-            Ok(Ok(Some(ReadResult {
-                events,
-                mut new_offsets,
-                is_live,
-            }))) => {
-                // Handle skipping past all events in the transaction
-                if let Some(ref committed_events) = events
-                    && let Some(max_seq) = committed_events.last_partition_sequence()
-                {
-                    // Skip all offsets with sequences <= max_seq we just returned
-                    if is_live {
-                        self.live_segment_offsets
-                            .retain(|offset| offset.sequence > max_seq);
-                    } else if let Some((_, ref mut new_offsets)) = new_offsets {
-                        new_offsets.retain(|offset| offset.sequence > max_seq);
-                    } else {
-                        self.segment_offsets
-                            .retain(|offset| offset.sequence > max_seq);
-                    }
-                }
-
-                // Now update segment state
-                if is_live {
-                    self.segment_id = self.live_segment_id;
-                    self.next_live_offset = self.live_segment_offsets.pop_front().map(
-                        |PartitionSequenceOffset { offset, .. }| NextOffset {
-                            offset,
-                            segment_id: self.live_segment_id,
-                        },
-                    );
-                } else {
-                    if let Some((new_segment, new_offsets)) = new_offsets {
-                        self.segment_id = new_segment;
-                        self.segment_offsets = new_offsets;
-                    }
-                    self.next_offset = self.segment_offsets.pop_front().map(
-                        |PartitionSequenceOffset { offset, .. }| NextOffset {
-                            offset,
-                            segment_id: self.segment_id,
-                        },
-                    );
-                }
-
-                Ok(events)
-            }
-            Ok(Ok(None)) => Ok(None),
-            Ok(Err(err)) => Err(err),
-            Err(_) => {
-                error!("no reply from reader pool");
-                Ok(None)
-            }
-        }
-    }
-}
-
-/// Loads the MPHF-based index from a file format
-///
-/// The file format is:
-///   [0..4]   : magic marker: b"PIDX"
-///   [4..12]  : number of keys (n) as a u64
-///   [12..20] : length of serialized MPHF (L) as a u64
-///   [20..20+L] : serialized MPHF bytes (using bincode)
-///   [20+L..] : records array, exactly n records of RECORD_SIZE bytes each.
-fn load_index_from_file(
-    file: &mut File,
-) -> Result<(Mphf<PartitionId>, u64, u64), PartitionIndexError> {
-    // File should already be positioned after the magic bytes
-
-    // Read number of keys
-    let mut n_buf = [0u8; 8];
-    file.read_exact(&mut n_buf)?;
-    let n = u64::from_le_bytes(n_buf);
-
-    // Read length of serialized MPHF
-    let mut mph_len_buf = [0u8; 8];
-    file.read_exact(&mut mph_len_buf)?;
-    let mph_bytes_len = u64::from_le_bytes(mph_len_buf) as usize;
-
-    // Read the MPHF bytes and deserialize
-    let mut mph_bytes = vec![0u8; mph_bytes_len];
-    file.read_exact(&mut mph_bytes)?;
-    let (mph, _): (Mphf<PartitionId>, _) =
-        bincode::serde::decode_from_slice(&mph_bytes, bincode::config::standard())
-            .map_err(PartitionIndexError::DeserializeMphf)?;
-
-    // The records array immediately follows
-    let records_offset = 4 + 8 + 8 + mph_bytes_len as u64;
-
-    Ok((mph, n, records_offset))
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    pub use sierradb_protocol::ExpectedVersion;
+    use smallvec::smallvec;
+    use uuid::Uuid;
 
     use super::*;
+    use crate::StreamId;
+    use crate::bucket::BucketSegmentId;
+    use crate::bucket::segment::CommittedEvents;
+    use crate::cache::BLOCK_SIZE;
+    use crate::database::{Database, DatabaseBuilder, NewEvent, Transaction};
+    use crate::id::{uuid_to_partition_hash, uuid_v7_with_partition_hash};
+
+    const SEGMENT_SIZE: usize = 256_000_000; // 256 MB
+    const SMALL_SEGMENT_SIZE: usize = BLOCK_SIZE * 2; // 2 blocks (128KB), forcing multiple segments
 
     fn temp_file_path() -> PathBuf {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
         // Create a unique filename for each test to avoid conflicts
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1013,11 +82,81 @@ mod tests {
 
         tempfile::Builder::new()
             .prefix(&format!("test_{timestamp}_"))
-            .suffix(".pidx")
-            .tempfile()
+            .make(|path| Ok(path.to_path_buf()))
             .unwrap()
-            .into_temp_path()
+            .path()
             .to_path_buf()
+    }
+
+    fn temp_dir() -> PathBuf {
+        tempfile::tempdir()
+            .expect("failed to create temp dir")
+            .path()
+            .to_path_buf()
+    }
+
+    /// Create a test database with configurable segment size for forcing
+    /// multiple segments
+    async fn create_test_database(segment_size_bytes: usize) -> Database {
+        let dir = temp_dir();
+        DatabaseBuilder::new()
+            .segment_size_bytes(segment_size_bytes)
+            .total_buckets(1) // Use single bucket for predictable testing
+            .bucket_ids(Arc::from(vec![0])) // Single bucket with ID 0
+            .reader_threads(1)
+            .writer_threads(1)
+            .open(dir)
+            .expect("failed to create test database")
+    }
+
+    /// Helper to create test events for a stream
+    fn create_test_event(stream_id: &str, partition_key: Uuid, partition_id: u16) -> NewEvent {
+        let partition_hash = uuid_to_partition_hash(partition_key);
+        let event_id = uuid_v7_with_partition_hash(partition_hash);
+
+        NewEvent {
+            event_id,
+            stream_id: StreamId::new(stream_id).expect("invalid stream id"),
+            stream_version: ExpectedVersion::Any,
+            event_name: "TestEvent".to_string(),
+            timestamp: 1000 + (partition_id as u64 * 1000), /* Different timestamp per event and
+                                                             * partition */
+            metadata: vec![],
+            payload: b"payload".to_vec(),
+        }
+    }
+
+    /// Helper to append events to database and return their details
+    async fn append_events_to_stream(
+        db: &Database,
+        stream_id: &str,
+        count: usize,
+        partition_key: Uuid,
+        partition_id: u16,
+    ) -> Result<Vec<(u64, Uuid)>, Box<dyn std::error::Error>> {
+        let mut results = Vec::new();
+
+        for i in 0..count {
+            let event = create_test_event(stream_id, partition_key, partition_id);
+            let event_id = event.event_id;
+            let transaction = Transaction::new(partition_key, partition_id, smallvec![event])?;
+            let _result = db.append_events(transaction).await?;
+            results.push((i as u64, event_id));
+        }
+
+        Ok(results)
+    }
+
+    /// Helper to append multiple events in a single transaction
+    async fn append_transaction_events(
+        db: &Database,
+        events: Vec<NewEvent>,
+        partition_key: Uuid,
+        partition_id: u16,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let transaction = Transaction::new(partition_key, partition_id, events.into())?;
+        db.append_events(transaction).await?;
+        Ok(())
     }
 
     #[test]
@@ -1267,5 +406,872 @@ mod tests {
             index.get(partition_id).unwrap(),
             Some(PartitionOffsets::ExternalBucket)
         );
+    }
+
+    #[tokio::test]
+    async fn test_partition_iter_single_segment() {
+        let db = create_test_database(SEGMENT_SIZE).await;
+        let partition_key = Uuid::new_v4();
+        let partition_id = 0;
+
+        // Append 10 events to a single partition
+        let event_count = 10;
+        append_events_to_stream(&db, "stream-a", event_count, partition_key, partition_id)
+            .await
+            .expect("failed to append events");
+
+        // Read all events in partition
+        let mut partition_iter = db
+            .read_partition(partition_id, 0)
+            .await
+            .expect("failed to create partition iterator");
+
+        let mut collected_sequences = Vec::new();
+        while let Some(committed_events) = partition_iter.next().await.expect("read err") {
+            match committed_events {
+                CommittedEvents::Single(event) => {
+                    collected_sequences.push(event.partition_sequence);
+                }
+                CommittedEvents::Transaction { events, .. } => {
+                    for event in events.iter() {
+                        collected_sequences.push(event.partition_sequence);
+                    }
+                }
+            }
+        }
+
+        // Verify all events were read in sequence order
+        assert_eq!(collected_sequences.len(), event_count);
+        for (i, &seq) in collected_sequences.iter().enumerate() {
+            assert_eq!(seq, i as u64, "sequences should be in order");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_partition_iter_multiple_segments() {
+        let db = create_test_database(SMALL_SEGMENT_SIZE).await;
+        let partition_key = Uuid::new_v4();
+        let partition_id = 0;
+
+        // Append enough events to force multiple segments
+        let event_count = 1500;
+        append_events_to_stream(&db, "stream-a", event_count, partition_key, partition_id)
+            .await
+            .expect("failed to append events");
+
+        // Force segments to close
+        let _other_events =
+            append_events_to_stream(&db, "stream-b", 100, Uuid::new_v4(), partition_id + 1).await;
+
+        // Read all events from partition
+        let mut partition_iter = db
+            .read_partition(partition_id, 0)
+            .await
+            .expect("failed to create partition iterator");
+
+        let mut collected_sequences = Vec::new();
+        while let Some(committed_events) = partition_iter.next().await.expect("read err") {
+            match committed_events {
+                CommittedEvents::Single(event) => {
+                    collected_sequences.push(event.partition_sequence);
+                }
+                CommittedEvents::Transaction { events, .. } => {
+                    for event in events.iter() {
+                        collected_sequences.push(event.partition_sequence);
+                    }
+                }
+            }
+        }
+
+        // Verify all events were read in order across segments
+        assert_eq!(collected_sequences.len(), event_count);
+        for (i, &seq) in collected_sequences.iter().enumerate() {
+            assert_eq!(
+                seq, i as u64,
+                "sequences should be sequential across segments"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_partition_iter_batch_reading() {
+        let db = create_test_database(SMALL_SEGMENT_SIZE).await;
+        let partition_key = Uuid::new_v4();
+        let partition_id = 0;
+
+        let event_count = 1500;
+        append_events_to_stream(&db, "stream-a", event_count, partition_key, partition_id)
+            .await
+            .expect("failed to append events");
+
+        // Test next_batch with different limits
+        let mut partition_iter = db
+            .read_partition(partition_id, 0)
+            .await
+            .expect("failed to create partition iterator");
+
+        let mut all_sequences = Vec::new();
+        let batch_size = 5;
+
+        while let Some(batch) = partition_iter
+            .next_batch(batch_size)
+            .await
+            .expect("read err")
+        {
+            assert!(!batch.is_empty());
+            for committed_events in batch {
+                match committed_events {
+                    CommittedEvents::Single(event) => {
+                        all_sequences.push(event.partition_sequence);
+                    }
+                    CommittedEvents::Transaction { events, .. } => {
+                        for event in events.iter() {
+                            all_sequences.push(event.partition_sequence);
+                        }
+                    }
+                }
+            }
+        }
+
+        assert_eq!(all_sequences.len(), event_count);
+        for (i, &seq) in all_sequences.iter().enumerate() {
+            assert_eq!(seq, i as u64);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_partition_iter_from_middle_sequence() {
+        let db = create_test_database(SMALL_SEGMENT_SIZE).await;
+        let partition_key = Uuid::new_v4();
+        let partition_id = 0;
+
+        let event_count = 20;
+        append_events_to_stream(&db, "stream-a", event_count, partition_key, partition_id)
+            .await
+            .expect("failed to append events");
+
+        // Start reading from sequence 10
+        let start_sequence = 10;
+        let mut partition_iter = db
+            .read_partition(partition_id, start_sequence)
+            .await
+            .expect("failed to create partition iterator");
+
+        let mut collected_sequences = Vec::new();
+        while let Some(committed_events) = partition_iter.next().await.expect("read err") {
+            match committed_events {
+                CommittedEvents::Single(event) => {
+                    collected_sequences.push(event.partition_sequence);
+                }
+                CommittedEvents::Transaction { events, .. } => {
+                    for event in events.iter() {
+                        collected_sequences.push(event.partition_sequence);
+                    }
+                }
+            }
+        }
+
+        // Should read sequences from 10 to 19
+        let expected_count = event_count - start_sequence as usize;
+        assert_eq!(collected_sequences.len(), expected_count);
+        assert_eq!(collected_sequences[0], start_sequence);
+        assert_eq!(
+            collected_sequences[collected_sequences.len() - 1],
+            event_count as u64 - 1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_partition_iter_multiple_streams_single_transaction() {
+        let db = create_test_database(SMALL_SEGMENT_SIZE).await;
+        let partition_key = Uuid::new_v4();
+        let partition_id = 0;
+
+        // Create transaction with events for multiple streams in same partition
+        let events = vec![
+            create_test_event("stream-a", partition_key, partition_id),
+            create_test_event("stream-b", partition_key, partition_id),
+            create_test_event("stream-a", partition_key, partition_id),
+            create_test_event("stream-c", partition_key, partition_id),
+            create_test_event("stream-a", partition_key, partition_id),
+        ];
+
+        append_transaction_events(&db, events, partition_key, partition_id)
+            .await
+            .expect("failed to append transaction events");
+
+        // Read partition - should get ALL events
+        let mut partition_iter = db
+            .read_partition(partition_id, 0)
+            .await
+            .expect("failed to create partition iterator");
+
+        let mut collected_sequences = Vec::new();
+        let mut stream_counts = std::collections::HashMap::new();
+
+        while let Some(committed_events) = partition_iter.next().await.expect("read err") {
+            match committed_events {
+                CommittedEvents::Single(event) => {
+                    collected_sequences.push(event.partition_sequence);
+                    *stream_counts
+                        .entry(event.stream_id.to_string())
+                        .or_insert(0) += 1;
+                }
+                CommittedEvents::Transaction { events, .. } => {
+                    for event in events.iter() {
+                        collected_sequences.push(event.partition_sequence);
+                        *stream_counts
+                            .entry(event.stream_id.to_string())
+                            .or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+
+        // Should have all 5 events
+        assert_eq!(collected_sequences, vec![0, 1, 2, 3, 4]);
+        assert_eq!(stream_counts.get("stream-a"), Some(&3));
+        assert_eq!(stream_counts.get("stream-b"), Some(&1));
+        assert_eq!(stream_counts.get("stream-c"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn test_partition_iter_transaction_deduplication() {
+        let db = create_test_database(SMALL_SEGMENT_SIZE).await;
+        let partition_key = Uuid::new_v4();
+        let partition_id = 0;
+
+        // Create transaction with multiple events in same partition
+        let events = vec![
+            create_test_event("stream-a", partition_key, partition_id),
+            create_test_event("stream-a", partition_key, partition_id),
+            create_test_event("stream-a", partition_key, partition_id),
+        ];
+
+        append_transaction_events(&db, events, partition_key, partition_id)
+            .await
+            .expect("failed to append transaction events");
+
+        // Add another single event
+        append_events_to_stream(&db, "stream-a", 1, partition_key, partition_id)
+            .await
+            .expect("failed to append single event");
+
+        let mut partition_iter = db
+            .read_partition(partition_id, 0)
+            .await
+            .expect("failed to create partition iterator");
+
+        let mut collected_sequences = Vec::new();
+        let mut transaction_count = 0;
+        let mut single_event_count = 0;
+
+        while let Some(committed_events) = partition_iter.next().await.expect("read err") {
+            match committed_events {
+                CommittedEvents::Single(_) => {
+                    single_event_count += 1;
+                    if let CommittedEvents::Single(event) = committed_events {
+                        collected_sequences.push(event.partition_sequence);
+                    }
+                }
+                CommittedEvents::Transaction { events, .. } => {
+                    transaction_count += 1;
+                    for event in events.iter() {
+                        collected_sequences.push(event.partition_sequence);
+                    }
+                }
+            }
+        }
+
+        // Should have one transaction (with 3 events) and one single event
+        assert_eq!(transaction_count, 1, "should have exactly one transaction");
+        assert_eq!(
+            single_event_count, 1,
+            "should have exactly one single event"
+        );
+        assert_eq!(
+            collected_sequences,
+            vec![0, 1, 2, 3],
+            "sequences should be in order"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_partition_iter_mixed_streams_across_segments() {
+        let db = create_test_database(SMALL_SEGMENT_SIZE).await;
+        let partition_key = Uuid::new_v4();
+        let partition_id = 0;
+
+        // Append events for multiple streams in the same partition
+        append_events_to_stream(&db, "stream-a", 500, partition_key, partition_id)
+            .await
+            .expect("failed to append stream-a events");
+        append_events_to_stream(&db, "stream-b", 500, partition_key, partition_id)
+            .await
+            .expect("failed to append stream-b events");
+        append_events_to_stream(&db, "stream-c", 500, partition_key, partition_id)
+            .await
+            .expect("failed to append stream-c events");
+
+        // Force segments to close
+        let _other_events =
+            append_events_to_stream(&db, "other-stream", 100, Uuid::new_v4(), partition_id + 1)
+                .await;
+
+        let mut partition_iter = db
+            .read_partition(partition_id, 0)
+            .await
+            .expect("failed to create partition iterator");
+
+        let mut collected_sequences = Vec::new();
+        while let Some(committed_events) = partition_iter.next().await.expect("read err") {
+            match committed_events {
+                CommittedEvents::Single(event) => {
+                    collected_sequences.push(event.partition_sequence);
+                }
+                CommittedEvents::Transaction { events, .. } => {
+                    for event in events.iter() {
+                        collected_sequences.push(event.partition_sequence);
+                    }
+                }
+            }
+        }
+
+        // Should have all 1500 events in sequence order
+        assert_eq!(collected_sequences.len(), 1500);
+        for (i, &seq) in collected_sequences.iter().enumerate() {
+            assert_eq!(seq, i as u64, "sequences should be sequential");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_partition_iter_no_gaps_across_segments() {
+        let db = create_test_database(SMALL_SEGMENT_SIZE).await;
+        let partition_key = Uuid::new_v4();
+        let partition_id = 0;
+
+        // Append enough events to span multiple segments
+        let total_events = 100;
+        for _ in 0..10 {
+            for _ in 0..10 {
+                let event = create_test_event("stream-a", partition_key, partition_id);
+                let transaction = Transaction::new(partition_key, partition_id, smallvec![event])
+                    .expect("failed to create transaction");
+                db.append_events(transaction)
+                    .await
+                    .expect("failed to append event");
+            }
+        }
+
+        let mut partition_iter = db
+            .read_partition(partition_id, 0)
+            .await
+            .expect("failed to create partition iterator");
+
+        let mut collected_sequences = Vec::new();
+        while let Some(committed_events) = partition_iter.next().await.expect("read err") {
+            match committed_events {
+                CommittedEvents::Single(event) => {
+                    collected_sequences.push(event.partition_sequence);
+                }
+                CommittedEvents::Transaction { events, .. } => {
+                    for event in events.iter() {
+                        collected_sequences.push(event.partition_sequence);
+                    }
+                }
+            }
+        }
+
+        // Verify no gaps and correct count
+        assert_eq!(collected_sequences.len(), total_events);
+
+        // Check for any gaps or duplicates
+        for (i, &seq) in collected_sequences.iter().enumerate() {
+            assert_eq!(
+                seq, i as u64,
+                "gap or duplicate detected: expected={i}, actual={seq}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_partition_iter_large_partition_completeness() {
+        let db = create_test_database(SMALL_SEGMENT_SIZE).await;
+        let partition_key = Uuid::new_v4();
+        let partition_id = 0;
+
+        // Create a large partition with mixed streams and transactions
+        let mut expected_count = 0;
+
+        // Add 50 single events to stream-a
+        append_events_to_stream(&db, "stream-a", 50, partition_key, partition_id)
+            .await
+            .expect("failed to append stream-a events");
+        expected_count += 50;
+
+        // Add 10 transactions with 3 events each to stream-b
+        for _ in 0..10 {
+            let transaction_events = vec![
+                create_test_event("stream-b", partition_key, partition_id),
+                create_test_event("stream-b", partition_key, partition_id),
+                create_test_event("stream-b", partition_key, partition_id),
+            ];
+            append_transaction_events(&db, transaction_events, partition_key, partition_id)
+                .await
+                .expect("failed to append transaction");
+            expected_count += 3;
+        }
+
+        // Add 20 more single events to stream-c
+        append_events_to_stream(&db, "stream-c", 20, partition_key, partition_id)
+            .await
+            .expect("failed to append stream-c events");
+        expected_count += 20;
+
+        // Read all events from partition
+        let mut partition_iter = db
+            .read_partition(partition_id, 0)
+            .await
+            .expect("failed to create partition iterator");
+
+        let mut collected_sequences = Vec::new();
+        while let Some(committed_events) = partition_iter.next().await.expect("read err") {
+            match committed_events {
+                CommittedEvents::Single(event) => {
+                    collected_sequences.push(event.partition_sequence);
+                }
+                CommittedEvents::Transaction { events, .. } => {
+                    for event in events.iter() {
+                        collected_sequences.push(event.partition_sequence);
+                    }
+                }
+            }
+        }
+
+        // Verify completeness
+        assert_eq!(collected_sequences.len(), expected_count);
+        for (i, &seq) in collected_sequences.iter().enumerate() {
+            assert_eq!(seq, i as u64);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_partition_iter_batch_vs_single_consistency() {
+        let db = create_test_database(SMALL_SEGMENT_SIZE).await;
+        let partition_key = Uuid::new_v4();
+        let partition_id = 0;
+
+        // Add mixed events
+        append_events_to_stream(&db, "stream-a", 10, partition_key, partition_id)
+            .await
+            .expect("failed to append events");
+
+        let transaction_events = vec![
+            create_test_event("stream-b", partition_key, partition_id),
+            create_test_event("stream-b", partition_key, partition_id),
+        ];
+        append_transaction_events(&db, transaction_events, partition_key, partition_id)
+            .await
+            .expect("failed to append transaction");
+
+        // Read using next() method
+        let mut partition_iter1 = db
+            .read_partition(partition_id, 0)
+            .await
+            .expect("failed to create partition iterator");
+
+        let mut single_read_sequences = Vec::new();
+        while let Some(committed_events) = partition_iter1.next().await.expect("read err") {
+            match committed_events {
+                CommittedEvents::Single(event) => {
+                    single_read_sequences.push(event.partition_sequence);
+                }
+                CommittedEvents::Transaction { events, .. } => {
+                    for event in events.iter() {
+                        single_read_sequences.push(event.partition_sequence);
+                    }
+                }
+            }
+        }
+
+        // Read using next_batch() method
+        let mut partition_iter2 = db
+            .read_partition(partition_id, 0)
+            .await
+            .expect("failed to create partition iterator");
+
+        let mut batch_read_sequences = Vec::new();
+        while let Some(batch) = partition_iter2.next_batch(5).await.expect("read err") {
+            for committed_events in batch {
+                match committed_events {
+                    CommittedEvents::Single(event) => {
+                        batch_read_sequences.push(event.partition_sequence);
+                    }
+                    CommittedEvents::Transaction { events, .. } => {
+                        for event in events.iter() {
+                            batch_read_sequences.push(event.partition_sequence);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Both methods should return identical results
+        assert_eq!(single_read_sequences, batch_read_sequences);
+        assert_eq!(single_read_sequences.len(), 12); // 10 single + 2 from transaction
+    }
+
+    #[tokio::test]
+    async fn test_partition_iter_cache_behavior() {
+        let db = create_test_database(SMALL_SEGMENT_SIZE).await;
+        let partition_key = Uuid::new_v4();
+        let partition_id = 0;
+
+        // Create enough events to force multiple segments and cache operations
+        let event_count = 1500;
+        append_events_to_stream(&db, "stream-a", event_count, partition_key, partition_id)
+            .await
+            .expect("failed to append events");
+
+        // First pass - populate cache
+        let mut partition_iter1 = db
+            .read_partition(partition_id, 0)
+            .await
+            .expect("failed to create partition iterator");
+
+        let mut first_pass_sequences = Vec::new();
+        while let Some(committed_events) = partition_iter1.next().await.expect("read err") {
+            match committed_events {
+                CommittedEvents::Single(event) => {
+                    first_pass_sequences.push(event.partition_sequence);
+                }
+                CommittedEvents::Transaction { events, .. } => {
+                    for event in events.iter() {
+                        first_pass_sequences.push(event.partition_sequence);
+                    }
+                }
+            }
+        }
+
+        // Second pass - should use cached data
+        let mut partition_iter2 = db
+            .read_partition(partition_id, 0)
+            .await
+            .expect("failed to create partition iterator");
+
+        let mut second_pass_sequences = Vec::new();
+        while let Some(committed_events) = partition_iter2.next().await.expect("read err") {
+            match committed_events {
+                CommittedEvents::Single(event) => {
+                    second_pass_sequences.push(event.partition_sequence);
+                }
+                CommittedEvents::Transaction { events, .. } => {
+                    for event in events.iter() {
+                        second_pass_sequences.push(event.partition_sequence);
+                    }
+                }
+            }
+        }
+
+        // Both passes should return identical results
+        assert_eq!(first_pass_sequences, second_pass_sequences);
+        assert_eq!(first_pass_sequences.len(), event_count);
+    }
+
+    #[tokio::test]
+    async fn test_partition_iter_empty_partition() {
+        let db = create_test_database(SMALL_SEGMENT_SIZE).await;
+        let partition_id = 0;
+
+        let mut partition_iter = db
+            .read_partition(partition_id, 0)
+            .await
+            .expect("failed to create partition iterator");
+
+        let result = partition_iter.next().await.expect("read err");
+        assert!(result.is_none(), "empty partition should return None");
+
+        // Test batch reading on empty partition
+        let batch = partition_iter.next_batch(10).await.expect("read err");
+        assert!(batch.is_none(), "empty partition should return empty batch");
+    }
+
+    #[tokio::test]
+    async fn test_partition_iter_start_beyond_partition_end() {
+        let db = create_test_database(SMALL_SEGMENT_SIZE).await;
+        let partition_key = Uuid::new_v4();
+        let partition_id = 0;
+
+        // Add only 5 events
+        append_events_to_stream(&db, "stream-a", 5, partition_key, partition_id)
+            .await
+            .expect("failed to append events");
+
+        // Try to start reading from sequence 10 (beyond partition end)
+        let mut partition_iter = db
+            .read_partition(partition_id, 10)
+            .await
+            .expect("failed to create partition iterator");
+
+        let result = partition_iter.next().await.expect("read err");
+        assert!(
+            result.is_none(),
+            "reading beyond partition end should return None"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_partition_iter_very_large_batch() {
+        let db = create_test_database(SMALL_SEGMENT_SIZE).await;
+        let partition_key = Uuid::new_v4();
+        let partition_id = 0;
+
+        let event_count = 20;
+        append_events_to_stream(&db, "stream-a", event_count, partition_key, partition_id)
+            .await
+            .expect("failed to append events");
+
+        let mut partition_iter = db
+            .read_partition(partition_id, 0)
+            .await
+            .expect("failed to create partition iterator");
+
+        // Request more events than available
+        let batch = partition_iter
+            .next_batch(100)
+            .await
+            .expect("read err")
+            .expect("not empty batch");
+
+        let mut collected_sequences = Vec::new();
+        for committed_events in batch {
+            match committed_events {
+                CommittedEvents::Single(event) => {
+                    collected_sequences.push(event.partition_sequence);
+                }
+                CommittedEvents::Transaction { events, .. } => {
+                    for event in events.iter() {
+                        collected_sequences.push(event.partition_sequence);
+                    }
+                }
+            }
+        }
+
+        // Should return all available events
+        assert_eq!(collected_sequences.len(), event_count);
+        for (i, &seq) in collected_sequences.iter().enumerate() {
+            assert_eq!(seq, i as u64);
+        }
+
+        // Subsequent batch should be empty
+        let empty_batch = partition_iter.next_batch(10).await.expect("read err");
+        assert!(empty_batch.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_partition_iter_partial_partition_reading() {
+        let db = create_test_database(SMALL_SEGMENT_SIZE).await;
+        let partition_key = Uuid::new_v4();
+        let partition_id = 0;
+
+        let event_count = 50;
+        append_events_to_stream(&db, "stream-a", event_count, partition_key, partition_id)
+            .await
+            .expect("failed to append events");
+
+        // Read only first 25 events
+        let mut partition_iter = db
+            .read_partition(partition_id, 0)
+            .await
+            .expect("failed to create partition iterator");
+
+        let mut collected_sequences = Vec::new();
+        let target_count = 25;
+
+        while collected_sequences.len() < target_count {
+            if let Some(committed_events) = partition_iter.next().await.expect("read err") {
+                match committed_events {
+                    CommittedEvents::Single(event) => {
+                        collected_sequences.push(event.partition_sequence);
+                    }
+                    CommittedEvents::Transaction { events, .. } => {
+                        for event in events.iter() {
+                            collected_sequences.push(event.partition_sequence);
+                        }
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+
+        assert_eq!(collected_sequences.len(), target_count);
+        for (i, &seq) in collected_sequences.iter().enumerate() {
+            assert_eq!(seq, i as u64);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_partition_iter_mixed_transactions() {
+        let db = create_test_database(SMALL_SEGMENT_SIZE).await;
+        let partition_key = Uuid::new_v4();
+        let partition_id = 0;
+
+        // Create multiple transactions with different streams
+        for _ in 0..5 {
+            let mixed_events = vec![
+                create_test_event("stream-a", partition_key, partition_id),
+                create_test_event("stream-b", partition_key, partition_id),
+                create_test_event("stream-a", partition_key, partition_id),
+                create_test_event("stream-c", partition_key, partition_id),
+            ];
+            append_transaction_events(&db, mixed_events, partition_key, partition_id)
+                .await
+                .expect("failed to append mixed transaction");
+        }
+
+        let mut partition_iter = db
+            .read_partition(partition_id, 0)
+            .await
+            .expect("failed to create partition iterator");
+
+        let mut all_sequences = Vec::new();
+        while let Some(committed_events) = partition_iter.next().await.expect("read err") {
+            match committed_events {
+                CommittedEvents::Single(event) => {
+                    all_sequences.push(event.partition_sequence);
+                }
+                CommittedEvents::Transaction { events, .. } => {
+                    for event in events.iter() {
+                        all_sequences.push(event.partition_sequence);
+                    }
+                }
+            }
+        }
+
+        // Should have 20 events total (4 per transaction * 5 transactions)
+        assert_eq!(all_sequences.len(), 20);
+        for (i, &seq) in all_sequences.iter().enumerate() {
+            assert_eq!(seq, i as u64);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_partition_iter_ordering_with_mixed_events() {
+        let db = create_test_database(SMALL_SEGMENT_SIZE).await;
+        let partition_key = Uuid::new_v4();
+        let partition_id = 0;
+
+        // Mix of single events and transactions
+        append_events_to_stream(&db, "stream-a", 3, partition_key, partition_id)
+            .await
+            .expect("failed to append initial events");
+
+        // Transaction with multiple events
+        let transaction_events = vec![
+            create_test_event("stream-b", partition_key, partition_id),
+            create_test_event("stream-b", partition_key, partition_id),
+        ];
+        append_transaction_events(&db, transaction_events, partition_key, partition_id)
+            .await
+            .expect("failed to append transaction");
+
+        // More single events
+        append_events_to_stream(&db, "stream-c", 2, partition_key, partition_id)
+            .await
+            .expect("failed to append final events");
+
+        let mut partition_iter = db
+            .read_partition(partition_id, 0)
+            .await
+            .expect("failed to create partition iterator");
+
+        let mut collected_sequences = Vec::new();
+        while let Some(committed_events) = partition_iter.next().await.expect("read err") {
+            match committed_events {
+                CommittedEvents::Single(event) => {
+                    collected_sequences.push(event.partition_sequence);
+                }
+                CommittedEvents::Transaction { events, .. } => {
+                    for event in events.iter() {
+                        collected_sequences.push(event.partition_sequence);
+                    }
+                }
+            }
+        }
+
+        // Should read: 0,1,2 (stream-a), then 3,4 (transaction), then 5,6 (stream-c)
+        let expected = vec![0, 1, 2, 3, 4, 5, 6];
+        assert_eq!(collected_sequences, expected);
+    }
+
+    #[tokio::test]
+    async fn test_partition_iter_concurrent_writing_reading() {
+        let db = create_test_database(SMALL_SEGMENT_SIZE).await;
+        let partition_key = Uuid::new_v4();
+        let partition_id = 0;
+
+        // Add initial events
+        append_events_to_stream(&db, "stream-a", 10, partition_key, partition_id)
+            .await
+            .expect("failed to append initial events");
+
+        // Start reading
+        let mut partition_iter = db
+            .read_partition(partition_id, 0)
+            .await
+            .expect("failed to create partition iterator");
+
+        let mut collected_sequences = Vec::new();
+
+        // Read first few events
+        for _ in 0..5 {
+            if let Some(committed_events) = partition_iter.next().await.expect("read err") {
+                match committed_events {
+                    CommittedEvents::Single(event) => {
+                        collected_sequences.push(event.partition_sequence);
+                    }
+                    CommittedEvents::Transaction { events, .. } => {
+                        for event in events.iter() {
+                            collected_sequences.push(event.partition_sequence);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Write more events while reading
+        append_events_to_stream(&db, "stream-a", 5, partition_key, partition_id)
+            .await
+            .expect("failed to append additional events");
+
+        // Continue reading
+        while let Some(committed_events) = partition_iter.next().await.expect("read err") {
+            match committed_events {
+                CommittedEvents::Single(event) => {
+                    collected_sequences.push(event.partition_sequence);
+                }
+                CommittedEvents::Transaction { events, .. } => {
+                    for event in events.iter() {
+                        collected_sequences.push(event.partition_sequence);
+                    }
+                }
+            }
+        }
+
+        // Should read initial 10 events, additional 5 may or may not be visible
+        assert!(
+            collected_sequences.len() >= 10,
+            "should read at least initial 10 events"
+        );
+        assert!(
+            collected_sequences.len() <= 15,
+            "should read at most 15 events"
+        );
+
+        // Events should be in order
+        for (i, &seq) in collected_sequences.iter().enumerate() {
+            assert_eq!(seq, i as u64);
+        }
     }
 }

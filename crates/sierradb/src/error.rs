@@ -257,8 +257,20 @@ pub enum StreamIdError {
     ContainsNullByte,
 }
 
-impl From<oneshot::error::RecvError> for StreamIndexError {
+impl From<oneshot::error::RecvError> for ReadError {
     fn from(_: oneshot::error::RecvError) -> Self {
-        StreamIndexError::Read(ReadError::NoThreadReply)
+        ReadError::NoThreadReply
+    }
+}
+
+impl From<oneshot::error::RecvError> for PartitionIndexError {
+    fn from(err: oneshot::error::RecvError) -> Self {
+        PartitionIndexError::Read(err.into())
+    }
+}
+
+impl From<oneshot::error::RecvError> for StreamIndexError {
+    fn from(err: oneshot::error::RecvError) -> Self {
+        StreamIndexError::Read(err.into())
     }
 }

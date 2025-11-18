@@ -208,17 +208,19 @@ impl Message<UpdateConfirmationWithBroadcast> for ConfirmationActor {
                 .read_partition(msg.partition_id, first_seq)
                 .await;
             if let Ok(mut iter) = read_result
-                && let Ok(Some(commit)) = iter.next().await
+                && let Ok(Some(commits)) = iter.next_batch(1).await
             {
                 // Broadcast events in sequence order within the confirmed range
-                for event in commit {
-                    // Only broadcast if within range and confirmed
-                    if event.partition_sequence >= first_seq
-                        && event.partition_sequence <= last_seq
-                        && event.partition_sequence < new_watermark
-                        && self.broadcast_tx.send(event).is_err()
-                    {
-                        break; // No active subscribers
+                'outer: for commit in commits {
+                    for event in commit {
+                        // Only broadcast if within range and confirmed
+                        if event.partition_sequence >= first_seq
+                            && event.partition_sequence <= last_seq
+                            && event.partition_sequence < new_watermark
+                            && self.broadcast_tx.send(event).is_err()
+                        {
+                            break 'outer; // No active subscribers
+                        }
                     }
                 }
             }
