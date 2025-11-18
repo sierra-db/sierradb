@@ -266,8 +266,8 @@ impl HandleRequest for ESub {
         )
         .map_err(io::Error::other)?;
 
-        conn.socket.write_all(&conn.write).await?;
-        conn.socket.flush().await?;
+        conn.stream.write_all(&conn.write).await?;
+        conn.stream.flush().await?;
         conn.write.clear();
 
         Ok(None)

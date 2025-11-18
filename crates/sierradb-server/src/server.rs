@@ -54,7 +54,8 @@ impl Server {
             tokio::select! {
                 res = listener.accept() => {
                     match res {
-                        Ok((socket, _)) => {
+                        Ok((stream, _)) => {
+                            stream.set_nodelay(true)?;
                             let cluster_ref = self.cluster_ref.clone();
                             let caches = self.caches.clone();
                             let num_partitions = self.num_partitions;
@@ -66,7 +67,7 @@ impl Server {
                                     caches,
                                     num_partitions,
                                     cache_capacity_bytes,
-                                    socket,
+                                    stream,
                                     shutdown,
                                 )
                                 .run()
@@ -93,7 +94,7 @@ pub struct Conn {
     pub caches: Arc<HashMap<BucketId, Arc<SegmentBlockCache>>>,
     pub num_partitions: u16,
     pub cache_capacity_bytes: usize,
-    pub socket: TcpStream,
+    pub stream: TcpStream,
     pub shutdown: CancellationToken,
     pub read: BytesMut,
     pub write: BytesMut,
@@ -110,7 +111,7 @@ impl Conn {
         caches: Arc<HashMap<BucketId, Arc<SegmentBlockCache>>>,
         num_partitions: u16,
         cache_capacity_bytes: usize,
-        socket: TcpStream,
+        stream: TcpStream,
         shutdown: CancellationToken,
     ) -> Self {
         let read = BytesMut::new();
@@ -121,7 +122,7 @@ impl Conn {
             caches,
             num_partitions,
             cache_capacity_bytes,
-            socket,
+            stream,
             shutdown,
             read,
             write,
@@ -135,7 +136,7 @@ impl Conn {
             match &mut self.subscription_channel {
                 Some((_, rx)) => {
                     tokio::select! {
-                        res = self.socket.read_buf(&mut self.read) => {
+                        res = self.stream.read_buf(&mut self.read) => {
                             match res {
                                 Ok(bytes_read) => {
                                     if bytes_read == 0 && self.read.is_empty() {
@@ -153,8 +154,8 @@ impl Conn {
                                             resp3::encode::complete::extend_encode(&mut self.write, &resp, false)
                                                 .map_err(io::Error::other)?;
 
-                                            self.socket.write_all(&self.write).await?;
-                                            self.socket.flush().await?;
+                                            self.stream.write_all(&self.write).await?;
+                                            self.stream.flush().await?;
                                             self.write.clear();
                                         }
                                     }
@@ -183,13 +184,13 @@ impl Conn {
                         }
                         _ = self.shutdown.cancelled() => {
                             rx.close();
-                            return self.socket.shutdown().await;
+                            return self.stream.shutdown().await;
                         }
                     }
                 }
                 None => {
                     tokio::select! {
-                        res = self.socket.read_buf(&mut self.read) => {
+                        res = self.stream.read_buf(&mut self.read) => {
                             // Not in subscription mode - block normally on socket reads
                             let bytes_read = res?;
                             if bytes_read == 0 && self.read.is_empty() {
@@ -205,14 +206,14 @@ impl Conn {
                                     resp3::encode::complete::extend_encode(&mut self.write, &resp, false)
                                         .map_err(io::Error::other)?;
 
-                                    self.socket.write_all(&self.write).await?;
-                                    self.socket.flush().await?;
+                                    self.stream.write_all(&self.write).await?;
+                                    self.stream.flush().await?;
                                     self.write.clear();
                                 }
                             }
                         }
                         _ = self.shutdown.cancelled() => {
-                            return self.socket.shutdown().await;
+                            return self.stream.shutdown().await;
                         }
                     }
                 }
@@ -246,8 +247,8 @@ impl Conn {
         )
         .map_err(io::Error::other)?;
 
-        self.socket.write_all(&self.write).await?;
-        self.socket.flush().await?;
+        self.stream.write_all(&self.write).await?;
+        self.stream.flush().await?;
         self.write.clear();
 
         Ok(())
