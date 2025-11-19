@@ -10,11 +10,9 @@ use std::mem;
 use crate::bucket::PartitionId;
 
 mod closed;
-mod iter;
 mod open;
 
 pub use self::closed::{ClosedIndex, ClosedOffsetKind, ClosedPartitionIndex};
-pub use self::iter::PartitionIter;
 pub use self::open::OpenPartitionIndex;
 
 // Partition ID, sequence min, sequence max, event count, events offset, events

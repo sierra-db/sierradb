@@ -16,13 +16,12 @@ use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use crate::bucket::event_index::ClosedEventIndex;
+use crate::bucket::iter::{PartitionIter, PartitionIterConfig, StreamIter, StreamIterConfig};
 use crate::bucket::partition_index::{
-    ClosedPartitionIndex, PartitionIndexRecord, PartitionIter, PartitionOffsets,
+    ClosedPartitionIndex, PartitionIndexRecord, PartitionOffsets,
 };
 use crate::bucket::segment::{BucketSegmentReader, CommittedEvents, EventRecord, ReadHint};
-use crate::bucket::stream_index::{
-    ClosedStreamIndex, StreamIndexRecord, StreamIter, StreamOffsets,
-};
+use crate::bucket::stream_index::{ClosedStreamIndex, StreamIndexRecord, StreamOffsets};
 use crate::bucket::{BucketId, BucketSegmentId, PartitionId, SegmentId};
 use crate::cache::BLOCK_SIZE;
 use crate::error::{
@@ -171,7 +170,7 @@ impl Database {
     ) -> Result<PartitionIter, PartitionIndexError> {
         let bucket_id = partition_id % self.total_buckets;
         PartitionIter::new(
-            partition_id,
+            PartitionIterConfig::new(partition_id),
             bucket_id,
             self.reader_pool.clone(),
             self.writer_pool.indexes().clone(),
@@ -266,7 +265,7 @@ impl Database {
     ) -> Result<StreamIter, StreamIndexError> {
         let bucket_id = partition_id % self.total_buckets;
         StreamIter::new(
-            stream_id,
+            StreamIterConfig::new(stream_id),
             bucket_id,
             self.reader_pool.clone(),
             self.writer_pool.indexes().clone(),

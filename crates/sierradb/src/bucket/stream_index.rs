@@ -6,7 +6,6 @@
 //! - `[20+L..]`   : records array, exactly n records of RECORD_SIZE bytes each.
 
 mod closed;
-mod iter;
 mod open;
 
 use std::mem;
@@ -14,7 +13,6 @@ use std::mem;
 use uuid::Uuid;
 
 pub use self::closed::{ClosedIndex, ClosedStreamIndex};
-pub use self::iter::StreamIter;
 pub use self::open::OpenStreamIndex;
 use crate::STREAM_ID_SIZE;
 
