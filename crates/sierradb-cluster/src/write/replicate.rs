@@ -10,6 +10,7 @@ use futures::future::Either;
 use kameo::{mailbox::Signal, prelude::*};
 use serde::{Deserialize, Serialize};
 use sierradb::{
+    IterDirection,
     bucket::{PartitionId, segment::CommittedEvents},
     database::{Database, ExpectedVersion, NewEvent, PartitionLatestSequence, Transaction},
     writer_thread_pool::AppendResult,
@@ -540,7 +541,7 @@ impl Message<PartitionSyncRequest> for ClusterActor {
 
         ctx.spawn(async move {
             let mut iter = db
-                .read_partition(msg.partition_id, msg.from_seq)
+                .read_partition(msg.partition_id, msg.from_seq, IterDirection::Forward)
                 .await
                 .map_err(|err| ClusterError::Read(err.to_string()))?;
             let mut all_commits = Vec::new();

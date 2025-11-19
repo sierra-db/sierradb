@@ -518,7 +518,7 @@ impl Subscription {
 
         let mut iter = self
             .database
-            .read_partition(partition_id, *from_sequence)
+            .read_partition(partition_id, *from_sequence, IterDirection::Forward)
             .await?;
         'iter: while let Some(commits) = iter.next_batch(DEFAULT_BATCH_SIZE).await? {
             for commit in commits {
@@ -581,7 +581,7 @@ impl Subscription {
                     {
                         let iter = self
                             .database
-                            .read_partition(*partition_id, *from_sequence)
+                            .read_partition(*partition_id, *from_sequence, IterDirection::Forward)
                             .await?;
                         partition_iters.insert(*partition_id, (iter, from_sequence));
                     }
