@@ -73,20 +73,25 @@ impl SegmentIter {
         self.offsets_index = (self.offsets_index + count).min(self.offsets.len());
     }
 
-    pub async fn next(&mut self, limit: usize) -> Result<Vec<CommittedEvents>, ReadError> {
+    pub async fn next(&mut self, limit: usize) -> Result<Option<Vec<CommittedEvents>>, ReadError> {
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok(None);
         }
 
         let mut offsets_index = self.offsets_index;
         // Arbitrary max capacity of 10 - can we use something better, or should we just
         // not assume capacity?
         let mut commits = Vec::with_capacity(limit.min(10));
-        self.read_from_cache(&mut offsets_index, &mut commits, limit)
+        let commits_from_cache = self
+            .read_from_cache(&mut offsets_index, &mut commits, limit)
             .await?;
         if offsets_index >= self.offsets.len() {
+            assert!(
+                commits_from_cache > 0,
+                "if offsets_index has advanced, then we should've read at least one commit from cache"
+            );
             self.offsets_index = offsets_index;
-            return Ok(commits);
+            return Ok(Some(commits));
         }
 
         let bucket_segment_id = self.bucket_segment_id;
@@ -94,7 +99,7 @@ impl SegmentIter {
 
         let (reply_tx, reply_rx) = oneshot::channel();
         struct Reply {
-            res: Result<Vec<CommittedEvents>, ReadError>,
+            res: Result<(Vec<CommittedEvents>, usize), ReadError>,
             offsets: Vec<u64>,
             offsets_index: usize,
         }
@@ -109,7 +114,7 @@ impl SegmentIter {
                     &mut commits,
                     limit,
                 )
-                .map(|_| commits);
+                .map(|commits_from_disk| (commits, commits_from_disk));
                 let _ = reply_tx.send(Reply {
                     res,
                     offsets,
@@ -125,9 +130,18 @@ impl SegmentIter {
         } = reply_rx.await?;
         self.offsets = offsets;
 
-        let commits = res?;
+        let (commits, commits_from_disk) = res?;
         self.offsets_index = offsets_index;
-        Ok(commits)
+
+        if commits_from_cache + commits_from_disk == 0 {
+            assert!(
+                commits.is_empty(),
+                "if we read nothing from cache nor disk, then commits should be empty"
+            );
+            return Ok(None);
+        }
+
+        Ok(Some(commits))
     }
 
     async fn hydrate_block(&mut self, offset: u64) -> Result<bool, ReadError> {
@@ -160,8 +174,9 @@ impl SegmentIter {
         offsets_index: &'a mut usize,
         commits: &'a mut Vec<CommittedEvents>,
         limit: usize,
-    ) -> BoxFuture<'a, Result<(), ReadError>> {
+    ) -> BoxFuture<'a, Result<usize, ReadError>> {
         async move {
+            let mut appended = 0;
             if let Some(block) = &self.block {
                 debug!("offsets_index = {offsets_index}, offsets_len = {}, next_offset = {:?}", self.offsets.len(), self.offsets.get(*offsets_index));
                 while *offsets_index < self.offsets.len() {
@@ -178,7 +193,7 @@ impl SegmentIter {
                                 // Preload the next cache block and read from cache again
                                 self.hydrate_block(block.next_segment_block_offset())
                                     .await?;
-                                return self.read_from_cache(offsets_index, commits, limit).await;
+                                return self.read_from_cache(offsets_index, commits, limit).await.map(|n| appended + n);
                             } else {
                                 debug!("offset {offset} is before the next segment block offset {next_segment_block_offset}");
                                 self.block = None;
@@ -191,20 +206,21 @@ impl SegmentIter {
 
                     advance_offsets_index(&commit, &self.offsets, offsets_index);
                     commits.push(commit);
+                    appended += 1;
 
                     if commits.len() >= limit {
-                        return Ok(());
+                        return Ok(appended);
                     }
                 }
             } else if let Some(next_offset) = self.offsets.get(*offsets_index) {
                 self.hydrate_block(*next_offset).await?;
                 if self.block.is_some() {
                     // We got a new block, lets try from cache again
-                    return self.read_from_cache(offsets_index, commits, limit).await;
+                    return self.read_from_cache(offsets_index, commits, limit).await.map(|n| appended + n);
                 }
             }
 
-            Ok(())
+            Ok(appended)
         }
         .boxed()
     }
@@ -216,15 +232,16 @@ impl SegmentIter {
         offsets_index: &mut usize,
         commits: &mut Vec<CommittedEvents>,
         limit: usize,
-    ) -> Result<(), ReadError> {
+    ) -> Result<usize, ReadError> {
         let Some(readers) = readers.get_mut(&bucket_segment_id.bucket_id) else {
-            return Ok(());
+            return Ok(0);
         };
 
         let Some(reader_set) = readers.get_mut(&bucket_segment_id.segment_id) else {
-            return Ok(());
+            return Ok(0);
         };
 
+        let mut appended = 0;
         while *offsets_index < offsets.len() {
             let offset = offsets[*offsets_index];
             match reader_set
@@ -234,9 +251,10 @@ impl SegmentIter {
                 (Some(commit), _) => {
                     advance_offsets_index(&commit, offsets, offsets_index);
                     commits.push(commit);
+                    appended += 1;
 
                     if commits.len() >= limit {
-                        return Ok(());
+                        return Ok(appended);
                     }
                 }
                 (None, _) => {
@@ -247,7 +265,7 @@ impl SegmentIter {
             }
         }
 
-        Ok(())
+        Ok(appended)
     }
 }
 
@@ -256,12 +274,11 @@ impl SegmentIter {
 /// Returns false if no events are in this transaction.
 fn advance_offsets_index(commit: &CommittedEvents, offsets: &[u64], offsets_index: &mut usize) {
     // Skip over any remaining offsets that point to events in the same transaction
-    if let CommittedEvents::Transaction {
-        events: tx_events, ..
-    } = &commit
+    if let CommittedEvents::Transaction { events, .. } = &commit
+        && !events.is_empty()
     {
-        let min_event_offset = tx_events.iter().map(|e| e.offset).min().unwrap_or(0);
-        let max_event_offset = tx_events.iter().map(|e| e.offset).max().unwrap_or(0);
+        let min_event_offset = events.iter().map(|e| e.offset).min().unwrap_or(0);
+        let max_event_offset = events.iter().map(|e| e.offset).max().unwrap_or(0);
 
         // Count how many offsets (after current position) are in this transaction
         let offsets_in_transaction = offsets[*offsets_index + 1..]
