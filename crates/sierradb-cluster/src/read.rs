@@ -11,7 +11,7 @@ use sierradb::{
 use tracing::{debug, instrument, warn};
 use uuid::Uuid;
 
-use crate::{ClusterActor, ClusterError, ReplicaRefs};
+use crate::{ClusterActor, ClusterError, DEFAULT_BATCH_SIZE, ReplicaRefs};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReadRequestMetadata {
@@ -504,7 +504,8 @@ impl ClusterActor {
 
             'iter: while let Some(commits) = match iter
                 .next_batch(
-                    (effective_end_sequence.saturating_sub(last_read_sequence)).min(50) as usize,
+                    (effective_end_sequence.saturating_sub(last_read_sequence) as usize)
+                        .min(DEFAULT_BATCH_SIZE),
                 )
                 .await
             {
@@ -636,8 +637,11 @@ impl ClusterActor {
             'iter: while let Some(commits) = match iter
                 .next_batch({
                     end_version
-                        .map(|end| end.saturating_sub(last_read_version).clamp(1, 50))
-                        .unwrap_or(50) as usize
+                        .map(|end| {
+                            (end.saturating_sub(last_read_version) as usize)
+                                .clamp(1, DEFAULT_BATCH_SIZE)
+                        })
+                        .unwrap_or(DEFAULT_BATCH_SIZE)
                 })
                 .await
             {
@@ -1035,7 +1039,7 @@ impl Message<GetStreamVersion> for ClusterActor {
                         .map_err(|err| ClusterError::Read(err.to_string()))?;
 
                     while let Some(commits) = iter
-                        .next_batch(50)
+                        .next_batch(DEFAULT_BATCH_SIZE)
                         .await
                         .map_err(|err| ClusterError::Read(err.to_string()))?
                     {

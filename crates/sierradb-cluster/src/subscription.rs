@@ -25,7 +25,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::{ClusterActor, confirmation::AtomicWatermark};
+use crate::{ClusterActor, DEFAULT_BATCH_SIZE, confirmation::AtomicWatermark};
 
 pub struct Subscribe {
     pub subscription_id: Uuid,
@@ -520,7 +520,7 @@ impl Subscription {
             .database
             .read_partition(partition_id, *from_sequence)
             .await?;
-        'iter: while let Some(commits) = iter.next_batch(50).await? {
+        'iter: while let Some(commits) = iter.next_batch(DEFAULT_BATCH_SIZE).await? {
             for commit in commits {
                 let Some(first_partition_sequence) = commit.first_partition_sequence() else {
                     continue;
@@ -591,7 +591,7 @@ impl Subscription {
                     while let Some((partition_id, (iter, from_sequence))) =
                         partition_iters.iter_mut().choose(&mut rng)
                     {
-                        let Some(commits) = iter.next_batch(50).await? else {
+                        let Some(commits) = iter.next_batch(DEFAULT_BATCH_SIZE).await? else {
                             let partition_id = *partition_id;
                             partition_iters.remove(&partition_id);
                             continue;
@@ -676,7 +676,7 @@ impl Subscription {
             .database
             .read_stream(partition_id, stream_id, *from_version, false)
             .await?;
-        while let Some(commits) = iter.next_batch(50).await? {
+        while let Some(commits) = iter.next_batch(DEFAULT_BATCH_SIZE).await? {
             for commit in commits {
                 let Some(first_partition_sequence) = commit.first_partition_sequence() else {
                     continue;

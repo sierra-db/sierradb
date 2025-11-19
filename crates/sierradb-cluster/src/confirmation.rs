@@ -18,6 +18,8 @@ use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::info;
 
+use crate::DEFAULT_BATCH_SIZE;
+
 /// Errors that can occur during confirmation state operations
 #[derive(Error, Debug)]
 pub enum ConfirmationError {
@@ -277,7 +279,7 @@ impl BucketConfirmationManager {
             .collect();
         for (partition_id, watermark) in watermarks {
             let mut iter = database.read_partition(partition_id, watermark).await?;
-            while let Some(commits) = iter.next_batch(100).await? {
+            while let Some(commits) = iter.next_batch(DEFAULT_BATCH_SIZE).await? {
                 for commit in commits {
                     for event in commit {
                         self.update_confirmation(

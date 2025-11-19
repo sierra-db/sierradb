@@ -40,6 +40,7 @@ pub type ReplicaRefs = ArrayVec<(RemoteActorRef<ClusterActor>, u64), MAX_REPLICA
 
 /// Maximum number of request forwards allowed to prevent loops
 const MAX_FORWARDS: u8 = 3;
+const DEFAULT_BATCH_SIZE: usize = 50;
 
 #[derive(NetworkBehaviour)]
 pub struct Behaviour {
