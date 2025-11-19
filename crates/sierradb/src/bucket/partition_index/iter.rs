@@ -331,63 +331,35 @@ impl PartitionIter {
                 return Ok(None);
             };
 
-            let commits = segment_iter.next(limit).await?;
-
-            if commits.is_empty() {
-                if segment_iter.is_finished() && (!self.is_live || self.has_next_segment) {
-                    // Rollover to next segment
-                    let segment_iter = self.segment_iter.take().unwrap();
-                    let current_segment_id = segment_iter.bucket_segment_id.segment_id;
-
-                    // For reverse iteration, stop if we've reached segment 0
-                    if self.reverse && current_segment_id == 0 {
-                        return Ok(None);
-                    }
-
-                    let next_segment_id = if self.reverse {
-                        // For reverse iteration, go to previous (lower numbered) segment
-                        current_segment_id.saturating_sub(1)
-                    } else {
-                        // For forward iteration, go to next (higher numbered) segment
-                        current_segment_id + 1
-                    };
-
-                    let from_sequence = self.last_sequence;
-
-                    let min_segment_id = next_segment_id;
-
-                    *self = Self::new_inner(
-                        self.partition_id,
-                        segment_iter.bucket_segment_id.bucket_id,
-                        from_sequence,
-                        segment_iter.reader_pool,
-                        self.live_indexes.clone(),
-                        self.reverse,
-                        min_segment_id,
-                        self.has_next_segment,
-                    )
-                    .await?;
-
-                    return self.next_batch(limit).await;
-                }
-
-                return Ok(None);
-            } else {
-                self.last_sequence = commits
-                    .last()
-                    .and_then(|commit| {
-                        commit.last_partition_sequence().map(|v| {
+            match segment_iter.next(limit).await? {
+                Some(commits) => {
+                    self.last_sequence = commits
+                        .last()
+                        .expect("commits should not be empty if Some is returned")
+                        .last_partition_sequence()
+                        .map(|v| {
                             if self.reverse {
                                 v.saturating_sub(1)
                             } else {
                                 v + 1
                             }
                         })
-                    })
-                    .unwrap_or(self.last_sequence);
-            }
+                        .unwrap_or(self.last_sequence);
 
-            Ok(Some(commits))
+                    Ok(Some(commits))
+                }
+                None => {
+                    if segment_iter.is_finished() && (!self.is_live || self.has_next_segment) {
+                        if !self.rollover().await? {
+                            return Ok(None);
+                        }
+
+                        return self.next_batch(limit).await;
+                    }
+
+                    Ok(None)
+                }
+            }
         }
         .boxed()
     }
@@ -403,5 +375,41 @@ impl PartitionIter {
         }
 
         Ok(self.batch.pop_front())
+    }
+
+    async fn rollover(&mut self) -> Result<bool, PartitionIndexError> {
+        let segment_iter = self.segment_iter.take().unwrap();
+        let current_segment_id = segment_iter.bucket_segment_id.segment_id;
+
+        // For reverse iteration, stop if we've reached segment 0
+        if self.reverse && current_segment_id == 0 {
+            return Ok(false);
+        }
+
+        let next_segment_id = if self.reverse {
+            // For reverse iteration, go to previous (lower numbered) segment
+            current_segment_id.saturating_sub(1)
+        } else {
+            // For forward iteration, go to next (higher numbered) segment
+            current_segment_id + 1
+        };
+
+        let from_sequence = self.last_sequence;
+
+        let min_segment_id = next_segment_id;
+
+        *self = Self::new_inner(
+            self.partition_id,
+            segment_iter.bucket_segment_id.bucket_id,
+            from_sequence,
+            segment_iter.reader_pool,
+            self.live_indexes.clone(),
+            self.reverse,
+            min_segment_id,
+            self.has_next_segment,
+        )
+        .await?;
+
+        Ok(true)
     }
 }
