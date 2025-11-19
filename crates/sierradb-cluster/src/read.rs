@@ -490,7 +490,10 @@ impl ClusterActor {
 
         tokio::spawn(async move {
             // Create iterator and collect events
-            let mut iter = match database.read_partition(partition_id, start_sequence).await {
+            let mut iter = match database
+                .read_partition(partition_id, start_sequence, IterDirection::Forward)
+                .await
+            {
                 Ok(iter) => iter,
                 Err(err) => {
                     reply_sender.send(Err(ClusterError::Read(err.to_string())));

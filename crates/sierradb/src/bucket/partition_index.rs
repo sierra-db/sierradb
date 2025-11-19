@@ -61,12 +61,12 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::StreamId;
     use crate::bucket::BucketSegmentId;
     use crate::bucket::segment::CommittedEvents;
     use crate::cache::BLOCK_SIZE;
     use crate::database::{Database, DatabaseBuilder, NewEvent, Transaction};
     use crate::id::{uuid_to_partition_hash, uuid_v7_with_partition_hash};
+    use crate::{IterDirection, StreamId};
 
     const SEGMENT_SIZE: usize = 256_000_000; // 256 MB
     const SMALL_SEGMENT_SIZE: usize = BLOCK_SIZE * 2; // 2 blocks (128KB), forcing multiple segments
@@ -420,7 +420,7 @@ mod tests {
 
         // Read all events in partition
         let mut partition_iter = db
-            .read_partition(partition_id, 0)
+            .read_partition(partition_id, 0, IterDirection::Forward)
             .await
             .expect("failed to create partition iterator");
 
@@ -463,7 +463,7 @@ mod tests {
 
         // Read all events from partition
         let mut partition_iter = db
-            .read_partition(partition_id, 0)
+            .read_partition(partition_id, 0, IterDirection::Forward)
             .await
             .expect("failed to create partition iterator");
 
@@ -504,7 +504,7 @@ mod tests {
 
         // Test next_batch with different limits
         let mut partition_iter = db
-            .read_partition(partition_id, 0)
+            .read_partition(partition_id, 0, IterDirection::Forward)
             .await
             .expect("failed to create partition iterator");
 
@@ -551,7 +551,7 @@ mod tests {
         // Start reading from sequence 10
         let start_sequence = 10;
         let mut partition_iter = db
-            .read_partition(partition_id, start_sequence)
+            .read_partition(partition_id, start_sequence, IterDirection::Forward)
             .await
             .expect("failed to create partition iterator");
 
@@ -600,7 +600,7 @@ mod tests {
 
         // Read partition - should get ALL events
         let mut partition_iter = db
-            .read_partition(partition_id, 0)
+            .read_partition(partition_id, 0, IterDirection::Forward)
             .await
             .expect("failed to create partition iterator");
 
@@ -656,7 +656,7 @@ mod tests {
             .expect("failed to append single event");
 
         let mut partition_iter = db
-            .read_partition(partition_id, 0)
+            .read_partition(partition_id, 0, IterDirection::Forward)
             .await
             .expect("failed to create partition iterator");
 
@@ -717,7 +717,7 @@ mod tests {
                 .await;
 
         let mut partition_iter = db
-            .read_partition(partition_id, 0)
+            .read_partition(partition_id, 0, IterDirection::Forward)
             .await
             .expect("failed to create partition iterator");
 
@@ -762,7 +762,7 @@ mod tests {
         }
 
         let mut partition_iter = db
-            .read_partition(partition_id, 0)
+            .read_partition(partition_id, 0, IterDirection::Forward)
             .await
             .expect("failed to create partition iterator");
 
@@ -828,7 +828,7 @@ mod tests {
 
         // Read all events from partition
         let mut partition_iter = db
-            .read_partition(partition_id, 0)
+            .read_partition(partition_id, 0, IterDirection::Forward)
             .await
             .expect("failed to create partition iterator");
 
@@ -874,7 +874,7 @@ mod tests {
 
         // Read using next() method
         let mut partition_iter1 = db
-            .read_partition(partition_id, 0)
+            .read_partition(partition_id, 0, IterDirection::Forward)
             .await
             .expect("failed to create partition iterator");
 
@@ -894,7 +894,7 @@ mod tests {
 
         // Read using next_batch() method
         let mut partition_iter2 = db
-            .read_partition(partition_id, 0)
+            .read_partition(partition_id, 0, IterDirection::Forward)
             .await
             .expect("failed to create partition iterator");
 
@@ -933,7 +933,7 @@ mod tests {
 
         // First pass - populate cache
         let mut partition_iter1 = db
-            .read_partition(partition_id, 0)
+            .read_partition(partition_id, 0, IterDirection::Forward)
             .await
             .expect("failed to create partition iterator");
 
@@ -953,7 +953,7 @@ mod tests {
 
         // Second pass - should use cached data
         let mut partition_iter2 = db
-            .read_partition(partition_id, 0)
+            .read_partition(partition_id, 0, IterDirection::Forward)
             .await
             .expect("failed to create partition iterator");
 
@@ -982,7 +982,7 @@ mod tests {
         let partition_id = 0;
 
         let mut partition_iter = db
-            .read_partition(partition_id, 0)
+            .read_partition(partition_id, 0, IterDirection::Forward)
             .await
             .expect("failed to create partition iterator");
 
@@ -1007,7 +1007,7 @@ mod tests {
 
         // Try to start reading from sequence 10 (beyond partition end)
         let mut partition_iter = db
-            .read_partition(partition_id, 10)
+            .read_partition(partition_id, 10, IterDirection::Forward)
             .await
             .expect("failed to create partition iterator");
 
@@ -1030,7 +1030,7 @@ mod tests {
             .expect("failed to append events");
 
         let mut partition_iter = db
-            .read_partition(partition_id, 0)
+            .read_partition(partition_id, 0, IterDirection::Forward)
             .await
             .expect("failed to create partition iterator");
 
@@ -1079,7 +1079,7 @@ mod tests {
 
         // Read only first 25 events
         let mut partition_iter = db
-            .read_partition(partition_id, 0)
+            .read_partition(partition_id, 0, IterDirection::Forward)
             .await
             .expect("failed to create partition iterator");
 
@@ -1129,7 +1129,7 @@ mod tests {
         }
 
         let mut partition_iter = db
-            .read_partition(partition_id, 0)
+            .read_partition(partition_id, 0, IterDirection::Forward)
             .await
             .expect("failed to create partition iterator");
 
@@ -1180,7 +1180,7 @@ mod tests {
             .expect("failed to append final events");
 
         let mut partition_iter = db
-            .read_partition(partition_id, 0)
+            .read_partition(partition_id, 0, IterDirection::Forward)
             .await
             .expect("failed to create partition iterator");
 
@@ -1216,7 +1216,7 @@ mod tests {
 
         // Start reading
         let mut partition_iter = db
-            .read_partition(partition_id, 0)
+            .read_partition(partition_id, 0, IterDirection::Forward)
             .await
             .expect("failed to create partition iterator");
 

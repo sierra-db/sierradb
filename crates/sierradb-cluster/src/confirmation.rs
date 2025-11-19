@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bincode::{Decode, Encode};
 use kameo::Reply;
 use serde::{Deserialize, Serialize};
+use sierradb::IterDirection;
 use sierradb::bucket::{BucketId, PartitionId};
 use sierradb::database::Database;
 use sierradb::error::PartitionIndexError;
@@ -278,7 +279,9 @@ impl BucketConfirmationManager {
             })
             .collect();
         for (partition_id, watermark) in watermarks {
-            let mut iter = database.read_partition(partition_id, watermark).await?;
+            let mut iter = database
+                .read_partition(partition_id, watermark, IterDirection::Forward)
+                .await?;
             while let Some(commits) = iter.next_batch(DEFAULT_BATCH_SIZE).await? {
                 for commit in commits {
                     for event in commit {

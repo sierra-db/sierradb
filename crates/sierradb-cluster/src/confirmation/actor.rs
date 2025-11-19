@@ -42,6 +42,7 @@ use std::sync::Arc;
 
 use kameo::prelude::*;
 use serde::{Deserialize, Serialize};
+use sierradb::IterDirection;
 use sierradb::{bucket::segment::EventRecord, database::Database};
 use smallvec::SmallVec;
 use tokio::sync::broadcast;
@@ -205,7 +206,7 @@ impl Message<UpdateConfirmationWithBroadcast> for ConfirmationActor {
             // Read events synchronously to maintain ordering
             let read_result = self
                 .database
-                .read_partition(msg.partition_id, first_seq)
+                .read_partition(msg.partition_id, first_seq, IterDirection::Forward)
                 .await;
             if let Ok(mut iter) = read_result
                 && let Ok(Some(commits)) = iter.next_batch(1).await

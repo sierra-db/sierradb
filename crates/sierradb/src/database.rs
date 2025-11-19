@@ -167,6 +167,7 @@ impl Database {
         &self,
         partition_id: PartitionId,
         from_sequence: u64,
+        dir: IterDirection,
     ) -> Result<PartitionIter, PartitionIndexError> {
         let bucket_id = partition_id % self.total_buckets;
         PartitionIter::new(
@@ -175,7 +176,7 @@ impl Database {
             self.reader_pool.clone(),
             self.writer_pool.indexes().clone(),
             from_sequence,
-            IterDirection::Forward,
+            dir,
         )
         .await
     }
@@ -1153,7 +1154,7 @@ mod tests {
 
         // Read the partition
         let mut partition_iter = db
-            .read_partition(partition_id, 0)
+            .read_partition(partition_id, 0, IterDirection::Forward)
             .await
             .expect("Failed to read partition");
 
@@ -1167,7 +1168,7 @@ mod tests {
 
         // Read the partition
         let mut partition_iter = db
-            .read_partition(partition_id, 1)
+            .read_partition(partition_id, 1, IterDirection::Forward)
             .await
             .expect("Failed to read partition");
 
@@ -1449,7 +1450,7 @@ mod tests {
         let unused_partition_id = 999;
 
         let mut partition_iter = db
-            .read_partition(unused_partition_id, 0)
+            .read_partition(unused_partition_id, 0, IterDirection::Forward)
             .await
             .expect("Failed to read empty partition");
         let event = partition_iter.next().await.unwrap();

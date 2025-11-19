@@ -1966,7 +1966,7 @@ async fn execute_read_partition(
 
     let mut db_iter = state
         .database
-        .read_partition(partition_id as u16, from_sequence)
+        .read_partition(partition_id as u16, from_sequence, IterDirection::Forward)
         .await?;
     let model_events = state
         .model
