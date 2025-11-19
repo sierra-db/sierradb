@@ -74,11 +74,12 @@ impl SegmentIter {
     }
 
     pub async fn next(&mut self, limit: usize) -> Result<Option<Vec<CommittedEvents>>, ReadError> {
-        if limit == 0 {
+        let mut offsets_index = self.offsets_index;
+
+        if limit == 0 || offsets_index >= self.offsets.len() {
             return Ok(None);
         }
 
-        let mut offsets_index = self.offsets_index;
         // Arbitrary max capacity of 10 - can we use something better, or should we just
         // not assume capacity?
         let mut commits = Vec::with_capacity(limit.min(10));
