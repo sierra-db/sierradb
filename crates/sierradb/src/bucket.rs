@@ -6,6 +6,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub mod event_index;
+pub mod iter;
 pub mod partition_index;
 pub mod segment;
 pub mod stream_index;

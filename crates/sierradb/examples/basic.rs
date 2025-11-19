@@ -1,6 +1,6 @@
+use sierradb::StreamId;
 use sierradb::database::{DatabaseBuilder, ExpectedVersion, NewEvent, Transaction};
 use sierradb::id::{uuid_to_partition_hash, uuid_v7_with_partition_hash};
-use sierradb::{IterDirection, StreamId};
 use uuid::Uuid;
 
 #[tokio::main]
@@ -66,18 +66,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let transaction = Transaction::new(partition_key, partition_id, new_events.clone()).unwrap();
 
     db.append_events(transaction).await.unwrap();
-
-    let res = db
-        .read_stream(
-            partition_id,
-            new_events.first().unwrap().stream_id.clone(),
-            362,
-            IterDirection::Reverse,
-        )
-        .await
-        .unwrap();
-
-    dbg!(res);
 
     Ok(())
 }
