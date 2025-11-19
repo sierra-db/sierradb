@@ -327,47 +327,50 @@ impl StreamIter {
                 return Ok(Some(mem::take(&mut self.batch).into()));
             }
 
-            let Some(segment_iter) = &mut self.segment_iter else {
-                return Ok(None);
-            };
+            loop {
+                let Some(segment_iter) = &mut self.segment_iter else {
+                    return Ok(None);
+                };
 
-            match segment_iter.next(limit).await? {
-                Some(commits) => {
-                    self.last_version = commits
-                        .last()
-                        .expect("commits should not be empty if Some is returned")
-                        .last_stream_version()
-                        .map(|v| {
-                            if self.reverse {
-                                v.saturating_sub(1)
-                            } else {
-                                v + 1
-                            }
-                        })
-                        .unwrap_or(self.last_version);
+                match segment_iter.next(limit).await? {
+                    Some(commits) => {
+                        self.last_version = commits
+                            .last()
+                            .expect("commits should not be empty if Some is returned")
+                            .last_stream_version()
+                            .map(|v| {
+                                if self.reverse {
+                                    v.saturating_sub(1)
+                                } else {
+                                    v + 1
+                                }
+                            })
+                            .unwrap_or(self.last_version);
 
-                    let commits: Vec<_> = commits
-                        .into_iter()
-                        .filter_map(|commit| filter_commit_for_stream(&self.stream_id, commit))
-                        .collect();
-                    if commits.is_empty() {
-                        // This shouldn't happen
-                        warn!("transaction had no events for stream id {}", self.stream_id);
-                        return self.next_batch(limit).await;
-                    }
-
-                    Ok(Some(commits))
-                }
-                None => {
-                    if segment_iter.is_finished() && (!self.is_live || self.has_next_segment) {
-                        if !self.rollover().await? {
-                            return Ok(None);
+                        let commits: Vec<_> = commits
+                            .into_iter()
+                            .filter_map(|commit| filter_commit_for_stream(&self.stream_id, commit))
+                            .collect();
+                        if commits.is_empty() {
+                            // This shouldn't happen
+                            warn!("transaction had no events for stream id {}", self.stream_id);
+                            continue;
                         }
 
-                        return self.next_batch(limit).await;
+                        return Ok(Some(commits));
                     }
+                    None => {
+                        let is_finished = segment_iter.is_finished();
+                        if is_finished && (!self.is_live || self.has_next_segment) {
+                            if !self.rollover().await? {
+                                return Ok(None);
+                            }
 
-                    Ok(None)
+                            continue;
+                        }
+
+                        return Ok(None);
+                    }
                 }
             }
         }
