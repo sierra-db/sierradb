@@ -19,7 +19,7 @@ use tokio::{select, time::Instant};
 use tracing::{debug, error, instrument, warn};
 
 use crate::{
-    ClusterActor, ClusterError,
+    ClusterActor, ClusterError, DEFAULT_BATCH_SIZE,
     confirmation::actor::{ConfirmationActor, UpdateConfirmationWithBroadcast},
     write::{
         ordered_queue::{self, OrderedValue},
@@ -545,7 +545,7 @@ impl Message<PartitionSyncRequest> for ClusterActor {
                 .map_err(|err| ClusterError::Read(err.to_string()))?;
             let mut all_commits = Vec::new();
             'iter: while let Some(commits) = iter
-                .next_batch(50)
+                .next_batch(DEFAULT_BATCH_SIZE)
                 .await
                 .map_err(|err| ClusterError::Read(err.to_string()))?
             {
