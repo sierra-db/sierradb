@@ -32,17 +32,17 @@ impl StreamIter {
     pub(crate) async fn new(
         stream_id: StreamId,
         bucket_id: BucketId,
-        from_version: u64,
         reader_pool: ReaderThreadPool,
         live_indexes: Arc<HashMap<BucketId, (Arc<AtomicU32>, LiveIndexes)>>,
+        from_version: u64,
         reverse: bool,
     ) -> Result<Self, StreamIndexError> {
         Self::new_inner(
             stream_id,
             bucket_id,
-            from_version,
             reader_pool,
             live_indexes,
+            from_version,
             reverse,
             if reverse { u32::MAX } else { 0 },
             true,
@@ -54,9 +54,9 @@ impl StreamIter {
     async fn new_inner(
         stream_id: StreamId,
         bucket_id: BucketId,
-        from_version: u64,
         reader_pool: ReaderThreadPool,
         live_indexes: Arc<HashMap<BucketId, (Arc<AtomicU32>, LiveIndexes)>>,
+        from_version: u64,
         reverse: bool,
         next_segment_id: SegmentId,
         check_closed_segments: bool,
@@ -411,9 +411,9 @@ impl StreamIter {
         *self = Self::new_inner(
             self.stream_id.clone(),
             segment_iter.bucket_segment_id.bucket_id,
-            from_version,
             segment_iter.reader_pool,
             self.live_indexes.clone(),
+            from_version,
             self.reverse,
             min_segment_id,
             self.has_next_segment,
