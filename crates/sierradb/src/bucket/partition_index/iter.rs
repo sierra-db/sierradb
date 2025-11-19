@@ -3,8 +3,6 @@ use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use futures::FutureExt;
-use futures::future::BoxFuture;
 use tokio::sync::oneshot;
 
 use crate::bucket::partition_index::PartitionOffsets;
@@ -304,29 +302,29 @@ impl PartitionIter {
         }
     }
 
-    pub fn next_batch(
+    pub async fn next_batch(
         &mut self,
         limit: usize,
-    ) -> BoxFuture<'_, Result<Option<Vec<CommittedEvents>>, PartitionIndexError>> {
-        async move {
-            if limit == 0 {
-                return Ok(None);
-            }
+    ) -> Result<Option<Vec<CommittedEvents>>, PartitionIndexError> {
+        if limit == 0 {
+            return Ok(None);
+        }
 
-            if let Some(batch_back) = self.batch.back() {
-                self.last_sequence = batch_back
-                    .last_partition_sequence()
-                    .map(|v| {
-                        if self.reverse {
-                            v.saturating_sub(1)
-                        } else {
-                            v + 1
-                        }
-                    })
-                    .unwrap_or(self.last_sequence);
-                return Ok(Some(mem::take(&mut self.batch).into()));
-            }
+        if let Some(batch_back) = self.batch.back() {
+            self.last_sequence = batch_back
+                .last_partition_sequence()
+                .map(|v| {
+                    if self.reverse {
+                        v.saturating_sub(1)
+                    } else {
+                        v + 1
+                    }
+                })
+                .unwrap_or(self.last_sequence);
+            return Ok(Some(mem::take(&mut self.batch).into()));
+        }
 
+        loop {
             let Some(segment_iter) = &mut self.segment_iter else {
                 return Ok(None);
             };
@@ -346,22 +344,20 @@ impl PartitionIter {
                         })
                         .unwrap_or(self.last_sequence);
 
-                    Ok(Some(commits))
+                    return Ok(Some(commits));
                 }
                 None => {
                     if segment_iter.is_finished() && (!self.is_live || self.has_next_segment) {
                         if !self.rollover().await? {
                             return Ok(None);
                         }
-
-                        return self.next_batch(limit).await;
+                        continue; // Instead of recursing, loop again
                     }
 
-                    Ok(None)
+                    return Ok(None);
                 }
             }
         }
-        .boxed()
     }
 
     /// Convenience method that maintains backward compatibility.
