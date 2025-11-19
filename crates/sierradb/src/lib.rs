@@ -98,6 +98,12 @@ impl PartialEq<StreamId> for &str {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum IterDirection {
+    Forward,
+    Reverse,
+}
+
 #[macro_export]
 macro_rules! from_bytes {
     ($buf:expr, $pos:expr, [ $( $t:tt ),* ]) => {

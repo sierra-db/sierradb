@@ -7,6 +7,7 @@ use futures::future::BoxFuture;
 use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
+use crate::IterDirection;
 use crate::bucket::segment::{CommittedEvents, ReadHint, SegmentBlock};
 use crate::bucket::{BucketId, BucketSegmentId, SegmentId};
 use crate::cache::SegmentBlockCache;
@@ -29,7 +30,7 @@ impl SegmentIter {
         bucket_segment_id: BucketSegmentId,
         mut offsets: Vec<u64>,
         offsets_index: usize,
-        reverse: bool,
+        dir: IterDirection,
     ) -> Self {
         debug_assert!(
             offsets.windows(2).all(|w| w[0] <= w[1]),
@@ -37,18 +38,18 @@ impl SegmentIter {
         );
 
         // For reverse iteration, reverse the offsets and adjust the index
-        let offsets_index = if reverse {
-            offsets.reverse();
-            // For reverse iteration, if offsets_index is 0, start from the last offset
-            if offsets_index == 0 && !offsets.is_empty() {
-                0 // Start from first index after reversal (which is the last event)
-            } else if offsets_index < offsets.len() {
-                offsets.len() - 1 - offsets_index
-            } else {
-                0
+        let offsets_index = match dir {
+            IterDirection::Forward => offsets_index,
+            IterDirection::Reverse => {
+                offsets.reverse();
+                if offsets_index == 0 && !offsets.is_empty() {
+                    0 // Start from first index after reversal (which is the last event)
+                } else if offsets_index < offsets.len() {
+                    offsets.len() - 1 - offsets_index
+                } else {
+                    0
+                }
             }
-        } else {
-            offsets_index
         };
 
         SegmentIter {

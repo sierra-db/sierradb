@@ -52,7 +52,6 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::StreamId;
     use crate::bucket::BucketSegmentId;
     use crate::bucket::segment::CommittedEvents;
     use crate::bucket::stream_index::closed::ClosedStreamIndex;
@@ -60,6 +59,7 @@ mod tests {
     use crate::cache::BLOCK_SIZE;
     use crate::database::{Database, DatabaseBuilder, NewEvent, Transaction};
     use crate::id::{uuid_to_partition_hash, uuid_v7_with_partition_hash};
+    use crate::{IterDirection, StreamId};
 
     const SEGMENT_SIZE: usize = 256_000_000; // 256 MB
     const SMALL_SEGMENT_SIZE: usize = BLOCK_SIZE * 2; // 2 blocks (128KB), forcing multiple segments
@@ -388,7 +388,12 @@ mod tests {
 
         // Read events using stream iterator
         let mut stream_iter = db
-            .read_stream(partition_id, StreamId::new(stream_id).unwrap(), 0, false)
+            .read_stream(
+                partition_id,
+                StreamId::new(stream_id).unwrap(),
+                0,
+                IterDirection::Forward,
+            )
             .await
             .expect("failed to create stream iterator");
 
@@ -435,7 +440,12 @@ mod tests {
 
         // Read events using stream iterator from beginning
         let mut stream_iter = db
-            .read_stream(partition_id, StreamId::new(stream_id).unwrap(), 0, false)
+            .read_stream(
+                partition_id,
+                StreamId::new(stream_id).unwrap(),
+                0,
+                IterDirection::Forward,
+            )
             .await
             .expect("failed to create stream iterator");
 
@@ -482,7 +492,12 @@ mod tests {
 
         // Test next_batch with different limits
         let mut stream_iter = db
-            .read_stream(partition_id, StreamId::new(stream_id).unwrap(), 0, false)
+            .read_stream(
+                partition_id,
+                StreamId::new(stream_id).unwrap(),
+                0,
+                IterDirection::Forward,
+            )
             .await
             .expect("failed to create stream iterator");
 
@@ -532,7 +547,7 @@ mod tests {
                 partition_id,
                 StreamId::new(stream_id).unwrap(),
                 start_version,
-                false,
+                IterDirection::Forward,
             )
             .await
             .expect("failed to create stream iterator");
@@ -585,7 +600,12 @@ mod tests {
 
         // Read stream-a events
         let mut stream_iter = db
-            .read_stream(partition_id, StreamId::new("stream-a").unwrap(), 0, false)
+            .read_stream(
+                partition_id,
+                StreamId::new("stream-a").unwrap(),
+                0,
+                IterDirection::Forward,
+            )
             .await
             .expect("failed to create stream iterator");
 
@@ -634,7 +654,12 @@ mod tests {
             .expect("failed to append single event");
 
         let mut stream_iter = db
-            .read_stream(partition_id, StreamId::new(stream_id).unwrap(), 0, false)
+            .read_stream(
+                partition_id,
+                StreamId::new(stream_id).unwrap(),
+                0,
+                IterDirection::Forward,
+            )
             .await
             .expect("failed to create stream iterator");
 
@@ -705,7 +730,12 @@ mod tests {
             .expect("failed to append final events");
 
         let mut stream_iter = db
-            .read_stream(partition_id, StreamId::new(stream_id).unwrap(), 0, false)
+            .read_stream(
+                partition_id,
+                StreamId::new(stream_id).unwrap(),
+                0,
+                IterDirection::Forward,
+            )
             .await
             .expect("failed to create stream iterator");
 
@@ -757,7 +787,7 @@ mod tests {
                 partition_id,
                 StreamId::new("target-stream").unwrap(),
                 0,
-                false,
+                IterDirection::Forward,
             )
             .await
             .expect("failed to create stream iterator");
@@ -810,7 +840,12 @@ mod tests {
             .expect("failed to append final events");
 
         let mut stream_iter = db
-            .read_stream(partition_id, StreamId::new(stream_id).unwrap(), 0, false)
+            .read_stream(
+                partition_id,
+                StreamId::new(stream_id).unwrap(),
+                0,
+                IterDirection::Forward,
+            )
             .await
             .expect("failed to create stream iterator");
 
@@ -857,7 +892,12 @@ mod tests {
         }
 
         let mut stream_iter = db
-            .read_stream(partition_id, StreamId::new(stream_id).unwrap(), 0, false)
+            .read_stream(
+                partition_id,
+                StreamId::new(stream_id).unwrap(),
+                0,
+                IterDirection::Forward,
+            )
             .await
             .expect("failed to create stream iterator");
 
@@ -928,7 +968,12 @@ mod tests {
 
         // Read all events
         let mut stream_iter = db
-            .read_stream(partition_id, StreamId::new(stream_id).unwrap(), 0, false)
+            .read_stream(
+                partition_id,
+                StreamId::new(stream_id).unwrap(),
+                0,
+                IterDirection::Forward,
+            )
             .await
             .expect("failed to create stream iterator");
 
@@ -976,7 +1021,12 @@ mod tests {
 
         // Read using next() method
         let mut stream_iter1 = db
-            .read_stream(partition_id, StreamId::new(stream_id).unwrap(), 0, false)
+            .read_stream(
+                partition_id,
+                StreamId::new(stream_id).unwrap(),
+                0,
+                IterDirection::Forward,
+            )
             .await
             .expect("failed to create stream iterator");
 
@@ -999,7 +1049,12 @@ mod tests {
 
         // Read using next_batch() method
         let mut stream_iter2 = db
-            .read_stream(partition_id, StreamId::new(stream_id).unwrap(), 0, false)
+            .read_stream(
+                partition_id,
+                StreamId::new(stream_id).unwrap(),
+                0,
+                IterDirection::Forward,
+            )
             .await
             .expect("failed to create stream iterator");
 
@@ -1042,7 +1097,12 @@ mod tests {
 
         // First pass - populate cache
         let mut stream_iter1 = db
-            .read_stream(partition_id, StreamId::new(stream_id).unwrap(), 0, false)
+            .read_stream(
+                partition_id,
+                StreamId::new(stream_id).unwrap(),
+                0,
+                IterDirection::Forward,
+            )
             .await
             .expect("failed to create stream iterator");
 
@@ -1065,7 +1125,12 @@ mod tests {
 
         // Second pass - should use cached data
         let mut stream_iter2 = db
-            .read_stream(partition_id, StreamId::new(stream_id).unwrap(), 0, false)
+            .read_stream(
+                partition_id,
+                StreamId::new(stream_id).unwrap(),
+                0,
+                IterDirection::Forward,
+            )
             .await
             .expect("failed to create stream iterator");
 
@@ -1105,7 +1170,12 @@ mod tests {
 
         // Read only first 25 events
         let mut stream_iter = db
-            .read_stream(partition_id, StreamId::new(stream_id).unwrap(), 0, false)
+            .read_stream(
+                partition_id,
+                StreamId::new(stream_id).unwrap(),
+                0,
+                IterDirection::Forward,
+            )
             .await
             .expect("failed to create stream iterator");
 
@@ -1144,7 +1214,12 @@ mod tests {
         let stream_id = "non-existent-stream";
 
         let mut stream_iter = db
-            .read_stream(partition_id, StreamId::new(stream_id).unwrap(), 0, false)
+            .read_stream(
+                partition_id,
+                StreamId::new(stream_id).unwrap(),
+                0,
+                IterDirection::Forward,
+            )
             .await
             .expect("failed to create stream iterator");
 
@@ -1170,7 +1245,12 @@ mod tests {
 
         // Try to start reading from version 10 (beyond stream end)
         let mut stream_iter = db
-            .read_stream(partition_id, StreamId::new(stream_id).unwrap(), 10, false)
+            .read_stream(
+                partition_id,
+                StreamId::new(stream_id).unwrap(),
+                10,
+                IterDirection::Forward,
+            )
             .await
             .expect("failed to create stream iterator");
 
@@ -1195,7 +1275,12 @@ mod tests {
 
         // Start reading
         let mut stream_iter = db
-            .read_stream(partition_id, StreamId::new(stream_id).unwrap(), 0, false)
+            .read_stream(
+                partition_id,
+                StreamId::new(stream_id).unwrap(),
+                0,
+                IterDirection::Forward,
+            )
             .await
             .expect("failed to create stream iterator");
 
@@ -1276,7 +1361,12 @@ mod tests {
             .expect("failed to append events");
 
         let mut stream_iter = db
-            .read_stream(partition_id, StreamId::new(stream_id).unwrap(), 0, false)
+            .read_stream(
+                partition_id,
+                StreamId::new(stream_id).unwrap(),
+                0,
+                IterDirection::Forward,
+            )
             .await
             .expect("failed to create stream iterator");
 
@@ -1332,7 +1422,7 @@ mod tests {
                 partition_id,
                 StreamId::new(stream_id).unwrap(),
                 u64::MAX,
-                true,
+                IterDirection::Reverse,
             )
             .await
             .expect("failed to create reverse stream iterator");
@@ -1388,7 +1478,7 @@ mod tests {
                 partition_id,
                 StreamId::new(stream_id).unwrap(),
                 u64::MAX,
-                true,
+                IterDirection::Reverse,
             )
             .await
             .expect("failed to create reverse stream iterator");
@@ -1443,7 +1533,7 @@ mod tests {
                 partition_id,
                 StreamId::new(stream_id).unwrap(),
                 start_version,
-                true,
+                IterDirection::Reverse,
             )
             .await
             .expect("failed to create reverse stream iterator");
@@ -1495,7 +1585,7 @@ mod tests {
                 partition_id,
                 StreamId::new(stream_id).unwrap(),
                 u64::MAX,
-                true,
+                IterDirection::Reverse,
             )
             .await
             .expect("failed to create reverse stream iterator");
@@ -1557,7 +1647,7 @@ mod tests {
                 partition_id,
                 StreamId::new(stream_id).unwrap(),
                 u64::MAX,
-                true,
+                IterDirection::Reverse,
             )
             .await
             .expect("failed to create reverse stream iterator");
@@ -1625,7 +1715,7 @@ mod tests {
                 partition_id,
                 StreamId::new(stream_id).unwrap(),
                 u64::MAX,
-                true,
+                IterDirection::Reverse,
             )
             .await
             .expect("failed to create reverse stream iterator");
@@ -1697,7 +1787,7 @@ mod tests {
                 partition_id,
                 StreamId::new(stream_id).unwrap(),
                 u64::MAX,
-                true,
+                IterDirection::Reverse,
             )
             .await
             .expect("failed to create reverse stream iterator");
@@ -1757,7 +1847,7 @@ mod tests {
                 partition_id,
                 StreamId::new(stream_id).unwrap(),
                 u64::MAX,
-                true,
+                IterDirection::Reverse,
             )
             .await
             .expect("failed to create reverse stream iterator");
@@ -1785,7 +1875,7 @@ mod tests {
                 partition_id,
                 StreamId::new(stream_id).unwrap(),
                 u64::MAX,
-                true,
+                IterDirection::Reverse,
             )
             .await
             .expect("failed to create reverse stream iterator");
@@ -1829,7 +1919,7 @@ mod tests {
                 partition_id,
                 StreamId::new(stream_id).unwrap(),
                 u64::MAX,
-                true,
+                IterDirection::Reverse,
             )
             .await
             .expect("failed to create reverse stream iterator");
@@ -1864,7 +1954,12 @@ mod tests {
         // For reverse iteration, this should actually start from the latest available
         // version (4) and go backwards
         let mut stream_iter = db
-            .read_stream(partition_id, StreamId::new(stream_id).unwrap(), 10, true)
+            .read_stream(
+                partition_id,
+                StreamId::new(stream_id).unwrap(),
+                10,
+                IterDirection::Reverse,
+            )
             .await
             .expect("failed to create reverse stream iterator");
 
@@ -1917,7 +2012,7 @@ mod tests {
                 partition_id,
                 StreamId::new(stream_id).unwrap(),
                 u64::MAX,
-                true,
+                IterDirection::Reverse,
             )
             .await
             .expect("failed to create reverse stream iterator");
@@ -1976,7 +2071,7 @@ mod tests {
                 partition_id,
                 StreamId::new(stream_id).unwrap(),
                 u64::MAX,
-                true,
+                IterDirection::Reverse,
             )
             .await
             .expect("failed to create reverse stream iterator");
@@ -2004,7 +2099,7 @@ mod tests {
                 partition_id,
                 StreamId::new(stream_id).unwrap(),
                 u64::MAX,
-                true,
+                IterDirection::Reverse,
             )
             .await
             .expect("failed to create reverse stream iterator");
@@ -2062,7 +2157,7 @@ mod tests {
                 partition_id,
                 StreamId::new(stream_id).unwrap(),
                 u64::MAX,
-                true,
+                IterDirection::Reverse,
             )
             .await
             .expect("failed to create reverse stream iterator");
@@ -2133,7 +2228,12 @@ mod tests {
 
         // Read stream-a and verify no duplicates
         let mut stream_iter = db
-            .read_stream(partition_id, StreamId::new("stream-a").unwrap(), 0, false)
+            .read_stream(
+                partition_id,
+                StreamId::new("stream-a").unwrap(),
+                0,
+                IterDirection::Forward,
+            )
             .await
             .expect("failed to create stream iterator");
 
@@ -2195,7 +2295,12 @@ mod tests {
 
         // Read stream-a
         let mut stream_iter = db
-            .read_stream(partition_id, StreamId::new("stream-a").unwrap(), 0, false)
+            .read_stream(
+                partition_id,
+                StreamId::new("stream-a").unwrap(),
+                0,
+                IterDirection::Forward,
+            )
             .await
             .expect("failed to create stream iterator");
 
@@ -2299,7 +2404,12 @@ mod tests {
 
         // Read stream-a
         let mut stream_iter = db
-            .read_stream(partition_id, StreamId::new("stream-a").unwrap(), 0, false)
+            .read_stream(
+                partition_id,
+                StreamId::new("stream-a").unwrap(),
+                0,
+                IterDirection::Forward,
+            )
             .await
             .expect("failed to create stream iterator");
 
@@ -2349,7 +2459,12 @@ mod tests {
 
         // Read stream-a with small batch size
         let mut stream_iter = db
-            .read_stream(partition_id, StreamId::new("stream-a").unwrap(), 0, false)
+            .read_stream(
+                partition_id,
+                StreamId::new("stream-a").unwrap(),
+                0,
+                IterDirection::Forward,
+            )
             .await
             .expect("failed to create stream iterator");
 
@@ -2398,7 +2513,12 @@ mod tests {
 
         // Read stream-a
         let mut stream_iter = db
-            .read_stream(partition_id, StreamId::new("stream-a").unwrap(), 0, false)
+            .read_stream(
+                partition_id,
+                StreamId::new("stream-a").unwrap(),
+                0,
+                IterDirection::Forward,
+            )
             .await
             .expect("failed to create iterator");
 
