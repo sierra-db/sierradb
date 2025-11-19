@@ -30,17 +30,17 @@ impl PartitionIter {
     pub(crate) async fn new(
         partition_id: PartitionId,
         bucket_id: BucketId,
-        from_sequence: u64,
         reader_pool: ReaderThreadPool,
         live_indexes: Arc<HashMap<BucketId, (Arc<AtomicU32>, LiveIndexes)>>,
+        from_sequence: u64,
         reverse: bool,
     ) -> Result<Self, PartitionIndexError> {
         Self::new_inner(
             partition_id,
             bucket_id,
-            from_sequence,
             reader_pool,
             live_indexes,
+            from_sequence,
             reverse,
             if reverse { u32::MAX } else { 0 },
             true,
@@ -52,9 +52,9 @@ impl PartitionIter {
     async fn new_inner(
         partition_id: PartitionId,
         bucket_id: BucketId,
-        from_sequence: u64,
         reader_pool: ReaderThreadPool,
         live_indexes: Arc<HashMap<BucketId, (Arc<AtomicU32>, LiveIndexes)>>,
+        from_sequence: u64,
         reverse: bool,
         next_segment_id: SegmentId,
         check_closed_segments: bool,
@@ -401,9 +401,9 @@ impl PartitionIter {
         *self = Self::new_inner(
             self.partition_id,
             segment_iter.bucket_segment_id.bucket_id,
-            from_sequence,
             segment_iter.reader_pool,
             self.live_indexes.clone(),
+            from_sequence,
             self.reverse,
             min_segment_id,
             self.has_next_segment,

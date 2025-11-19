@@ -173,9 +173,9 @@ impl Database {
         PartitionIter::new(
             partition_id,
             bucket_id,
-            from_sequence,
             self.reader_pool.clone(),
             self.writer_pool.indexes().clone(),
+            from_sequence,
             false,
         )
         .await
@@ -268,9 +268,9 @@ impl Database {
         StreamIter::new(
             stream_id,
             bucket_id,
-            from_version,
             self.reader_pool.clone(),
             self.writer_pool.indexes().clone(),
+            from_version,
             reverse,
         )
         .await
