@@ -6,13 +6,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::oneshot;
 use tracing::warn;
 
-use crate::StreamId;
 use crate::bucket::segment::{CommittedEvents, SegmentIter};
 use crate::bucket::stream_index::StreamOffsets;
 use crate::bucket::{BucketId, BucketSegmentId, SegmentId};
 use crate::error::StreamIndexError;
 use crate::reader_thread_pool::{ReaderSet, ReaderThreadPool};
 use crate::writer_thread_pool::LiveIndexes;
+use crate::{IterDirection, StreamId};
 
 #[derive(Debug)]
 pub struct StreamIter {
@@ -22,7 +22,7 @@ pub struct StreamIter {
     last_version: u64,
     is_live: bool,
     has_next_segment: bool,
-    reverse: bool,
+    dir: IterDirection,
     batch: VecDeque<CommittedEvents>,
 }
 
@@ -33,7 +33,7 @@ impl StreamIter {
         reader_pool: ReaderThreadPool,
         live_indexes: Arc<HashMap<BucketId, (Arc<AtomicU32>, LiveIndexes)>>,
         from_version: u64,
-        reverse: bool,
+        dir: IterDirection,
     ) -> Result<Self, StreamIndexError> {
         Self::new_inner(
             stream_id,
@@ -41,8 +41,11 @@ impl StreamIter {
             reader_pool,
             live_indexes,
             from_version,
-            reverse,
-            if reverse { u32::MAX } else { 0 },
+            dir,
+            match dir {
+                IterDirection::Forward => 0,
+                IterDirection::Reverse => u32::MAX,
+            },
             true,
         )
         .await
@@ -55,37 +58,31 @@ impl StreamIter {
         reader_pool: ReaderThreadPool,
         live_indexes: Arc<HashMap<BucketId, (Arc<AtomicU32>, LiveIndexes)>>,
         from_version: u64,
-        reverse: bool,
+        dir: IterDirection,
         next_segment_id: SegmentId,
         check_closed_segments: bool,
     ) -> Result<Self, StreamIndexError> {
         // Check live indexes first
         if let Some((segment_id, index)) = live_indexes.get(&bucket_id) {
             let segment_id = segment_id.load(Ordering::Acquire);
-            let matches = if reverse {
-                segment_id <= next_segment_id
-            } else {
-                segment_id >= next_segment_id
+            let matches = match dir {
+                IterDirection::Forward => segment_id >= next_segment_id,
+                IterDirection::Reverse => segment_id <= next_segment_id,
             };
             if matches {
                 let index_guard = index.read().await;
                 if let Some(stream_index) = index_guard.stream_index.get(&stream_id)
                     && let StreamOffsets::Offsets(offsets) = stream_index.offsets.clone()
-                    && (if reverse {
-                        // For reverse iteration, check if segment contains versions <= from_version
-                        stream_index.version_min <= from_version
-                    } else {
-                        // For forward iteration, use original logic
-                        stream_index.version_min <= from_version
-                    })
+                    && stream_index.version_min <= from_version
                 {
-                    let offsets_index = if reverse && from_version == u64::MAX {
-                        // For reverse iteration from max, start from the end
-                        offsets.len()
-                    } else {
-                        (from_version.saturating_sub(stream_index.version_min) as usize)
-                            .min(offsets.len())
-                    };
+                    let offsets_index =
+                        if matches!(dir, IterDirection::Reverse) && from_version == u64::MAX {
+                            // For reverse iteration from max, start from the end
+                            offsets.len()
+                        } else {
+                            (from_version.saturating_sub(stream_index.version_min) as usize)
+                                .min(offsets.len())
+                        };
 
                     drop(index_guard);
 
@@ -94,14 +91,13 @@ impl StreamIter {
                         BucketSegmentId::new(bucket_id, segment_id),
                         offsets,
                         offsets_index,
-                        reverse,
+                        dir,
                     );
 
                     // For reverse iteration, check if there are segments with lower IDs
-                    let has_next_segment = if reverse {
-                        segment_id > 0 // If segment_id > 0, there are lower numbered segments
-                    } else {
-                        false
+                    let has_next_segment = match dir {
+                        IterDirection::Forward => false,
+                        IterDirection::Reverse => segment_id > 0,
                     };
 
                     return Ok(StreamIter {
@@ -111,7 +107,7 @@ impl StreamIter {
                         last_version: from_version,
                         is_live: true,
                         has_next_segment,
-                        reverse,
+                        dir,
                         batch: VecDeque::new(),
                     });
                 }
@@ -126,7 +122,7 @@ impl StreamIter {
                 last_version: from_version,
                 is_live: false,
                 has_next_segment: false,
-                reverse,
+                dir,
                 batch: VecDeque::new(),
             });
         }
@@ -142,92 +138,102 @@ impl StreamIter {
                     };
 
                     let segments_len = segments.len();
-                    let res = if reverse {
-                        // For reverse iteration, start from the last (newest) segment and work
-                        // backwards
-                        segments.iter_mut().enumerate().rev().find_map(
-                            |(i, (segment_id, reader_set)): (usize, (&u32, &mut ReaderSet))| {
-                                if *segment_id > next_segment_id {
-                                    return None;
-                                }
-
-                                let stream_index = reader_set.stream_index.as_mut()?;
-
-                                match stream_index.get_key(&stream_id) {
-                                    Ok(Some(key))
-                                        if key.version_min <= from_version
-                                            || i == segments_len - 1 =>
-                                    {
-                                        let version_min = key.version_min;
-                                        match stream_index.get_from_key(key) {
-                                            Ok(StreamOffsets::Offsets(offsets)) => {
-                                                let offsets_index =
-                                                    if reverse && from_version == u64::MAX {
-                                                        // For reverse iteration from max, start
-                                                        // from the end
-                                                        offsets.len()
-                                                    } else {
-                                                        (from_version.saturating_sub(version_min)
-                                                            as usize)
-                                                            .min(offsets.len())
-                                                    };
-
-                                                debug_assert!(segments_len > 0);
-                                                let has_next_segment = i > 0;
-                                                Some(Ok((
-                                                    *segment_id,
-                                                    offsets,
-                                                    offsets_index,
-                                                    has_next_segment,
-                                                )))
-                                            }
-                                            Ok(StreamOffsets::ExternalBucket) => unimplemented!(),
-                                            Err(err) => Some(Err(err)),
-                                        }
+                    let res = match dir {
+                        IterDirection::Forward => {
+                            // For forward iteration, start from the last (newest) segment
+                            segments.iter_mut().enumerate().rev().find_map(
+                                |(i, (segment_id, reader_set)): (usize, (&u32, &mut ReaderSet))| {
+                                    if *segment_id < next_segment_id {
+                                        return None;
                                     }
-                                    Ok(_) => None,
-                                    Err(err) => Some(Err(err)),
-                                }
-                            },
-                        )
-                    } else {
-                        // For forward iteration, start from the last (newest) segment
-                        segments.iter_mut().enumerate().rev().find_map(
-                            |(i, (segment_id, reader_set)): (usize, (&u32, &mut ReaderSet))| {
-                                if *segment_id < next_segment_id {
-                                    return None;
-                                }
 
-                                let stream_index = reader_set.stream_index.as_mut()?;
+                                    let stream_index = reader_set.stream_index.as_mut()?;
 
-                                match stream_index.get_key(&stream_id) {
-                                    Ok(Some(key)) if key.version_min <= from_version || i == 0 => {
-                                        let version_min = key.version_min;
-                                        match stream_index.get_from_key(key) {
-                                            Ok(StreamOffsets::Offsets(offsets)) => {
-                                                let offsets_index = (from_version
-                                                    .saturating_sub(version_min)
-                                                    as usize)
-                                                    .min(offsets.len());
+                                    match stream_index.get_key(&stream_id) {
+                                        Ok(Some(key))
+                                            if key.version_min <= from_version || i == 0 =>
+                                        {
+                                            let version_min = key.version_min;
+                                            match stream_index.get_from_key(key) {
+                                                Ok(StreamOffsets::Offsets(offsets)) => {
+                                                    let offsets_index = (from_version
+                                                        .saturating_sub(version_min)
+                                                        as usize)
+                                                        .min(offsets.len());
 
-                                                debug_assert!(segments_len > 0);
-                                                let has_next_segment = segments_len - 1 > i;
-                                                Some(Ok((
-                                                    *segment_id,
-                                                    offsets,
-                                                    offsets_index,
-                                                    has_next_segment,
-                                                )))
+                                                    debug_assert!(segments_len > 0);
+                                                    let has_next_segment = segments_len - 1 > i;
+                                                    Some(Ok((
+                                                        *segment_id,
+                                                        offsets,
+                                                        offsets_index,
+                                                        has_next_segment,
+                                                    )))
+                                                }
+                                                Ok(StreamOffsets::ExternalBucket) => {
+                                                    unimplemented!()
+                                                }
+                                                Err(err) => Some(Err(err)),
                                             }
-                                            Ok(StreamOffsets::ExternalBucket) => unimplemented!(),
-                                            Err(err) => Some(Err(err)),
                                         }
+                                        Ok(_) => None,
+                                        Err(err) => Some(Err(err)),
                                     }
-                                    Ok(_) => None,
-                                    Err(err) => Some(Err(err)),
-                                }
-                            },
-                        )
+                                },
+                            )
+                        }
+                        IterDirection::Reverse => {
+                            segments.iter_mut().enumerate().rev().find_map(
+                                |(i, (segment_id, reader_set)): (usize, (&u32, &mut ReaderSet))| {
+                                    if *segment_id > next_segment_id {
+                                        return None;
+                                    }
+
+                                    let stream_index = reader_set.stream_index.as_mut()?;
+
+                                    match stream_index.get_key(&stream_id) {
+                                        Ok(Some(key))
+                                            if key.version_min <= from_version
+                                                || i == segments_len - 1 =>
+                                        {
+                                            let version_min = key.version_min;
+                                            match stream_index.get_from_key(key) {
+                                                Ok(StreamOffsets::Offsets(offsets)) => {
+                                                    let offsets_index =
+                                                        if matches!(dir, IterDirection::Reverse)
+                                                            && from_version == u64::MAX
+                                                        {
+                                                            // For reverse iteration from max, start
+                                                            // from the end
+                                                            offsets.len()
+                                                        } else {
+                                                            (from_version
+                                                                .saturating_sub(version_min)
+                                                                as usize)
+                                                                .min(offsets.len())
+                                                        };
+
+                                                    debug_assert!(segments_len > 0);
+                                                    let has_next_segment = i > 0;
+                                                    Some(Ok((
+                                                        *segment_id,
+                                                        offsets,
+                                                        offsets_index,
+                                                        has_next_segment,
+                                                    )))
+                                                }
+                                                Ok(StreamOffsets::ExternalBucket) => {
+                                                    unimplemented!()
+                                                }
+                                                Err(err) => Some(Err(err)),
+                                            }
+                                        }
+                                        Ok(_) => None,
+                                        Err(err) => Some(Err(err)),
+                                    }
+                                },
+                            )
+                        }
                     };
 
                     let _ = reply_tx.send(res);
@@ -242,7 +248,7 @@ impl StreamIter {
                     BucketSegmentId::new(bucket_id, segment_id),
                     offsets,
                     offsets_index,
-                    reverse,
+                    dir,
                 ));
                 Ok(StreamIter {
                     stream_id,
@@ -251,7 +257,7 @@ impl StreamIter {
                     last_version: from_version,
                     is_live: false,
                     has_next_segment,
-                    reverse,
+                    dir,
                     batch: VecDeque::new(),
                 })
             }
@@ -273,7 +279,7 @@ impl StreamIter {
                             BucketSegmentId::new(bucket_id, segment_id),
                             offsets,
                             offsets_index,
-                            reverse,
+                            dir,
                         );
                         return Ok(StreamIter {
                             stream_id,
@@ -282,7 +288,7 @@ impl StreamIter {
                             last_version: from_version,
                             is_live: true,
                             has_next_segment: false,
-                            reverse,
+                            dir,
                             batch: VecDeque::new(),
                         });
                     }
@@ -295,7 +301,7 @@ impl StreamIter {
                     last_version: from_version,
                     is_live: false,
                     has_next_segment: false,
-                    reverse,
+                    dir,
                     batch: VecDeque::new(),
                 })
             }
@@ -313,12 +319,9 @@ impl StreamIter {
         if let Some(batch_back) = self.batch.back() {
             self.last_version = batch_back
                 .last_stream_version()
-                .map(|v| {
-                    if self.reverse {
-                        v.saturating_sub(1)
-                    } else {
-                        v + 1
-                    }
+                .map(|v| match self.dir {
+                    IterDirection::Forward => v + 1,
+                    IterDirection::Reverse => v.saturating_sub(1),
                 })
                 .unwrap_or(self.last_version);
             return Ok(Some(mem::take(&mut self.batch).into()));
@@ -335,12 +338,9 @@ impl StreamIter {
                         .last()
                         .expect("commits should not be empty if Some is returned")
                         .last_stream_version()
-                        .map(|v| {
-                            if self.reverse {
-                                v.saturating_sub(1)
-                            } else {
-                                v + 1
-                            }
+                        .map(|v| match self.dir {
+                            IterDirection::Forward => v + 1,
+                            IterDirection::Reverse => v.saturating_sub(1),
                         })
                         .unwrap_or(self.last_version);
 
@@ -388,16 +388,16 @@ impl StreamIter {
         let current_segment_id = segment_iter.bucket_segment_id.segment_id;
 
         // For reverse iteration, stop if we've reached segment 0
-        if self.reverse && current_segment_id == 0 {
+        if matches!(self.dir, IterDirection::Reverse) && current_segment_id == 0 {
             return Ok(false);
         }
 
-        let next_segment_id = if self.reverse {
-            // For reverse iteration, go to previous (lower numbered) segment
-            current_segment_id.saturating_sub(1)
-        } else {
-            // For forward iteration, go to next (higher numbered) segment
-            current_segment_id + 1
+        let next_segment_id = match self.dir {
+            IterDirection::Forward => {
+                // For forward iteration, go to next (higher numbered) segment
+                current_segment_id + 1
+            }
+            IterDirection::Reverse => current_segment_id.saturating_sub(1),
         };
 
         let from_version = self.last_version;
@@ -410,7 +410,7 @@ impl StreamIter {
             segment_iter.reader_pool,
             self.live_indexes.clone(),
             from_version,
-            self.reverse,
+            self.dir,
             min_segment_id,
             self.has_next_segment,
         )

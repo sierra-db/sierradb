@@ -4,7 +4,7 @@ use kameo::prelude::*;
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use sierradb::{
-    StreamId,
+    IterDirection, StreamId,
     bucket::{PartitionHash, PartitionId, segment::EventRecord},
     id::uuid_to_partition_hash,
 };
@@ -619,7 +619,12 @@ impl ClusterActor {
 
             // Create iterator and collect events
             let mut iter = match database
-                .read_stream(partition_id, stream_id, start_version, false)
+                .read_stream(
+                    partition_id,
+                    stream_id,
+                    start_version,
+                    IterDirection::Forward,
+                )
                 .await
             {
                 Ok(iter) => iter,
@@ -1034,7 +1039,12 @@ impl Message<GetStreamVersion> for ClusterActor {
 
                 ctx.spawn(async move {
                     let mut iter = database
-                        .read_stream(msg.partition_id, msg.stream_id, u64::MAX, true)
+                        .read_stream(
+                            msg.partition_id,
+                            msg.stream_id,
+                            u64::MAX,
+                            IterDirection::Reverse,
+                        )
                         .await
                         .map_err(|err| ClusterError::Read(err.to_string()))?;
 

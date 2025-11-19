@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use tokio::sync::oneshot;
 
+use crate::IterDirection;
 use crate::bucket::partition_index::PartitionOffsets;
 use crate::bucket::segment::{CommittedEvents, SegmentIter};
 use crate::bucket::{BucketId, BucketSegmentId, PartitionId, SegmentId};
@@ -20,7 +21,7 @@ pub struct PartitionIter {
     last_sequence: u64,
     is_live: bool,
     has_next_segment: bool,
-    reverse: bool,
+    dir: IterDirection,
     batch: VecDeque<CommittedEvents>,
 }
 
@@ -31,7 +32,7 @@ impl PartitionIter {
         reader_pool: ReaderThreadPool,
         live_indexes: Arc<HashMap<BucketId, (Arc<AtomicU32>, LiveIndexes)>>,
         from_sequence: u64,
-        reverse: bool,
+        dir: IterDirection,
     ) -> Result<Self, PartitionIndexError> {
         Self::new_inner(
             partition_id,
@@ -39,8 +40,11 @@ impl PartitionIter {
             reader_pool,
             live_indexes,
             from_sequence,
-            reverse,
-            if reverse { u32::MAX } else { 0 },
+            dir,
+            match dir {
+                IterDirection::Forward => 0,
+                IterDirection::Reverse => u32::MAX,
+            },
             true,
         )
         .await
@@ -53,38 +57,31 @@ impl PartitionIter {
         reader_pool: ReaderThreadPool,
         live_indexes: Arc<HashMap<BucketId, (Arc<AtomicU32>, LiveIndexes)>>,
         from_sequence: u64,
-        reverse: bool,
+        dir: IterDirection,
         next_segment_id: SegmentId,
         check_closed_segments: bool,
     ) -> Result<Self, PartitionIndexError> {
         // Check live indexes first
         if let Some((segment_id, index)) = live_indexes.get(&bucket_id) {
             let segment_id = segment_id.load(Ordering::Acquire);
-            let matches = if reverse {
-                segment_id <= next_segment_id
-            } else {
-                segment_id >= next_segment_id
+            let matches = match dir {
+                IterDirection::Reverse => segment_id <= next_segment_id,
+                IterDirection::Forward => segment_id >= next_segment_id,
             };
             if matches {
                 let index_guard = index.read().await;
                 if let Some(partition_index) = index_guard.partition_index.get(partition_id)
                     && let PartitionOffsets::Offsets(offsets) = partition_index.offsets.clone()
-                    && (if reverse {
-                        // For reverse iteration, check if segment contains sequences <=
-                        // from_sequence
-                        partition_index.sequence_min <= from_sequence
-                    } else {
-                        // For forward iteration, use original logic
-                        partition_index.sequence_min <= from_sequence
-                    })
+                    && partition_index.sequence_min <= from_sequence
                 {
-                    let offsets_index = if reverse && from_sequence == u64::MAX {
-                        // For reverse iteration from max, start from the end
-                        offsets.len()
-                    } else {
-                        (from_sequence.saturating_sub(partition_index.sequence_min) as usize)
-                            .min(offsets.len())
-                    };
+                    let offsets_index =
+                        if matches!(dir, IterDirection::Reverse) && from_sequence == u64::MAX {
+                            // For reverse iteration from max, start from the end
+                            offsets.len()
+                        } else {
+                            (from_sequence.saturating_sub(partition_index.sequence_min) as usize)
+                                .min(offsets.len())
+                        };
 
                     drop(index_guard);
 
@@ -93,14 +90,13 @@ impl PartitionIter {
                         BucketSegmentId::new(bucket_id, segment_id),
                         offsets.into_iter().map(|i| i.offset).collect(),
                         offsets_index,
-                        reverse,
+                        dir,
                     );
 
                     // For reverse iteration, check if there are segments with lower IDs
-                    let has_next_segment = if reverse {
-                        segment_id > 0 // If segment_id > 0, there are lower numbered segments
-                    } else {
-                        false
+                    let has_next_segment = match dir {
+                        IterDirection::Forward => false,
+                        IterDirection::Reverse => segment_id > 0,
                     };
 
                     return Ok(PartitionIter {
@@ -110,7 +106,7 @@ impl PartitionIter {
                         last_sequence: from_sequence,
                         is_live: true,
                         has_next_segment,
-                        reverse,
+                        dir,
                         batch: VecDeque::new(),
                     });
                 }
@@ -125,7 +121,7 @@ impl PartitionIter {
                 last_sequence: from_sequence,
                 is_live: false,
                 has_next_segment: false,
-                reverse,
+                dir,
                 batch: VecDeque::new(),
             });
         }
@@ -139,96 +135,101 @@ impl PartitionIter {
                 };
 
                 let segments_len = segments.len();
-                let res = if reverse {
-                    // For reverse iteration, start from the last (newest) segment and work
-                    // backwards
-                    segments.iter_mut().enumerate().rev().find_map(
-                        |(i, (segment_id, reader_set)): (usize, (&u32, &mut ReaderSet))| {
-                            if *segment_id > next_segment_id {
-                                return None;
-                            }
-
-                            let partition_index = reader_set.partition_index.as_mut()?;
-
-                            match partition_index.get_key(partition_id) {
-                                Ok(Some(key))
-                                    if key.sequence_min <= from_sequence
-                                        || i == segments_len - 1 =>
-                                {
-                                    let sequence_min = key.sequence_min;
-                                    match partition_index.get_from_key(key) {
-                                        Ok(PartitionOffsets::Offsets(offsets)) => {
-                                            let offsets_index =
-                                                if reverse && from_sequence == u64::MAX {
-                                                    // For reverse iteration from max, start
-                                                    // from the end
-                                                    offsets.len()
-                                                } else {
-                                                    (from_sequence.saturating_sub(sequence_min)
-                                                        as usize)
-                                                        .min(offsets.len())
-                                                };
-
-                                            debug_assert!(segments_len > 0);
-                                            let has_next_segment = i > 0;
-                                            Some(Ok((
-                                                *segment_id,
-                                                offsets,
-                                                offsets_index,
-                                                has_next_segment,
-                                            )))
-                                        }
-                                        Ok(PartitionOffsets::ExternalBucket) => {
-                                            unimplemented!()
-                                        }
-                                        Err(err) => Some(Err(err)),
-                                    }
+                let res = match dir {
+                    IterDirection::Forward => {
+                        // For forward iteration, start from the last (newest) segment
+                        segments.iter_mut().enumerate().rev().find_map(
+                            |(i, (segment_id, reader_set)): (usize, (&u32, &mut ReaderSet))| {
+                                if *segment_id < next_segment_id {
+                                    return None;
                                 }
-                                Ok(_) => None,
-                                Err(err) => Some(Err(err)),
-                            }
-                        },
-                    )
-                } else {
-                    // For forward iteration, start from the last (newest) segment
-                    segments.iter_mut().enumerate().rev().find_map(
-                        |(i, (segment_id, reader_set)): (usize, (&u32, &mut ReaderSet))| {
-                            if *segment_id < next_segment_id {
-                                return None;
-                            }
 
-                            let partition_index = reader_set.partition_index.as_mut()?;
+                                let partition_index = reader_set.partition_index.as_mut()?;
 
-                            match partition_index.get_key(partition_id) {
-                                Ok(Some(key)) if key.sequence_min <= from_sequence || i == 0 => {
-                                    let sequence_min = key.sequence_min;
-                                    match partition_index.get_from_key(key) {
-                                        Ok(PartitionOffsets::Offsets(offsets)) => {
-                                            let offsets_index = (from_sequence
-                                                .saturating_sub(sequence_min)
-                                                as usize)
-                                                .min(offsets.len());
+                                match partition_index.get_key(partition_id) {
+                                    Ok(Some(key))
+                                        if key.sequence_min <= from_sequence || i == 0 =>
+                                    {
+                                        let sequence_min = key.sequence_min;
+                                        match partition_index.get_from_key(key) {
+                                            Ok(PartitionOffsets::Offsets(offsets)) => {
+                                                let offsets_index = (from_sequence
+                                                    .saturating_sub(sequence_min)
+                                                    as usize)
+                                                    .min(offsets.len());
 
-                                            debug_assert!(segments_len > 0);
-                                            let has_next_segment = segments_len - 1 > i;
-                                            Some(Ok((
-                                                *segment_id,
-                                                offsets,
-                                                offsets_index,
-                                                has_next_segment,
-                                            )))
+                                                debug_assert!(segments_len > 0);
+                                                let has_next_segment = segments_len - 1 > i;
+                                                Some(Ok((
+                                                    *segment_id,
+                                                    offsets,
+                                                    offsets_index,
+                                                    has_next_segment,
+                                                )))
+                                            }
+                                            Ok(PartitionOffsets::ExternalBucket) => {
+                                                unimplemented!()
+                                            }
+                                            Err(err) => Some(Err(err)),
                                         }
-                                        Ok(PartitionOffsets::ExternalBucket) => {
-                                            unimplemented!()
-                                        }
-                                        Err(err) => Some(Err(err)),
                                     }
+                                    Ok(_) => None,
+                                    Err(err) => Some(Err(err)),
                                 }
-                                Ok(_) => None,
-                                Err(err) => Some(Err(err)),
-                            }
-                        },
-                    )
+                            },
+                        )
+                    }
+                    IterDirection::Reverse => {
+                        segments.iter_mut().enumerate().rev().find_map(
+                            |(i, (segment_id, reader_set)): (usize, (&u32, &mut ReaderSet))| {
+                                if *segment_id > next_segment_id {
+                                    return None;
+                                }
+
+                                let partition_index = reader_set.partition_index.as_mut()?;
+
+                                match partition_index.get_key(partition_id) {
+                                    Ok(Some(key))
+                                        if key.sequence_min <= from_sequence
+                                            || i == segments_len - 1 =>
+                                    {
+                                        let sequence_min = key.sequence_min;
+                                        match partition_index.get_from_key(key) {
+                                            Ok(PartitionOffsets::Offsets(offsets)) => {
+                                                let offsets_index =
+                                                    if matches!(dir, IterDirection::Reverse)
+                                                        && from_sequence == u64::MAX
+                                                    {
+                                                        // For reverse iteration from max, start
+                                                        // from the end
+                                                        offsets.len()
+                                                    } else {
+                                                        (from_sequence.saturating_sub(sequence_min)
+                                                            as usize)
+                                                            .min(offsets.len())
+                                                    };
+
+                                                debug_assert!(segments_len > 0);
+                                                let has_next_segment = i > 0;
+                                                Some(Ok((
+                                                    *segment_id,
+                                                    offsets,
+                                                    offsets_index,
+                                                    has_next_segment,
+                                                )))
+                                            }
+                                            Ok(PartitionOffsets::ExternalBucket) => {
+                                                unimplemented!()
+                                            }
+                                            Err(err) => Some(Err(err)),
+                                        }
+                                    }
+                                    Ok(_) => None,
+                                    Err(err) => Some(Err(err)),
+                                }
+                            },
+                        )
+                    }
                 };
 
                 let _ = reply_tx.send(res);
@@ -242,7 +243,7 @@ impl PartitionIter {
                     BucketSegmentId::new(bucket_id, segment_id),
                     offsets.into_iter().map(|i| i.offset).collect(),
                     offsets_index,
-                    reverse,
+                    dir,
                 ));
                 Ok(PartitionIter {
                     partition_id,
@@ -251,7 +252,7 @@ impl PartitionIter {
                     last_sequence: from_sequence,
                     is_live: false,
                     has_next_segment,
-                    reverse,
+                    dir,
                     batch: VecDeque::new(),
                 })
             }
@@ -273,7 +274,7 @@ impl PartitionIter {
                             BucketSegmentId::new(bucket_id, segment_id),
                             offsets.into_iter().map(|i| i.offset).collect(),
                             offsets_index,
-                            reverse,
+                            dir,
                         );
                         return Ok(PartitionIter {
                             partition_id,
@@ -282,7 +283,7 @@ impl PartitionIter {
                             last_sequence: from_sequence,
                             is_live: true,
                             has_next_segment: false,
-                            reverse,
+                            dir,
                             batch: VecDeque::new(),
                         });
                     }
@@ -295,7 +296,7 @@ impl PartitionIter {
                     last_sequence: from_sequence,
                     is_live: false,
                     has_next_segment: false,
-                    reverse,
+                    dir,
                     batch: VecDeque::new(),
                 })
             }
@@ -313,12 +314,9 @@ impl PartitionIter {
         if let Some(batch_back) = self.batch.back() {
             self.last_sequence = batch_back
                 .last_partition_sequence()
-                .map(|v| {
-                    if self.reverse {
-                        v.saturating_sub(1)
-                    } else {
-                        v + 1
-                    }
+                .map(|v| match self.dir {
+                    IterDirection::Forward => v + 1,
+                    IterDirection::Reverse => v.saturating_sub(1),
                 })
                 .unwrap_or(self.last_sequence);
             return Ok(Some(mem::take(&mut self.batch).into()));
@@ -335,12 +333,9 @@ impl PartitionIter {
                         .last()
                         .expect("commits should not be empty if Some is returned")
                         .last_partition_sequence()
-                        .map(|v| {
-                            if self.reverse {
-                                v.saturating_sub(1)
-                            } else {
-                                v + 1
-                            }
+                        .map(|v| match self.dir {
+                            IterDirection::Forward => v + 1,
+                            IterDirection::Reverse => v.saturating_sub(1),
                         })
                         .unwrap_or(self.last_sequence);
 
@@ -378,16 +373,16 @@ impl PartitionIter {
         let current_segment_id = segment_iter.bucket_segment_id.segment_id;
 
         // For reverse iteration, stop if we've reached segment 0
-        if self.reverse && current_segment_id == 0 {
+        if matches!(self.dir, IterDirection::Reverse) && current_segment_id == 0 {
             return Ok(false);
         }
 
-        let next_segment_id = if self.reverse {
-            // For reverse iteration, go to previous (lower numbered) segment
-            current_segment_id.saturating_sub(1)
-        } else {
-            // For forward iteration, go to next (higher numbered) segment
-            current_segment_id + 1
+        let next_segment_id = match self.dir {
+            IterDirection::Forward => {
+                // For forward iteration, go to next (higher numbered) segment
+                current_segment_id + 1
+            }
+            IterDirection::Reverse => current_segment_id.saturating_sub(1),
         };
 
         let from_sequence = self.last_sequence;
@@ -400,7 +395,7 @@ impl PartitionIter {
             segment_iter.reader_pool,
             self.live_indexes.clone(),
             from_sequence,
-            self.reverse,
+            self.dir,
             min_segment_id,
             self.has_next_segment,
         )

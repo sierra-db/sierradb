@@ -8,7 +8,7 @@ use futures::{FutureExt, future::BoxFuture};
 use kameo::prelude::*;
 use rand::{SeedableRng, rngs::StdRng, seq::IteratorRandom};
 use sierradb::{
-    StreamId,
+    IterDirection, StreamId,
     bucket::{PartitionId, segment::EventRecord},
     database::Database,
     error::{PartitionIndexError, StreamIndexError},
@@ -674,7 +674,12 @@ impl Subscription {
 
         let mut iter = self
             .database
-            .read_stream(partition_id, stream_id, *from_version, false)
+            .read_stream(
+                partition_id,
+                stream_id,
+                *from_version,
+                IterDirection::Forward,
+            )
             .await?;
         while let Some(commits) = iter.next_batch(DEFAULT_BATCH_SIZE).await? {
             for commit in commits {

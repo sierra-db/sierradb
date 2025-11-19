@@ -15,7 +15,6 @@ use tokio::sync::oneshot;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
-use crate::StreamId;
 use crate::bucket::event_index::ClosedEventIndex;
 use crate::bucket::partition_index::{
     ClosedPartitionIndex, PartitionIndexRecord, PartitionIter, PartitionOffsets,
@@ -33,6 +32,7 @@ use crate::error::{
 use crate::id::{set_uuid_flag, uuid_to_partition_hash, validate_event_id};
 use crate::reader_thread_pool::ReaderThreadPool;
 use crate::writer_thread_pool::{AppendResult, WriterThreadPool};
+use crate::{IterDirection, StreamId};
 
 #[derive(Clone)]
 pub struct Database {
@@ -176,7 +176,7 @@ impl Database {
             self.reader_pool.clone(),
             self.writer_pool.indexes().clone(),
             from_sequence,
-            false,
+            IterDirection::Forward,
         )
         .await
     }
@@ -262,7 +262,7 @@ impl Database {
         partition_id: PartitionId,
         stream_id: StreamId,
         from_version: u64,
-        reverse: bool,
+        dir: IterDirection,
     ) -> Result<StreamIter, StreamIndexError> {
         let bucket_id = partition_id % self.total_buckets;
         StreamIter::new(
@@ -271,7 +271,7 @@ impl Database {
             self.reader_pool.clone(),
             self.writer_pool.indexes().clone(),
             from_version,
-            reverse,
+            dir,
         )
         .await
     }
@@ -1280,7 +1280,7 @@ mod tests {
         // Read the stream
         let stream_id = StreamId::new(stream_id_str).unwrap();
         let mut stream_iter = db
-            .read_stream(partition_id, stream_id, 0, false)
+            .read_stream(partition_id, stream_id, 0, IterDirection::Forward)
             .await
             .expect("Failed to read stream");
 
@@ -1435,7 +1435,7 @@ mod tests {
         let nonexistent_stream = StreamId::new("nonexistent-stream").unwrap();
 
         let mut stream_iter = db
-            .read_stream(partition_id, nonexistent_stream, 0, false)
+            .read_stream(partition_id, nonexistent_stream, 0, IterDirection::Forward)
             .await
             .expect("Failed to read empty stream");
         let event = stream_iter.next().await.unwrap();

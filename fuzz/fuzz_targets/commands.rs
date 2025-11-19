@@ -7,7 +7,6 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use arbitrary::{Arbitrary, Unstructured, size_hint};
 libfuzzer_sys::fuzz_target!(|commands: Commands| -> libfuzzer_sys::Corpus { run(commands) });
 
-use sierradb::StreamId;
 use sierradb::bucket::BucketId;
 use sierradb::bucket::segment::EventRecord;
 use sierradb::database::{
@@ -17,6 +16,7 @@ use sierradb::database::{
 use sierradb::error::{StreamIdError, WriteError};
 use sierradb::id::{NAMESPACE_PARTITION_KEY, uuid_to_partition_hash, uuid_v7_with_partition_hash};
 use sierradb::writer_thread_pool::AppendResult;
+use sierradb::{IterDirection, StreamId};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -2186,7 +2186,11 @@ async fn execute_read_stream(
             partition_id as u16,
             stream_id.clone(),
             from_version,
-            reverse,
+            if reverse {
+                IterDirection::Reverse
+            } else {
+                IterDirection::Forward
+            },
         )
         .await?;
     let model_events = state
