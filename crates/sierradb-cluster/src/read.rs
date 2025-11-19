@@ -500,7 +500,7 @@ impl ClusterActor {
 
             let mut events = Vec::new();
             let mut events_collected = 0;
-            let mut last_read_sequence = 0;
+            let mut last_read_sequence = start_sequence;
 
             'iter: while let Some(commits) = match iter
                 .next_batch(
