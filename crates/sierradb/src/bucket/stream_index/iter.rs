@@ -3,8 +3,6 @@ use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use futures::FutureExt;
-use futures::future::BoxFuture;
 use tokio::sync::oneshot;
 use tracing::warn;
 
@@ -304,29 +302,29 @@ impl StreamIter {
         }
     }
 
-    pub fn next_batch(
+    pub async fn next_batch(
         &mut self,
         limit: usize,
-    ) -> BoxFuture<'_, Result<Option<Vec<CommittedEvents>>, StreamIndexError>> {
-        async move {
-            if limit == 0 {
-                return Ok(None);
-            }
+    ) -> Result<Option<Vec<CommittedEvents>>, StreamIndexError> {
+        if limit == 0 {
+            return Ok(None);
+        }
 
-            if let Some(batch_back) = self.batch.back() {
-                self.last_version = batch_back
-                    .last_stream_version()
-                    .map(|v| {
-                        if self.reverse {
-                            v.saturating_sub(1)
-                        } else {
-                            v + 1
-                        }
-                    })
-                    .unwrap_or(self.last_version);
-                return Ok(Some(mem::take(&mut self.batch).into()));
-            }
+        if let Some(batch_back) = self.batch.back() {
+            self.last_version = batch_back
+                .last_stream_version()
+                .map(|v| {
+                    if self.reverse {
+                        v.saturating_sub(1)
+                    } else {
+                        v + 1
+                    }
+                })
+                .unwrap_or(self.last_version);
+            return Ok(Some(mem::take(&mut self.batch).into()));
+        }
 
+        loop {
             let Some(segment_iter) = &mut self.segment_iter else {
                 return Ok(None);
             };
@@ -350,28 +348,26 @@ impl StreamIter {
                         .into_iter()
                         .filter_map(|commit| filter_commit_for_stream(&self.stream_id, commit))
                         .collect();
+
                     if commits.is_empty() {
-                        // This shouldn't happen
                         warn!("transaction had no events for stream id {}", self.stream_id);
-                        return self.next_batch(limit).await;
+                        continue; // Instead of recursing, loop again
                     }
 
-                    Ok(Some(commits))
+                    return Ok(Some(commits));
                 }
                 None => {
                     if segment_iter.is_finished() && (!self.is_live || self.has_next_segment) {
                         if !self.rollover().await? {
                             return Ok(None);
                         }
-
-                        return self.next_batch(limit).await;
+                        continue; // Instead of recursing, loop again
                     }
 
-                    Ok(None)
+                    return Ok(None);
                 }
             }
         }
-        .boxed()
     }
 
     /// Convenience method that maintains backward compatibility.
