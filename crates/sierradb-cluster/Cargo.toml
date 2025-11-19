@@ -9,6 +9,7 @@ keywords.workspace = true
 license.workspace = true
 repository.workspace = true
 version.workspace = true
+rust-version = "1.91"
 
 [dependencies]
 sierradb.workspace = true
