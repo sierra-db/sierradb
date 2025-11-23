@@ -104,10 +104,11 @@ impl str::FromStr for ExpectedVersion {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 /// Actual position of a stream.
 pub enum CurrentVersion {
     /// The stream/partition doesn't exist.
+    #[default]
     Empty,
     /// The last stream version/partition sequence.
     Current(u64),
@@ -165,9 +166,10 @@ impl ops::AddAssign<u64> for CurrentVersion {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum VersionGap {
     /// No gap - expectation is satisfied
+    #[default]
     None,
     /// Stream is ahead by this many versions
     Ahead(u64),
