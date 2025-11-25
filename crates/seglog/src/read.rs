@@ -9,8 +9,9 @@ use tracing::warn;
 use crate::{CRC32C_SIZE, FlushedOffset, LEN_SIZE, RECORD_HEAD_SIZE, ReadError, calculate_crc32c};
 
 const PAGE_SIZE: usize = 4096; // Usually a page is 4KB on Linux
+const OPTIMISTIC_DATA_SIZE: usize = 2048; // Optimistic read size for random access: read header + this much data in one syscall
+const FALLBACK_BUF_SIZE: usize = PAGE_SIZE;
 const READ_AHEAD_SIZE: usize = 64 * 1024; // 64 KB read ahead buffer
-const READ_BUF_SIZE: usize = PAGE_SIZE - RECORD_HEAD_SIZE;
 
 /// Hint for optimizing read operations based on access pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,10 +28,13 @@ pub enum ReadHint {
 /// Records are read with CRC32C validation to ensure data integrity.
 pub struct Reader {
     file: File,
-    header_buf: [u8; RECORD_HEAD_SIZE],
-    body_buf: [u8; READ_BUF_SIZE],
-    flushed_offset: FlushedOffset,
+    // L1 cache: if a record fits in this buffer, it'll result in 1 syscall, 0 allocations
+    optimistic_buf: [u8; RECORD_HEAD_SIZE + OPTIMISTIC_DATA_SIZE],
+    // L2 cache: if a record fits in this buffer, it'll result in 2 syscalls, 0 allocations
+    fallback_buf: [u8; FALLBACK_BUF_SIZE],
+    // Sequential read cache
     read_ahead_buf: ReadAheadBuf,
+    flushed_offset: FlushedOffset,
 }
 
 impl Reader {
@@ -51,8 +55,7 @@ impl Reader {
         }
 
         let file = opts.open(path)?;
-        let header_buf = [0u8; RECORD_HEAD_SIZE];
-        let body_buf = [0u8; READ_BUF_SIZE];
+        let fallback_buf = [0u8; FALLBACK_BUF_SIZE];
 
         let flushed_offset = match flushed_offset {
             Some(flushed_offset) => flushed_offset,
@@ -64,10 +67,10 @@ impl Reader {
 
         let reader = Reader {
             file,
-            header_buf,
-            body_buf,
-            flushed_offset,
+            optimistic_buf: [0u8; RECORD_HEAD_SIZE + OPTIMISTIC_DATA_SIZE],
+            fallback_buf,
             read_ahead_buf: ReadAheadBuf::new(),
+            flushed_offset,
         };
 
         Ok(reader)
@@ -79,10 +82,10 @@ impl Reader {
     pub fn try_clone(&self) -> Result<Self, ReadError> {
         Ok(Reader {
             file: self.file.try_clone()?,
-            header_buf: self.header_buf,
-            body_buf: self.body_buf,
-            flushed_offset: self.flushed_offset.clone(),
+            optimistic_buf: [0u8; RECORD_HEAD_SIZE + OPTIMISTIC_DATA_SIZE],
+            fallback_buf: self.fallback_buf,
             read_ahead_buf: ReadAheadBuf::new(),
+            flushed_offset: self.flushed_offset.clone(),
         })
     }
 
@@ -130,31 +133,31 @@ impl Reader {
     ///
     /// Returns the record data after validating the CRC32C checksum. The hint parameter
     /// can optimize performance for sequential vs random access patterns.
-    pub fn read_record(
-        &mut self,
-        mut offset: u64,
-        hint: ReadHint,
-    ) -> Result<Cow<'_, [u8]>, ReadError> {
+    pub fn read_record(&mut self, offset: u64, hint: ReadHint) -> Result<Cow<'_, [u8]>, ReadError> {
         let flushed_offset = self.flushed_offset.load();
         if offset + RECORD_HEAD_SIZE as u64 > flushed_offset {
             return Err(ReadError::OutOfBounds);
         }
 
-        let header_buf = if matches!(hint, ReadHint::Sequential) {
-            self.read_ahead_buf
-                .read(&self.file, offset, RECORD_HEAD_SIZE)?
-        } else {
-            self.file
-                .read_exact_at(&mut self.header_buf[..RECORD_HEAD_SIZE], offset)?;
-            self.header_buf.as_slice()
-        };
-        offset += RECORD_HEAD_SIZE as u64;
+        if matches!(hint, ReadHint::Sequential) {
+            // Sequential reads use the read-ahead buffer
+            return self.read_record_sequential(offset, flushed_offset);
+        }
 
-        if is_truncation_marker(&header_buf[..RECORD_HEAD_SIZE]) {
+        // Random reads: optimistic read of header + data in one syscall
+        let optimistic_read_len =
+            (RECORD_HEAD_SIZE + OPTIMISTIC_DATA_SIZE).min((flushed_offset - offset) as usize);
+
+        self.file
+            .read_exact_at(&mut self.optimistic_buf[..optimistic_read_len], offset)?;
+
+        let header_buf = &self.optimistic_buf[..RECORD_HEAD_SIZE];
+
+        if is_truncation_marker(header_buf) {
             return Err(ReadError::OutOfBounds);
         }
 
-        let data_len_bytes = header_buf[..LEN_SIZE].try_into().unwrap();
+        let data_len_bytes: [u8; LEN_SIZE] = header_buf[..LEN_SIZE].try_into().unwrap();
         let data_len = u32::from_le_bytes(data_len_bytes) as usize;
         let crc = u32::from_le_bytes(
             header_buf[LEN_SIZE..LEN_SIZE + CRC32C_SIZE]
@@ -162,24 +165,30 @@ impl Reader {
                 .unwrap(),
         );
 
-        if offset + data_len as u64 > flushed_offset {
+        let data_offset = offset + RECORD_HEAD_SIZE as u64;
+        if data_offset + data_len as u64 > flushed_offset {
             return Err(ReadError::OutOfBounds);
         }
 
-        let (data, new_crc) = if matches!(hint, ReadHint::Sequential) {
-            let data = self.read_ahead_buf.read(&self.file, offset, data_len)?;
+        let (data, new_crc) = if data_len <= OPTIMISTIC_DATA_SIZE
+            && optimistic_read_len >= RECORD_HEAD_SIZE + data_len
+        {
+            // Data fits in the optimistic buffer - we got it all in one read!
+            let data = &self.optimistic_buf[RECORD_HEAD_SIZE..RECORD_HEAD_SIZE + data_len];
             let new_crc = calculate_crc32c(&data_len_bytes, data);
             (Cow::Borrowed(data), new_crc)
-        } else if data_len > self.body_buf.len() {
-            let mut body_buf = vec![0u8; data_len];
-            self.file.read_exact_at(&mut body_buf, offset)?;
-            let new_crc = calculate_crc32c(&data_len_bytes, &body_buf);
-            (Cow::Owned(body_buf), new_crc)
-        } else {
+        } else if data_len <= self.fallback_buf.len() {
+            // Data fits in fallback_buf but not in optimistic buffer
             self.file
-                .read_exact_at(&mut self.body_buf[..data_len], offset)?;
-            let new_crc = calculate_crc32c(&data_len_bytes, &self.body_buf[..data_len]);
-            (Cow::Borrowed(&self.body_buf[..data_len]), new_crc)
+                .read_exact_at(&mut self.fallback_buf[..data_len], data_offset)?;
+            let new_crc = calculate_crc32c(&data_len_bytes, &self.fallback_buf[..data_len]);
+            (Cow::Borrowed(&self.fallback_buf[..data_len]), new_crc)
+        } else {
+            // Data is large, allocate a buffer
+            let mut buf = vec![0u8; data_len];
+            self.file.read_exact_at(&mut buf, data_offset)?;
+            let new_crc = calculate_crc32c(&data_len_bytes, &buf);
+            (Cow::Owned(buf), new_crc)
         };
 
         if crc != new_crc {
@@ -187,6 +196,44 @@ impl Reader {
         }
 
         Ok(data)
+    }
+
+    fn read_record_sequential(
+        &mut self,
+        offset: u64,
+        flushed_offset: u64,
+    ) -> Result<Cow<'_, [u8]>, ReadError> {
+        let header_buf = self
+            .read_ahead_buf
+            .read(&self.file, offset, RECORD_HEAD_SIZE)?;
+
+        if is_truncation_marker(&header_buf[..RECORD_HEAD_SIZE]) {
+            return Err(ReadError::OutOfBounds);
+        }
+
+        let data_len_bytes: [u8; LEN_SIZE] = header_buf[..LEN_SIZE].try_into().unwrap();
+        let data_len = u32::from_le_bytes(data_len_bytes) as usize;
+        let crc = u32::from_le_bytes(
+            header_buf[LEN_SIZE..LEN_SIZE + CRC32C_SIZE]
+                .try_into()
+                .unwrap(),
+        );
+
+        let data_offset = offset + RECORD_HEAD_SIZE as u64;
+        if data_offset + data_len as u64 > flushed_offset {
+            return Err(ReadError::OutOfBounds);
+        }
+
+        let data = self
+            .read_ahead_buf
+            .read(&self.file, data_offset, data_len)?;
+        let new_crc = calculate_crc32c(&data_len_bytes, data);
+
+        if crc != new_crc {
+            return Err(ReadError::Crc32cMismatch);
+        }
+
+        Ok(Cow::Borrowed(data))
     }
 
     /// Reads raw bytes from the file at the specified offset and length.
