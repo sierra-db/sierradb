@@ -8,3 +8,6 @@ crc32fast.workspace = true
 nix = { workspace = true, features = ["fs"] }
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
