@@ -1,0 +1,10 @@
+[package]
+name = "seglog"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crc32fast.workspace = true
+nix = { workspace = true, features = ["fs"] }
+thiserror.workspace = true
+tracing.workspace = true
