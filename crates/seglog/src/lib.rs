@@ -69,7 +69,7 @@
 //! # let dir = tempfile::TempDir::new()?;
 //! # let temp = dir.path().join("segment.log");
 //! let segment_size = 1024 * 1024; // 1 MB
-//! let mut writer = Writer::create(&temp, segment_size)?;
+//! let mut writer = Writer::create(&temp, segment_size, 0)?;
 //!
 //! // Append records
 //! let (offset, len) = writer.append(b"event data")?;
@@ -89,7 +89,7 @@
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! # let dir = tempfile::TempDir::new()?;
 //! # let temp = dir.path().join("segment.log");
-//! # let mut writer = seglog::write::Writer::create(&temp, 1024)?;
+//! # let mut writer = seglog::write::Writer::create(&temp, 1024, 0)?;
 //! # writer.append(b"event 1")?;
 //! # writer.append(b"event 2")?;
 //! # writer.sync()?;
@@ -114,7 +114,7 @@
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! # let dir = tempfile::TempDir::new()?;
 //! # let temp = dir.path().join("segment.log");
-//! # let mut writer = seglog::write::Writer::create(&temp, 1024)?;
+//! # let mut writer = seglog::write::Writer::create(&temp, 1024, 0)?;
 //! # let (offset, _) = writer.append(b"specific event")?;
 //! # writer.sync()?;
 //! # let flushed = writer.flushed_offset();
@@ -137,7 +137,7 @@
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! # let dir = tempfile::TempDir::new()?;
 //! # let temp = dir.path().join("segment.log");
-//! # let mut writer = seglog::write::Writer::create(&temp, 1024)?;
+//! # let mut writer = seglog::write::Writer::create(&temp, 1024, 0)?;
 //! # writer.append(b"shared data")?;
 //! # writer.sync()?;
 //! # let flushed = writer.flushed_offset();
@@ -185,17 +185,18 @@
 //! [`Writer::close`]: write::Writer::close
 //! [`Reader::open`]: read::Reader::open
 //! [`Reader::close`]: read::Reader::close
+//! [`ReadError`]: read::ReadError
+//! [`WriteError`]: write::WriteError
 
 use std::{
-    io, mem,
+    mem,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
 };
 
-use thiserror::Error;
-
+pub mod parse;
 pub mod read;
 pub mod write;
 
@@ -227,32 +228,7 @@ impl FlushedOffset {
     }
 }
 
-/// Errors that can occur during segment reading operations.
-#[derive(Debug, Error)]
-pub enum ReadError {
-    #[error("crc32c hash mismatch")]
-    Crc32cMismatch,
-    #[error("read offset and length is out of bounds")]
-    OutOfBounds,
-    #[error(transparent)]
-    Io(#[from] io::Error),
-}
-
-/// Errors that can occur during segment writing operations.
-#[derive(Debug, Error)]
-pub enum WriteError {
-    #[error("segment full: attempted to write {attempted} bytes, only {available} bytes remaining")]
-    SegmentFull { attempted: u64, available: u64 },
-    #[error(transparent)]
-    Read(#[from] ReadError),
-    #[error(transparent)]
-    Io(#[from] io::Error),
-    #[cfg(target_os = "linux")]
-    #[error(transparent)]
-    Nix(#[from] nix::errno::Errno),
-}
-
-fn calculate_crc32c(len_bytes: &[u8], data: &[u8]) -> u32 {
+pub fn calculate_crc32c(len_bytes: &[u8], data: &[u8]) -> u32 {
     let mut crc_hasher = crc32fast::Hasher::new();
     crc_hasher.update(len_bytes);
     crc_hasher.update(data);
@@ -261,6 +237,8 @@ fn calculate_crc32c(len_bytes: &[u8], data: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use crate::{read::ReadError, write::WriteError};
+
     use super::*;
     use read::{ReadHint, Reader};
     use std::io::{Seek, Write as _};
@@ -282,7 +260,7 @@ mod tests {
     #[test]
     fn test_writer_create() {
         let temp = temp_path();
-        let writer = Writer::create(&temp, SEGMENT_SIZE).expect("failed to create writer");
+        let writer = Writer::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
         assert_eq!(writer.write_offset(), 0);
         assert_eq!(writer.remaining_bytes(), SEGMENT_SIZE as u64);
     }
@@ -290,7 +268,7 @@ mod tests {
     #[test]
     fn test_writer_append_single_record() {
         let temp = temp_path();
-        let mut writer = Writer::create(&temp, SEGMENT_SIZE).expect("failed to create writer");
+        let mut writer = Writer::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         let data = b"hello world";
         let (offset, len) = writer.append(data).expect("failed to append");
@@ -303,7 +281,7 @@ mod tests {
     #[test]
     fn test_writer_append_multiple_records() {
         let temp = temp_path();
-        let mut writer = Writer::create(&temp, SEGMENT_SIZE).expect("failed to create writer");
+        let mut writer = Writer::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         let records = vec![b"first".as_slice(), b"second", b"third"];
         let mut expected_offset = 0u64;
@@ -320,7 +298,7 @@ mod tests {
     #[test]
     fn test_writer_remaining_bytes() {
         let temp = temp_path();
-        let mut writer = Writer::create(&temp, SEGMENT_SIZE).expect("failed to create writer");
+        let mut writer = Writer::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         let initial_remaining = writer.remaining_bytes();
         assert_eq!(initial_remaining, SEGMENT_SIZE as u64);
@@ -338,7 +316,7 @@ mod tests {
     #[test]
     fn test_writer_write_offset() {
         let temp = temp_path();
-        let mut writer = Writer::create(&temp, SEGMENT_SIZE).expect("failed to create writer");
+        let mut writer = Writer::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         assert_eq!(writer.write_offset(), 0);
 
@@ -353,20 +331,26 @@ mod tests {
     fn test_writer_segment_full() {
         let small_size = 100;
         let temp = temp_path();
-        let mut writer = Writer::create(&temp, small_size).expect("failed to create writer");
+        let mut writer = Writer::create(&temp, small_size, 0).expect("failed to create writer");
 
         let large_data = vec![0u8; small_size];
         let result = writer.append(&large_data);
 
-        assert!(matches!(result, Err(WriteError::SegmentFull { .. })));
+        assert!(matches!(
+            result,
+            Err(WriteError::SegmentFull {
+                attempted: 0,
+                available: 100,
+            })
+        ));
     }
 
     #[test]
     fn test_writer_create_already_exists() {
         let temp = temp_path();
-        Writer::create(&temp, SEGMENT_SIZE).expect("failed to create writer");
+        Writer::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
-        let result = Writer::create(&temp, SEGMENT_SIZE);
+        let result = Writer::create(&temp, SEGMENT_SIZE, 0);
         assert!(result.is_err());
     }
 
@@ -375,7 +359,7 @@ mod tests {
     #[test]
     fn test_writer_sync() {
         let temp = temp_path();
-        let mut writer = Writer::create(&temp, SEGMENT_SIZE).expect("failed to create writer");
+        let mut writer = Writer::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         let data = b"sync test";
         writer.append(data).expect("failed to append");
@@ -391,7 +375,7 @@ mod tests {
     #[test]
     fn test_writer_flush_writer() {
         let temp = temp_path();
-        let mut writer = Writer::create(&temp, SEGMENT_SIZE).expect("failed to create writer");
+        let mut writer = Writer::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         writer.append(b"data").expect("failed to append");
         writer.flush_writer().expect("failed to flush");
@@ -400,7 +384,7 @@ mod tests {
     #[test]
     fn test_writer_close() {
         let temp = temp_path();
-        let mut writer = Writer::create(&temp, SEGMENT_SIZE).expect("failed to create writer");
+        let mut writer = Writer::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         writer.append(b"data").expect("failed to append");
         let write_offset = writer.write_offset();
@@ -418,7 +402,7 @@ mod tests {
     #[test]
     fn test_writer_set_len() {
         let temp = temp_path();
-        let mut writer = Writer::create(&temp, SEGMENT_SIZE).expect("failed to create writer");
+        let mut writer = Writer::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         writer.append(b"first").expect("failed to append");
         let truncate_offset = writer.write_offset();
@@ -432,7 +416,7 @@ mod tests {
     #[test]
     fn test_writer_set_len_noop() {
         let temp = temp_path();
-        let mut writer = Writer::create(&temp, SEGMENT_SIZE).expect("failed to create writer");
+        let mut writer = Writer::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         writer.append(b"data").expect("failed to append");
         let offset = writer.write_offset();
@@ -446,7 +430,7 @@ mod tests {
     #[test]
     fn test_writer_open_existing() {
         let temp = temp_path();
-        let mut writer = Writer::create(&temp, SEGMENT_SIZE).expect("failed to create writer");
+        let mut writer = Writer::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         writer.append(b"first").expect("failed to append");
         writer.append(b"second").expect("failed to append");
@@ -454,7 +438,7 @@ mod tests {
         writer.sync().expect("failed to sync");
         drop(writer);
 
-        let mut writer = Writer::open(&temp, SEGMENT_SIZE).expect("failed to open writer");
+        let mut writer = Writer::open(&temp, SEGMENT_SIZE, 0).expect("failed to open writer");
         assert_eq!(writer.write_offset(), offset_before);
 
         writer.append(b"third").expect("failed to append");
@@ -464,7 +448,7 @@ mod tests {
     #[test]
     fn test_writer_open_with_corruption() {
         let temp = temp_path();
-        let mut writer = Writer::create(&temp, SEGMENT_SIZE).expect("failed to create writer");
+        let mut writer = Writer::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         writer.append(b"good data").expect("failed to append");
         let good_offset = writer.write_offset();
@@ -483,7 +467,7 @@ mod tests {
         drop(file);
 
         // Opening should detect corruption and stop at the last valid record
-        let writer = Writer::open(&temp, SEGMENT_SIZE).expect("failed to open writer");
+        let writer = Writer::open(&temp, SEGMENT_SIZE, 0).expect("failed to open writer");
         assert_eq!(writer.write_offset(), good_offset);
     }
 
@@ -492,7 +476,7 @@ mod tests {
     #[test]
     fn test_reader_open() {
         let temp = temp_path();
-        let mut writer = Writer::create(&temp, SEGMENT_SIZE).expect("failed to create writer");
+        let mut writer = Writer::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
         writer.append(b"data").expect("failed to append");
         writer.sync().expect("failed to sync");
         let flushed = writer.flushed_offset();
@@ -505,7 +489,7 @@ mod tests {
     #[test]
     fn test_reader_read_record_random() {
         let temp = temp_path();
-        let mut writer = Writer::create(&temp, SEGMENT_SIZE).expect("failed to create writer");
+        let mut writer = Writer::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         let data = b"test data";
         writer.append(data).expect("failed to append");
@@ -523,7 +507,7 @@ mod tests {
     #[test]
     fn test_reader_read_record_sequential() {
         let temp = temp_path();
-        let mut writer = Writer::create(&temp, SEGMENT_SIZE).expect("failed to create writer");
+        let mut writer = Writer::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         let data = b"sequential data";
         writer.append(data).expect("failed to append");
@@ -541,7 +525,7 @@ mod tests {
     #[test]
     fn test_reader_read_bytes() {
         let temp = temp_path();
-        let mut writer = Writer::create(&temp, SEGMENT_SIZE).expect("failed to create writer");
+        let mut writer = Writer::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         let data = b"raw bytes";
         writer.append(data).expect("failed to append");
@@ -550,16 +534,17 @@ mod tests {
         drop(writer);
 
         let reader = Reader::open(&temp, Some(flushed)).expect("failed to open reader");
-        let bytes = reader
-            .read_bytes(0, RECORD_HEAD_SIZE + data.len())
+        let mut buf = vec![0; RECORD_HEAD_SIZE + data.len()];
+        reader
+            .read_bytes(0, &mut buf)
             .expect("failed to read bytes");
-        assert_eq!(bytes.len(), RECORD_HEAD_SIZE + data.len());
+        assert_eq!(buf.len(), RECORD_HEAD_SIZE + data.len());
     }
 
     #[test]
     fn test_reader_try_clone() {
         let temp = temp_path();
-        let mut writer = Writer::create(&temp, SEGMENT_SIZE).expect("failed to create writer");
+        let mut writer = Writer::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
         writer.append(b"data").expect("failed to append");
         writer.sync().expect("failed to sync");
         let flushed = writer.flushed_offset();
@@ -577,7 +562,7 @@ mod tests {
     #[test]
     fn test_reader_close() {
         let temp = temp_path();
-        let writer = Writer::create(&temp, SEGMENT_SIZE).expect("failed to create writer");
+        let writer = Writer::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
         writer.close().expect("failed to close writer");
 
         let reader = Reader::open(&temp, None).expect("failed to open reader");
@@ -589,7 +574,7 @@ mod tests {
     #[test]
     fn test_reader_crc_mismatch() {
         let temp = temp_path();
-        let mut writer = Writer::create(&temp, SEGMENT_SIZE).expect("failed to create writer");
+        let mut writer = Writer::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         writer.append(b"data").expect("failed to append");
         let _offset = writer.write_offset();
@@ -609,39 +594,59 @@ mod tests {
         let mut reader = Reader::open(&temp, None).expect("failed to open reader");
         let result = reader.read_record(0, ReadHint::Random);
 
-        assert!(matches!(result, Err(ReadError::Crc32cMismatch)));
+        assert!(matches!(
+            result,
+            Err(ReadError::Crc32cMismatch { offset: 0 })
+        ));
     }
 
     #[test]
     fn test_reader_out_of_bounds() {
         let temp = temp_path();
-        let writer = Writer::create(&temp, SEGMENT_SIZE).expect("failed to create writer");
+        let writer = Writer::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
         let flushed = writer.flushed_offset();
+        assert_eq!(flushed.load(), 0);
         drop(writer);
 
         let mut reader = Reader::open(&temp, Some(flushed)).expect("failed to open reader");
         let result = reader.read_record(1000, ReadHint::Random);
 
-        assert!(matches!(result, Err(ReadError::OutOfBounds)));
+        assert!(matches!(
+            result,
+            Err(ReadError::OutOfBounds {
+                offset: 1000,
+                length: 8,
+                flushed_offset: 0,
+            })
+        ));
     }
 
     #[test]
     fn test_reader_truncation_marker() {
         let temp = temp_path();
-        let mut writer = Writer::create(&temp, SEGMENT_SIZE).expect("failed to create writer");
+        let mut writer = Writer::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         writer.append(b"first").expect("failed to append");
         let truncate_offset = writer.write_offset();
+        assert_eq!(truncate_offset, 13);
         writer.append(b"second").expect("failed to append");
         writer.set_len(truncate_offset).expect("failed to truncate");
 
         let flushed = writer.flushed_offset();
+        assert_eq!(flushed.load(), 13);
         drop(writer);
 
         let mut reader = Reader::open(&temp, Some(flushed)).expect("failed to open reader");
         let result = reader.read_record(truncate_offset, ReadHint::Random);
 
-        assert!(matches!(result, Err(ReadError::OutOfBounds)));
+        assert!(matches!(
+            result,
+            Err(ReadError::OutOfBounds {
+                offset: 13,
+                length: 8,
+                flushed_offset: 13,
+            })
+        ));
     }
 
     // Iterator Tests
@@ -649,7 +654,7 @@ mod tests {
     #[test]
     fn test_iter_all_records() {
         let temp = temp_path();
-        let mut writer = Writer::create(&temp, SEGMENT_SIZE).expect("failed to create writer");
+        let mut writer = Writer::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         let records = vec![b"first".as_slice(), b"second", b"third"];
         for data in &records {
@@ -676,7 +681,7 @@ mod tests {
     #[test]
     fn test_iter_from_offset() {
         let temp = temp_path();
-        let mut writer = Writer::create(&temp, SEGMENT_SIZE).expect("failed to create writer");
+        let mut writer = Writer::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         writer.append(b"first").expect("failed to append");
         let second_offset = writer.write_offset();
@@ -707,7 +712,7 @@ mod tests {
     #[test]
     fn test_iter_empty_segment() {
         let temp = temp_path();
-        let writer = Writer::create(&temp, SEGMENT_SIZE).expect("failed to create writer");
+        let writer = Writer::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
         let flushed = writer.flushed_offset();
         drop(writer);
 
@@ -720,7 +725,7 @@ mod tests {
     #[test]
     fn test_iter_single_record() {
         let temp = temp_path();
-        let mut writer = Writer::create(&temp, SEGMENT_SIZE).expect("failed to create writer");
+        let mut writer = Writer::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         writer.append(b"only one").expect("failed to append");
         writer.sync().expect("failed to sync");
@@ -744,7 +749,7 @@ mod tests {
     #[test]
     fn test_flushed_offset_sync() {
         let temp = temp_path();
-        let mut writer = Writer::create(&temp, SEGMENT_SIZE).expect("failed to create writer");
+        let mut writer = Writer::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         let flushed = writer.flushed_offset();
         assert_eq!(flushed.load(), 0);
@@ -759,7 +764,7 @@ mod tests {
     #[test]
     fn test_concurrent_read_write() {
         let temp = temp_path();
-        let mut writer = Writer::create(&temp, SEGMENT_SIZE).expect("failed to create writer");
+        let mut writer = Writer::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         let flushed = writer.flushed_offset();
         let mut reader = Reader::open(&temp, Some(flushed.clone())).expect("failed to open reader");
@@ -782,7 +787,7 @@ mod tests {
     #[test]
     fn test_empty_segment() {
         let temp = temp_path();
-        let writer = Writer::create(&temp, SEGMENT_SIZE).expect("failed to create writer");
+        let writer = Writer::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
         let flushed = writer.flushed_offset();
         drop(writer);
 
@@ -796,7 +801,7 @@ mod tests {
     #[test]
     fn test_large_record() {
         let temp = temp_path();
-        let mut writer = Writer::create(&temp, SEGMENT_SIZE).expect("failed to create writer");
+        let mut writer = Writer::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         // Create a record larger than internal buffers
         let large_data = vec![0x42u8; 100_000];
@@ -816,7 +821,7 @@ mod tests {
     fn test_max_segment_size() {
         let small_size = 1000;
         let temp = temp_path();
-        let mut writer = Writer::create(&temp, small_size).expect("failed to create writer");
+        let mut writer = Writer::create(&temp, small_size, 0).expect("failed to create writer");
 
         // Fill segment almost completely
         let data = vec![0u8; 100];
@@ -829,13 +834,19 @@ mod tests {
 
         // Should not be able to fit another record
         let result = writer.append(&data);
-        assert!(matches!(result, Err(WriteError::SegmentFull { .. })));
+        assert!(matches!(
+            result,
+            Err(WriteError::SegmentFull {
+                attempted: 972,
+                available: 28,
+            })
+        ));
     }
 
     #[test]
     fn test_record_boundaries() {
         let temp = temp_path();
-        let mut writer = Writer::create(&temp, SEGMENT_SIZE).expect("failed to create writer");
+        let mut writer = Writer::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         // Test records of varying sizes
         let sizes = vec![0, 1, 7, 8, 15, 16, 255, 256, 4095, 4096];
@@ -856,5 +867,204 @@ mod tests {
                 .expect("failed to read");
             assert_eq!(record.len(), size);
         }
+    }
+
+    // Start Offset Tests
+
+    #[test]
+    fn test_writer_create_with_start_offset() {
+        let temp = temp_path();
+        const HEADER_SIZE: u64 = 64;
+        let mut writer =
+            Writer::create(&temp, SEGMENT_SIZE, HEADER_SIZE).expect("failed to create writer");
+
+        assert_eq!(writer.write_offset(), HEADER_SIZE);
+        assert_eq!(
+            writer.remaining_bytes(),
+            SEGMENT_SIZE as u64 - HEADER_SIZE
+        );
+
+        // First record should start at HEADER_SIZE
+        let (offset, len) = writer.append(b"data").expect("failed to append");
+        assert_eq!(offset, HEADER_SIZE);
+        assert_eq!(writer.write_offset(), HEADER_SIZE + len as u64);
+    }
+
+    #[test]
+    fn test_writer_with_header_data() {
+        use std::os::unix::fs::FileExt;
+
+        let temp = temp_path();
+        const HEADER_SIZE: u64 = 32;
+        let mut writer =
+            Writer::create(&temp, SEGMENT_SIZE, HEADER_SIZE).expect("failed to create writer");
+
+        // Write header data before start_offset
+        let magic = b"MAGIC";
+        let version = 1u16.to_le_bytes();
+        writer
+            .file()
+            .write_all_at(magic, 0)
+            .expect("failed to write magic");
+        writer
+            .file()
+            .write_all_at(&version, magic.len() as u64)
+            .expect("failed to write version");
+
+        // Append records (should start at HEADER_SIZE)
+        let (offset, _) = writer.append(b"record1").expect("failed to append");
+        assert_eq!(offset, HEADER_SIZE);
+        writer.append(b"record2").expect("failed to append");
+        writer.sync().expect("failed to sync");
+        drop(writer);
+
+        // Verify header is intact
+        let file = std::fs::File::open(&temp).expect("failed to open file");
+        let mut magic_read = vec![0u8; magic.len()];
+        file.read_exact_at(&mut magic_read, 0)
+            .expect("failed to read magic");
+        assert_eq!(&magic_read, magic);
+
+        let mut version_read = [0u8; 2];
+        file.read_exact_at(&mut version_read, magic.len() as u64)
+            .expect("failed to read version");
+        assert_eq!(version_read, version);
+    }
+
+    #[test]
+    fn test_writer_open_with_start_offset() {
+        let temp = temp_path();
+        const HEADER_SIZE: u64 = 64;
+        let mut writer =
+            Writer::create(&temp, SEGMENT_SIZE, HEADER_SIZE).expect("failed to create writer");
+
+        writer.append(b"first").expect("failed to append");
+        writer.append(b"second").expect("failed to append");
+        let offset_before = writer.write_offset();
+        writer.sync().expect("failed to sync");
+        drop(writer);
+
+        // Open with same start_offset
+        let mut writer =
+            Writer::open(&temp, SEGMENT_SIZE, HEADER_SIZE).expect("failed to open writer");
+        assert_eq!(writer.write_offset(), offset_before);
+
+        // Should be able to continue appending
+        writer.append(b"third").expect("failed to append");
+        assert!(writer.write_offset() > offset_before);
+    }
+
+    #[test]
+    fn test_reader_with_start_offset() {
+        let temp = temp_path();
+        const HEADER_SIZE: u64 = 64;
+        let mut writer =
+            Writer::create(&temp, SEGMENT_SIZE, HEADER_SIZE).expect("failed to create writer");
+
+        let (first_offset, _) = writer.append(b"first").expect("failed to append");
+        let (second_offset, _) = writer.append(b"second").expect("failed to append");
+        writer.sync().expect("failed to sync");
+        let flushed = writer.flushed_offset();
+        drop(writer);
+
+        assert_eq!(first_offset, HEADER_SIZE);
+
+        // Read records starting from HEADER_SIZE
+        let mut reader = Reader::open(&temp, Some(flushed)).expect("failed to open reader");
+        let record = reader
+            .read_record(first_offset, ReadHint::Random)
+            .expect("failed to read");
+        assert_eq!(&*record, b"first");
+
+        let record = reader
+            .read_record(second_offset, ReadHint::Random)
+            .expect("failed to read");
+        assert_eq!(&*record, b"second");
+    }
+
+    #[test]
+    fn test_iter_with_start_offset() {
+        let temp = temp_path();
+        const HEADER_SIZE: u64 = 64;
+        let mut writer =
+            Writer::create(&temp, SEGMENT_SIZE, HEADER_SIZE).expect("failed to create writer");
+
+        let records = vec![b"first".as_slice(), b"second", b"third"];
+        for data in &records {
+            writer.append(data).expect("failed to append");
+        }
+        writer.sync().expect("failed to sync");
+        let flushed = writer.flushed_offset();
+        drop(writer);
+
+        // Iterator should start from HEADER_SIZE
+        let mut reader = Reader::open(&temp, Some(flushed)).expect("failed to open reader");
+        let mut iter = reader.iter_from(HEADER_SIZE);
+
+        for expected in &records {
+            let (offset, data) = iter
+                .next_record()
+                .expect("failed to read")
+                .expect("no record");
+            assert!(offset >= HEADER_SIZE);
+            assert_eq!(&*data, *expected);
+        }
+
+        assert!(iter.next_record().expect("failed to read").is_none());
+    }
+
+    #[test]
+    fn test_start_offset_remaining_bytes() {
+        let temp = temp_path();
+        const HEADER_SIZE: u64 = 100;
+        let segment_size = 1000;
+        let mut writer =
+            Writer::create(&temp, segment_size, HEADER_SIZE).expect("failed to create writer");
+
+        // Remaining should not include header space
+        assert_eq!(
+            writer.remaining_bytes(),
+            segment_size as u64 - HEADER_SIZE
+        );
+
+        let data = vec![0u8; 50];
+        writer.append(&data).expect("failed to append");
+
+        assert_eq!(
+            writer.remaining_bytes(),
+            segment_size as u64 - HEADER_SIZE - (RECORD_HEAD_SIZE + data.len()) as u64
+        );
+    }
+
+    #[test]
+    fn test_open_with_corruption_after_header() {
+        use std::io::Seek;
+        use std::io::Write as _;
+
+        let temp = temp_path();
+        const HEADER_SIZE: u64 = 64;
+        let mut writer =
+            Writer::create(&temp, SEGMENT_SIZE, HEADER_SIZE).expect("failed to create writer");
+
+        writer.append(b"good data").expect("failed to append");
+        let good_offset = writer.write_offset();
+        writer.sync().expect("failed to sync");
+
+        // Manually corrupt the file after valid data
+        drop(writer);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&temp)
+            .expect("failed to open file");
+        file.seek(std::io::SeekFrom::Start(good_offset))
+            .expect("failed to seek");
+        file.write_all(&[0xFF; 100])
+            .expect("failed to write garbage");
+        drop(file);
+
+        // Opening should detect corruption and stop at the last valid record
+        let writer =
+            Writer::open(&temp, SEGMENT_SIZE, HEADER_SIZE).expect("failed to open writer");
+        assert_eq!(writer.write_offset(), good_offset);
     }
 }
