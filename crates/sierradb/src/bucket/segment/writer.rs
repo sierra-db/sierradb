@@ -36,6 +36,8 @@ impl BucketSegmentWriter {
     /// Opens a segment for writing.
     pub fn open(path: impl AsRef<Path>, segment_size: usize) -> Result<Self, WriteError> {
         let writer = seglog::write::Writer::open(path, segment_size, SEGMENT_HEADER_SIZE as u64)?;
+        BucketSegmentHeader::load_from_file(writer.file())?.validate()?;
+
         Ok(BucketSegmentWriter { writer })
     }
 

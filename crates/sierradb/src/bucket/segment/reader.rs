@@ -1,5 +1,4 @@
 use std::io;
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::{fmt, mem, ops, option, vec};
 
@@ -11,14 +10,11 @@ use smallvec::{SmallVec, smallvec};
 use tracing::warn;
 use uuid::Uuid;
 
-use super::{
-    BINCODE_CONFIG, BUCKET_ID_SIZE, BucketSegmentHeader, COMMIT_SIZE, CREATED_AT_SIZE,
-    EVENT_HEADER_SIZE, MAGIC_BYTES, MAGIC_BYTES_SIZE, VERSION_SIZE,
-};
+use super::{BINCODE_CONFIG, BucketSegmentHeader, COMMIT_SIZE, EVENT_HEADER_SIZE};
 use crate::StreamId;
+use crate::bucket::PartitionId;
 use crate::bucket::segment::SEGMENT_HEADER_SIZE;
 use crate::bucket::segment::format::{RawCommit, RawEvent};
-use crate::bucket::{BucketId, PartitionId};
 use crate::cache::BLOCK_SIZE;
 use crate::error::{ReadError, WriteError};
 use crate::id::{get_uuid_flag, uuid_to_partition_hash};
@@ -329,9 +325,10 @@ impl BucketSegmentReader {
         path: impl AsRef<Path>,
         flushed_offset: Option<FlushedOffset>,
     ) -> Result<Self, ReadError> {
-        Ok(BucketSegmentReader {
-            reader: seglog::read::Reader::open(path, flushed_offset)?,
-        })
+        let reader = seglog::read::Reader::open(path, flushed_offset)?;
+        BucketSegmentHeader::load_from_file(reader.file())?.validate()?;
+
+        Ok(BucketSegmentReader { reader })
     }
 
     pub fn try_clone(&self) -> Result<Self, ReadError> {
@@ -340,60 +337,8 @@ impl BucketSegmentReader {
         })
     }
 
-    /// Reads the segments header.
-    pub fn read_segment_header(&mut self) -> Result<BucketSegmentHeader, ReadError> {
-        let mut buf = [0u8; mem::size_of::<BucketSegmentHeader>()];
-        self.reader.file().read_exact_at(&mut buf, 0)?;
-
-        let (header, _) = bincode::decode_from_slice(&buf, BINCODE_CONFIG)?;
-
-        Ok(header)
-    }
-
-    /// Validates the segments magic bytes.
-    ///
-    /// TODO: We're not using this... we should use it on startup?
-    pub fn validate_magic_bytes(&mut self) -> Result<bool, ReadError> {
-        let mut magic_bytes = [0u8; MAGIC_BYTES_SIZE];
-
-        self.reader.file().read_exact_at(&mut magic_bytes, 0)?;
-
-        Ok(u32::from_le_bytes(magic_bytes) == MAGIC_BYTES)
-    }
-
-    /// Reads the segments version.
-    pub fn read_version(&mut self) -> Result<u16, ReadError> {
-        let mut version_bytes = [0u8; VERSION_SIZE];
-
-        self.reader
-            .file()
-            .read_exact_at(&mut version_bytes, MAGIC_BYTES_SIZE as u64)?;
-
-        Ok(u16::from_le_bytes(version_bytes))
-    }
-
-    /// Reads the segments bucket ID.
-    pub fn read_bucket_id(&mut self) -> Result<BucketId, ReadError> {
-        let mut bucket_id_bytes = [0u8; BUCKET_ID_SIZE];
-
-        self.reader.file().read_exact_at(
-            &mut bucket_id_bytes,
-            (MAGIC_BYTES_SIZE + VERSION_SIZE) as u64,
-        )?;
-
-        Ok(u16::from_le_bytes(bucket_id_bytes))
-    }
-
-    /// Reads the segments created at date.
-    pub fn read_created_at(&mut self) -> Result<u64, ReadError> {
-        let mut created_at_bytes = [0u8; CREATED_AT_SIZE];
-
-        self.reader.file().read_exact_at(
-            &mut created_at_bytes,
-            (MAGIC_BYTES_SIZE + VERSION_SIZE + BUCKET_ID_SIZE) as u64,
-        )?;
-
-        Ok(u64::from_le_bytes(created_at_bytes))
+    pub fn read_header(&self) -> Result<BucketSegmentHeader, ReadError> {
+        BucketSegmentHeader::load_from_file(self.reader.file())
     }
 
     pub fn set_confirmations(

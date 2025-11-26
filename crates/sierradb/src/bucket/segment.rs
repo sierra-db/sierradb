@@ -23,7 +23,7 @@ pub use self::reader::{
     EventRecord, Record, SegmentBlock, SegmentBlockIter,
 };
 pub use self::writer::BucketSegmentWriter;
-use crate::error::WriteError;
+use crate::error::{InvalidHeaderError, ReadError, WriteError};
 
 const BINCODE_CONFIG: bincode::config::Configuration<LittleEndian, Fixint, NoLimit> =
     bincode::config::legacy();
@@ -67,13 +67,42 @@ pub struct BucketSegmentHeader {
 }
 
 impl BucketSegmentHeader {
+    const VERSION: u16 = 0;
+
     pub fn new(bucket_id: BucketId) -> Result<Self, SystemTimeError> {
         Ok(BucketSegmentHeader {
             magic_bytes: MAGIC_BYTES,
-            version: 0,
+            version: Self::VERSION,
             bucket_id,
             created_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64,
         })
+    }
+
+    pub fn load_from_file(file: &fs::File) -> Result<Self, ReadError> {
+        let mut header_buf = [0; SEGMENT_HEADER_SIZE];
+        file.read_exact_at(&mut header_buf, 0)?;
+        let (header, _) =
+            bincode::decode_from_slice::<BucketSegmentHeader, _>(&header_buf, BINCODE_CONFIG)?;
+        Ok(header)
+    }
+
+    pub fn validate(&self) -> Result<(), InvalidHeaderError> {
+        if self.magic_bytes != MAGIC_BYTES {
+            return Err(InvalidHeaderError::InvalidMagicBytes {
+                expected: MAGIC_BYTES,
+                actual: self.magic_bytes,
+            });
+        }
+
+        #[allow(clippy::absurd_extreme_comparisons)]
+        if self.version < Self::VERSION {
+            return Err(InvalidHeaderError::IncompatibleVersion {
+                expected: Self::VERSION,
+                actual: self.version,
+            });
+        }
+
+        Ok(())
     }
 }
 
@@ -143,21 +172,11 @@ mod tests {
 
         BucketSegmentWriter::create(&path, 62, 256 * 1024).unwrap();
 
-        let mut reader = BucketSegmentReader::open(&path, None).unwrap();
-        let read_header = reader.read_segment_header().unwrap();
+        let reader = BucketSegmentReader::open(&path, None).unwrap();
+        let read_header = reader.read_header().unwrap();
 
         assert_eq!(read_header.version, 0);
         assert_eq!(read_header.bucket_id, 62);
-    }
-
-    #[test]
-    fn test_validate_magic_bytes() {
-        let path = temp_file_path();
-
-        BucketSegmentWriter::create(&path, 42, 1024).unwrap();
-
-        let mut reader = BucketSegmentReader::open(&path, None).unwrap();
-        assert!(reader.validate_magic_bytes().unwrap());
     }
 
     #[test]

@@ -68,6 +68,8 @@ pub enum ReadError {
     #[error("no reply from the reader thread")]
     NoThreadReply,
     #[error(transparent)]
+    InvalidHeader(#[from] InvalidHeaderError),
+    #[error(transparent)]
     Bincode(#[from] bincode::error::DecodeError),
     #[error(transparent)]
     EventIndex(#[from] Box<EventIndexError>),
@@ -127,7 +129,9 @@ pub enum WriteError {
     #[error("no reply from the writer thread")]
     NoThreadReply,
     #[error(transparent)]
-    Bincode(#[from] bincode::error::EncodeError),
+    Encode(#[from] bincode::error::EncodeError),
+    #[error(transparent)]
+    Decode(#[from] bincode::error::DecodeError),
     #[error(transparent)]
     Validation(#[from] EventValidationError),
     #[error(transparent)]
@@ -157,6 +161,12 @@ impl From<SystemTimeError> for WriteError {
 impl From<InvalidTimestamp> for WriteError {
     fn from(_: InvalidTimestamp) -> Self {
         WriteError::BadSystemTime
+    }
+}
+
+impl From<InvalidHeaderError> for WriteError {
+    fn from(err: InvalidHeaderError) -> Self {
+        WriteError::Read(ReadError::InvalidHeader(err))
     }
 }
 
@@ -283,4 +293,12 @@ impl From<oneshot::error::RecvError> for StreamIndexError {
     fn from(err: oneshot::error::RecvError) -> Self {
         StreamIndexError::Read(err.into())
     }
+}
+
+#[derive(Debug, Error)]
+pub enum InvalidHeaderError {
+    #[error("invalid magic bytes: expected {expected}, got {actual}")]
+    InvalidMagicBytes { expected: u32, actual: u32 },
+    #[error("incompatible segment format version: expected {expected}, got {actual}")]
+    IncompatibleVersion { expected: u16, actual: u16 },
 }
