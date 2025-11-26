@@ -98,7 +98,7 @@
 //! let mut reader = Reader::open(&temp, Some(flushed))?;
 //!
 //! // Iterate over all records
-//! let mut iter = reader.iter();
+//! let mut iter = reader.iter(0);
 //! while let Some((offset, data)) = iter.next_record()? {
 //!     println!("Record at {}: {:?}", offset, data);
 //! }

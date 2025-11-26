@@ -162,11 +162,7 @@ mod tests {
         let result = parse_record(&buffer, 0);
         assert!(matches!(
             result,
-            Err(ReadError::OutOfBounds {
-                offset: 0,
-                length: 8,
-                flushed_offset: 18,
-            })
+            Err(ReadError::TruncationMarker { offset: 0 })
         ));
     }
 
