@@ -133,13 +133,8 @@ impl Reader {
         }
     }
 
-    /// Creates an iterator over all records starting from offset 0.
-    pub fn iter(&mut self) -> Iter<'_> {
-        self.iter_from(0)
-    }
-
     /// Creates an iterator over records starting from the specified offset.
-    pub fn iter_from(&mut self, start_offset: u64) -> Iter<'_> {
+    pub fn iter(&mut self, start_offset: u64) -> Iter<'_> {
         Iter {
             reader: self,
             offset: start_offset,

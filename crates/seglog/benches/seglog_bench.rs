@@ -141,7 +141,7 @@ fn bench_reader_sequential(c: &mut Criterion) {
         b.iter(|| {
             let mut reader =
                 Reader::open(&path, Some(flushed.clone())).expect("failed to open reader");
-            let mut iter = reader.iter();
+            let mut iter = reader.iter(0);
             let mut count = 0;
 
             while let Some(result) = iter.next_record().transpose() {
@@ -244,7 +244,7 @@ fn bench_read_small_records(c: &mut Criterion) {
         b.iter(|| {
             let mut reader =
                 Reader::open(&path, Some(flushed.clone())).expect("failed to open reader");
-            let mut iter = reader.iter();
+            let mut iter = reader.iter(0);
 
             while let Some(result) = iter.next_record().transpose() {
                 let (_, data) = result.expect("failed to read");
@@ -275,7 +275,7 @@ fn bench_read_large_records(c: &mut Criterion) {
         b.iter(|| {
             let mut reader =
                 Reader::open(&path, Some(flushed.clone())).expect("failed to open reader");
-            let mut iter = reader.iter();
+            let mut iter = reader.iter(0);
 
             while let Some(result) = iter.next_record().transpose() {
                 let (_, data) = result.expect("failed to read");
@@ -306,7 +306,7 @@ fn bench_read_throughput(c: &mut Criterion) {
         b.iter(|| {
             let mut reader =
                 Reader::open(&path, Some(flushed.clone())).expect("failed to open reader");
-            let mut iter = reader.iter();
+            let mut iter = reader.iter(0);
 
             while let Some(result) = iter.next_record().transpose() {
                 let (_, data) = result.expect("failed to read");
@@ -342,7 +342,7 @@ fn bench_iter_vs_random(c: &mut Criterion) {
         b.iter(|| {
             let mut reader =
                 Reader::open(&path, Some(flushed.clone())).expect("failed to open reader");
-            let mut iter = reader.iter();
+            let mut iter = reader.iter(0);
 
             while let Some(result) = iter.next_record().transpose() {
                 let (_, data) = result.expect("failed to read");

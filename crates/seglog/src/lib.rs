@@ -665,7 +665,7 @@ mod tests {
         drop(writer);
 
         let mut reader = Reader::open(&temp, Some(flushed)).expect("failed to open reader");
-        let mut iter = reader.iter();
+        let mut iter = reader.iter(0);
 
         for expected in &records {
             let (_, data) = iter
@@ -692,7 +692,7 @@ mod tests {
         drop(writer);
 
         let mut reader = Reader::open(&temp, Some(flushed)).expect("failed to open reader");
-        let mut iter = reader.iter_from(second_offset);
+        let mut iter = reader.iter(second_offset);
 
         let (_, data) = iter
             .next_record()
@@ -717,7 +717,7 @@ mod tests {
         drop(writer);
 
         let mut reader = Reader::open(&temp, Some(flushed)).expect("failed to open reader");
-        let mut iter = reader.iter();
+        let mut iter = reader.iter(0);
 
         assert!(iter.next_record().expect("failed to read").is_none());
     }
@@ -733,7 +733,7 @@ mod tests {
         drop(writer);
 
         let mut reader = Reader::open(&temp, Some(flushed)).expect("failed to open reader");
-        let mut iter = reader.iter();
+        let mut iter = reader.iter(0);
 
         let (_, data) = iter
             .next_record()
@@ -996,7 +996,7 @@ mod tests {
 
         // Iterator should start from HEADER_SIZE
         let mut reader = Reader::open(&temp, Some(flushed)).expect("failed to open reader");
-        let mut iter = reader.iter_from(HEADER_SIZE);
+        let mut iter = reader.iter(HEADER_SIZE);
 
         for expected in &records {
             let (offset, data) = iter
