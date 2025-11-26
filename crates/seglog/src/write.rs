@@ -271,13 +271,13 @@ impl Writer {
 
         self.sync()?;
 
+        self.flushed_offset.set(offset);
+        self.write_offset = offset;
+
         // Write full zero header as clear truncation marker
         let zero_header = [0u8; RECORD_HEAD_SIZE];
         self.writer.get_ref().write_all_at(&zero_header, offset)?;
         self.writer.get_ref().sync_data()?;
-
-        self.write_offset = offset;
-        self.flushed_offset.set(offset);
 
         Ok(())
     }
