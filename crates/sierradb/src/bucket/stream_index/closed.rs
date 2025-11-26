@@ -11,7 +11,7 @@ use boomphf::Mphf;
 use uuid::Uuid;
 
 use crate::bucket::BucketSegmentId;
-use crate::bucket::stream_index::{RECORD_SIZE, StreamIndexRecord, StreamOffsets};
+use crate::bucket::stream_index::{RECORD_SIZE, StreamIndexRecord};
 use crate::error::StreamIndexError;
 use crate::{STREAM_ID_SIZE, StreamId, from_bytes};
 
@@ -19,21 +19,11 @@ use crate::{STREAM_ID_SIZE, StreamId, from_bytes};
 pub enum ClosedOffsetKind {
     Pointer(u64, u32), // Its in the file at this location
     Cached(Vec<u64>),  // Its cached
-    ExternalBucket,    // This stream lives in a different bucket
-}
-
-impl From<StreamOffsets> for ClosedOffsetKind {
-    fn from(offsets: StreamOffsets) -> Self {
-        match offsets {
-            StreamOffsets::Offsets(offsets) => ClosedOffsetKind::Cached(offsets),
-            StreamOffsets::ExternalBucket => ClosedOffsetKind::ExternalBucket,
-        }
-    }
 }
 
 #[derive(Debug)]
 pub enum ClosedIndex {
-    Cache(BTreeMap<StreamId, StreamIndexRecord<StreamOffsets>>),
+    Cache(BTreeMap<StreamId, StreamIndexRecord<Vec<u64>>>),
     Mphf {
         mphf: Mphf<StreamId>,
         records_offset: u64,
@@ -119,7 +109,7 @@ impl ClosedStreamIndex {
                         version_min: record.version_min,
                         version_max: record.version_max,
                         partition_key: record.partition_key,
-                        offsets: record.offsets.into(),
+                        offsets: ClosedOffsetKind::Cached(record.offsets),
                     }))
             }
             // New MPHF-based lookup
@@ -156,12 +146,7 @@ impl ClosedStreamIndex {
                 let (partition_key, version_min, version_max, offset, len) =
                     from_bytes!(&buf, pos, [Uuid, u64, u64, u64, u32]);
 
-                // Determine the type of offset
-                let offsets = if offset == u64::MAX && len == u32::MAX {
-                    ClosedOffsetKind::ExternalBucket
-                } else {
-                    ClosedOffsetKind::Pointer(offset, len)
-                };
+                let offsets = ClosedOffsetKind::Pointer(offset, len);
 
                 // Return the record
                 Ok(Some(StreamIndexRecord {
@@ -177,7 +162,7 @@ impl ClosedStreamIndex {
     pub fn get_from_key(
         &self,
         key: StreamIndexRecord<ClosedOffsetKind>,
-    ) -> Result<StreamOffsets, StreamIndexError> {
+    ) -> Result<Vec<u64>, StreamIndexError> {
         match key.offsets {
             ClosedOffsetKind::Pointer(offset, len) => {
                 // Read values from the file
@@ -189,7 +174,7 @@ impl ClosedStreamIndex {
                             .chunks_exact(8)
                             .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
                             .collect();
-                        Ok(StreamOffsets::Offsets(offsets))
+                        Ok(offsets)
                     }
                     Err(err) => {
                         // If we can't read the values, use the offset and len for diagnostic info
@@ -197,12 +182,11 @@ impl ClosedStreamIndex {
                     }
                 }
             }
-            ClosedOffsetKind::Cached(offsets) => Ok(StreamOffsets::Offsets(offsets)),
-            ClosedOffsetKind::ExternalBucket => Ok(StreamOffsets::ExternalBucket),
+            ClosedOffsetKind::Cached(offsets) => Ok(offsets),
         }
     }
 
-    pub fn get(&mut self, stream_id: &str) -> Result<Option<StreamOffsets>, StreamIndexError> {
+    pub fn get(&mut self, stream_id: &str) -> Result<Option<Vec<u64>>, StreamIndexError> {
         self.get_key(stream_id)
             .and_then(|key| key.map(|key| self.get_from_key(key)).transpose())
     }

@@ -9,8 +9,7 @@ use arc_swap::{ArcSwap, Cache};
 use boomphf::Mphf;
 
 use super::{
-    EVENTS_OFFSET_SIZE, PartitionIndexRecord, PartitionOffsets, PartitionSequenceOffset,
-    RECORD_SIZE, SEQUENCE_SIZE,
+    EVENTS_OFFSET_SIZE, PartitionIndexRecord, PartitionSequenceOffset, RECORD_SIZE, SEQUENCE_SIZE,
 };
 use crate::bucket::{BucketSegmentId, PartitionId};
 use crate::error::PartitionIndexError;
@@ -19,21 +18,11 @@ use crate::error::PartitionIndexError;
 pub enum ClosedOffsetKind {
     Pointer(u64, u32), // Its in the file at this location (offset, length)
     Cached(Vec<PartitionSequenceOffset>), // Its cached
-    ExternalBucket,    // This partition lives in a different bucket
-}
-
-impl From<PartitionOffsets> for ClosedOffsetKind {
-    fn from(offsets: PartitionOffsets) -> Self {
-        match offsets {
-            PartitionOffsets::Offsets(offsets) => ClosedOffsetKind::Cached(offsets),
-            PartitionOffsets::ExternalBucket => ClosedOffsetKind::ExternalBucket,
-        }
-    }
 }
 
 #[derive(Debug)]
 pub enum ClosedIndex {
-    Cache(BTreeMap<PartitionId, PartitionIndexRecord<PartitionOffsets>>),
+    Cache(BTreeMap<PartitionId, PartitionIndexRecord<Vec<PartitionSequenceOffset>>>),
     Mphf {
         mphf: Mphf<PartitionId>,
         records_offset: u64,
@@ -101,7 +90,7 @@ impl ClosedPartitionIndex {
                         sequence_min: record.sequence_min,
                         sequence_max: record.sequence_max,
                         sequence: record.sequence,
-                        offsets: record.offsets.into(),
+                        offsets: ClosedOffsetKind::Cached(record.offsets),
                     }))
             }
             // New MPHF-based lookup
@@ -141,13 +130,7 @@ impl ClosedPartitionIndex {
                 let sequence = u64::from_le_bytes(buf[18..26].try_into().unwrap());
                 let events_offset = u64::from_le_bytes(buf[26..34].try_into().unwrap());
                 let events_len = u32::from_le_bytes(buf[34..38].try_into().unwrap());
-
-                // Determine the type of offset
-                let offsets = if events_offset == u64::MAX && events_len == u32::MAX {
-                    ClosedOffsetKind::ExternalBucket
-                } else {
-                    ClosedOffsetKind::Pointer(events_offset, events_len)
-                };
+                let offsets = ClosedOffsetKind::Pointer(events_offset, events_len);
 
                 // Return the record
                 Ok(Some(PartitionIndexRecord {
@@ -163,7 +146,7 @@ impl ClosedPartitionIndex {
     pub fn get_from_key(
         &self,
         key: PartitionIndexRecord<ClosedOffsetKind>,
-    ) -> Result<PartitionOffsets, PartitionIndexError> {
+    ) -> Result<Vec<PartitionSequenceOffset>, PartitionIndexError> {
         match key.offsets {
             ClosedOffsetKind::Pointer(offset, len) => {
                 // Read values from the file
@@ -184,7 +167,7 @@ impl ClosedPartitionIndex {
                                 PartitionSequenceOffset { sequence, offset }
                             })
                             .collect();
-                        Ok(PartitionOffsets::Offsets(offsets))
+                        Ok(offsets)
                     }
                     Err(err) => {
                         // If we can't read the values, use the offset and len for diagnostic info
@@ -192,15 +175,14 @@ impl ClosedPartitionIndex {
                     }
                 }
             }
-            ClosedOffsetKind::Cached(offsets) => Ok(PartitionOffsets::Offsets(offsets)),
-            ClosedOffsetKind::ExternalBucket => Ok(PartitionOffsets::ExternalBucket),
+            ClosedOffsetKind::Cached(offsets) => Ok(offsets),
         }
     }
 
     pub fn get(
         &mut self,
         partition_id: PartitionId,
-    ) -> Result<Option<PartitionOffsets>, PartitionIndexError> {
+    ) -> Result<Option<Vec<PartitionSequenceOffset>>, PartitionIndexError> {
         self.get_key(partition_id)
             .and_then(|key| key.map(|key| self.get_from_key(key)).transpose())
     }

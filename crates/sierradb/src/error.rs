@@ -210,8 +210,6 @@ pub enum PartitionIndexError {
     InvalidStreamIdUtf8(Utf8Error),
     #[error("partition id already exists with an offset")]
     PartitionIdOffsetExists,
-    #[error("partition id is already mapped to another bucket")]
-    PartitionIdMappedToExternalBucket,
     #[error("bucket segment not found: {bucket_segment_id}")]
     SegmentNotFound { bucket_segment_id: BucketSegmentId },
     #[error(transparent)]
@@ -242,8 +240,6 @@ pub enum StreamIndexError {
     InvalidStreamIdUtf8(Utf8Error),
     #[error("stream id already exists with an offset")]
     StreamIdOffsetExists,
-    #[error("stream id is already mapped to another bucket")]
-    StreamIdMappedToExternalBucket,
     #[error("bucket segment not found: {bucket_segment_id}")]
     SegmentNotFound { bucket_segment_id: BucketSegmentId },
     #[error(transparent)]

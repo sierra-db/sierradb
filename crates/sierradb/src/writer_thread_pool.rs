@@ -21,12 +21,12 @@ use uuid::Uuid;
 
 use crate::StreamId;
 use crate::bucket::event_index::OpenEventIndex;
-use crate::bucket::partition_index::{OpenPartitionIndex, PartitionIndexRecord, PartitionOffsets};
+use crate::bucket::partition_index::{OpenPartitionIndex, PartitionIndexRecord};
 use crate::bucket::segment::{
     BucketSegmentReader, BucketSegmentWriter, COMMIT_SIZE, EVENT_HEADER_SIZE, LongBytes, RawCommit,
     RawEvent, RecordHeader, SEGMENT_HEADER_SIZE, ShortString,
 };
-use crate::bucket::stream_index::{OpenStreamIndex, StreamIndexRecord, StreamOffsets};
+use crate::bucket::stream_index::{OpenStreamIndex, StreamIndexRecord};
 use crate::bucket::{BucketId, BucketSegmentId, PartitionId, SegmentKind};
 use crate::database::{
     CurrentVersion, ExpectedVersion, NewEvent, PartitionLatestSequence, StreamLatestVersion,
@@ -913,7 +913,7 @@ impl WriterSet {
                             .rev()
                             .find_map(|pending| {
                                 if pending.stream_id == event.stream_id {
-                                    Some(StreamLatestVersion::LatestVersion {
+                                    Some(StreamLatestVersion {
                                         partition_key: pending.partition_key,
                                         version: pending.stream_version,
                                     })
@@ -929,7 +929,7 @@ impl WriterSet {
                             .transpose()?;
 
                         match latest_stream_version {
-                            Some(StreamLatestVersion::LatestVersion {
+                            Some(StreamLatestVersion {
                                 partition_key: existing_partition_key,
                                 version,
                             }) => {
@@ -945,9 +945,6 @@ impl WriterSet {
                                 event_versions.push(CurrentVersion::Current(version));
                                 entry.insert(version + 1);
                             }
-                            Some(StreamLatestVersion::ExternalBucket { .. }) => {
-                                todo!()
-                            }
                             None => {
                                 event_versions.push(CurrentVersion::Empty);
                                 entry.insert(0);
@@ -961,7 +958,7 @@ impl WriterSet {
                             .rev()
                             .find_map(|pending| {
                                 if pending.stream_id == event.stream_id {
-                                    Some(StreamLatestVersion::LatestVersion {
+                                    Some(StreamLatestVersion {
                                         partition_key: pending.partition_key,
                                         version: pending.stream_version,
                                     })
@@ -977,7 +974,7 @@ impl WriterSet {
                             .transpose()?;
 
                         match latest_stream_version {
-                            Some(StreamLatestVersion::LatestVersion {
+                            Some(StreamLatestVersion {
                                 partition_key: existing_partition_key,
                                 version,
                             }) => {
@@ -993,9 +990,6 @@ impl WriterSet {
 
                                 event_versions.push(CurrentVersion::Current(version));
                                 entry.insert(version + 1);
-                            }
-                            Some(StreamLatestVersion::ExternalBucket { .. }) => {
-                                todo!()
                             }
                             None => {
                                 // Stream doesn't exist, which violates the StreamExists expectation
@@ -1015,7 +1009,7 @@ impl WriterSet {
                             .rev()
                             .find_map(|pending| {
                                 if pending.stream_id == event.stream_id {
-                                    Some(StreamLatestVersion::LatestVersion {
+                                    Some(StreamLatestVersion {
                                         partition_key: pending.partition_key,
                                         version: pending.stream_version,
                                     })
@@ -1031,7 +1025,7 @@ impl WriterSet {
                             .transpose()?;
 
                         match latest_stream_version {
-                            Some(StreamLatestVersion::LatestVersion {
+                            Some(StreamLatestVersion {
                                 partition_key: existing_partition_key,
                                 version,
                             }) => {
@@ -1051,9 +1045,6 @@ impl WriterSet {
                                     expected: event.stream_version,
                                 });
                             }
-                            Some(StreamLatestVersion::ExternalBucket { .. }) => {
-                                todo!()
-                            }
                             None => {
                                 event_versions.push(CurrentVersion::Empty);
                                 entry.insert(0);
@@ -1067,7 +1058,7 @@ impl WriterSet {
                             .rev()
                             .find_map(|pending| {
                                 if pending.stream_id == event.stream_id {
-                                    Some(StreamLatestVersion::LatestVersion {
+                                    Some(StreamLatestVersion {
                                         partition_key: pending.partition_key,
                                         version: pending.stream_version,
                                     })
@@ -1083,7 +1074,7 @@ impl WriterSet {
                             .transpose()?;
 
                         match latest_stream_version {
-                            Some(StreamLatestVersion::LatestVersion {
+                            Some(StreamLatestVersion {
                                 partition_key: existing_partition_key,
                                 version,
                             }) => {
@@ -1107,9 +1098,6 @@ impl WriterSet {
 
                                 event_versions.push(CurrentVersion::Current(version));
                                 entry.insert(expected_version + 1);
-                            }
-                            Some(StreamLatestVersion::ExternalBucket { .. }) => {
-                                todo!()
                             }
                             None => {
                                 return Err(WriteError::WrongExpectedVersion {
@@ -1135,8 +1123,7 @@ impl WriterSet {
         match self.next_partition_sequences.get(&partition_id) {
             Some(sequence) => Ok(*sequence),
             None => match self.read_partition_latest_sequence(partition_id)? {
-                Some(PartitionLatestSequence::LatestSequence { sequence, .. }) => Ok(sequence + 1),
-                Some(PartitionLatestSequence::ExternalBucket { .. }) => todo!(),
+                Some(PartitionLatestSequence { sequence, .. }) => Ok(sequence + 1),
                 None => Ok(0),
             },
         }
@@ -1152,18 +1139,9 @@ impl WriterSet {
             .partition_index
             .get(partition_id)
             .map(
-                |PartitionIndexRecord {
-                     sequence_max,
-                     offsets,
-                     ..
-                 }| match offsets {
-                    PartitionOffsets::Offsets(_) => PartitionLatestSequence::LatestSequence {
-                        partition_id,
-                        sequence: *sequence_max,
-                    },
-                    PartitionOffsets::ExternalBucket => {
-                        PartitionLatestSequence::ExternalBucket { partition_id }
-                    }
+                |PartitionIndexRecord { sequence_max, .. }| PartitionLatestSequence {
+                    partition_id,
+                    sequence: *sequence_max,
                 },
             );
 
@@ -1181,13 +1159,8 @@ impl WriterSet {
                         .and_then(|segments| {
                             segments.iter_mut().rev().find_map(|(_, reader_set)| {
                                 let partition_index = reader_set.partition_index.as_mut()?;
-                                let record =
-                                    match partition_index.get_key(partition_id).transpose()? {
-                                        Ok(record) => record,
-                                        Err(err) => return Some(Err(err)),
-                                    };
-                                match partition_index.get(partition_id).transpose()? {
-                                    Ok(offsets) => Some(Ok((record, offsets))),
+                                match partition_index.get_key(partition_id).transpose()? {
+                                    Ok(record) => Some(Ok(record.sequence_max)),
                                     Err(err) => Some(Err(err)),
                                 }
                             })
@@ -1198,16 +1171,9 @@ impl WriterSet {
         })?;
 
         Ok(
-            partition_index_sequence.map(|(PartitionIndexRecord { sequence_max, .. }, offsets)| {
-                match offsets {
-                    PartitionOffsets::Offsets(_) => PartitionLatestSequence::LatestSequence {
-                        partition_id,
-                        sequence: sequence_max,
-                    },
-                    PartitionOffsets::ExternalBucket => {
-                        PartitionLatestSequence::ExternalBucket { partition_id }
-                    }
-                }
+            partition_index_sequence.map(|sequence| PartitionLatestSequence {
+                partition_id,
+                sequence,
             }),
         )
     }
@@ -1225,17 +1191,11 @@ impl WriterSet {
                 |StreamIndexRecord {
                      partition_key,
                      version_max,
-                     offsets,
                      ..
                  }| {
-                    match offsets {
-                        StreamOffsets::Offsets(_) => StreamLatestVersion::LatestVersion {
-                            partition_key: *partition_key,
-                            version: *version_max,
-                        },
-                        StreamOffsets::ExternalBucket => StreamLatestVersion::ExternalBucket {
-                            partition_key: *partition_key,
-                        },
+                    StreamLatestVersion {
+                        partition_key: *partition_key,
+                        version: *version_max,
                     }
                 },
             );
@@ -1255,12 +1215,10 @@ impl WriterSet {
                         .and_then(|segments| {
                             segments.iter_mut().rev().find_map(|(_, reader_set)| {
                                 let stream_index = reader_set.stream_index.as_mut()?;
-                                let record = match stream_index.get_key(&stream_id).transpose()? {
-                                    Ok(record) => record,
-                                    Err(err) => return Some(Err(err)),
-                                };
-                                match stream_index.get(&stream_id).transpose()? {
-                                    Ok(offsets) => Some(Ok((record, offsets))),
+                                match stream_index.get_key(&stream_id).transpose()? {
+                                    Ok(record) => {
+                                        Some(Ok((record.partition_key, record.version_max)))
+                                    }
                                     Err(err) => Some(Err(err)),
                                 }
                             })
@@ -1270,24 +1228,12 @@ impl WriterSet {
             }
         })?;
 
-        Ok(stream_index_version.map(
-            |(
-                StreamIndexRecord {
-                    partition_key,
-                    version_max,
-                    ..
-                },
-                offsets,
-            )| match offsets {
-                StreamOffsets::Offsets(_) => StreamLatestVersion::LatestVersion {
-                    partition_key,
-                    version: version_max,
-                },
-                StreamOffsets::ExternalBucket => {
-                    StreamLatestVersion::ExternalBucket { partition_key }
-                }
-            },
-        ))
+        Ok(
+            stream_index_version.map(|(partition_key, version_max)| StreamLatestVersion {
+                partition_key,
+                version: version_max,
+            }),
+        )
     }
 }
 

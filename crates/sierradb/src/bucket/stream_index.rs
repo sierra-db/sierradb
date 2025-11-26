@@ -32,12 +32,6 @@ pub struct StreamIndexRecord<T> {
     pub offsets: T,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StreamOffsets {
-    Offsets(Vec<u64>), // Its cached
-    ExternalBucket,    // This stream lives in a different bucket
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -169,7 +163,7 @@ mod tests {
                 version_min: 0,
                 version_max: 1,
                 partition_key,
-                offsets: StreamOffsets::Offsets(offsets),
+                offsets,
             })
         );
         assert_eq!(index.get("unknown"), None);
@@ -216,10 +210,7 @@ mod tests {
         assert_eq!(key1.partition_key, partition_key1);
 
         // Test get with MPHF implementation
-        assert_eq!(
-            closed_index.get(&stream_id1).unwrap(),
-            Some(StreamOffsets::Offsets(offsets1)),
-        );
+        assert_eq!(closed_index.get(&stream_id1).unwrap(), Some(offsets1),);
 
         // Test get_key for second stream ID
         let key2 = closed_index.get_key(&stream_id2).unwrap().unwrap();
@@ -228,10 +219,7 @@ mod tests {
         assert_eq!(key2.partition_key, partition_key2);
 
         // Test get for second stream ID
-        assert_eq!(
-            closed_index.get(&stream_id2).unwrap(),
-            Some(StreamOffsets::Offsets(offsets2)),
-        );
+        assert_eq!(closed_index.get(&stream_id2).unwrap(), Some(offsets2),);
 
         // Test unknown stream ID
         assert_eq!(closed_index.get_key("unknown").unwrap(), None);
@@ -304,22 +292,10 @@ mod tests {
 
         // For this test, we'll just check that we can retrieve all the stream IDs
         // without checking the exact offsets, since the file format has been updated
-        assert_eq!(
-            closed_index.get(&stream_id1).unwrap(),
-            Some(StreamOffsets::Offsets(offsets1))
-        );
-        assert_eq!(
-            closed_index.get(&stream_id2).unwrap(),
-            Some(StreamOffsets::Offsets(offsets2))
-        );
-        assert_eq!(
-            closed_index.get(&stream_id3).unwrap(),
-            Some(StreamOffsets::Offsets(offsets3))
-        );
-        assert_eq!(
-            closed_index.get(&stream_id4).unwrap(),
-            Some(StreamOffsets::Offsets(offsets4))
-        );
+        assert_eq!(closed_index.get(&stream_id1).unwrap(), Some(offsets1));
+        assert_eq!(closed_index.get(&stream_id2).unwrap(), Some(offsets2));
+        assert_eq!(closed_index.get(&stream_id3).unwrap(), Some(offsets3));
+        assert_eq!(closed_index.get(&stream_id4).unwrap(), Some(offsets4));
 
         // Unknown stream ID should not be found
         assert_eq!(closed_index.get("unknown").unwrap(), None);
@@ -336,37 +312,6 @@ mod tests {
         let mut index =
             ClosedStreamIndex::open(BucketSegmentId::new(0, 0), path, SEGMENT_SIZE).unwrap();
         assert_eq!(index.get("unknown").unwrap(), None);
-    }
-
-    #[test]
-    fn test_insert_external_bucket() {
-        let path = temp_file_path();
-
-        let stream_id = StreamId::new("my-stream").unwrap();
-        let partition_key = Uuid::new_v4();
-
-        let mut index =
-            OpenStreamIndex::create(BucketSegmentId::new(0, 0), &path, SEGMENT_SIZE).unwrap();
-        index
-            .insert_external_bucket(stream_id.clone(), partition_key)
-            .unwrap();
-        assert_eq!(
-            index.get(&stream_id),
-            Some(&StreamIndexRecord {
-                partition_key,
-                version_min: 0,
-                version_max: 0,
-                offsets: StreamOffsets::ExternalBucket
-            })
-        );
-        index.flush().unwrap();
-
-        let mut index =
-            ClosedStreamIndex::open(BucketSegmentId::new(0, 0), &path, SEGMENT_SIZE).unwrap();
-        assert_eq!(
-            index.get(&stream_id).unwrap(),
-            Some(StreamOffsets::ExternalBucket)
-        );
     }
 
     // ==================== STREAM ITERATOR TESTS ====================

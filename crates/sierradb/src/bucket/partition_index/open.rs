@@ -13,8 +13,7 @@ use rayon::ThreadPool;
 
 use super::{
     ClosedIndex, ClosedPartitionIndex, EVENTS_LEN_SIZE, EVENTS_OFFSET_SIZE, MPHF_GAMMA,
-    PARTITION_ID_SIZE, PartitionIndexRecord, PartitionOffsets, PartitionSequenceOffset,
-    RECORD_SIZE, SEQUENCE_SIZE,
+    PARTITION_ID_SIZE, PartitionIndexRecord, PartitionSequenceOffset, RECORD_SIZE, SEQUENCE_SIZE,
 };
 use crate::bucket::segment::{BucketSegmentReader, EventRecord, Record};
 use crate::bucket::{BucketSegmentId, PartitionId};
@@ -24,7 +23,7 @@ use crate::error::{PartitionIndexError, ThreadPoolError};
 pub struct OpenPartitionIndex {
     id: BucketSegmentId,
     file: File,
-    index: BTreeMap<PartitionId, PartitionIndexRecord<PartitionOffsets>>,
+    index: BTreeMap<PartitionId, PartitionIndexRecord<Vec<PartitionSequenceOffset>>>,
 }
 
 impl OpenPartitionIndex {
@@ -89,7 +88,7 @@ impl OpenPartitionIndex {
     pub fn get(
         &self,
         partition_id: PartitionId,
-    ) -> Option<&PartitionIndexRecord<PartitionOffsets>> {
+    ) -> Option<&PartitionIndexRecord<Vec<PartitionSequenceOffset>>> {
         self.index.get(&partition_id)
     }
 
@@ -105,55 +104,20 @@ impl OpenPartitionIndex {
                     sequence_min: sequence,
                     sequence_max: sequence,
                     sequence: 1,
-                    offsets: PartitionOffsets::Offsets(vec![PartitionSequenceOffset {
-                        sequence,
-                        offset,
-                    }]),
+                    offsets: vec![PartitionSequenceOffset { sequence, offset }],
                 });
             }
             Entry::Occupied(mut entry) => {
                 let entry = entry.get_mut();
                 entry.sequence_min = entry.sequence_min.min(sequence);
                 entry.sequence_max = entry.sequence_max.max(sequence);
-                match &mut entry.offsets {
-                    PartitionOffsets::Offsets(offsets) => {
-                        offsets.push(PartitionSequenceOffset { sequence, offset });
-                        entry.sequence = entry
-                            .sequence
-                            .checked_add(1)
-                            .ok_or(PartitionIndexError::EventCountOverflow)?;
-                    }
-                    PartitionOffsets::ExternalBucket => {
-                        return Err(PartitionIndexError::PartitionIdMappedToExternalBucket);
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn insert_external_bucket(
-        &mut self,
-        partition_id: PartitionId,
-    ) -> Result<(), PartitionIndexError> {
-        match self.index.entry(partition_id) {
-            Entry::Vacant(entry) => {
-                entry.insert(PartitionIndexRecord {
-                    sequence_min: 0,
-                    sequence_max: 0,
-                    sequence: 0,
-                    offsets: PartitionOffsets::ExternalBucket,
-                });
-            }
-            Entry::Occupied(mut entry) => {
-                let entry = entry.get_mut();
-                match &mut entry.offsets {
-                    PartitionOffsets::Offsets(_) => {
-                        return Err(PartitionIndexError::PartitionIdOffsetExists);
-                    }
-                    PartitionOffsets::ExternalBucket => {}
-                }
+                entry
+                    .offsets
+                    .push(PartitionSequenceOffset { sequence, offset });
+                entry.sequence = entry
+                    .sequence
+                    .checked_add(1)
+                    .ok_or(PartitionIndexError::EventCountOverflow)?;
             }
         }
 
@@ -186,7 +150,7 @@ impl OpenPartitionIndex {
 
     fn flush_inner(
         file: &mut File,
-        index: &BTreeMap<PartitionId, PartitionIndexRecord<PartitionOffsets>>,
+        index: &BTreeMap<PartitionId, PartitionIndexRecord<Vec<PartitionSequenceOffset>>>,
     ) -> Result<(Mphf<PartitionId>, u64), PartitionIndexError> {
         // Collect all keys from the index
         let keys: Vec<PartitionId> = index.keys().copied().collect();
@@ -216,98 +180,59 @@ impl OpenPartitionIndex {
             let slot = mphf.hash(&partition_id) as usize;
             let pos = slot * RECORD_SIZE;
 
-            match &record.offsets {
-                PartitionOffsets::Offsets(offsets) => {
-                    let mut offsets_bytes: Vec<u8> =
-                        vec![0; (SEQUENCE_SIZE + EVENTS_OFFSET_SIZE) * offsets.len()];
-                    for (i, PartitionSequenceOffset { sequence, offset }) in
-                        offsets.iter().enumerate()
-                    {
-                        let mut i = (SEQUENCE_SIZE + EVENTS_OFFSET_SIZE) * i;
-                        offsets_bytes[i..i + SEQUENCE_SIZE]
-                            .copy_from_slice(&sequence.to_le_bytes());
-                        i += SEQUENCE_SIZE;
-                        offsets_bytes[i..i + EVENTS_OFFSET_SIZE]
-                            .copy_from_slice(&offset.to_le_bytes());
-                    }
-
-                    if offsets_bytes.is_empty() {
-                        continue;
-                    }
-
-                    // Record entry: partition_id, sequence_min, sequence_max, event_count,
-                    // events_offset, events_len
-                    let mut pos_in_record = 0;
-
-                    // Partition ID
-                    records[pos + pos_in_record..pos + pos_in_record + PARTITION_ID_SIZE]
-                        .copy_from_slice(&partition_id.to_le_bytes());
-                    pos_in_record += PARTITION_ID_SIZE;
-
-                    // Sequence min
-                    records[pos + pos_in_record..pos + pos_in_record + SEQUENCE_SIZE]
-                        .copy_from_slice(&record.sequence_min.to_le_bytes());
-                    pos_in_record += SEQUENCE_SIZE;
-
-                    // Sequence max
-                    records[pos + pos_in_record..pos + pos_in_record + SEQUENCE_SIZE]
-                        .copy_from_slice(&record.sequence_max.to_le_bytes());
-                    pos_in_record += SEQUENCE_SIZE;
-
-                    // Event count
-                    records[pos + pos_in_record..pos + pos_in_record + SEQUENCE_SIZE]
-                        .copy_from_slice(&record.sequence.to_le_bytes());
-                    pos_in_record += SEQUENCE_SIZE;
-
-                    // Current offset in values section
-                    let current_value_offset = values_base_offset + value_data.len() as u64;
-
-                    // Events offset - use the actual file offset
-                    records[pos + pos_in_record..pos + pos_in_record + EVENTS_OFFSET_SIZE]
-                        .copy_from_slice(&current_value_offset.to_le_bytes());
-                    pos_in_record += EVENTS_OFFSET_SIZE;
-
-                    // Events length
-                    records[pos + pos_in_record..pos + pos_in_record + EVENTS_LEN_SIZE]
-                        .copy_from_slice(&(offsets.len() as u32).to_le_bytes());
-
-                    // Add to value data
-                    value_data.extend(offsets_bytes);
-                }
-                PartitionOffsets::ExternalBucket => {
-                    // Record entry for external bucket
-                    let mut pos_in_record = 0;
-
-                    // Partition ID
-                    records[pos + pos_in_record..pos + pos_in_record + PARTITION_ID_SIZE]
-                        .copy_from_slice(&partition_id.to_le_bytes());
-                    pos_in_record += PARTITION_ID_SIZE;
-
-                    // Sequence min
-                    records[pos + pos_in_record..pos + pos_in_record + SEQUENCE_SIZE]
-                        .copy_from_slice(&record.sequence_min.to_le_bytes());
-                    pos_in_record += SEQUENCE_SIZE;
-
-                    // Sequence max
-                    records[pos + pos_in_record..pos + pos_in_record + SEQUENCE_SIZE]
-                        .copy_from_slice(&record.sequence_max.to_le_bytes());
-                    pos_in_record += SEQUENCE_SIZE;
-
-                    // Event count
-                    records[pos + pos_in_record..pos + pos_in_record + SEQUENCE_SIZE]
-                        .copy_from_slice(&record.sequence.to_le_bytes());
-                    pos_in_record += SEQUENCE_SIZE;
-
-                    // Special value for external bucket (u64::MAX)
-                    records[pos + pos_in_record..pos + pos_in_record + EVENTS_OFFSET_SIZE]
-                        .copy_from_slice(&u64::MAX.to_le_bytes());
-                    pos_in_record += EVENTS_OFFSET_SIZE;
-
-                    // Special value for external bucket (u32::MAX)
-                    records[pos + pos_in_record..pos + pos_in_record + EVENTS_LEN_SIZE]
-                        .copy_from_slice(&u32::MAX.to_le_bytes());
-                }
+            let mut offsets_bytes: Vec<u8> =
+                vec![0; (SEQUENCE_SIZE + EVENTS_OFFSET_SIZE) * record.offsets.len()];
+            for (i, PartitionSequenceOffset { sequence, offset }) in
+                record.offsets.iter().enumerate()
+            {
+                let mut i = (SEQUENCE_SIZE + EVENTS_OFFSET_SIZE) * i;
+                offsets_bytes[i..i + SEQUENCE_SIZE].copy_from_slice(&sequence.to_le_bytes());
+                i += SEQUENCE_SIZE;
+                offsets_bytes[i..i + EVENTS_OFFSET_SIZE].copy_from_slice(&offset.to_le_bytes());
             }
+
+            if offsets_bytes.is_empty() {
+                continue;
+            }
+
+            // Record entry: partition_id, sequence_min, sequence_max, event_count,
+            // events_offset, events_len
+            let mut pos_in_record = 0;
+
+            // Partition ID
+            records[pos + pos_in_record..pos + pos_in_record + PARTITION_ID_SIZE]
+                .copy_from_slice(&partition_id.to_le_bytes());
+            pos_in_record += PARTITION_ID_SIZE;
+
+            // Sequence min
+            records[pos + pos_in_record..pos + pos_in_record + SEQUENCE_SIZE]
+                .copy_from_slice(&record.sequence_min.to_le_bytes());
+            pos_in_record += SEQUENCE_SIZE;
+
+            // Sequence max
+            records[pos + pos_in_record..pos + pos_in_record + SEQUENCE_SIZE]
+                .copy_from_slice(&record.sequence_max.to_le_bytes());
+            pos_in_record += SEQUENCE_SIZE;
+
+            // Event count
+            records[pos + pos_in_record..pos + pos_in_record + SEQUENCE_SIZE]
+                .copy_from_slice(&record.sequence.to_le_bytes());
+            pos_in_record += SEQUENCE_SIZE;
+
+            // Current offset in values section
+            let current_value_offset = values_base_offset + value_data.len() as u64;
+
+            // Events offset - use the actual file offset
+            records[pos + pos_in_record..pos + pos_in_record + EVENTS_OFFSET_SIZE]
+                .copy_from_slice(&current_value_offset.to_le_bytes());
+            pos_in_record += EVENTS_OFFSET_SIZE;
+
+            // Events length
+            records[pos + pos_in_record..pos + pos_in_record + EVENTS_LEN_SIZE]
+                .copy_from_slice(&(record.offsets.len() as u32).to_le_bytes());
+
+            // Add to value data
+            value_data.extend(offsets_bytes);
         }
 
         // Build the file header

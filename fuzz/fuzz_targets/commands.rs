@@ -2107,7 +2107,7 @@ async fn execute_get_partition_sequence(
 
     match (db_result, model_sequence) {
         (
-            Some(PartitionLatestSequence::LatestSequence {
+            Some(PartitionLatestSequence {
                 sequence: db_seq, ..
             }),
             Some(model_seq),
@@ -2122,11 +2122,6 @@ async fn execute_get_partition_sequence(
             // Validate the sequence is within reasonable bounds
             // Note: Partition sequences start from 0, so 0 is valid
         }
-        (Some(PartitionLatestSequence::ExternalBucket { .. }), _) => {
-            // External bucket case - this indicates the partition is in a
-            // different bucket For fuzzing purposes, we can accept
-            // this as a valid state
-        }
         (None, None) => {
             // Both agree no sequence exists - validate consistency
             if state.model.partitions.contains_key(&partition_id) {
@@ -2137,7 +2132,7 @@ async fn execute_get_partition_sequence(
             }
         }
         (
-            Some(PartitionLatestSequence::LatestSequence {
+            Some(PartitionLatestSequence {
                 sequence: db_seq, ..
             }),
             None,
@@ -2366,7 +2361,7 @@ async fn execute_get_stream_version(
 
     match (db_result, model_version) {
         (
-            Some(StreamLatestVersion::LatestVersion {
+            Some(StreamLatestVersion {
                 version: db_ver, ..
             }),
             Some(model_ver),
@@ -2381,17 +2376,12 @@ async fn execute_get_stream_version(
             // Validate the version is within reasonable bounds
             // Note: Stream versions start from 0, so 0 is valid
         }
-        (Some(StreamLatestVersion::ExternalBucket { .. }), _) => {
-            // External bucket case - this indicates the stream is in a
-            // different bucket For fuzzing purposes, we can accept
-            // this as a valid state
-        }
         (None, None) => {
             // Both agree no version exists - this is fine for non-existent
             // streams
         }
         (
-            Some(StreamLatestVersion::LatestVersion {
+            Some(StreamLatestVersion {
                 version: db_ver, ..
             }),
             None,

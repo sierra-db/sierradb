@@ -17,8 +17,7 @@ use crate::bucket::BucketSegmentId;
 use crate::bucket::segment::{BucketSegmentReader, EventRecord, Record};
 use crate::bucket::stream_index::closed::{ClosedIndex, ClosedStreamIndex};
 use crate::bucket::stream_index::{
-    LEN_SIZE, OFFSET_SIZE, PARTITION_KEY_SIZE, RECORD_SIZE, StreamIndexRecord, StreamOffsets,
-    VERSION_SIZE,
+    LEN_SIZE, OFFSET_SIZE, PARTITION_KEY_SIZE, RECORD_SIZE, StreamIndexRecord, VERSION_SIZE,
 };
 use crate::error::{EventValidationError, StreamIndexError, ThreadPoolError};
 use crate::{BLOOM_SEED, STREAM_ID_SIZE, StreamId};
@@ -32,7 +31,7 @@ const MPHF_GAMMA: f64 = 1.4;
 pub struct OpenStreamIndex {
     id: BucketSegmentId,
     file: File,
-    index: BTreeMap<StreamId, StreamIndexRecord<StreamOffsets>>,
+    index: BTreeMap<StreamId, StreamIndexRecord<Vec<u64>>>,
     bloom: Bloom<str>,
 }
 
@@ -129,7 +128,7 @@ impl OpenStreamIndex {
         ))
     }
 
-    pub fn get(&self, stream_id: &str) -> Option<&StreamIndexRecord<StreamOffsets>> {
+    pub fn get(&self, stream_id: &str) -> Option<&StreamIndexRecord<Vec<u64>>> {
         self.index.get(stream_id)
     }
 
@@ -147,7 +146,7 @@ impl OpenStreamIndex {
                     partition_key,
                     version_min: stream_version,
                     version_max: stream_version,
-                    offsets: StreamOffsets::Offsets(vec![offset]),
+                    offsets: vec![offset],
                 });
             }
             Entry::Occupied(mut entry) => {
@@ -162,51 +161,7 @@ impl OpenStreamIndex {
                 }
                 entry.version_min = entry.version_min.min(stream_version);
                 entry.version_max = entry.version_max.max(stream_version);
-                match &mut entry.offsets {
-                    StreamOffsets::Offsets(offsets) => {
-                        offsets.push(offset);
-                    }
-                    StreamOffsets::ExternalBucket => {
-                        return Err(StreamIndexError::StreamIdMappedToExternalBucket);
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn insert_external_bucket(
-        &mut self,
-        stream_id: StreamId,
-        partition_key: Uuid,
-    ) -> Result<(), StreamIndexError> {
-        match self.index.entry(stream_id) {
-            Entry::Vacant(entry) => {
-                self.bloom.set(entry.key());
-                entry.insert(StreamIndexRecord {
-                    partition_key,
-                    version_min: 0,
-                    version_max: 0,
-                    offsets: StreamOffsets::ExternalBucket,
-                });
-            }
-            Entry::Occupied(mut entry) => {
-                let entry = entry.get_mut();
-                if entry.partition_key != partition_key {
-                    return Err(StreamIndexError::Validation(
-                        EventValidationError::PartitionKeyMismatch {
-                            existing_partition_key: entry.partition_key,
-                            new_partition_key: partition_key,
-                        },
-                    ));
-                }
-                match &mut entry.offsets {
-                    StreamOffsets::Offsets(_) => {
-                        return Err(StreamIndexError::StreamIdOffsetExists);
-                    }
-                    StreamOffsets::ExternalBucket => {}
-                }
+                entry.offsets.push(offset);
             }
         }
 
@@ -240,7 +195,7 @@ impl OpenStreamIndex {
 
     fn flush_inner(
         file: &mut File,
-        index: &BTreeMap<StreamId, StreamIndexRecord<StreamOffsets>>,
+        index: &BTreeMap<StreamId, StreamIndexRecord<Vec<u64>>>,
         bloom: &Bloom<str>,
     ) -> Result<(Mphf<StreamId>, u64), StreamIndexError> {
         // Collect all keys from the index as strings
@@ -277,91 +232,56 @@ impl OpenStreamIndex {
             let slot = mphf.hash(stream_id) as usize;
             let pos = slot * RECORD_SIZE;
 
-            match &record.offsets {
-                StreamOffsets::Offsets(offsets) => {
-                    let offsets_bytes: Vec<_> =
-                        offsets.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let offsets_bytes: Vec<_> = record
+                .offsets
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
 
-                    if offsets_bytes.is_empty() {
-                        continue;
-                    }
-
-                    let offsets_len = offsets.len() as u32;
-
-                    // Record entry: stream_id, partition_key, version_min, version_max, offset, len
-                    let mut pos_in_record = 0;
-
-                    // Stream ID with padding to STREAM_ID_SIZE
-                    let stream_id_bytes = stream_id.as_bytes();
-                    records[pos + pos_in_record..pos + pos_in_record + stream_id_bytes.len()]
-                        .copy_from_slice(stream_id_bytes);
-                    pos_in_record += STREAM_ID_SIZE;
-
-                    // Partition key
-                    records[pos + pos_in_record..pos + pos_in_record + PARTITION_KEY_SIZE]
-                        .copy_from_slice(record.partition_key.as_bytes());
-                    pos_in_record += PARTITION_KEY_SIZE;
-
-                    // Version min
-                    records[pos + pos_in_record..pos + pos_in_record + VERSION_SIZE]
-                        .copy_from_slice(&record.version_min.to_le_bytes());
-                    pos_in_record += VERSION_SIZE;
-
-                    // Version max
-                    records[pos + pos_in_record..pos + pos_in_record + VERSION_SIZE]
-                        .copy_from_slice(&record.version_max.to_le_bytes());
-                    pos_in_record += VERSION_SIZE;
-
-                    // Current offset in values section
-                    let current_value_offset = values_base_offset + value_data.len() as u64;
-
-                    // Offset to values - use the actual file offset
-                    records[pos + pos_in_record..pos + pos_in_record + OFFSET_SIZE]
-                        .copy_from_slice(&current_value_offset.to_le_bytes());
-                    pos_in_record += OFFSET_SIZE;
-
-                    // Length of values
-                    records[pos + pos_in_record..pos + pos_in_record + LEN_SIZE]
-                        .copy_from_slice(&offsets_len.to_le_bytes());
-
-                    // Add to value data
-                    value_data.extend(offsets_bytes);
-                }
-                StreamOffsets::ExternalBucket => {
-                    // Record entry for external bucket
-                    let mut pos_in_record = 0;
-
-                    // Stream ID with padding to STREAM_ID_SIZE
-                    let stream_id_bytes = stream_id.as_bytes();
-                    records[pos + pos_in_record..pos + pos_in_record + stream_id_bytes.len()]
-                        .copy_from_slice(stream_id_bytes);
-                    pos_in_record += STREAM_ID_SIZE;
-
-                    // Partition key
-                    records[pos + pos_in_record..pos + pos_in_record + PARTITION_KEY_SIZE]
-                        .copy_from_slice(record.partition_key.as_bytes());
-                    pos_in_record += PARTITION_KEY_SIZE;
-
-                    // Version min
-                    records[pos + pos_in_record..pos + pos_in_record + VERSION_SIZE]
-                        .copy_from_slice(&record.version_min.to_le_bytes());
-                    pos_in_record += VERSION_SIZE;
-
-                    // Version max
-                    records[pos + pos_in_record..pos + pos_in_record + VERSION_SIZE]
-                        .copy_from_slice(&record.version_max.to_le_bytes());
-                    pos_in_record += VERSION_SIZE;
-
-                    // Special value for external bucket (u64::MAX)
-                    records[pos + pos_in_record..pos + pos_in_record + OFFSET_SIZE]
-                        .copy_from_slice(&u64::MAX.to_le_bytes());
-                    pos_in_record += OFFSET_SIZE;
-
-                    // Special value for external bucket (u32::MAX)
-                    records[pos + pos_in_record..pos + pos_in_record + LEN_SIZE]
-                        .copy_from_slice(&u32::MAX.to_le_bytes());
-                }
+            if offsets_bytes.is_empty() {
+                continue;
             }
+
+            let offsets_len = record.offsets.len() as u32;
+
+            // Record entry: stream_id, partition_key, version_min, version_max, offset, len
+            let mut pos_in_record = 0;
+
+            // Stream ID with padding to STREAM_ID_SIZE
+            let stream_id_bytes = stream_id.as_bytes();
+            records[pos + pos_in_record..pos + pos_in_record + stream_id_bytes.len()]
+                .copy_from_slice(stream_id_bytes);
+            pos_in_record += STREAM_ID_SIZE;
+
+            // Partition key
+            records[pos + pos_in_record..pos + pos_in_record + PARTITION_KEY_SIZE]
+                .copy_from_slice(record.partition_key.as_bytes());
+            pos_in_record += PARTITION_KEY_SIZE;
+
+            // Version min
+            records[pos + pos_in_record..pos + pos_in_record + VERSION_SIZE]
+                .copy_from_slice(&record.version_min.to_le_bytes());
+            pos_in_record += VERSION_SIZE;
+
+            // Version max
+            records[pos + pos_in_record..pos + pos_in_record + VERSION_SIZE]
+                .copy_from_slice(&record.version_max.to_le_bytes());
+            pos_in_record += VERSION_SIZE;
+
+            // Current offset in values section
+            let current_value_offset = values_base_offset + value_data.len() as u64;
+
+            // Offset to values - use the actual file offset
+            records[pos + pos_in_record..pos + pos_in_record + OFFSET_SIZE]
+                .copy_from_slice(&current_value_offset.to_le_bytes());
+            pos_in_record += OFFSET_SIZE;
+
+            // Length of values
+            records[pos + pos_in_record..pos + pos_in_record + LEN_SIZE]
+                .copy_from_slice(&offsets_len.to_le_bytes());
+
+            // Add to value data
+            value_data.extend(offsets_bytes);
         }
 
         // Build the file header

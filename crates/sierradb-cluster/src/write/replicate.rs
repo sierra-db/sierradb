@@ -72,10 +72,7 @@ impl Actor for PartitionReplicatorActor {
             .await
             .map_err(|err| WriteError::DatabaseOperationFailed(err.to_string()))?
         {
-            Some(PartitionLatestSequence::LatestSequence { sequence, .. }) => sequence + 1,
-            Some(PartitionLatestSequence::ExternalBucket { .. }) => {
-                todo!()
-            }
+            Some(PartitionLatestSequence { sequence, .. }) => sequence + 1,
             None => 0,
         };
 

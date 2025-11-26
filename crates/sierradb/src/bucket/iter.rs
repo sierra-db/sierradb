@@ -6,9 +6,7 @@ use std::{fmt, mem};
 use tokio::sync::oneshot;
 use tracing::warn;
 
-use crate::bucket::partition_index::PartitionOffsets;
 use crate::bucket::segment::{CommittedEvents, SegmentIter};
-use crate::bucket::stream_index::StreamOffsets;
 use crate::bucket::{BucketId, BucketSegmentId, PartitionId, SegmentId};
 use crate::error::{PartitionIndexError, ReadError, StreamIndexError};
 use crate::reader_thread_pool::{ReaderSet, ReaderThreadPool};
@@ -85,11 +83,10 @@ impl IterConfig for PartitionIterConfig {
                 return None;
             }
 
-            let PartitionOffsets::Offsets(offsets) = partition_index.offsets.clone() else {
-                return None;
-            };
-
-            (partition_index.sequence_min, offsets)
+            (
+                partition_index.sequence_min,
+                partition_index.offsets.clone(),
+            )
         };
 
         let offsets_index = if matches!(dir, IterDirection::Reverse) && from_position == u64::MAX {
@@ -127,10 +124,7 @@ impl IterConfig for PartitionIterConfig {
         };
 
         let sequence_min = key.sequence_min;
-        let offsets = match partition_index.get_from_key(key)? {
-            PartitionOffsets::Offsets(offsets) => offsets,
-            PartitionOffsets::ExternalBucket => unimplemented!(),
-        };
+        let offsets = partition_index.get_from_key(key)?;
 
         let offsets_index = if matches!(dir, IterDirection::Reverse) && from_position == u64::MAX {
             offsets.len()
@@ -182,15 +176,11 @@ impl IterConfig for StreamIterConfig {
             let live_indexes_guard = live_indexes.read().await;
             let stream_index = live_indexes_guard.stream_index.get(&self.stream_id)?;
 
-            let StreamOffsets::Offsets(offsets) = stream_index.offsets.clone() else {
-                return None;
-            };
-
             if stream_index.version_min > from_position {
                 return None;
             }
 
-            (stream_index.version_min, offsets)
+            (stream_index.version_min, stream_index.offsets.clone())
         };
 
         let offsets_index = if matches!(dir, IterDirection::Reverse) && from_position == u64::MAX {
@@ -226,10 +216,7 @@ impl IterConfig for StreamIterConfig {
         };
 
         let version_min = key.version_min;
-        let offsets = match stream_index.get_from_key(key)? {
-            StreamOffsets::Offsets(offsets) => offsets,
-            StreamOffsets::ExternalBucket => unimplemented!(),
-        };
+        let offsets = stream_index.get_from_key(key)?;
 
         let offsets_index = if matches!(dir, IterDirection::Reverse) && from_position == u64::MAX {
             offsets.len()
