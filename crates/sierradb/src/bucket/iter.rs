@@ -77,24 +77,25 @@ impl IterConfig for PartitionIterConfig {
         from_position: u64,
         dir: IterDirection,
     ) -> Option<(Vec<u64>, usize)> {
-        let partition_index = live_indexes
-            .read()
-            .await
-            .partition_index
-            .get(self.partition_id)?
-            .clone();
-        let PartitionOffsets::Offsets(offsets) = partition_index.offsets else {
-            return None;
-        };
+        let (sequence_min, offsets) = {
+            let live_indexes_guard = live_indexes.read().await;
+            let partition_index = live_indexes_guard.partition_index.get(self.partition_id)?;
 
-        if partition_index.sequence_min > from_position {
-            return None;
-        }
+            if partition_index.sequence_min > from_position {
+                return None;
+            }
+
+            let PartitionOffsets::Offsets(offsets) = partition_index.offsets.clone() else {
+                return None;
+            };
+
+            (partition_index.sequence_min, offsets)
+        };
 
         let offsets_index = if matches!(dir, IterDirection::Reverse) && from_position == u64::MAX {
             offsets.len()
         } else {
-            (from_position.saturating_sub(partition_index.sequence_min) as usize).min(offsets.len())
+            (from_position.saturating_sub(sequence_min) as usize).min(offsets.len())
         };
 
         let file_offsets = offsets.into_iter().map(|o| o.offset).collect();
@@ -177,24 +178,25 @@ impl IterConfig for StreamIterConfig {
         from_position: u64,
         dir: IterDirection,
     ) -> Option<(Vec<u64>, usize)> {
-        let stream_index = live_indexes
-            .read()
-            .await
-            .stream_index
-            .get(&self.stream_id)?
-            .clone();
-        let StreamOffsets::Offsets(offsets) = stream_index.offsets.clone() else {
-            return None;
-        };
+        let (version_min, offsets) = {
+            let live_indexes_guard = live_indexes.read().await;
+            let stream_index = live_indexes_guard.stream_index.get(&self.stream_id)?;
 
-        if stream_index.version_min > from_position {
-            return None;
-        }
+            let StreamOffsets::Offsets(offsets) = stream_index.offsets.clone() else {
+                return None;
+            };
+
+            if stream_index.version_min > from_position {
+                return None;
+            }
+
+            (stream_index.version_min, offsets)
+        };
 
         let offsets_index = if matches!(dir, IterDirection::Reverse) && from_position == u64::MAX {
             offsets.len()
         } else {
-            (from_position.saturating_sub(stream_index.version_min) as usize).min(offsets.len())
+            (from_position.saturating_sub(version_min) as usize).min(offsets.len())
         };
 
         Some((offsets, offsets_index))
