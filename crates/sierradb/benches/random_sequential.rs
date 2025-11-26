@@ -6,8 +6,8 @@ use rand::seq::SliceRandom;
 use seglog::read::ReadHint;
 use sierradb::StreamId;
 use sierradb::bucket::segment::{
-    BucketSegmentReader, BucketSegmentWriter, LongBytes, RawCommit, RawEvent,
-    RecordHeader, ShortString,
+    BucketSegmentReader, BucketSegmentWriter, LongBytes, RawCommit, RawEvent, RecordHeader,
+    ShortString,
 };
 use tempfile::NamedTempFile;
 use uuid::Uuid;

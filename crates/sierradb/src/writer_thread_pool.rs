@@ -23,8 +23,8 @@ use crate::StreamId;
 use crate::bucket::event_index::OpenEventIndex;
 use crate::bucket::partition_index::{OpenPartitionIndex, PartitionIndexRecord, PartitionOffsets};
 use crate::bucket::segment::{
-    BucketSegmentReader, BucketSegmentWriter, COMMIT_SIZE, EVENT_HEADER_SIZE, LongBytes,
-    RawCommit, RawEvent, RecordHeader, SEGMENT_HEADER_SIZE, ShortString,
+    BucketSegmentReader, BucketSegmentWriter, COMMIT_SIZE, EVENT_HEADER_SIZE, LongBytes, RawCommit,
+    RawEvent, RecordHeader, SEGMENT_HEADER_SIZE, ShortString,
 };
 use crate::bucket::stream_index::{OpenStreamIndex, StreamIndexRecord, StreamOffsets};
 use crate::bucket::{BucketId, BucketSegmentId, PartitionId, SegmentKind};
