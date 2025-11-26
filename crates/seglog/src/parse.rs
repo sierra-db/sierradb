@@ -21,8 +21,8 @@ use crate::{
 ///
 /// # Errors
 ///
-/// - `ReadError::OutOfBounds` - If the buffer doesn't contain enough bytes for the header or data,
-///   or if a truncation marker (all zeros) is encountered
+/// - `ReadError::OutOfBounds` - If the buffer doesn't contain enough bytes for the header or data
+/// - `ReadError::TruncationMarker` - If a truncation marker (all zeros) is encountered
 /// - `ReadError::Crc32cMismatch` - If the CRC32C checksum validation fails
 ///
 /// # Example
