@@ -4,14 +4,30 @@ use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
+use thiserror::Error;
 use tracing::warn;
 
-use crate::{CRC32C_SIZE, FlushedOffset, LEN_SIZE, RECORD_HEAD_SIZE, ReadError, calculate_crc32c};
+use crate::{CRC32C_SIZE, FlushedOffset, LEN_SIZE, RECORD_HEAD_SIZE, calculate_crc32c};
 
 const PAGE_SIZE: usize = 4096; // Usually a page is 4KB on Linux
 const OPTIMISTIC_DATA_SIZE: usize = 2048; // Optimistic read size for random access: read header + this much data in one syscall
 const FALLBACK_BUF_SIZE: usize = PAGE_SIZE;
 const READ_AHEAD_SIZE: usize = 64 * 1024; // 64 KB read ahead buffer
+
+/// Errors that can occur during segment reading operations.
+#[derive(Debug, Error)]
+pub enum ReadError {
+    #[error("crc32c hash mismatch at offset {offset}")]
+    Crc32cMismatch { offset: u64 },
+    #[error("read at offset {offset} with length {length} exceeds flushed offset {flushed_offset}")]
+    OutOfBounds {
+        offset: u64,
+        length: usize,
+        flushed_offset: u64,
+    },
+    #[error(transparent)]
+    Io(#[from] io::Error),
+}
 
 /// Hint for optimizing read operations based on access pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +105,11 @@ impl Reader {
         })
     }
 
+    /// Returns a reference to the file handle.
+    pub fn file(&self) -> &File {
+        &self.file
+    }
+
     /// Returns a reference to the flushed offset tracker.
     pub fn flushed_offset(&self) -> &FlushedOffset {
         &self.flushed_offset
@@ -97,24 +118,20 @@ impl Reader {
     /// Prefetches data at the given offset into the OS page cache.
     ///
     /// On Linux, uses `posix_fadvise` to hint the kernel to load the page. No-op on other platforms.
-    #[cfg(all(unix, target_os = "linux"))]
     pub fn prefetch(&self, offset: u64) {
-        use std::os::fd::AsRawFd;
-        unsafe {
-            nix::libc::posix_fadvise(
-                self.file.as_raw_fd(),
-                offset as i64,
-                PAGE_SIZE as i64,
-                nix::libc::POSIX_FADV_WILLNEED,
-            );
+        #[cfg(all(unix, target_os = "linux"))]
+        {
+            use std::os::fd::AsRawFd;
+            unsafe {
+                nix::libc::posix_fadvise(
+                    self.file.as_raw_fd(),
+                    offset as i64,
+                    PAGE_SIZE as i64,
+                    nix::libc::POSIX_FADV_WILLNEED,
+                );
+            }
         }
     }
-
-    /// Prefetches data at the given offset into the OS page cache.
-    ///
-    /// On Linux, uses `posix_fadvise` to hint the kernel to load the page. No-op on other platforms.
-    #[cfg(not(all(unix, target_os = "linux")))]
-    pub fn prefetch(&self, _offset: u64) {}
 
     /// Creates an iterator over all records starting from offset 0.
     pub fn iter(&mut self) -> Iter<'_> {
@@ -136,7 +153,11 @@ impl Reader {
     pub fn read_record(&mut self, offset: u64, hint: ReadHint) -> Result<Cow<'_, [u8]>, ReadError> {
         let flushed_offset = self.flushed_offset.load();
         if offset + RECORD_HEAD_SIZE as u64 > flushed_offset {
-            return Err(ReadError::OutOfBounds);
+            return Err(ReadError::OutOfBounds {
+                offset,
+                length: RECORD_HEAD_SIZE,
+                flushed_offset,
+            });
         }
 
         if matches!(hint, ReadHint::Sequential) {
@@ -154,7 +175,11 @@ impl Reader {
         let header_buf = &self.optimistic_buf[..RECORD_HEAD_SIZE];
 
         if is_truncation_marker(header_buf) {
-            return Err(ReadError::OutOfBounds);
+            return Err(ReadError::OutOfBounds {
+                offset,
+                length: RECORD_HEAD_SIZE,
+                flushed_offset,
+            });
         }
 
         let data_len_bytes: [u8; LEN_SIZE] = header_buf[..LEN_SIZE].try_into().unwrap();
@@ -167,7 +192,11 @@ impl Reader {
 
         let data_offset = offset + RECORD_HEAD_SIZE as u64;
         if data_offset + data_len as u64 > flushed_offset {
-            return Err(ReadError::OutOfBounds);
+            return Err(ReadError::OutOfBounds {
+                offset,
+                length: RECORD_HEAD_SIZE,
+                flushed_offset,
+            });
         }
 
         let (data, new_crc) = if data_len <= OPTIMISTIC_DATA_SIZE
@@ -192,7 +221,7 @@ impl Reader {
         };
 
         if crc != new_crc {
-            return Err(ReadError::Crc32cMismatch);
+            return Err(ReadError::Crc32cMismatch { offset });
         }
 
         Ok(data)
@@ -208,7 +237,11 @@ impl Reader {
             .read(&self.file, offset, RECORD_HEAD_SIZE)?;
 
         if is_truncation_marker(&header_buf[..RECORD_HEAD_SIZE]) {
-            return Err(ReadError::OutOfBounds);
+            return Err(ReadError::OutOfBounds {
+                offset,
+                length: RECORD_HEAD_SIZE,
+                flushed_offset,
+            });
         }
 
         let data_len_bytes: [u8; LEN_SIZE] = header_buf[..LEN_SIZE].try_into().unwrap();
@@ -221,7 +254,11 @@ impl Reader {
 
         let data_offset = offset + RECORD_HEAD_SIZE as u64;
         if data_offset + data_len as u64 > flushed_offset {
-            return Err(ReadError::OutOfBounds);
+            return Err(ReadError::OutOfBounds {
+                offset,
+                length: RECORD_HEAD_SIZE,
+                flushed_offset,
+            });
         }
 
         let data = self
@@ -230,7 +267,7 @@ impl Reader {
         let new_crc = calculate_crc32c(&data_len_bytes, data);
 
         if crc != new_crc {
-            return Err(ReadError::Crc32cMismatch);
+            return Err(ReadError::Crc32cMismatch { offset });
         }
 
         Ok(Cow::Borrowed(data))
@@ -239,31 +276,33 @@ impl Reader {
     /// Reads raw bytes from the file at the specified offset and length.
     ///
     /// This bypasses record structure and CRC validation, reading directly from the file.
-    pub fn read_bytes(&self, offset: u64, len: usize) -> Result<Vec<u8>, ReadError> {
-        let end = offset.checked_add(len as u64).ok_or_else(|| {
+    pub fn read_bytes(&self, offset: u64, buf: &mut [u8]) -> Result<(), ReadError> {
+        let end = offset.checked_add(buf.len() as u64).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("block offset {offset} + len {len} overflows u64"),
+                format!("block offset {offset} + len {} overflows u64", buf.len()),
             )
         })?;
 
-        let flushed = self.flushed_offset.load();
-        if end > flushed {
-            return Err(ReadError::OutOfBounds);
+        let flushed_offset = self.flushed_offset.load();
+        if end > flushed_offset {
+            return Err(ReadError::OutOfBounds {
+                offset,
+                length: buf.len(),
+                flushed_offset,
+            });
         }
-
-        let mut buf = vec![0; len];
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::FileExt;
-            self.file.read_exact_at(&mut buf, offset)?;
+            self.file.read_exact_at(buf, offset)?;
         }
 
         #[cfg(windows)]
         {
             use std::os::windows::fs::FileExt;
-            self.file.seek_read(&mut buf, offset)?;
+            self.file.seek_read(buf, offset)?;
         }
 
         #[cfg(not(any(unix, windows)))]
@@ -271,13 +310,43 @@ impl Reader {
             compile_error!("Unsupported platform for positioned file I/O");
         }
 
-        Ok(buf)
+        Ok(())
     }
 
     /// Closes the reader.
     ///
     /// This explicitly consumes the reader. All resources are released when the reader is dropped.
     pub fn close(self) {}
+}
+
+/// Type alias for a result returned from [`Iter::next_record`].
+pub type IterResult<'a> = Result<Option<(u64, Cow<'a, [u8]>)>, ReadError>;
+
+/// Iterator for sequentially reading records from a segment.
+pub struct Iter<'a> {
+    reader: &'a mut Reader,
+    offset: u64,
+}
+
+impl Iter<'_> {
+    /// Returns the next record as a tuple of (offset, data).
+    ///
+    /// Returns `Ok(None)` when reaching the end of valid records or a truncation marker.
+    /// Uses sequential read hints for optimized performance.
+    pub fn next_record(&mut self) -> IterResult<'_> {
+        let offset = self.offset;
+        match self.reader.read_record(self.offset, ReadHint::Sequential) {
+            Ok(data) => {
+                self.offset += (RECORD_HEAD_SIZE + data.len()) as u64;
+                Ok(Some((offset, data)))
+            }
+            Err(ReadError::OutOfBounds { .. }) => Ok(None),
+            Err(err) => {
+                warn!("unexpected read error at offset {}: {err}", self.offset);
+                Err(err)
+            }
+        }
+    }
 }
 
 struct ReadAheadBuf {
@@ -356,37 +425,7 @@ impl ReadAheadBuf {
     }
 }
 
-/// Type alias for a result returned from [`Iter::next_record`].
-pub type IterResult<'a> = Result<Option<(u64, Cow<'a, [u8]>)>, ReadError>;
-
-/// Iterator for sequentially reading records from a segment.
-pub struct Iter<'a> {
-    reader: &'a mut Reader,
-    offset: u64,
-}
-
-impl Iter<'_> {
-    /// Returns the next record as a tuple of (offset, data).
-    ///
-    /// Returns `Ok(None)` when reaching the end of valid records or a truncation marker.
-    /// Uses sequential read hints for optimized performance.
-    pub fn next_record(&mut self) -> IterResult<'_> {
-        let offset = self.offset;
-        match self.reader.read_record(self.offset, ReadHint::Sequential) {
-            Ok(data) => {
-                self.offset += (RECORD_HEAD_SIZE + data.len()) as u64;
-                Ok(Some((offset, data)))
-            }
-            Err(ReadError::OutOfBounds) => Ok(None),
-            Err(err) => {
-                warn!("unexpected read error at offset {}: {err}", self.offset);
-                Err(err)
-            }
-        }
-    }
-}
-
 #[inline]
-fn is_truncation_marker(header: &[u8]) -> bool {
+pub(crate) fn is_truncation_marker(header: &[u8]) -> bool {
     header.iter().all(|&b| b == 0)
 }
