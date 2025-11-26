@@ -879,10 +879,7 @@ mod tests {
             Writer::create(&temp, SEGMENT_SIZE, HEADER_SIZE).expect("failed to create writer");
 
         assert_eq!(writer.write_offset(), HEADER_SIZE);
-        assert_eq!(
-            writer.remaining_bytes(),
-            SEGMENT_SIZE as u64 - HEADER_SIZE
-        );
+        assert_eq!(writer.remaining_bytes(), SEGMENT_SIZE as u64 - HEADER_SIZE);
 
         // First record should start at HEADER_SIZE
         let (offset, len) = writer.append(b"data").expect("failed to append");
@@ -1022,10 +1019,7 @@ mod tests {
             Writer::create(&temp, segment_size, HEADER_SIZE).expect("failed to create writer");
 
         // Remaining should not include header space
-        assert_eq!(
-            writer.remaining_bytes(),
-            segment_size as u64 - HEADER_SIZE
-        );
+        assert_eq!(writer.remaining_bytes(), segment_size as u64 - HEADER_SIZE);
 
         let data = vec![0u8; 50];
         writer.append(&data).expect("failed to append");
@@ -1063,8 +1057,7 @@ mod tests {
         drop(file);
 
         // Opening should detect corruption and stop at the last valid record
-        let writer =
-            Writer::open(&temp, SEGMENT_SIZE, HEADER_SIZE).expect("failed to open writer");
+        let writer = Writer::open(&temp, SEGMENT_SIZE, HEADER_SIZE).expect("failed to open writer");
         assert_eq!(writer.write_offset(), good_offset);
     }
 }
