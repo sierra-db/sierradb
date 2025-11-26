@@ -88,7 +88,7 @@ impl Writer {
         );
 
         let file = OpenOptions::new()
-            .read(false)
+            .read(true)
             .write(true)
             .create_new(true)
             .open(path)?;
@@ -161,7 +161,7 @@ impl Writer {
             "segment size cannot be less than or equal to start offset"
         );
 
-        let file = OpenOptions::new().read(false).write(true).open(&path)?;
+        let file = OpenOptions::new().read(true).write(true).open(&path)?;
         let mut write_offset = start_offset;
 
         // We need to scan forward to find the latest valid record, and consider that to
