@@ -61,10 +61,8 @@ pub fn parse_record(bytes: &[u8], offset: usize) -> Result<(&[u8], usize), ReadE
 
     // Check for truncation marker
     if is_truncation_marker(header_buf) {
-        return Err(ReadError::OutOfBounds {
+        return Err(ReadError::TruncationMarker {
             offset: offset as u64,
-            length: RECORD_HEAD_SIZE,
-            flushed_offset: bytes.len() as u64,
         });
     }
 

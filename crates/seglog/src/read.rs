@@ -25,6 +25,8 @@ pub enum ReadError {
         length: usize,
         flushed_offset: u64,
     },
+    #[error("truncation marker found at offset {offset}")]
+    TruncationMarker { offset: u64 },
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -170,11 +172,7 @@ impl Reader {
         let header_buf = &self.optimistic_buf[..RECORD_HEAD_SIZE];
 
         if is_truncation_marker(header_buf) {
-            return Err(ReadError::OutOfBounds {
-                offset,
-                length: RECORD_HEAD_SIZE,
-                flushed_offset,
-            });
+            return Err(ReadError::TruncationMarker { offset });
         }
 
         let data_len_bytes: [u8; LEN_SIZE] = header_buf[..LEN_SIZE].try_into().unwrap();
@@ -232,11 +230,7 @@ impl Reader {
             .read(&self.file, offset, RECORD_HEAD_SIZE)?;
 
         if is_truncation_marker(&header_buf[..RECORD_HEAD_SIZE]) {
-            return Err(ReadError::OutOfBounds {
-                offset,
-                length: RECORD_HEAD_SIZE,
-                flushed_offset,
-            });
+            return Err(ReadError::TruncationMarker { offset });
         }
 
         let data_len_bytes: [u8; LEN_SIZE] = header_buf[..LEN_SIZE].try_into().unwrap();
@@ -251,7 +245,7 @@ impl Reader {
         if data_offset + data_len as u64 > flushed_offset {
             return Err(ReadError::OutOfBounds {
                 offset,
-                length: RECORD_HEAD_SIZE,
+                length: RECORD_HEAD_SIZE + data_len,
                 flushed_offset,
             });
         }
@@ -335,7 +329,7 @@ impl Iter<'_> {
                 self.offset += (RECORD_HEAD_SIZE + data.len()) as u64;
                 Ok(Some((offset, data)))
             }
-            Err(ReadError::OutOfBounds { .. }) => Ok(None),
+            Err(ReadError::OutOfBounds { .. } | ReadError::TruncationMarker { .. }) => Ok(None),
             Err(err) => {
                 warn!("unexpected read error at offset {}: {err}", self.offset);
                 Err(err)

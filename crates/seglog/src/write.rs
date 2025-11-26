@@ -167,17 +167,25 @@ impl Writer {
         // We need to scan forward to find the latest valid record, and consider that to
         // be the write offset
         let mut reader = Reader::open(path, None)?;
-        let mut iter = reader.iter_from(start_offset);
+        let mut iter = reader.iter(start_offset);
         while let Some(res) = iter.next_record().transpose() {
             match res {
                 Ok((offset, data)) => {
                     write_offset = offset + (RECORD_HEAD_SIZE + data.len()) as u64;
                 }
                 Err(err) => match err {
-                    ReadError::Crc32cMismatch { .. } | ReadError::OutOfBounds { .. } => {
+                    ReadError::Crc32cMismatch { .. } => {
                         warn!(
                             "corruption found at {write_offset}: {err} - all data after this point will be considered invalid"
                         );
+                        break;
+                    }
+                    ReadError::OutOfBounds { .. } => {
+                        trace!("reached out of bounds at {write_offset}");
+                        break;
+                    }
+                    ReadError::TruncationMarker { .. } => {
+                        trace!("found truncation marker at {write_offset}");
                         break;
                     }
                     ReadError::Io(err) => return Err(WriteError::Io(err)),
