@@ -1,22 +1,28 @@
+mod format;
 mod iter;
 mod reader;
 mod writer;
 
 use std::os::unix::fs::FileExt;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
 use std::{fs, mem};
 
 use bincode::config::{Fixint, LittleEndian, NoLimit};
+use bincode::{Decode, Encode};
+use seglog::RECORD_HEAD_SIZE;
 use tracing::trace;
 use uuid::Uuid;
 
+pub use self::format::{
+    InvalidTimestamp, LongBytes, RawCommit, RawEvent, RecordHeader, RecordKind,
+    RecordKindTimestamp, ShortString,
+};
 pub use self::iter::SegmentIter;
 pub use self::reader::{
     BucketSegmentIter, BucketSegmentReader, CommitRecord, CommittedEvents, CommittedEventsIntoIter,
-    EventRecord, ReadHint, Record, SegmentBlock, SegmentBlockIter,
+    EventRecord, Record, SegmentBlock, SegmentBlockIter,
 };
-pub use self::writer::{AppendEvent, BucketSegmentWriter};
+pub use self::writer::BucketSegmentWriter;
 use crate::error::WriteError;
 
 const BINCODE_CONFIG: bincode::config::Configuration<LittleEndian, Fixint, NoLimit> =
@@ -35,11 +41,11 @@ pub const SEGMENT_HEADER_SIZE: usize =
     MAGIC_BYTES_SIZE + VERSION_SIZE + BUCKET_ID_SIZE + CREATED_AT_SIZE + PADDING_SIZE;
 
 // Record sizes
-pub const RECORD_HEADER_SIZE: usize = mem::size_of::<u64>() // Timestamp nanoseconds
-        + mem::size_of::<Uuid>() // Transaction ID
-        + mem::size_of::<u32>() // CRC32C hash
-        + mem::size_of::<u8>() // Confirmation count
-        + mem::size_of::<u32>(); // Confirmation count CRC32C hash
+pub const RECORD_HEADER_SIZE: usize = RECORD_HEAD_SIZE // seglog head size (len + crc32c)
+    + mem::size_of::<u64>() // Timestamp nanoseconds
+    + mem::size_of::<Uuid>() // Transaction ID
+    + mem::size_of::<u8>() // Confirmation count
+    + mem::size_of::<u32>(); // Confirmation count CRC32C hash
 pub const EVENT_HEADER_SIZE: usize = RECORD_HEADER_SIZE
     + mem::size_of::<Uuid>() // Event ID
     + mem::size_of::<Uuid>() // Partition key
@@ -52,91 +58,23 @@ pub const EVENT_HEADER_SIZE: usize = RECORD_HEADER_SIZE
     + mem::size_of::<u32>(); // Payload length
 pub const COMMIT_SIZE: usize = RECORD_HEADER_SIZE + mem::size_of::<u32>(); // Event count
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct BucketSegmentHeader {
-    version: u16,
-    bucket_id: BucketId,
-    created_at: u64,
+    pub magic_bytes: u32,
+    pub version: u16,
+    pub bucket_id: BucketId,
+    pub created_at: u64,
 }
 
-#[derive(Clone, Debug)]
-pub struct FlushedOffset(Arc<AtomicU64>);
-
-impl FlushedOffset {
-    pub fn new(offset: Arc<AtomicU64>) -> Self {
-        FlushedOffset(offset)
+impl BucketSegmentHeader {
+    pub fn new(bucket_id: BucketId) -> Result<Self, SystemTimeError> {
+        Ok(BucketSegmentHeader {
+            magic_bytes: MAGIC_BYTES,
+            version: 0,
+            bucket_id,
+            created_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64,
+        })
     }
-
-    pub fn load(&self) -> u64 {
-        self.0.load(Ordering::Acquire)
-    }
-}
-
-#[must_use]
-#[allow(clippy::too_many_arguments)]
-fn calculate_event_crc32c(
-    timestamp: u64,
-    transaction_id: &Uuid,
-    event_id: &Uuid,
-    partition_key: &Uuid,
-    partition_id: PartitionId,
-    partition_sequence: u64,
-    stream_version: u64,
-    stream_id: &str,
-    event_name: &str,
-    metadata: &[u8],
-    payload: &[u8],
-) -> u32 {
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(&timestamp.to_le_bytes());
-    hasher.update(transaction_id.as_bytes());
-    hasher.update(event_id.as_bytes());
-    hasher.update(partition_key.as_bytes());
-    hasher.update(&partition_id.to_le_bytes());
-    hasher.update(&partition_sequence.to_le_bytes());
-    hasher.update(&stream_version.to_le_bytes());
-    hasher.update(stream_id.as_bytes());
-    hasher.update(event_name.as_bytes());
-    hasher.update(metadata);
-    hasher.update(payload);
-    let hash = hasher.finalize();
-
-    trace!(
-        timestamp,
-        %transaction_id,
-        %event_id,
-        %partition_key,
-        partition_id,
-        partition_sequence,
-        stream_version,
-        %stream_id,
-        %event_name,
-        ?metadata,
-        ?payload,
-        hash,
-        "calculating event crc32c"
-    );
-
-    hash
-}
-
-#[must_use]
-fn calculate_commit_crc32c(transaction_id: &Uuid, encoded_timestamp: u64, event_count: u32) -> u32 {
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(transaction_id.as_bytes());
-    hasher.update(&encoded_timestamp.to_le_bytes());
-    hasher.update(&event_count.to_le_bytes());
-    let hash = hasher.finalize();
-
-    trace!(
-        %transaction_id,
-        encoded_timestamp,
-        event_count,
-        hash,
-        "calculating commit crc32c"
-    );
-
-    hash
 }
 
 #[must_use]
@@ -162,7 +100,7 @@ fn set_confirmations(
     transaction_id: &Uuid,
     confirmation_count: u8,
 ) -> Result<(), WriteError> {
-    offset += 8 + 16 + 4; // timestamp + transaction id + main crc32c
+    offset += RECORD_HEAD_SIZE as u64 + 8 + 16; // timestamp + transaction id
 
     let confirmation_count_crc32c =
         calculate_confirmation_count_crc32c(transaction_id, confirmation_count);
@@ -182,11 +120,14 @@ mod tests {
 
     use rand::rng;
     use rand::seq::SliceRandom;
+    use seglog::read::ReadHint;
     use uuid::Uuid;
-    use writer::AppendEvent;
 
     use super::*;
     use crate::StreamId;
+    use crate::bucket::segment::format::{
+        LongBytes, RawCommit, RawEvent, RecordHeader, ShortString,
+    };
 
     fn temp_file_path() -> PathBuf {
         tempfile::Builder::new()
@@ -213,17 +154,7 @@ mod tests {
     fn test_validate_magic_bytes() {
         let path = temp_file_path();
 
-        let header = BucketSegmentHeader {
-            version: 1,
-            bucket_id: 42,
-            created_at: 1700000000,
-        };
-
-        {
-            let mut writer = BucketSegmentWriter::create(&path, 0, 256 * 1024).unwrap();
-            writer.write_segment_header(&header).unwrap();
-            writer.flush().unwrap();
-        }
+        BucketSegmentWriter::create(&path, 42, 1024).unwrap();
 
         let mut reader = BucketSegmentReader::open(&path, None).unwrap();
         assert!(reader.validate_magic_bytes().unwrap());
@@ -249,34 +180,36 @@ mod tests {
         let flushed_offset;
 
         {
-            let mut writer = BucketSegmentWriter::create(&path, 0, 256 * 1024).unwrap();
+            let mut writer = BucketSegmentWriter::create(&path, 0, 256 * 1024 * 5).unwrap();
 
             for i in 0..10_000 {
                 if i % 5 == 0 {
                     let (offset, _) = writer
-                        .append_commit(&transaction_id, timestamp, 1, 1)
+                        .append_commit(&RawCommit {
+                            header: RecordHeader::new_commit(timestamp, transaction_id, 1).unwrap(),
+                            event_count: 1,
+                        })
                         .unwrap();
                     offsets.push((1u8, offset));
                 } else {
-                    let append = AppendEvent {
-                        event_id: &event_id,
-                        partition_key: &partition_key,
+                    let append = RawEvent {
+                        header: RecordHeader::new_event(timestamp, transaction_id, 1).unwrap(),
+                        event_id: event_id.into_bytes(),
+                        partition_key: partition_key.into_bytes(),
                         partition_id,
                         partition_sequence,
                         stream_version,
-                        stream_id: &stream_id,
-                        event_name,
-                        metadata,
-                        payload,
+                        stream_id: stream_id.clone(),
+                        event_name: ShortString(event_name.to_string()),
+                        metadata: LongBytes(metadata.to_vec()),
+                        payload: LongBytes(payload.to_vec()),
                     };
-                    let (offset, _) = writer
-                        .append_event(&transaction_id, timestamp, 1, append)
-                        .unwrap();
+                    let (offset, _) = writer.append_event(&append).unwrap();
                     offsets.push((0u8, offset));
                 }
             }
 
-            writer.flush().unwrap();
+            writer.sync().unwrap();
             flushed_offset = writer.flushed_offset();
         }
 

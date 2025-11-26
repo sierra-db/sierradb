@@ -24,7 +24,8 @@ fn bench_writer_append_small(c: &mut Criterion) {
     group.bench_function("1kb_records", |b| {
         b.iter(|| {
             let (_dir, path) = create_temp_segment();
-            let mut writer = Writer::create(&path, SEGMENT_SIZE).expect("failed to create writer");
+            let mut writer =
+                Writer::create(&path, SEGMENT_SIZE, 0).expect("failed to create writer");
 
             for _ in 0..1000 {
                 writer.append(black_box(&data)).expect("failed to append");
@@ -42,7 +43,8 @@ fn bench_writer_append_medium(c: &mut Criterion) {
     group.bench_function("64kb_records", |b| {
         b.iter(|| {
             let (_dir, path) = create_temp_segment();
-            let mut writer = Writer::create(&path, SEGMENT_SIZE).expect("failed to create writer");
+            let mut writer =
+                Writer::create(&path, SEGMENT_SIZE, 0).expect("failed to create writer");
 
             for _ in 0..100 {
                 writer.append(black_box(&data)).expect("failed to append");
@@ -60,7 +62,8 @@ fn bench_writer_append_large(c: &mut Criterion) {
     group.bench_function("1mb_records", |b| {
         b.iter(|| {
             let (_dir, path) = create_temp_segment();
-            let mut writer = Writer::create(&path, SEGMENT_SIZE).expect("failed to create writer");
+            let mut writer =
+                Writer::create(&path, SEGMENT_SIZE, 0).expect("failed to create writer");
 
             for _ in 0..10 {
                 writer.append(black_box(&data)).expect("failed to append");
@@ -78,7 +81,7 @@ fn bench_writer_sync(c: &mut Criterion) {
             || {
                 let (_dir, path) = create_temp_segment();
                 let mut writer =
-                    Writer::create(&path, SEGMENT_SIZE).expect("failed to create writer");
+                    Writer::create(&path, SEGMENT_SIZE, 0).expect("failed to create writer");
 
                 // Write some data
                 let data = vec![0u8; 1024];
@@ -104,7 +107,8 @@ fn bench_writer_throughput(c: &mut Criterion) {
     group.bench_function("sequential_writes", |b| {
         b.iter(|| {
             let (_dir, path) = create_temp_segment();
-            let mut writer = Writer::create(&path, SEGMENT_SIZE).expect("failed to create writer");
+            let mut writer =
+                Writer::create(&path, SEGMENT_SIZE, 0).expect("failed to create writer");
 
             for _ in 0..1000 {
                 writer.append(black_box(&data)).expect("failed to append");
@@ -122,7 +126,7 @@ fn bench_reader_sequential(c: &mut Criterion) {
 
     // Prepare segment with data
     let (_dir, path) = create_temp_segment();
-    let mut writer = Writer::create(&path, SEGMENT_SIZE).expect("failed to create writer");
+    let mut writer = Writer::create(&path, SEGMENT_SIZE, 0).expect("failed to create writer");
     let data = vec![0u8; 4096]; // 4 KB
 
     for _ in 0..1000 {
@@ -157,7 +161,7 @@ fn bench_reader_random(c: &mut Criterion) {
 
     // Prepare segment with data
     let (_dir, path) = create_temp_segment();
-    let mut writer = Writer::create(&path, SEGMENT_SIZE).expect("failed to create writer");
+    let mut writer = Writer::create(&path, SEGMENT_SIZE, 0).expect("failed to create writer");
     let data = vec![0u8; 4096]; // 4 KB
 
     let mut offsets = Vec::new();
@@ -191,7 +195,7 @@ fn bench_reader_sequential_hint(c: &mut Criterion) {
 
     // Prepare segment with data
     let (_dir, path) = create_temp_segment();
-    let mut writer = Writer::create(&path, SEGMENT_SIZE).expect("failed to create writer");
+    let mut writer = Writer::create(&path, SEGMENT_SIZE, 0).expect("failed to create writer");
     let data = vec![0u8; 4096]; // 4 KB
 
     let mut offsets = Vec::new();
@@ -226,7 +230,7 @@ fn bench_read_small_records(c: &mut Criterion) {
 
     // Prepare segment
     let (_dir, path) = create_temp_segment();
-    let mut writer = Writer::create(&path, SEGMENT_SIZE).expect("failed to create writer");
+    let mut writer = Writer::create(&path, SEGMENT_SIZE, 0).expect("failed to create writer");
 
     for _ in 0..1000 {
         writer.append(&data).expect("failed to append");
@@ -257,7 +261,7 @@ fn bench_read_large_records(c: &mut Criterion) {
 
     // Prepare segment
     let (_dir, path) = create_temp_segment();
-    let mut writer = Writer::create(&path, SEGMENT_SIZE).expect("failed to create writer");
+    let mut writer = Writer::create(&path, SEGMENT_SIZE, 0).expect("failed to create writer");
 
     for _ in 0..10 {
         writer.append(&data).expect("failed to append");
@@ -288,7 +292,7 @@ fn bench_read_throughput(c: &mut Criterion) {
 
     // Prepare segment
     let (_dir, path) = create_temp_segment();
-    let mut writer = Writer::create(&path, SEGMENT_SIZE).expect("failed to create writer");
+    let mut writer = Writer::create(&path, SEGMENT_SIZE, 0).expect("failed to create writer");
 
     for _ in 0..10000 {
         writer.append(&data).expect("failed to append");
@@ -320,7 +324,7 @@ fn bench_iter_vs_random(c: &mut Criterion) {
 
     // Prepare segment
     let (_dir, path) = create_temp_segment();
-    let mut writer = Writer::create(&path, SEGMENT_SIZE).expect("failed to create writer");
+    let mut writer = Writer::create(&path, SEGMENT_SIZE, 0).expect("failed to create writer");
     let data = vec![0u8; 4096];
 
     let mut offsets = Vec::new();
@@ -384,7 +388,7 @@ fn bench_record_size_comparison(c: &mut Criterion) {
                 || {
                     let (_dir, path) = create_temp_segment();
                     let writer =
-                        Writer::create(&path, SEGMENT_SIZE).expect("failed to create writer");
+                        Writer::create(&path, SEGMENT_SIZE, 0).expect("failed to create writer");
                     (_dir, path, writer)
                 },
                 |(_dir, _path, mut writer)| {
@@ -398,7 +402,7 @@ fn bench_record_size_comparison(c: &mut Criterion) {
                 || {
                     let (_dir, path) = create_temp_segment();
                     let mut writer =
-                        Writer::create(&path, SEGMENT_SIZE).expect("failed to create writer");
+                        Writer::create(&path, SEGMENT_SIZE, 0).expect("failed to create writer");
                     writer.append(data).expect("failed to append");
                     writer.sync().expect("failed to sync");
                     let flushed = writer.flushed_offset();

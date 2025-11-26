@@ -3,8 +3,12 @@ use std::fs;
 use criterion::{Criterion, criterion_group, criterion_main};
 use rand::rng;
 use rand::seq::SliceRandom;
+use seglog::read::ReadHint;
 use sierradb::StreamId;
-use sierradb::bucket::segment::{AppendEvent, BucketSegmentReader, BucketSegmentWriter, ReadHint};
+use sierradb::bucket::segment::{
+    BucketSegmentReader, BucketSegmentWriter, LongBytes, RawCommit, RawEvent,
+    RecordHeader, ShortString,
+};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
@@ -26,24 +30,23 @@ fn setup_test_file() -> (BucketSegmentWriter, Vec<u64>) {
         let metadata = b"{}";
         let payload = b"Some event data";
 
-        let event = AppendEvent {
-            event_id: &event_id,
-            partition_key: &partition_key,
+        let event = RawEvent {
+            header: RecordHeader::new_event(0, transaction_id, 0).unwrap(),
+            event_id: event_id.into_bytes(),
+            partition_key: partition_key.into_bytes(),
             partition_id: 0,
             partition_sequence: i as u64,
             stream_version: 0,
-            stream_id: &stream_id,
-            event_name,
-            metadata,
-            payload,
+            stream_id,
+            event_name: ShortString(event_name.to_string()),
+            metadata: LongBytes(metadata.to_vec()),
+            payload: LongBytes(payload.to_vec()),
         };
-        let (offset, _) = writer
-            .append_event(&transaction_id, 0, 0, event)
-            .expect("Failed to write event");
+        let (offset, _) = writer.append_event(&event).expect("Failed to write event");
         offsets.push(offset);
     }
 
-    writer.flush().expect("Failed to flush writer");
+    writer.sync().expect("Failed to flush writer");
     (writer, offsets)
 }
 
@@ -90,7 +93,8 @@ fn benchmark_writes(c: &mut Criterion) {
 
     group.bench_function("Append event", |b| {
         let file = NamedTempFile::new().unwrap();
-        let mut writer = BucketSegmentWriter::open(file.path()).expect("Failed to open writer");
+        let mut writer =
+            BucketSegmentWriter::open(file.path(), 1024 * 1024).expect("Failed to open writer");
         b.iter(|| {
             let event_id = Uuid::new_v4();
             let partition_key = Uuid::new_v4();
@@ -100,31 +104,34 @@ fn benchmark_writes(c: &mut Criterion) {
             let metadata = b"{}";
             let payload = b"Some event data";
 
-            let event = AppendEvent {
-                event_id: &event_id,
-                partition_key: &partition_key,
+            let event = RawEvent {
+                header: RecordHeader::new_event(0, transaction_id, 0).unwrap(),
+                event_id: event_id.into_bytes(),
+                partition_key: partition_key.into_bytes(),
                 partition_id: 0,
                 partition_sequence: 0,
                 stream_version: 0,
-                stream_id: &stream_id,
-                event_name,
-                metadata,
-                payload,
+                stream_id,
+                event_name: ShortString(event_name.to_string()),
+                metadata: LongBytes(metadata.to_vec()),
+                payload: LongBytes(payload.to_vec()),
             };
-            writer
-                .append_event(&transaction_id, 0, 0, event)
-                .expect("Failed to write event");
+            writer.append_event(&event).expect("Failed to write event");
         });
     });
 
     group.bench_function("Append commit", |b| {
         let file = NamedTempFile::new().unwrap();
-        let mut writer = BucketSegmentWriter::open(file.path()).expect("Failed to open writer");
+        let mut writer =
+            BucketSegmentWriter::open(file.path(), 1024 * 1024).expect("Failed to open writer");
         b.iter(|| {
             let transaction_id = Uuid::new_v4();
 
             writer
-                .append_commit(&transaction_id, 0, 0, 0)
+                .append_commit(&RawCommit {
+                    header: RecordHeader::new_commit(0, transaction_id, 0).unwrap(),
+                    event_count: 0,
+                })
                 .expect("Failed to write commit");
         });
     });

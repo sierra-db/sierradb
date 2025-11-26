@@ -11,10 +11,11 @@ repository.workspace = true
 version.workspace = true
 
 [dependencies]
+seglog.workspace = true
 sierradb-protocol.workspace = true
 
 arc-swap.workspace = true
-bincode = { workspace = true, features = ["serde"] }
+bincode = { workspace = true, features = ["derive", "serde"] }
 bloomfilter.workspace = true
 boomphf = { workspace = true, features = ["serde"] }
 crc32fast.workspace = true
