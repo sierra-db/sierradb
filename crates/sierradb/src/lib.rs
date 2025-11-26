@@ -2,6 +2,12 @@ use core::fmt;
 use std::sync::Arc;
 use std::{borrow, ops};
 
+use bincode::de::Decoder;
+use bincode::de::read::Reader;
+use bincode::enc::Encoder;
+use bincode::enc::write::Writer;
+use bincode::error::{DecodeError, EncodeError};
+use bincode::{Decode, Encode, impl_borrow_decode};
 use error::StreamIdError;
 use serde::{Deserialize, Serialize};
 
@@ -97,6 +103,28 @@ impl PartialEq<StreamId> for &str {
         *self == other.inner.as_ref()
     }
 }
+
+impl Encode for StreamId {
+    fn encode<E: Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {
+        (self.len() as u8).encode(encoder)?;
+        encoder.writer().write(self.as_bytes())
+    }
+}
+
+impl<C> Decode<C> for StreamId {
+    fn decode<D: Decoder<Context = C>>(decoder: &mut D) -> Result<Self, DecodeError> {
+        let len = u8::decode(decoder)? as usize;
+        decoder.claim_container_read::<u8>(len)?;
+        let mut vec = vec![0; len];
+        decoder.reader().read(&mut vec)?;
+        let s = String::from_utf8(vec).map_err(|e| DecodeError::Utf8 {
+            inner: e.utf8_error(),
+        })?;
+        StreamId::new(s).map_err(|err| DecodeError::OtherString(err.to_string()))
+    }
+}
+
+impl_borrow_decode!(StreamId);
 
 #[derive(Clone, Copy, Debug)]
 pub enum IterDirection {

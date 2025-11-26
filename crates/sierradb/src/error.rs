@@ -11,6 +11,7 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::StreamId;
+use crate::bucket::segment::InvalidTimestamp;
 use crate::bucket::{
     BucketId, BucketSegmentId, PartitionId, event_index, partition_index, stream_index,
 };
@@ -62,14 +63,8 @@ pub enum DatabaseError {
 
 #[derive(Debug, Error)]
 pub enum ReadError {
-    #[error("crc32c hash mismatch")]
-    Crc32cMismatch { offset: u64 },
     #[error("confirmation count crc32c hash mismatch")]
     ConfirmationCountCrc32cMismatch { offset: u64 },
-    #[error("offset out of bounds of segment block")]
-    OutOfBounds,
-    #[error("unknown record type: {0}")]
-    UnknownRecordType(u8),
     #[error("no reply from the reader thread")]
     NoThreadReply,
     #[error(transparent)]
@@ -77,7 +72,13 @@ pub enum ReadError {
     #[error(transparent)]
     EventIndex(#[from] Box<EventIndexError>),
     #[error(transparent)]
-    Io(#[from] io::Error),
+    Reader(#[from] seglog::read::ReadError),
+}
+
+impl From<io::Error> for ReadError {
+    fn from(err: io::Error) -> Self {
+        ReadError::Reader(seglog::read::ReadError::Io(err))
+    }
 }
 
 #[derive(Debug, Error)]
@@ -138,14 +139,23 @@ pub enum WriteError {
     #[error(transparent)]
     PartitionIndex(#[from] PartitionIndexError),
     #[error(transparent)]
-    Io(#[from] io::Error),
-    #[cfg(target_os = "linux")]
-    #[error(transparent)]
-    Nix(#[from] nix::errno::Errno),
+    Writer(#[from] seglog::write::WriteError),
+}
+
+impl From<io::Error> for WriteError {
+    fn from(err: io::Error) -> Self {
+        WriteError::Writer(seglog::write::WriteError::Io(err))
+    }
 }
 
 impl From<SystemTimeError> for WriteError {
     fn from(_: SystemTimeError) -> Self {
+        WriteError::BadSystemTime
+    }
+}
+
+impl From<InvalidTimestamp> for WriteError {
+    fn from(_: InvalidTimestamp) -> Self {
         WriteError::BadSystemTime
     }
 }

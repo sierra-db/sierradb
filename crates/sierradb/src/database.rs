@@ -8,6 +8,7 @@ use std::{fs, process};
 
 use libc::{RLIMIT_NOFILE, getrlimit, rlimit, setrlimit};
 use rayon::{ThreadPool, ThreadPoolBuildError, ThreadPoolBuilder};
+use seglog::read::ReadHint;
 use serde::{Deserialize, Serialize};
 pub use sierradb_protocol::{CurrentVersion, ExpectedVersion, VersionGap};
 use smallvec::SmallVec;
@@ -20,7 +21,7 @@ use crate::bucket::iter::{PartitionIter, PartitionIterConfig, StreamIter, Stream
 use crate::bucket::partition_index::{
     ClosedPartitionIndex, PartitionIndexRecord, PartitionOffsets,
 };
-use crate::bucket::segment::{BucketSegmentReader, CommittedEvents, EventRecord, ReadHint};
+use crate::bucket::segment::{BucketSegmentReader, CommittedEvents, EventRecord};
 use crate::bucket::stream_index::{ClosedStreamIndex, StreamIndexRecord, StreamOffsets};
 use crate::bucket::{BucketId, BucketSegmentId, PartitionId, SegmentId};
 use crate::cache::BLOCK_SIZE;

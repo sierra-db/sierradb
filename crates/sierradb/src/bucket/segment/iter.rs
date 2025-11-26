@@ -4,11 +4,12 @@ use std::{io, mem};
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
+use seglog::read::ReadHint;
 use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
 use crate::IterDirection;
-use crate::bucket::segment::{CommittedEvents, ReadHint, SegmentBlock};
+use crate::bucket::segment::{CommittedEvents, SegmentBlock};
 use crate::bucket::{BucketId, BucketSegmentId, SegmentId};
 use crate::cache::SegmentBlockCache;
 use crate::error::ReadError;
@@ -189,7 +190,7 @@ impl SegmentIter {
                             warn!("offset points to event which doesn't exist");
                             break;
                         }
-                        Err(ReadError::OutOfBounds) => {
+                        Err(ReadError::Reader(seglog::read::ReadError::OutOfBounds { .. })) => {
                             let next_segment_block_offset = block.next_segment_block_offset();
                             if offset >= next_segment_block_offset {
                                 // Preload the next cache block and read from cache again
@@ -260,9 +261,11 @@ impl SegmentIter {
                     }
                 }
                 (None, _) => {
-                    return Err(ReadError::Io(io::Error::other(format!(
-                        "event not found at offset {offset} in {bucket_segment_id}"
-                    ))));
+                    return Err(ReadError::Reader(seglog::read::ReadError::Io(
+                        io::Error::other(format!(
+                            "event not found at offset {offset} in {bucket_segment_id}"
+                        )),
+                    )));
                 }
             }
         }

@@ -1,42 +1,32 @@
-use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use std::{fmt, mem, ops, option, vec};
 
-use bincode::Decode;
-use bincode::de::Decoder;
-use bincode::de::read::Reader;
-use bincode::error::DecodeError;
 use polonius_the_crab::{exit_polonius, polonius, polonius_return, polonius_try};
+use seglog::FlushedOffset;
+use seglog::read::ReadHint;
 use serde::{Deserialize, Serialize};
 use smallvec::{SmallVec, smallvec};
-use tracing::{debug, warn};
+use tracing::warn;
 use uuid::Uuid;
 
 use super::{
     BINCODE_CONFIG, BUCKET_ID_SIZE, BucketSegmentHeader, COMMIT_SIZE, CREATED_AT_SIZE,
-    EVENT_HEADER_SIZE, FlushedOffset, MAGIC_BYTES, MAGIC_BYTES_SIZE, RECORD_HEADER_SIZE,
-    SEGMENT_HEADER_SIZE, VERSION_SIZE, calculate_commit_crc32c,
-    calculate_confirmation_count_crc32c, calculate_event_crc32c,
+    EVENT_HEADER_SIZE, MAGIC_BYTES, MAGIC_BYTES_SIZE, VERSION_SIZE,
 };
 use crate::StreamId;
+use crate::bucket::segment::SEGMENT_HEADER_SIZE;
+use crate::bucket::segment::format::{RawCommit, RawEvent};
 use crate::bucket::{BucketId, PartitionId};
 use crate::cache::BLOCK_SIZE;
 use crate::error::{ReadError, WriteError};
 use crate::id::{get_uuid_flag, uuid_to_partition_hash};
 
-const HEADER_BUF_SIZE: usize = EVENT_HEADER_SIZE - RECORD_HEADER_SIZE;
-const PAGE_SIZE: usize = 4096; // Usually a page is 4KB on Linux
-const READ_AHEAD_SIZE: usize = 64 * 1024; // 64 KB read ahead buffer
-const READ_BUF_SIZE: usize = PAGE_SIZE - COMMIT_SIZE;
-
 #[derive(Clone)]
 pub struct SegmentBlock {
     offset: u64,
-    block: [u8; BLOCK_SIZE],
+    block: Box<[u8]>, // Guaranteed to have length of BLOCK_SIZE
 }
 
 impl SegmentBlock {
@@ -107,74 +97,30 @@ impl SegmentBlock {
     }
 
     pub fn read_record(&self, start_offset: u64) -> Result<Option<Record>, ReadError> {
-        if start_offset < self.offset
-            || start_offset + RECORD_HEADER_SIZE as u64 - self.offset > BLOCK_SIZE as u64
-        {
-            return Err(ReadError::OutOfBounds);
+        let offset = (start_offset - self.offset) as usize;
+        let (bytes, _) = seglog::parse::parse_record(&self.block, offset)?;
+
+        if bytes.len() < mem::size_of::<u64>() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "insufficient bytes for record",
+            )
+            .into());
         }
 
-        let mut offset = (start_offset - self.offset) as usize;
-        let header_buf = &self.block[offset..offset + RECORD_HEADER_SIZE];
-        offset += RECORD_HEADER_SIZE;
+        let is_commit = u64::from_le_bytes(bytes[..8].try_into().unwrap()) & (1u64 << 63) != 0;
 
-        if is_truncation_marker(&header_buf[..RECORD_HEADER_SIZE]) {
-            return Ok(None);
-        }
-
-        let (record_header, _) = bincode::decode_from_slice::<RecordHeader, _>(
-            &header_buf[..RECORD_HEADER_SIZE],
-            BINCODE_CONFIG,
-        )?;
-
-        if record_header.record_kind == 0 {
-            self.read_event_body(start_offset, record_header, offset)
-                .map(|event| Some(Record::Event(event)))
-        } else if record_header.record_kind == 1 {
-            if offset + 4 > BLOCK_SIZE {
-                return Err(ReadError::OutOfBounds);
-            }
-
-            let event_count =
-                u32::from_le_bytes(self.block[offset..offset + 4].try_into().unwrap());
-            Ok(Some(Record::Commit(CommitRecord::from_parts(
-                start_offset,
-                record_header,
-                event_count,
-            )?)))
+        if is_commit {
+            let (record, _) = bincode::decode_from_slice::<RawCommit, _>(bytes, BINCODE_CONFIG)?;
+            record.header.validate(start_offset)?;
+            let commit = Record::Commit(CommitRecord::from_raw(start_offset, record));
+            Ok(Some(commit))
         } else {
-            Err(ReadError::UnknownRecordType(record_header.record_kind))
+            let (record, _) = bincode::decode_from_slice::<RawEvent, _>(bytes, BINCODE_CONFIG)?;
+            record.header.validate(start_offset)?;
+            let event = Record::Event(EventRecord::from_raw(start_offset, record));
+            Ok(Some(event))
         }
-    }
-
-    fn read_event_body(
-        &self,
-        start_offset: u64,
-        record_header: RecordHeader,
-        mut offset: usize,
-    ) -> Result<EventRecord, ReadError> {
-        let length = EVENT_HEADER_SIZE - RECORD_HEADER_SIZE;
-
-        if offset + length > BLOCK_SIZE {
-            return Err(ReadError::OutOfBounds);
-        }
-
-        let header_buf = &self.block[offset..offset + length];
-        offset += length;
-
-        let (event_header, _) =
-            bincode::decode_from_slice::<EventHeader, _>(header_buf, BINCODE_CONFIG)?;
-
-        let body_len = event_header.body_len();
-
-        if offset + body_len > BLOCK_SIZE {
-            return Err(ReadError::OutOfBounds);
-        }
-
-        let body_buf = &self.block[offset..offset + body_len];
-        let body =
-            bincode::decode_from_slice_with_context(body_buf, BINCODE_CONFIG, &event_header)?.0;
-
-        EventRecord::from_parts(start_offset, record_header, event_header, body)
     }
 }
 
@@ -188,7 +134,7 @@ impl fmt::Debug for SegmentBlock {
 }
 
 impl ops::Deref for SegmentBlock {
-    type Target = [u8; BLOCK_SIZE];
+    type Target = [u8]; // ; BLOCK_SIZE];
 
     fn deref(&self) -> &Self::Target {
         &self.block
@@ -374,142 +320,35 @@ impl DoubleEndedIterator for CommittedEventsIntoIter {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReadHint {
-    Random,
-    Sequential,
-}
-
 pub struct BucketSegmentReader {
-    file: File,
-    header_buf: [u8; HEADER_BUF_SIZE],
-    body_buf: [u8; READ_BUF_SIZE],
-    flushed_offset: FlushedOffset,
-
-    // Read-ahead buffer for sequential reads
-    read_ahead_buf: Vec<u8>,
-    read_ahead_offset: u64, // File offset of the buffer start
-    read_ahead_pos: usize,  // Current read position in buffer
-    read_ahead_valid_len: usize,
+    reader: seglog::read::Reader,
 }
 
 impl BucketSegmentReader {
-    /// Opens a segment as read only.
     pub fn open(
         path: impl AsRef<Path>,
         flushed_offset: Option<FlushedOffset>,
     ) -> Result<Self, ReadError> {
-        let mut opts = OpenOptions::new();
-        opts.read(true).write(false);
-
-        #[cfg(target_os = "macos")]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            // On OSX, gives ~5% better performance for both random and sequential reads
-            const O_DIRECT: i32 = 0o0040000;
-            opts.custom_flags(O_DIRECT);
-        }
-
-        let file = opts.open(path)?;
-        let header_buf = [0u8; HEADER_BUF_SIZE];
-        let body_buf = [0u8; READ_BUF_SIZE];
-
-        let flushed_offset = match flushed_offset {
-            Some(flushed_offset) => flushed_offset,
-            None => {
-                let len = file.metadata()?.len();
-                FlushedOffset::new(Arc::new(AtomicU64::new(len)))
-            }
-        };
-
-        let reader = BucketSegmentReader {
-            file,
-            header_buf,
-            body_buf,
-            flushed_offset,
-            read_ahead_buf: Vec::new(),
-            read_ahead_offset: 0,
-            read_ahead_pos: 0,
-            read_ahead_valid_len: 0,
-        };
-
-        Ok(reader)
+        Ok(BucketSegmentReader {
+            reader: seglog::read::Reader::open(path, flushed_offset)?,
+        })
     }
 
     pub fn try_clone(&self) -> Result<Self, ReadError> {
         Ok(BucketSegmentReader {
-            file: self.file.try_clone()?,
-            header_buf: self.header_buf,
-            body_buf: self.body_buf,
-            flushed_offset: self.flushed_offset.clone(),
-            read_ahead_buf: Vec::with_capacity(READ_AHEAD_SIZE),
-            read_ahead_offset: 0,
-            read_ahead_pos: 0,
-            read_ahead_valid_len: 0,
+            reader: self.reader.try_clone()?,
         })
-    }
-
-    pub fn flushed_offset(&self) -> &FlushedOffset {
-        &self.flushed_offset
     }
 
     /// Reads the segments header.
     pub fn read_segment_header(&mut self) -> Result<BucketSegmentHeader, ReadError> {
-        let mut header_bytes = [0u8; VERSION_SIZE + BUCKET_ID_SIZE + CREATED_AT_SIZE];
+        let mut buf = [0u8; mem::size_of::<BucketSegmentHeader>()];
+        self.reader.file().read_exact_at(&mut buf, 0)?;
 
-        self.file.seek(SeekFrom::Start(MAGIC_BYTES_SIZE as u64))?;
-        self.file.read_exact(&mut header_bytes)?;
+        let (header, _) = bincode::decode_from_slice(&buf, BINCODE_CONFIG)?;
 
-        let version_bytes = header_bytes[0..VERSION_SIZE].try_into().unwrap();
-        let version = u16::from_le_bytes(version_bytes);
-
-        let bucket_id_bytes = header_bytes[VERSION_SIZE..VERSION_SIZE + BUCKET_ID_SIZE]
-            .try_into()
-            .unwrap();
-        let bucket_id = BucketId::from_le_bytes(bucket_id_bytes);
-
-        let created_at_bytes = header_bytes
-            [VERSION_SIZE + BUCKET_ID_SIZE..VERSION_SIZE + BUCKET_ID_SIZE + CREATED_AT_SIZE]
-            .try_into()
-            .unwrap();
-        let created_at = u64::from_le_bytes(created_at_bytes);
-
-        Ok(BucketSegmentHeader {
-            version,
-            bucket_id,
-            created_at,
-        })
+        Ok(header)
     }
-
-    pub fn iter(&mut self) -> BucketSegmentIter<'_> {
-        BucketSegmentIter {
-            reader: self,
-            offset: SEGMENT_HEADER_SIZE as u64,
-        }
-    }
-
-    pub fn iter_from(&mut self, start_offset: u64) -> BucketSegmentIter<'_> {
-        BucketSegmentIter {
-            reader: self,
-            offset: start_offset,
-        }
-    }
-
-    #[cfg(all(unix, target_os = "linux"))]
-    pub fn prefetch(&self, offset: u64) {
-        use std::os::fd::AsRawFd;
-        unsafe {
-            libc::posix_fadvise(
-                self.file.as_raw_fd(),
-                offset as i64,
-                PAGE_SIZE as i64,
-                libc::POSIX_FADV_WILLNEED,
-            );
-        }
-    }
-
-    #[cfg(not(all(unix, target_os = "linux")))]
-    pub fn prefetch(&self, _offset: u64) {}
 
     /// Validates the segments magic bytes.
     ///
@@ -517,8 +356,7 @@ impl BucketSegmentReader {
     pub fn validate_magic_bytes(&mut self) -> Result<bool, ReadError> {
         let mut magic_bytes = [0u8; MAGIC_BYTES_SIZE];
 
-        self.file.seek(SeekFrom::Start(0))?;
-        self.file.read_exact(&mut magic_bytes)?;
+        self.reader.file().read_exact_at(&mut magic_bytes, 0)?;
 
         Ok(u32::from_le_bytes(magic_bytes) == MAGIC_BYTES)
     }
@@ -527,8 +365,9 @@ impl BucketSegmentReader {
     pub fn read_version(&mut self) -> Result<u16, ReadError> {
         let mut version_bytes = [0u8; VERSION_SIZE];
 
-        self.file.seek(SeekFrom::Start(MAGIC_BYTES_SIZE as u64))?;
-        self.file.read_exact(&mut version_bytes)?;
+        self.reader
+            .file()
+            .read_exact_at(&mut version_bytes, MAGIC_BYTES_SIZE as u64)?;
 
         Ok(u16::from_le_bytes(version_bytes))
     }
@@ -537,9 +376,10 @@ impl BucketSegmentReader {
     pub fn read_bucket_id(&mut self) -> Result<BucketId, ReadError> {
         let mut bucket_id_bytes = [0u8; BUCKET_ID_SIZE];
 
-        self.file
-            .seek(SeekFrom::Start((MAGIC_BYTES_SIZE + VERSION_SIZE) as u64))?;
-        self.file.read_exact(&mut bucket_id_bytes)?;
+        self.reader.file().read_exact_at(
+            &mut bucket_id_bytes,
+            (MAGIC_BYTES_SIZE + VERSION_SIZE) as u64,
+        )?;
 
         Ok(u16::from_le_bytes(bucket_id_bytes))
     }
@@ -548,10 +388,10 @@ impl BucketSegmentReader {
     pub fn read_created_at(&mut self) -> Result<u64, ReadError> {
         let mut created_at_bytes = [0u8; CREATED_AT_SIZE];
 
-        self.file.seek(SeekFrom::Start(
+        self.reader.file().read_exact_at(
+            &mut created_at_bytes,
             (MAGIC_BYTES_SIZE + VERSION_SIZE + BUCKET_ID_SIZE) as u64,
-        ))?;
-        self.file.read_exact(&mut created_at_bytes)?;
+        )?;
 
         Ok(u64::from_le_bytes(created_at_bytes))
     }
@@ -562,47 +402,12 @@ impl BucketSegmentReader {
         transaction_id: &Uuid,
         confirmation_count: u8,
     ) -> Result<(), WriteError> {
-        super::set_confirmations(&self.file, offset, transaction_id, confirmation_count)
-    }
-
-    pub fn read_block(&self, offset: u64) -> Result<Option<SegmentBlock>, ReadError> {
-        // Check that the entire block is within the flushed region
-        let block_end = offset.checked_add(BLOCK_SIZE as u64).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("block offset {offset} + size {BLOCK_SIZE} overflows u64"),
-            )
-        })?;
-
-        let flushed = self.flushed_offset.load();
-
-        if block_end > flushed {
-            // Block not fully flushed - not an error, just not ready yet
-            debug!("block end is {block_end}, but only flushed up to {flushed}");
-            return Ok(None);
-        }
-
-        let mut buf = [0; BLOCK_SIZE];
-
-        // Perform positioned read
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::FileExt;
-            self.file.read_exact_at(&mut buf, offset)?;
-        }
-
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::FileExt;
-            self.file.seek_read(&mut buf, offset)?;
-        }
-
-        #[cfg(not(any(unix, windows)))]
-        {
-            compile_error!("Unsupported platform for positioned file I/O");
-        }
-
-        Ok(Some(SegmentBlock { offset, block: buf }))
+        super::set_confirmations(
+            self.reader.file(),
+            offset,
+            transaction_id,
+            confirmation_count,
+        )
     }
 
     pub fn read_committed_events(
@@ -671,6 +476,19 @@ impl BucketSegmentReader {
         }
     }
 
+    /// Creates an iterator over all records starting from offset 0.
+    pub fn iter(&mut self) -> BucketSegmentIter<'_> {
+        self.iter_from(SEGMENT_HEADER_SIZE as u64)
+    }
+
+    /// Creates an iterator over records starting from the specified offset.
+    pub fn iter_from(&mut self, offset: u64) -> BucketSegmentIter<'_> {
+        BucketSegmentIter {
+            reader: self,
+            offset,
+        }
+    }
+
     /// Reads a record at the given offset, returning either an event or commit.
     ///
     /// If sequential is `true`, the read will be optimized for future
@@ -685,154 +503,42 @@ impl BucketSegmentReader {
         start_offset: u64,
         hint: ReadHint,
     ) -> Result<Option<Record>, ReadError> {
-        // This is the only check needed. We don't need to check for the event body,
-        // since if the offset supports this header read, then the event body would have
-        // also been written too for the flush.
-        if start_offset + COMMIT_SIZE as u64 > self.flushed_offset.load() {
-            return Ok(None);
-        }
-
-        let mut offset = start_offset;
-        let header_buf = if matches!(hint, ReadHint::Sequential) {
-            self.read_from_read_ahead(offset, COMMIT_SIZE)?
-        } else {
-            self.file
-                .read_exact_at(&mut self.header_buf[..COMMIT_SIZE], offset)?;
-            self.header_buf.as_slice()
-        };
-        offset += COMMIT_SIZE as u64;
-
-        if is_truncation_marker(&header_buf[..RECORD_HEADER_SIZE]) {
-            return Ok(None);
-        }
-
-        let (record_header, _) = bincode::decode_from_slice::<RecordHeader, _>(
-            &header_buf[..RECORD_HEADER_SIZE],
-            BINCODE_CONFIG,
-        )?;
-
-        if record_header.record_kind == 0 {
-            // Backtrack the event count
-            offset -= mem::size_of::<u32>() as u64;
-
-            self.read_event_body(start_offset, record_header, offset, hint)
-                .map(|event| Some(Record::Event(event)))
-        } else if record_header.record_kind == 1 {
-            let event_count = u32::from_le_bytes(
-                header_buf[RECORD_HEADER_SIZE..RECORD_HEADER_SIZE + 4]
-                    .try_into()
-                    .unwrap(),
-            );
-            Ok(Some(Record::Commit(CommitRecord::from_parts(
-                start_offset,
-                record_header,
-                event_count,
-            )?)))
-        } else {
-            Err(ReadError::UnknownRecordType(record_header.record_kind))
-        }
-    }
-
-    fn read_event_body(
-        &mut self,
-        start_offset: u64,
-        record_header: RecordHeader,
-        mut offset: u64,
-        hint: ReadHint,
-    ) -> Result<EventRecord, ReadError> {
-        let length = EVENT_HEADER_SIZE - RECORD_HEADER_SIZE;
-        let header_buf = if matches!(hint, ReadHint::Sequential) {
-            self.read_from_read_ahead(offset, length)?
-        } else {
-            self.file
-                .read_exact_at(&mut self.header_buf[..length], offset)?;
-            self.header_buf.as_slice()
-        };
-        offset += length as u64;
-
-        let (event_header, _) =
-            bincode::decode_from_slice::<EventHeader, _>(header_buf, BINCODE_CONFIG)?;
-
-        let body_len = event_header.body_len();
-        let body = if matches!(hint, ReadHint::Sequential) {
-            let body_buf = self.read_from_read_ahead(offset, body_len)?;
-            bincode::decode_from_slice_with_context(body_buf, BINCODE_CONFIG, &event_header)?.0
-        } else if body_len > self.body_buf.len() {
-            let mut body_buf = vec![0u8; body_len];
-            self.file.read_exact_at(&mut body_buf, offset)?;
-            bincode::decode_from_slice_with_context(&body_buf, BINCODE_CONFIG, &event_header)?.0
-        } else {
-            self.file
-                .read_exact_at(&mut self.body_buf[..body_len], offset)?;
-            bincode::decode_from_slice_with_context(&self.body_buf, BINCODE_CONFIG, &event_header)?
-                .0
+        let bytes = match self.reader.read_record(start_offset, hint) {
+            Ok(bytes) => bytes,
+            Err(seglog::read::ReadError::OutOfBounds { .. }) => return Ok(None),
+            Err(err) => return Err(err.into()),
         };
 
-        EventRecord::from_parts(start_offset, record_header, event_header, body)
-    }
-
-    fn fill_read_ahead(&mut self, offset: u64, mut length: usize) -> Result<(), ReadError> {
-        let end_offset = offset + length as u64;
-
-        // Set the new read-ahead offset aligned to 64KB
-        self.read_ahead_offset = offset - (offset % READ_AHEAD_SIZE as u64);
-        self.read_ahead_pos = 0;
-        length = (end_offset - self.read_ahead_offset) as usize;
-
-        // If the requested read is larger than READ_AHEAD_SIZE, expand the buffer to
-        // the next leargest interval of 4096
-        let required_size = (length.max(READ_AHEAD_SIZE) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-
-        // Resize buffer if necessary
-        if self.read_ahead_buf.len() != required_size {
-            self.read_ahead_buf.resize(required_size, 0);
-            self.read_ahead_buf.shrink_to_fit();
-        }
-
-        let mut total_read = 0;
-        while total_read < required_size {
-            let bytes_read = self.file.read_at(
-                &mut self.read_ahead_buf[total_read..],
-                self.read_ahead_offset + total_read as u64,
-            )?;
-            if bytes_read == 0 {
-                break; // EOF reached
-            }
-            total_read += bytes_read;
-        }
-
-        self.read_ahead_valid_len = total_read; // Track the actual valid bytes
-
-        Ok(())
-    }
-
-    fn read_from_read_ahead(&mut self, offset: u64, length: usize) -> Result<&[u8], ReadError> {
-        let end_offset = offset + length as u64;
-
-        // If offset is within the valid read-ahead range
-        if offset >= self.read_ahead_offset
-            && end_offset <= (self.read_ahead_offset + self.read_ahead_valid_len as u64)
-        {
-            let start = (offset - self.read_ahead_offset) as usize;
-            return Ok(&self.read_ahead_buf[start..start + length]);
-        }
-
-        // Fill the read-ahead buffer for the requested offset & length
-        self.fill_read_ahead(offset, length)?;
-
-        // Ensure we now have enough valid data
-        if offset < self.read_ahead_offset
-            || end_offset > (self.read_ahead_offset + self.read_ahead_valid_len as u64)
-        {
+        if bytes.len() < mem::size_of::<u64>() {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                "requested data exceeds available read-ahead buffer",
+                "insufficient bytes for record",
             )
             .into());
         }
 
-        let start = (offset - self.read_ahead_offset) as usize;
-        Ok(&self.read_ahead_buf[start..start + length])
+        let is_commit = u64::from_le_bytes(bytes[..8].try_into().unwrap()) & (1u64 << 63) != 0;
+
+        if is_commit {
+            let (record, _) = bincode::decode_from_slice::<RawCommit, _>(&bytes, BINCODE_CONFIG)?;
+            record.header.validate(start_offset)?;
+            let commit = Record::Commit(CommitRecord::from_raw(start_offset, record));
+            Ok(Some(commit))
+        } else {
+            let (record, _) = bincode::decode_from_slice::<RawEvent, _>(&bytes, BINCODE_CONFIG)?;
+            record.header.validate(start_offset)?;
+            let event = Record::Event(EventRecord::from_raw(start_offset, record));
+            Ok(Some(event))
+        }
+    }
+
+    pub fn read_block(&self, offset: u64) -> Result<Option<SegmentBlock>, ReadError> {
+        let mut block = vec![0; BLOCK_SIZE].into_boxed_slice();
+        match self.reader.read_bytes(offset, &mut block) {
+            Ok(()) => Ok(Some(SegmentBlock { offset, block })),
+            Err(seglog::read::ReadError::OutOfBounds { .. }) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
     }
 }
 
@@ -1018,91 +724,33 @@ pub struct EventRecord {
 }
 
 impl EventRecord {
-    // pub fn into_owned(self) -> EventRecord<'static> {
-    //     EventRecord {
-    //         offset: self.offset,
-    //         event_id: self.event_id,
-    //         partition_key: self.partition_key,
-    //         partition_id: self.partition_id,
-    //         transaction_id: self.transaction_id,
-    //         partition_sequence: self.partition_sequence,
-    //         stream_version: self.stream_version,
-    //         timestamp: self.timestamp,
-    //         confirmation_count: self.confirmation_count,
-    //         stream_id: Cow::Owned(self.stream_id.into_owned()),
-    //         event_name: Cow::Owned(self.event_name.into_owned()),
-    //         metadata: Cow::Owned(self.metadata.into_owned()),
-    //         payload: Cow::Owned(self.payload.into_owned()),
-    //     }
-    // }
-
     pub fn primary_partition_id(&self, num_partitions: u16) -> PartitionId {
         uuid_to_partition_hash(self.partition_key) % num_partitions
     }
 
-    // This method no longer is valid when reading just the header!
-    // #[allow(clippy::len_without_is_empty)]
-    // pub fn len(&self) -> u64 {
-    //     EVENT_HEADER_SIZE as u64
-    //         + self.stream_id.len() as u64
-    //         + self.event_name.len() as u64
-    //         + self.metadata.len() as u64
-    //         + self.payload.len() as u64
-    // }
-
-    fn from_parts(
-        offset: u64,
-        record_header: RecordHeader,
-        event_header: EventHeader,
-        body: EventBody,
-    ) -> Result<Self, ReadError> {
-        let new_confirmation_count_crc32c = calculate_confirmation_count_crc32c(
-            &record_header.transaction_id,
-            record_header.confirmation_count,
-        );
-        if record_header.confirmation_count_crc32c != new_confirmation_count_crc32c {
-            return Err(ReadError::ConfirmationCountCrc32cMismatch { offset });
-        }
-
-        let new_crc32c = calculate_event_crc32c(
-            record_header.timestamp,
-            &record_header.transaction_id,
-            &event_header.event_id,
-            &event_header.partition_key,
-            event_header.partition_id,
-            event_header.partition_sequence,
-            event_header.stream_version,
-            &body.stream_id,
-            &body.event_name,
-            &body.metadata,
-            &body.payload,
-        );
-        if record_header.crc32c != new_crc32c {
-            return Err(ReadError::Crc32cMismatch { offset });
-        }
-
+    fn from_raw(offset: u64, record: RawEvent) -> Self {
         let size = EVENT_HEADER_SIZE as u64
-            + event_header.stream_id_len as u64
-            + event_header.event_name_len as u64
-            + event_header.metadata_len as u64
-            + event_header.payload_len as u64;
+            + record.stream_id.len() as u64
+            + record.event_name.len() as u64
+            + record.metadata.len() as u64
+            + record.payload.len() as u64;
 
-        Ok(EventRecord {
+        EventRecord {
             offset,
-            event_id: event_header.event_id,
-            partition_key: event_header.partition_key,
-            partition_id: event_header.partition_id,
-            transaction_id: record_header.transaction_id,
-            partition_sequence: event_header.partition_sequence,
-            stream_version: event_header.stream_version,
-            timestamp: record_header.timestamp,
-            confirmation_count: record_header.confirmation_count,
-            stream_id: body.stream_id,
-            event_name: body.event_name,
-            metadata: body.metadata,
-            payload: body.payload,
+            event_id: Uuid::from_bytes(record.event_id),
+            partition_key: Uuid::from_bytes(record.partition_key),
+            partition_id: record.partition_id,
+            transaction_id: Uuid::from_bytes(record.header.transaction_id),
+            partition_sequence: record.partition_sequence,
+            stream_version: record.stream_version,
+            timestamp: record.header.timestamp.timestamp(),
+            confirmation_count: record.header.confirmation_count,
+            stream_id: record.stream_id,
+            event_name: record.event_name.into_inner(),
+            metadata: record.metadata.into_inner(),
+            payload: record.payload.into_inner(),
             size,
-        })
+        }
     }
 }
 
@@ -1116,173 +764,13 @@ pub struct CommitRecord {
 }
 
 impl CommitRecord {
-    fn from_parts(
-        offset: u64,
-        record_header: RecordHeader,
-        event_count: u32,
-    ) -> Result<Self, ReadError> {
-        let new_confirmation_count_crc32c = calculate_confirmation_count_crc32c(
-            &record_header.transaction_id,
-            record_header.confirmation_count,
-        );
-        if record_header.confirmation_count_crc32c != new_confirmation_count_crc32c {
-            return Err(ReadError::ConfirmationCountCrc32cMismatch { offset });
-        }
-
-        let new_crc32c = calculate_commit_crc32c(
-            &record_header.transaction_id,
-            record_header.timestamp,
-            event_count,
-        );
-        if record_header.crc32c != new_crc32c {
-            return Err(ReadError::Crc32cMismatch { offset });
-        }
-
-        Ok(CommitRecord {
+    fn from_raw(offset: u64, raw: RawCommit) -> Self {
+        CommitRecord {
             offset,
-            transaction_id: record_header.transaction_id,
-            timestamp: record_header.timestamp,
-            confirmation_count: record_header.confirmation_count,
-            event_count,
-        })
+            transaction_id: Uuid::from_bytes(raw.header.transaction_id),
+            timestamp: raw.header.timestamp.timestamp(),
+            confirmation_count: raw.header.confirmation_count,
+            event_count: raw.event_count,
+        }
     }
-}
-
-#[derive(Debug)]
-struct RecordHeader {
-    timestamp: u64,
-    transaction_id: Uuid,
-    crc32c: u32,
-    confirmation_count: u8,
-    confirmation_count_crc32c: u32,
-    record_kind: u8,
-}
-
-impl<C> Decode<C> for RecordHeader {
-    fn decode<D: Decoder<Context = C>>(decoder: &mut D) -> Result<Self, DecodeError> {
-        // Record Kind + Timestamp (8 bytes)
-        let encoded_timestamp = u64::decode(decoder)?;
-        let record_kind = ((encoded_timestamp >> 63) & 1) as u8;
-        let timestamp = encoded_timestamp & !(1u64 << 63);
-
-        // Transaction ID (16 bytes)
-        let transaction_id_bytes = <[u8; 16]>::decode(decoder)?;
-        let transaction_id = Uuid::from_bytes(transaction_id_bytes);
-
-        // Main data CRC32C (4 bytes)
-        let crc32c = u32::decode(decoder)?;
-
-        // Confirmation Count (1 byte)
-        let confirmation_count = u8::decode(decoder)?;
-
-        // Confirmation Count CRC32C (4 bytes)
-        let confirmation_count_crc32c = u32::decode(decoder)?;
-
-        Ok(RecordHeader {
-            timestamp,
-            transaction_id,
-            crc32c,
-            confirmation_count,
-            confirmation_count_crc32c,
-            record_kind,
-        })
-    }
-}
-
-#[derive(Debug)]
-struct EventHeader {
-    event_id: Uuid,
-    partition_key: Uuid,
-    partition_id: PartitionId,
-    partition_sequence: u64,
-    stream_version: u64,
-    stream_id_len: usize,
-    event_name_len: usize,
-    metadata_len: usize,
-    payload_len: usize,
-}
-
-impl<C> Decode<C> for EventHeader {
-    fn decode<D: Decoder<Context = C>>(decoder: &mut D) -> Result<Self, DecodeError> {
-        let event_id_bytes = <[u8; 16]>::decode(decoder)?;
-        let event_id = Uuid::from_bytes(event_id_bytes);
-
-        let partition_key_bytes = <[u8; 16]>::decode(decoder)?;
-        let partition_key = Uuid::from_bytes(partition_key_bytes);
-
-        let partition_id = u16::decode(decoder)?;
-
-        let partition_sequence = u64::decode(decoder)?;
-
-        let stream_version = u64::decode(decoder)?;
-
-        let stream_id_len = u8::decode(decoder)? as usize;
-        let event_name_len = u8::decode(decoder)? as usize;
-        let metadata_len = u32::decode(decoder)? as usize;
-        let payload_len = u32::decode(decoder)? as usize;
-
-        Ok(EventHeader {
-            event_id,
-            partition_key,
-            partition_id,
-            partition_sequence,
-            stream_version,
-            stream_id_len,
-            event_name_len,
-            metadata_len,
-            payload_len,
-        })
-    }
-}
-
-impl EventHeader {
-    fn body_len(&self) -> usize {
-        self.stream_id_len + self.event_name_len + self.metadata_len + self.payload_len
-    }
-}
-
-#[derive(Debug, Default)]
-struct EventBody {
-    stream_id: StreamId,
-    event_name: String,
-    metadata: Vec<u8>,
-    payload: Vec<u8>,
-}
-
-impl<'c> Decode<&'c EventHeader> for EventBody {
-    fn decode<D: Decoder<Context = &'c EventHeader>>(decoder: &mut D) -> Result<Self, DecodeError> {
-        let mut stream_id_bytes = vec![0; decoder.context().stream_id_len];
-        decoder.reader().read(&mut stream_id_bytes)?;
-        let stream_id =
-            StreamId::new(
-                String::from_utf8(stream_id_bytes).map_err(|err| DecodeError::Utf8 {
-                    inner: err.utf8_error(),
-                })?,
-            )
-            .map_err(|err| DecodeError::OtherString(err.to_string()))?;
-
-        let mut event_name_bytes = vec![0; decoder.context().event_name_len];
-        decoder.reader().read(&mut event_name_bytes)?;
-        let event_name = String::from_utf8(event_name_bytes).map_err(|err| DecodeError::Utf8 {
-            inner: err.utf8_error(),
-        })?;
-
-        let mut metadata = vec![0; decoder.context().metadata_len];
-        decoder.reader().read(&mut metadata)?;
-
-        let mut payload = vec![0; decoder.context().payload_len];
-        decoder.reader().read(&mut payload)?;
-
-        Ok(EventBody {
-            stream_id,
-            event_name,
-            metadata,
-            payload,
-        })
-    }
-}
-
-#[inline]
-fn is_truncation_marker(header: &[u8]) -> bool {
-    header.iter().all(|&b| b == 0)
 }

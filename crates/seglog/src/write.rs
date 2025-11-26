@@ -82,6 +82,11 @@ impl Writer {
         size: usize,
         start_offset: u64,
     ) -> Result<Self, WriteError> {
+        assert!(
+            size as u64 > start_offset,
+            "segment size cannot be less than or equal to start offset"
+        );
+
         let file = OpenOptions::new()
             .read(false)
             .write(true)
@@ -151,6 +156,11 @@ impl Writer {
         size: usize,
         start_offset: u64,
     ) -> Result<Self, WriteError> {
+        assert!(
+            size as u64 > start_offset,
+            "segment size cannot be less than or equal to start offset"
+        );
+
         let file = OpenOptions::new().read(false).write(true).open(&path)?;
         let mut write_offset = start_offset;
 

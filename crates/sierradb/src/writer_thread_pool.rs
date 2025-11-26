@@ -23,8 +23,8 @@ use crate::StreamId;
 use crate::bucket::event_index::OpenEventIndex;
 use crate::bucket::partition_index::{OpenPartitionIndex, PartitionIndexRecord, PartitionOffsets};
 use crate::bucket::segment::{
-    AppendEvent, BucketSegmentReader, BucketSegmentWriter, COMMIT_SIZE, EVENT_HEADER_SIZE,
-    SEGMENT_HEADER_SIZE,
+    BucketSegmentReader, BucketSegmentWriter, COMMIT_SIZE, EVENT_HEADER_SIZE, LongBytes,
+    RawCommit, RawEvent, RecordHeader, SEGMENT_HEADER_SIZE, ShortString,
 };
 use crate::bucket::stream_index::{OpenStreamIndex, StreamIndexRecord, StreamOffsets};
 use crate::bucket::{BucketId, BucketSegmentId, PartitionId, SegmentKind};
@@ -520,7 +520,7 @@ impl Worker {
             partition_key,
             partition_id,
             transaction_id,
-            events: &events,
+            events,
             event_versions,
             expected_partition_sequence,
             unique_streams: latest_stream_versions.len(),
@@ -591,11 +591,11 @@ impl Worker {
 }
 
 /// Parameters for a write operation
-pub struct WriteOperation<'a> {
+pub struct WriteOperation {
     pub partition_key: Uuid,
     pub partition_id: PartitionId,
     pub transaction_id: Uuid,
-    pub events: &'a [NewEvent],
+    pub events: SmallVec<[NewEvent; 4]>,
     pub event_versions: Vec<CurrentVersion>,
     pub expected_partition_sequence: ExpectedVersion,
     pub unique_streams: usize,
@@ -625,7 +625,7 @@ struct WriterSet {
 }
 
 impl WriterSet {
-    fn handle_write(&mut self, req: WriteOperation<'_>) -> Result<AppendResult, WriteError> {
+    fn handle_write(&mut self, req: WriteOperation) -> Result<AppendResult, WriteError> {
         if req.events.is_empty() {
             unreachable!("append event batch does not allow empty transactions");
         }
@@ -644,27 +644,27 @@ impl WriterSet {
 
         let event_count = req.events.len();
         debug_assert_eq!(req.events.len(), req.event_versions.len());
-        for (event, stream_version) in req.events.iter().zip(req.event_versions) {
+        for (event, stream_version) in req.events.into_iter().zip(req.event_versions) {
             let partition_sequence = next_partition_sequence;
             let stream_version = stream_version.next();
             stream_versions.insert(event.stream_id.clone(), stream_version);
-            let append = AppendEvent {
-                event_id: &event.event_id,
-                partition_key: &req.partition_key,
+            let append = RawEvent {
+                header: RecordHeader::new_event(
+                    event.timestamp,
+                    req.transaction_id,
+                    req.confirmation_count,
+                )?,
+                event_id: event.event_id.into_bytes(),
+                partition_key: req.partition_key.into_bytes(),
                 partition_id: req.partition_id,
                 partition_sequence,
                 stream_version,
-                stream_id: &event.stream_id,
-                event_name: &event.event_name,
-                metadata: &event.metadata,
-                payload: &event.payload,
+                stream_id: event.stream_id,
+                event_name: ShortString(event.event_name),
+                metadata: LongBytes(event.metadata),
+                payload: LongBytes(event.payload),
             };
-            let (offset, len) = self.writer.append_event(
-                &req.transaction_id,
-                event.timestamp,
-                req.confirmation_count,
-                append,
-            )?;
+            let (offset, len) = self.writer.append_event(&append)?;
             offsets.push(offset);
             self.bytes_since_sync += len;
             // We need to guarantee:
@@ -675,7 +675,7 @@ impl WriterSet {
                 partition_key: req.partition_key,
                 partition_id: req.partition_id,
                 partition_sequence,
-                stream_id: event.stream_id.clone(),
+                stream_id: append.stream_id,
                 stream_version,
                 offset,
             });
@@ -688,9 +688,14 @@ impl WriterSet {
                 .duration_since(UNIX_EPOCH)
                 .map_err(|_| WriteError::BadSystemTime)?
                 .as_nanos() as u64;
-            let (_, len) =
-                self.writer
-                    .append_commit(&req.transaction_id, timestamp, event_count as u32, 0)?;
+            let (_, len) = self.writer.append_commit(&RawCommit {
+                header: RecordHeader::new_commit(
+                    timestamp,
+                    req.transaction_id,
+                    req.confirmation_count,
+                )?,
+                event_count: event_count as u32,
+            })?;
             self.bytes_since_sync += len;
         }
 
@@ -712,7 +717,7 @@ impl WriterSet {
     }
 
     fn sync(&mut self) -> Result<(), WriteError> {
-        let write_offset = self.writer.flush()?;
+        let write_offset = self.writer.sync()?;
         self.last_synced = Instant::now();
         self.unflushed_events = 0;
         self.bytes_since_sync = 0;
@@ -1386,6 +1391,7 @@ mod tests {
     use proptest::prelude::*;
     use rayon::ThreadPoolBuilder;
     use sierradb_protocol::{CurrentVersion, ExpectedVersion};
+    use smallvec::SmallVec;
     use tempfile::{TempDir, tempdir};
     use tokio::sync::{RwLock, watch};
     use uuid::Uuid;
@@ -1482,7 +1488,7 @@ mod tests {
 
     fn events_from_expected_fn(
         partition_hash: PartitionHash,
-    ) -> impl Fn(&[(&StreamId, ExpectedVersion)]) -> Vec<NewEvent> {
+    ) -> impl Fn(&[(&StreamId, ExpectedVersion)]) -> SmallVec<[NewEvent; 4]> {
         move |expected| {
             expected
                 .iter()
@@ -1540,7 +1546,7 @@ mod tests {
                 partition_key,
                 partition_id,
                 transaction_id: Uuid::new_v4(),
-                events: &events_from_expected(&[(&stream_id, ExpectedVersion::Empty)]),
+                events: events_from_expected(&[(&stream_id, ExpectedVersion::Empty)]),
                 event_versions: vec![CurrentVersion::Empty],
                 expected_partition_sequence: ExpectedVersion::Empty,
                 unique_streams: 1,
@@ -1573,7 +1579,7 @@ mod tests {
                 partition_key,
                 partition_id,
                 transaction_id: Uuid::new_v4(),
-                events: &events_from_expected(&[
+                events: events_from_expected(&[
                     (&stream_id, ExpectedVersion::Exact(0)),
                     (&stream_id, ExpectedVersion::Exact(1)),
                     (&random_stream_id, ExpectedVersion::Empty),
@@ -1776,7 +1782,7 @@ mod tests {
                 partition_key,
                 partition_id: 0,
                 transaction_id: Uuid::new_v4(),
-                events: &[initial_event],
+                events: smallvec::smallvec![initial_event],
                 event_versions: versions,
                 expected_partition_sequence: ExpectedVersion::Empty,
                 unique_streams: 1,
@@ -1819,7 +1825,7 @@ mod tests {
                 partition_key,
                 partition_id: 0,
                 transaction_id: Uuid::new_v4(),
-                events: &[initial_event],
+                events: smallvec::smallvec![initial_event],
                 event_versions: versions,
                 expected_partition_sequence: ExpectedVersion::Empty,
                 unique_streams: 1,
