@@ -38,12 +38,6 @@ pub struct PartitionIndexRecord<T> {
     pub offsets: T,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PartitionOffsets {
-    Offsets(Vec<PartitionSequenceOffset>), // Its cached
-    ExternalBucket,                        // This partition lives in a different bucket
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PartitionSequenceOffset {
     pub sequence: u64,
@@ -189,7 +183,7 @@ mod tests {
                 sequence_min: 0,
                 sequence_max: 2,
                 sequence: 3,
-                offsets: PartitionOffsets::Offsets(offsets),
+                offsets,
             }
         );
         assert_eq!(index.get(99), None);
@@ -245,10 +239,7 @@ mod tests {
         assert_eq!(key1.sequence, 2);
 
         // Test get with MPHF implementation
-        assert_eq!(
-            closed_index.get(partition_id1).unwrap(),
-            Some(PartitionOffsets::Offsets(offsets1)),
-        );
+        assert_eq!(closed_index.get(partition_id1).unwrap(), Some(offsets1),);
 
         // Test get_key for second partition ID
         let key2 = closed_index.get_key(partition_id2).unwrap().unwrap();
@@ -257,10 +248,7 @@ mod tests {
         assert_eq!(key2.sequence, 1);
 
         // Test get for second partition ID
-        assert_eq!(
-            closed_index.get(partition_id2).unwrap(),
-            Some(PartitionOffsets::Offsets(offsets2)),
-        );
+        assert_eq!(closed_index.get(partition_id2).unwrap(), Some(offsets2),);
 
         // Test unknown partition ID
         assert_eq!(closed_index.get_key(999).unwrap(), None);
@@ -359,51 +347,13 @@ mod tests {
             ClosedPartitionIndex::open(BucketSegmentId::new(0, 0), &path).unwrap();
 
         // Verify all partitions can be retrieved correctly
-        assert_eq!(
-            closed_index.get(partition_id1).unwrap(),
-            Some(PartitionOffsets::Offsets(offsets1))
-        );
-        assert_eq!(
-            closed_index.get(partition_id2).unwrap(),
-            Some(PartitionOffsets::Offsets(offsets2))
-        );
-        assert_eq!(
-            closed_index.get(partition_id3).unwrap(),
-            Some(PartitionOffsets::Offsets(offsets3))
-        );
-        assert_eq!(
-            closed_index.get(partition_id4).unwrap(),
-            Some(PartitionOffsets::Offsets(offsets4))
-        );
+        assert_eq!(closed_index.get(partition_id1).unwrap(), Some(offsets1));
+        assert_eq!(closed_index.get(partition_id2).unwrap(), Some(offsets2));
+        assert_eq!(closed_index.get(partition_id3).unwrap(), Some(offsets3));
+        assert_eq!(closed_index.get(partition_id4).unwrap(), Some(offsets4));
 
         // Unknown partition ID should not be found
         assert_eq!(closed_index.get(999).unwrap(), None);
-    }
-
-    #[test]
-    fn test_insert_external_bucket() {
-        let path = temp_file_path();
-
-        let partition_id = 123;
-
-        let mut index = OpenPartitionIndex::create(BucketSegmentId::new(0, 0), &path).unwrap();
-        index.insert_external_bucket(partition_id).unwrap();
-        assert_eq!(
-            index.get(partition_id),
-            Some(&PartitionIndexRecord {
-                sequence_min: 0,
-                sequence_max: 0,
-                sequence: 0,
-                offsets: PartitionOffsets::ExternalBucket
-            })
-        );
-        index.flush().unwrap();
-
-        let mut index = ClosedPartitionIndex::open(BucketSegmentId::new(0, 0), &path).unwrap();
-        assert_eq!(
-            index.get(partition_id).unwrap(),
-            Some(PartitionOffsets::ExternalBucket)
-        );
     }
 
     #[tokio::test]

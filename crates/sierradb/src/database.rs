@@ -18,11 +18,9 @@ use uuid::Uuid;
 
 use crate::bucket::event_index::ClosedEventIndex;
 use crate::bucket::iter::{PartitionIter, PartitionIterConfig, StreamIter, StreamIterConfig};
-use crate::bucket::partition_index::{
-    ClosedPartitionIndex, PartitionIndexRecord, PartitionOffsets,
-};
+use crate::bucket::partition_index::{ClosedPartitionIndex, PartitionIndexRecord};
 use crate::bucket::segment::{BucketSegmentReader, CommittedEvents, EventRecord};
-use crate::bucket::stream_index::{ClosedStreamIndex, StreamIndexRecord, StreamOffsets};
+use crate::bucket::stream_index::{ClosedStreamIndex, StreamIndexRecord};
 use crate::bucket::{BucketId, BucketSegmentId, PartitionId, SegmentId};
 use crate::cache::BLOCK_SIZE;
 use crate::error::{
@@ -191,22 +189,9 @@ impl Database {
             .writer_pool
             .with_partition_index(bucket_id, |_, partition_index| {
                 partition_index.get(partition_id).map(
-                    |PartitionIndexRecord {
-                         sequence_max,
-                         offsets,
-                         ..
-                     }| {
-                        match offsets {
-                            PartitionOffsets::Offsets(_) => {
-                                PartitionLatestSequence::LatestSequence {
-                                    partition_id,
-                                    sequence: *sequence_max,
-                                }
-                            }
-                            &PartitionOffsets::ExternalBucket => {
-                                PartitionLatestSequence::ExternalBucket { partition_id }
-                            }
-                        }
+                    |PartitionIndexRecord { sequence_max, .. }| PartitionLatestSequence {
+                        partition_id,
+                        sequence: *sequence_max,
                     },
                 )
             })
@@ -225,13 +210,8 @@ impl Database {
                         .and_then(|segments| {
                             segments.iter_mut().rev().find_map(|(_, reader_set)| {
                                 let partition_index = reader_set.partition_index.as_mut()?;
-                                let record =
-                                    match partition_index.get_key(partition_id).transpose()? {
-                                        Ok(record) => record,
-                                        Err(err) => return Some(Err(err)),
-                                    };
-                                match partition_index.get(partition_id).transpose()? {
-                                    Ok(offsets) => Some(Ok((record, offsets))),
+                                match partition_index.get_key(partition_id).transpose()? {
+                                    Ok(record) => Some(Ok(record.sequence_max)),
                                     Err(err) => Some(Err(err)),
                                 }
                             })
@@ -245,17 +225,10 @@ impl Database {
         Ok(reply_rx
             .await
             .unwrap()?
-            .map(
-                |(PartitionIndexRecord { sequence_max, .. }, offsets)| match offsets {
-                    PartitionOffsets::Offsets(_) => PartitionLatestSequence::LatestSequence {
-                        partition_id,
-                        sequence: sequence_max,
-                    },
-                    PartitionOffsets::ExternalBucket => {
-                        PartitionLatestSequence::ExternalBucket { partition_id }
-                    }
-                },
-            ))
+            .map(|sequence| PartitionLatestSequence {
+                partition_id,
+                sequence,
+            }))
     }
 
     pub async fn read_stream(
@@ -290,17 +263,11 @@ impl Database {
                     |StreamIndexRecord {
                          partition_key,
                          version_max,
-                         offsets,
                          ..
                      }| {
-                        match offsets {
-                            StreamOffsets::Offsets(_) => StreamLatestVersion::LatestVersion {
-                                partition_key: *partition_key,
-                                version: *version_max,
-                            },
-                            StreamOffsets::ExternalBucket => StreamLatestVersion::ExternalBucket {
-                                partition_key: *partition_key,
-                            },
+                        StreamLatestVersion {
+                            partition_key: *partition_key,
+                            version: *version_max,
                         }
                     },
                 )
@@ -321,12 +288,10 @@ impl Database {
                         .and_then(|segments| {
                             segments.iter_mut().rev().find_map(|(_, reader_set)| {
                                 let stream_index = reader_set.stream_index.as_mut()?;
-                                let record = match stream_index.get_key(&stream_id).transpose()? {
-                                    Ok(record) => record,
-                                    Err(err) => return Some(Err(err)),
-                                };
-                                match stream_index.get(&stream_id).transpose()? {
-                                    Ok(offsets) => Some(Ok((record, offsets))),
+                                match stream_index.get_key(&stream_id).transpose()? {
+                                    Ok(record) => {
+                                        Some(Ok((record.partition_key, record.version_max)))
+                                    }
                                     Err(err) => Some(Err(err)),
                                 }
                             })
@@ -337,24 +302,13 @@ impl Database {
             }
         });
 
-        Ok(reply_rx.await.unwrap()?.map(
-            |(
-                StreamIndexRecord {
-                    partition_key,
-                    version_max,
-                    ..
-                },
-                offsets,
-            )| match offsets {
-                StreamOffsets::Offsets(_) => StreamLatestVersion::LatestVersion {
-                    partition_key,
-                    version: version_max,
-                },
-                StreamOffsets::ExternalBucket => {
-                    StreamLatestVersion::ExternalBucket { partition_key }
-                }
-            },
-        ))
+        Ok(reply_rx
+            .await
+            .unwrap()?
+            .map(|(partition_key, version_max)| StreamLatestVersion {
+                partition_key,
+                version: version_max,
+            }))
     }
 }
 
@@ -695,20 +649,15 @@ struct UnopenedFileSet {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PartitionLatestSequence {
-    LatestSequence {
-        partition_id: PartitionId,
-        sequence: u64,
-    },
-    ExternalBucket {
-        partition_id: PartitionId,
-    },
+pub struct PartitionLatestSequence {
+    pub partition_id: PartitionId,
+    pub sequence: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StreamLatestVersion {
-    LatestVersion { partition_key: Uuid, version: u64 },
-    ExternalBucket { partition_key: Uuid },
+pub struct StreamLatestVersion {
+    pub partition_key: Uuid,
+    pub version: u64,
 }
 
 fn create_thread_pool() -> Result<ThreadPool, ThreadPoolBuildError> {
@@ -1231,21 +1180,15 @@ mod tests {
             .expect("Failed to get partition sequence");
         assert!(seq_opt.is_some(), "Expected a sequence to be returned");
 
-        match seq_opt.unwrap() {
-            PartitionLatestSequence::LatestSequence {
-                partition_id: pid,
-                sequence,
-            } => {
-                assert_eq!(pid, partition_id, "Partition ID mismatch");
-                assert_eq!(
-                    sequence, 2,
-                    "Expected sequence to be 2 (0-based for 3 events)"
-                );
-            }
-            PartitionLatestSequence::ExternalBucket { .. } => {
-                panic!("Expected LatestSequence, got ExternalBucket");
-            }
-        }
+        let PartitionLatestSequence {
+            partition_id: pid,
+            sequence,
+        } = seq_opt.unwrap();
+        assert_eq!(pid, partition_id, "Partition ID mismatch");
+        assert_eq!(
+            sequence, 2,
+            "Expected sequence to be 2 (0-based for 3 events)"
+        );
     }
 
     // Stream reading tests
@@ -1345,21 +1288,15 @@ mod tests {
             .expect("Failed to get stream version");
         assert!(version_opt.is_some(), "Expected a version to be returned");
 
-        match version_opt.unwrap() {
-            StreamLatestVersion::LatestVersion {
-                partition_key: pk,
-                version,
-            } => {
-                assert_eq!(pk, partition_key, "Partition key mismatch");
-                assert_eq!(
-                    version, 2,
-                    "Expected version to be 2 (0-based for 3 events)"
-                );
-            }
-            StreamLatestVersion::ExternalBucket { .. } => {
-                panic!("Expected LatestVersion, got ExternalBucket");
-            }
-        }
+        let StreamLatestVersion {
+            partition_key: pk,
+            version,
+        } = version_opt.unwrap();
+        assert_eq!(pk, partition_key, "Partition key mismatch");
+        assert_eq!(
+            version, 2,
+            "Expected version to be 2 (0-based for 3 events)"
+        );
     }
 
     // Concurrency and version conflict tests
@@ -1563,15 +1500,11 @@ mod tests {
                 "Expected sequence for partition {partition_id}",
             );
 
-            match seq_opt.unwrap() {
-                PartitionLatestSequence::LatestSequence { sequence, .. } => {
-                    assert_eq!(
-                        sequence, 0,
-                        "Expected sequence 0 for partition {partition_id}",
-                    );
-                }
-                _ => panic!("Expected LatestSequence"),
-            }
+            assert_eq!(
+                seq_opt.unwrap().sequence,
+                0,
+                "Expected sequence 0 for partition {partition_id}",
+            );
         }
     }
 
