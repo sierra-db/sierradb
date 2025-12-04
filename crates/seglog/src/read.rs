@@ -7,12 +7,31 @@ use std::path::Path;
 use thiserror::Error;
 use tracing::warn;
 
-use crate::{CRC32C_SIZE, FlushedOffset, LEN_SIZE, RECORD_HEAD_SIZE, calculate_crc32c};
+use crate::{
+    COMPRESSION_FLAG, CRC32C_SIZE, FlushedOffset, LEN_SIZE, LENGTH_MASK, RECORD_HEAD_SIZE,
+    calculate_crc32c,
+};
 
 const PAGE_SIZE: usize = 4096; // Usually a page is 4KB on Linux
 const OPTIMISTIC_DATA_SIZE: usize = 2048; // Optimistic read size for random access: read header + this much data in one syscall
 const FALLBACK_BUF_SIZE: usize = PAGE_SIZE;
 const READ_AHEAD_SIZE: usize = 64 * 1024; // 64 KB read ahead buffer
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Record<'a, const H: usize> {
+    pub header: Cow<'a, [u8]>,
+    pub data: Cow<'a, [u8]>,
+    pub compressed_data: Option<Cow<'a, [u8]>>,
+    pub offset: u64,
+    pub len: usize,
+}
+
+// impl<const H: usize> Record<'_, H> {
+//     #[allow(clippy::len_without_is_empty)]
+//     pub fn len(&self) -> usize {
+//         RECORD_HEAD_SIZE + self.header.len() + self.data.len()
+//     }
+// }
 
 /// Errors that can occur during segment reading operations.
 #[derive(Debug, Error)]
@@ -27,6 +46,13 @@ pub enum ReadError {
     },
     #[error("truncation marker found at offset {offset}")]
     TruncationMarker { offset: u64 },
+    #[error(
+        "data length of {new_length} does not match existing data length of {existing_length} for replace"
+    )]
+    ReplaceLengthMismatch {
+        existing_length: usize,
+        new_length: usize,
+    },
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -44,7 +70,9 @@ pub enum ReadHint {
 ///
 /// Supports both random and sequential access patterns with appropriate optimizations.
 /// Records are read with CRC32C validation to ensure data integrity.
-pub struct Reader {
+///
+/// The generic parameter `H` specifies the size of the fixed header in bytes.
+pub struct Reader<const H: usize> {
     file: File,
     // L1 cache: if a record fits in this buffer, it'll result in 1 syscall, 0 allocations
     optimistic_buf: [u8; RECORD_HEAD_SIZE + OPTIMISTIC_DATA_SIZE],
@@ -53,16 +81,18 @@ pub struct Reader {
     // Sequential read cache
     read_ahead_buf: ReadAheadBuf,
     flushed_offset: FlushedOffset,
+    // Decompression buffer (reused across reads to avoid allocations)
+    decompress_buf: Vec<u8>,
 }
 
-impl Reader {
+impl<const H: usize> Reader<H> {
     /// Opens a segment as read only.
     pub fn open(
         path: impl AsRef<Path>,
         flushed_offset: Option<FlushedOffset>,
     ) -> Result<Self, ReadError> {
         let mut opts = OpenOptions::new();
-        opts.read(true).write(false);
+        opts.read(true).write(true);
 
         #[cfg(target_os = "macos")]
         {
@@ -89,6 +119,7 @@ impl Reader {
             fallback_buf,
             read_ahead_buf: ReadAheadBuf::new(),
             flushed_offset,
+            decompress_buf: Vec::new(),
         };
 
         Ok(reader)
@@ -104,6 +135,7 @@ impl Reader {
             fallback_buf: self.fallback_buf,
             read_ahead_buf: ReadAheadBuf::new(),
             flushed_offset: self.flushed_offset.clone(),
+            decompress_buf: Vec::new(),
         })
     }
 
@@ -136,7 +168,7 @@ impl Reader {
     }
 
     /// Creates an iterator over records starting from the specified offset.
-    pub fn iter(&mut self, start_offset: u64) -> Iter<'_> {
+    pub fn iter(&mut self, start_offset: u64) -> Iter<'_, H> {
         Iter {
             reader: self,
             offset: start_offset,
@@ -145,9 +177,11 @@ impl Reader {
 
     /// Reads a single record at the given offset.
     ///
-    /// Returns the record data after validating the CRC32C checksum. The hint parameter
-    /// can optimize performance for sequential vs random access patterns.
-    pub fn read_record(&mut self, offset: u64, hint: ReadHint) -> Result<Cow<'_, [u8]>, ReadError> {
+    /// Returns a tuple of (header, data) after validating the CRC32C checksum.
+    /// The hint parameter can optimize performance for sequential vs random access patterns.
+    ///
+    /// If the data is compressed, it will be automatically decompressed.
+    pub fn read_record(&mut self, offset: u64, hint: ReadHint) -> Result<Record<'_, H>, ReadError> {
         let flushed_offset = self.flushed_offset.load();
         if offset + RECORD_HEAD_SIZE as u64 > flushed_offset {
             return Err(ReadError::OutOfBounds {
@@ -162,104 +196,196 @@ impl Reader {
             return self.read_record_sequential(offset, flushed_offset);
         }
 
-        // Random reads: optimistic read of header + data in one syscall
+        // Random reads: optimistic read of record header + some data in one syscall
         let optimistic_read_len =
             (RECORD_HEAD_SIZE + OPTIMISTIC_DATA_SIZE).min((flushed_offset - offset) as usize);
 
         self.file
             .read_exact_at(&mut self.optimistic_buf[..optimistic_read_len], offset)?;
 
-        let header_buf = &self.optimistic_buf[..RECORD_HEAD_SIZE];
+        let record_header_buf = &self.optimistic_buf[..RECORD_HEAD_SIZE];
 
-        if is_truncation_marker(header_buf) {
+        if is_truncation_marker(record_header_buf) {
             return Err(ReadError::TruncationMarker { offset });
         }
 
-        let data_len_bytes: [u8; LEN_SIZE] = header_buf[..LEN_SIZE].try_into().unwrap();
-        let data_len = u32::from_le_bytes(data_len_bytes) as usize;
+        let length_bytes: [u8; LEN_SIZE] = record_header_buf[..LEN_SIZE].try_into().unwrap();
+        let length_with_flag = u32::from_le_bytes(length_bytes);
+        let is_compressed = length_with_flag & COMPRESSION_FLAG != 0;
+        let payload_len = (length_with_flag & LENGTH_MASK) as usize; // H + data_len
+
         let crc = u32::from_le_bytes(
-            header_buf[LEN_SIZE..LEN_SIZE + CRC32C_SIZE]
+            record_header_buf[LEN_SIZE..LEN_SIZE + CRC32C_SIZE]
                 .try_into()
                 .unwrap(),
         );
 
-        let data_offset = offset + RECORD_HEAD_SIZE as u64;
-        if data_offset + data_len as u64 > flushed_offset {
+        let payload_offset = offset + RECORD_HEAD_SIZE as u64;
+        if payload_offset + payload_len as u64 > flushed_offset {
             return Err(ReadError::OutOfBounds {
                 offset,
-                length: RECORD_HEAD_SIZE,
+                length: RECORD_HEAD_SIZE + payload_len,
                 flushed_offset,
             });
         }
 
-        let (data, new_crc) = if data_len <= OPTIMISTIC_DATA_SIZE
-            && optimistic_read_len >= RECORD_HEAD_SIZE + data_len
+        // Read header + data payload
+        let (header, compressed_data) = if payload_len <= OPTIMISTIC_DATA_SIZE
+            && optimistic_read_len >= RECORD_HEAD_SIZE + payload_len
         {
-            // Data fits in the optimistic buffer - we got it all in one read!
-            let data = &self.optimistic_buf[RECORD_HEAD_SIZE..RECORD_HEAD_SIZE + data_len];
-            let new_crc = calculate_crc32c(&data_len_bytes, data);
-            (Cow::Borrowed(data), new_crc)
-        } else if data_len <= self.fallback_buf.len() {
-            // Data fits in fallback_buf but not in optimistic buffer
+            // Payload fits in the optimistic buffer - we got it all in one read!
+            let payload = &self.optimistic_buf[RECORD_HEAD_SIZE..RECORD_HEAD_SIZE + payload_len];
+            let header = &payload[..H];
+            let data = &payload[H..];
+
+            // Validate CRC over header + compressed data
+            let new_crc = calculate_crc32c(&length_bytes, header, data);
+            if crc != new_crc {
+                return Err(ReadError::Crc32cMismatch { offset });
+            }
+
+            (Cow::Borrowed(header), Cow::Borrowed(data))
+        } else if payload_len <= self.fallback_buf.len() {
+            // Payload fits in fallback_buf but not in optimistic buffer
             self.file
-                .read_exact_at(&mut self.fallback_buf[..data_len], data_offset)?;
-            let new_crc = calculate_crc32c(&data_len_bytes, &self.fallback_buf[..data_len]);
-            (Cow::Borrowed(&self.fallback_buf[..data_len]), new_crc)
+                .read_exact_at(&mut self.fallback_buf[..payload_len], payload_offset)?;
+            let header = &self.fallback_buf[..H];
+            let data = &self.fallback_buf[H..payload_len];
+
+            // Validate CRC
+            let new_crc = calculate_crc32c(&length_bytes, header, data);
+            if crc != new_crc {
+                return Err(ReadError::Crc32cMismatch { offset });
+            }
+
+            (Cow::Borrowed(header), Cow::Borrowed(data))
         } else {
-            // Data is large, allocate a buffer
-            let mut buf = vec![0u8; data_len];
-            self.file.read_exact_at(&mut buf, data_offset)?;
-            let new_crc = calculate_crc32c(&data_len_bytes, &buf);
-            (Cow::Owned(buf), new_crc)
+            // Payload is large, allocate a buffer
+            let mut buf = vec![0u8; payload_len];
+            self.file.read_exact_at(&mut buf, payload_offset)?;
+            let data = buf[H..].to_vec();
+            buf.truncate(H);
+            let header = buf;
+
+            // Validate CRC
+            let new_crc = calculate_crc32c(&length_bytes, &header, &data);
+            if crc != new_crc {
+                return Err(ReadError::Crc32cMismatch { offset });
+            }
+
+            (Cow::Owned(header), Cow::Owned(data))
         };
 
-        if crc != new_crc {
-            return Err(ReadError::Crc32cMismatch { offset });
-        }
+        // Decompress if needed
+        let (final_data, compressed_data) = if is_compressed {
+            // First 4 bytes are the original size
+            if compressed_data.len() < 4 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "compressed data too short to contain original size",
+                )
+                .into());
+            }
+            let original_size_bytes: [u8; 4] = compressed_data[..4].try_into().unwrap();
+            let original_size = u32::from_le_bytes(original_size_bytes) as usize;
 
-        Ok(data)
+            // Decompress into reusable buffer
+            self.decompress_buf.clear();
+            self.decompress_buf.reserve(original_size);
+            zstd::stream::copy_decode(&compressed_data[4..], &mut self.decompress_buf)?;
+
+            (
+                Cow::Borrowed(self.decompress_buf.as_slice()),
+                Some(compressed_data),
+            )
+        } else {
+            (compressed_data, None)
+        };
+
+        Ok(Record {
+            header,
+            data: final_data,
+            compressed_data,
+            offset,
+            len: RECORD_HEAD_SIZE + payload_len,
+        })
     }
 
     fn read_record_sequential(
         &mut self,
         offset: u64,
         flushed_offset: u64,
-    ) -> Result<Cow<'_, [u8]>, ReadError> {
-        let header_buf = self
+    ) -> Result<Record<'_, H>, ReadError> {
+        let record_header_buf = self
             .read_ahead_buf
             .read(&self.file, offset, RECORD_HEAD_SIZE)?;
 
-        if is_truncation_marker(&header_buf[..RECORD_HEAD_SIZE]) {
+        if is_truncation_marker(&record_header_buf[..RECORD_HEAD_SIZE]) {
             return Err(ReadError::TruncationMarker { offset });
         }
 
-        let data_len_bytes: [u8; LEN_SIZE] = header_buf[..LEN_SIZE].try_into().unwrap();
-        let data_len = u32::from_le_bytes(data_len_bytes) as usize;
+        let length_bytes: [u8; LEN_SIZE] = record_header_buf[..LEN_SIZE].try_into().unwrap();
+        let length_with_flag = u32::from_le_bytes(length_bytes);
+        let is_compressed = length_with_flag & COMPRESSION_FLAG != 0;
+        let payload_len = (length_with_flag & LENGTH_MASK) as usize;
         let crc = u32::from_le_bytes(
-            header_buf[LEN_SIZE..LEN_SIZE + CRC32C_SIZE]
+            record_header_buf[LEN_SIZE..LEN_SIZE + CRC32C_SIZE]
                 .try_into()
                 .unwrap(),
         );
 
-        let data_offset = offset + RECORD_HEAD_SIZE as u64;
-        if data_offset + data_len as u64 > flushed_offset {
+        let payload_offset = offset + RECORD_HEAD_SIZE as u64;
+        if payload_offset + payload_len as u64 > flushed_offset {
             return Err(ReadError::OutOfBounds {
                 offset,
-                length: RECORD_HEAD_SIZE + data_len,
+                length: RECORD_HEAD_SIZE + payload_len,
                 flushed_offset,
             });
         }
 
-        let data = self
+        let payload = self
             .read_ahead_buf
-            .read(&self.file, data_offset, data_len)?;
-        let new_crc = calculate_crc32c(&data_len_bytes, data);
+            .read(&self.file, payload_offset, payload_len)?;
 
+        let header = &payload[..H];
+        let compressed_data = &payload[H..];
+
+        let new_crc = calculate_crc32c(&length_bytes, header, compressed_data);
         if crc != new_crc {
             return Err(ReadError::Crc32cMismatch { offset });
         }
 
-        Ok(Cow::Borrowed(data))
+        // Decompress if needed
+        let (final_data, compressed_data) = if is_compressed {
+            if compressed_data.len() < 4 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "compressed data too short to contain original size",
+                )
+                .into());
+            }
+            let original_size_bytes: [u8; 4] = compressed_data[..4].try_into().unwrap();
+            let original_size = u32::from_le_bytes(original_size_bytes) as usize;
+
+            self.decompress_buf.clear();
+            self.decompress_buf.reserve(original_size);
+            zstd::stream::copy_decode(&compressed_data[4..], &mut self.decompress_buf)?;
+
+            (
+                Cow::Borrowed(self.decompress_buf.as_slice()),
+                Some(Cow::Borrowed(compressed_data)),
+            )
+        } else {
+            (Cow::Borrowed(compressed_data), None)
+        };
+
+        Ok(Record {
+            header: Cow::Borrowed(header),
+            data: final_data,
+            compressed_data,
+            offset,
+            len: RECORD_HEAD_SIZE + payload_len,
+        })
     }
 
     /// Reads raw bytes from the file at the specified offset and length.
@@ -302,6 +428,56 @@ impl Reader {
         Ok(())
     }
 
+    /// Replaces the header portion of a record at the given offset.
+    ///
+    /// This method reads the full record to get the data portion, calculates a new CRC
+    /// with the new header, and writes back only the CRC and header bytes. The data
+    /// portion on disk is left untouched.
+    ///
+    /// This is safe to use even with compressed records since the data is not modified.
+    pub fn replace_header(&mut self, offset: u64, new_header: &[u8; H]) -> Result<(), ReadError> {
+        // Read the full record to validate it exists and is readable
+        let record = self.read_record(offset, ReadHint::Random)?;
+
+        // Calculate payload_len from the record's len field
+        let payload_len = record.len - RECORD_HEAD_SIZE;
+
+        // Reconstruct the length_with_flag for CRC calculation
+        let length_with_flag = if record.compressed_data.is_some() {
+            (payload_len as u32) | COMPRESSION_FLAG
+        } else {
+            payload_len as u32
+        };
+        let length_bytes = length_with_flag.to_le_bytes();
+
+        // Get the data as it exists on disk (compressed or not)
+        let data_on_disk = record.compressed_data.as_ref().unwrap_or(&record.data);
+
+        // Calculate new CRC over new_header + data_on_disk
+        let new_crc = calculate_crc32c(&length_bytes, new_header, data_on_disk);
+
+        // Write CRC + header (leave data untouched)
+        let mut write_buf = Vec::with_capacity(CRC32C_SIZE + H);
+        write_buf.extend_from_slice(&new_crc.to_le_bytes());
+        write_buf.extend_from_slice(new_header);
+
+        self.file
+            .write_all_at(&write_buf, offset + LEN_SIZE as u64)?;
+
+        // Invalidate cache if overlapping
+        if self
+            .read_ahead_buf
+            .overlaps(offset, RECORD_HEAD_SIZE + payload_len)
+        {
+            self.read_ahead_buf.invalidate();
+        }
+
+        // Sync to ensure durability
+        self.file.sync_data()?;
+
+        Ok(())
+    }
+
     /// Closes the reader.
     ///
     /// This explicitly consumes the reader. All resources are released when the reader is dropped.
@@ -309,25 +485,24 @@ impl Reader {
 }
 
 /// Type alias for a result returned from [`Iter::next_record`].
-pub type IterResult<'a> = Result<Option<(u64, Cow<'a, [u8]>)>, ReadError>;
+pub type IterResult<'a, const H: usize> = Result<Option<Record<'a, H>>, ReadError>;
 
 /// Iterator for sequentially reading records from a segment.
-pub struct Iter<'a> {
-    reader: &'a mut Reader,
+pub struct Iter<'a, const H: usize> {
+    reader: &'a mut Reader<H>,
     offset: u64,
 }
 
-impl Iter<'_> {
-    /// Returns the next record as a tuple of (offset, data).
+impl<const H: usize> Iter<'_, H> {
+    /// Returns the next record as a tuple of (offset, header, data).
     ///
     /// Returns `Ok(None)` when reaching the end of valid records or a truncation marker.
     /// Uses sequential read hints for optimized performance.
-    pub fn next_record(&mut self) -> IterResult<'_> {
-        let offset = self.offset;
+    pub fn next_record(&mut self) -> IterResult<'_, H> {
         match self.reader.read_record(self.offset, ReadHint::Sequential) {
-            Ok(data) => {
-                self.offset += (RECORD_HEAD_SIZE + data.len()) as u64;
-                Ok(Some((offset, data)))
+            Ok(record) => {
+                self.offset += record.len as u64;
+                Ok(Some(record))
             }
             Err(ReadError::OutOfBounds { .. } | ReadError::TruncationMarker { .. }) => Ok(None),
             Err(err) => {
@@ -353,6 +528,22 @@ impl ReadAheadBuf {
             pos: 0,
             valid_len: 0,
         }
+    }
+
+    fn overlaps(&self, offset: u64, len: usize) -> bool {
+        if self.valid_len == 0 {
+            return false;
+        }
+
+        let end = offset + len as u64;
+        let buf_end = self.offset + self.valid_len as u64;
+
+        // Two ranges [a, b) and [c, d) overlap if: a < d && c < b
+        offset < buf_end && self.offset < end
+    }
+
+    fn invalidate(&mut self) {
+        self.valid_len = 0;
     }
 
     fn read(&mut self, file: &File, offset: u64, length: usize) -> Result<&[u8], ReadError> {

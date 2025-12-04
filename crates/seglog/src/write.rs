@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
@@ -6,8 +7,11 @@ use std::path::Path;
 use thiserror::Error;
 use tracing::{trace, warn};
 
-use crate::read::{ReadError, Reader};
-use crate::{FlushedOffset, RECORD_HEAD_SIZE, calculate_crc32c};
+use crate::read::{ReadError, ReadHint, Reader};
+use crate::{
+    COMPRESSION_FLAG, FlushedOffset, MIN_COMPRESSION_SIZE, RECORD_HEAD_SIZE,
+    ZSTD_COMPRESSION_LEVEL, calculate_crc32c,
+};
 
 const WRITE_BUF_SIZE: usize = 16 * 1024; // 16 KB buffer
 
@@ -29,16 +33,26 @@ pub enum WriteError {
 ///
 /// Manages buffered writes to a segment file with a fixed maximum size.
 /// Tracks both the current write offset and the last flushed offset for concurrent read safety.
+///
+/// The generic parameter `H` specifies the size of the fixed header in bytes.
 #[derive(Debug)]
-pub struct Writer {
+pub struct Writer<const H: usize> {
     writer: BufWriter<File>,
     size: usize,
     write_offset: u64,
     flushed_offset: FlushedOffset,
     dirty: bool,
+    compression_enabled: bool,
 }
 
-impl Writer {
+impl Writer<0> {
+    #[inline]
+    pub fn append_data(&mut self, data: &[u8]) -> Result<(u64, usize), WriteError> {
+        self.append(&[], data)
+    }
+}
+
+impl<const H: usize> Writer<H> {
     /// Creates a new segment file at the specified path with the given size.
     ///
     /// # Arguments
@@ -65,15 +79,16 @@ impl Writer {
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let dir = tempfile::TempDir::new()?;
     /// # let temp = dir.path().join("segment.log");
-    /// const HEADER_SIZE: u64 = 16;
-    /// let mut writer = Writer::create(&temp, 1024 * 1024, HEADER_SIZE)?;
+    /// const START_OFFSET: u64 = 16;
+    /// let mut writer = Writer::<8>::create(&temp, 1024 * 1024, START_OFFSET)?;
     ///
-    /// // Write header before start_offset
+    /// // Write file header before start_offset
     /// let magic_bytes = b"MYSEG";
     /// writer.file().write_all_at(magic_bytes, 0)?;
     ///
-    /// // Append records (automatically start at HEADER_SIZE)
-    /// writer.append(b"event data")?;
+    /// // Append records with 8-byte headers (automatically start at START_OFFSET)
+    /// let header = [0u8; 8];
+    /// writer.append(&header, b"event data")?;
     /// # Ok(())
     /// # }
     /// ```
@@ -111,6 +126,7 @@ impl Writer {
             write_offset,
             flushed_offset,
             dirty: false,
+            compression_enabled: false,
         })
     }
 
@@ -137,17 +153,17 @@ impl Writer {
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let dir = tempfile::TempDir::new()?;
     /// # let temp = dir.path().join("segment.log");
-    /// # let mut writer = Writer::create(&temp, 1024, 64)?;
-    /// # writer.append(b"data")?;
+    /// # let mut writer = Writer::<0>::create(&temp, 1024, 64)?;
+    /// # writer.append(&[], b"data")?;
     /// # writer.sync()?;
     /// # drop(writer);
     /// const HEADER_SIZE: u64 = 64;
     ///
     /// // Open existing segment (skips header when scanning)
-    /// let mut writer = Writer::open(&temp, 1024, HEADER_SIZE)?;
+    /// let mut writer = Writer::<0>::open(&temp, 1024, HEADER_SIZE)?;
     ///
     /// // Continue appending records
-    /// writer.append(b"more data")?;
+    /// writer.append(&[], b"more data")?;
     /// # Ok(())
     /// # }
     /// ```
@@ -166,12 +182,13 @@ impl Writer {
 
         // We need to scan forward to find the latest valid record, and consider that to
         // be the write offset
-        let mut reader = Reader::open(path, None)?;
-        let mut iter = reader.iter(start_offset);
-        while let Some(res) = iter.next_record().transpose() {
-            match res {
-                Ok((offset, data)) => {
-                    write_offset = offset + (RECORD_HEAD_SIZE + data.len()) as u64;
+        let mut reader = Reader::<H>::open(path, None)?;
+        let mut current_offset = start_offset;
+        loop {
+            match reader.read_record(current_offset, ReadHint::Sequential) {
+                Ok(record) => {
+                    current_offset += record.len as u64;
+                    write_offset = current_offset;
                 }
                 Err(err) => match err {
                     ReadError::Crc32cMismatch { .. } => {
@@ -187,6 +204,9 @@ impl Writer {
                     ReadError::TruncationMarker { .. } => {
                         trace!("found truncation marker at {write_offset}");
                         break;
+                    }
+                    ReadError::ReplaceLengthMismatch { .. } => {
+                        unreachable!("no replacing is done during iteration")
                     }
                     ReadError::Io(err) => return Err(WriteError::Io(err)),
                 },
@@ -204,7 +224,21 @@ impl Writer {
             write_offset,
             flushed_offset,
             dirty: false,
+            compression_enabled: false,
         })
+    }
+
+    /// Enables compression for future append operations.
+    ///
+    /// Once enabled, all data appended via `append()` will be compressed using zstd
+    /// if the data size is >= [`MIN_COMPRESSION_SIZE`].
+    pub fn enable_compression(&mut self) {
+        self.compression_enabled = true;
+    }
+
+    /// Disables compression for future append operations.
+    pub fn disable_compression(&mut self) {
+        self.compression_enabled = false;
     }
 
     /// Returns a reference to the file handle.
@@ -222,12 +256,23 @@ impl Writer {
 
     /// Appends a record to the segment.
     ///
-    /// Returns the offset where the record was written and the total bytes written (including header).
+    /// # Arguments
+    ///
+    /// * `header` - Fixed-size header metadata (H bytes, never compressed)
+    /// * `data` - Variable-length data payload (optionally compressed based on `compression_enabled`)
+    ///
+    /// Returns the offset where the record was written and the total bytes written (including all headers and data).
     /// Returns an error if the segment does not have enough space remaining.
-    pub fn append(&mut self, data: &[u8]) -> Result<(u64, usize), WriteError> {
+    ///
+    /// If compression is enabled and `data.len() >= MIN_COMPRESSION_SIZE`, the data will be compressed
+    /// using zstd. The header is never compressed.
+    pub fn append(&mut self, header: &[u8; H], data: &[u8]) -> Result<(u64, usize), WriteError> {
         let offset = self.write_offset;
-        let len = RECORD_HEAD_SIZE + data.len();
-        if offset as usize + len > self.size {
+
+        let (final_data, length_with_flag) = self.prepare_data(data)?;
+
+        let total_record_len = RECORD_HEAD_SIZE + H + final_data.len();
+        if offset as usize + total_record_len > self.size {
             return Err(WriteError::SegmentFull {
                 attempted: offset,
                 available: self.size as u64 - offset,
@@ -236,17 +281,17 @@ impl Writer {
 
         self.dirty = true;
 
-        let data_len = data.len() as u32;
-        let data_len_bytes = data_len.to_le_bytes();
-        let crc = calculate_crc32c(&data_len_bytes, data);
+        let length_bytes = length_with_flag.to_le_bytes();
+        let crc = calculate_crc32c(&length_bytes, header, &final_data);
 
-        self.writer.write_all(&data_len_bytes)?;
+        self.writer.write_all(&length_bytes)?;
         self.writer.write_all(&crc.to_le_bytes())?;
-        self.writer.write_all(data)?;
+        self.writer.write_all(header)?;
+        self.writer.write_all(&final_data)?;
 
-        self.write_offset += len as u64;
+        self.write_offset += total_record_len as u64;
 
-        Ok((offset, len))
+        Ok((offset, total_record_len))
     }
 
     /// Returns the current write offset where the next record will be written.
@@ -309,5 +354,30 @@ impl Writer {
     pub fn close(mut self) -> Result<(), WriteError> {
         self.sync()?;
         Ok(())
+    }
+
+    fn prepare_data<'d>(&self, data: &'d [u8]) -> Result<(Cow<'d, [u8]>, u32), WriteError> {
+        // Decide whether to compress
+        let should_compress = self.compression_enabled && data.len() >= MIN_COMPRESSION_SIZE;
+
+        // Prepare data (with compression if needed)
+        if should_compress {
+            // Compress data and prepend original size
+            let original_size = data.len() as u32;
+            let compressed = zstd::bulk::compress(data, ZSTD_COMPRESSION_LEVEL)?;
+
+            let mut final_data = Vec::with_capacity(4 + compressed.len());
+            final_data.extend_from_slice(&original_size.to_le_bytes());
+            final_data.extend_from_slice(&compressed);
+
+            let total_payload_len = H + final_data.len();
+            let length_with_flag = (total_payload_len as u32) | COMPRESSION_FLAG;
+
+            Ok((Cow::Owned(final_data), length_with_flag))
+        } else {
+            let total_payload_len = H + data.len();
+            let length_with_flag = total_payload_len as u32;
+            Ok((Cow::Borrowed(data), length_with_flag))
+        }
     }
 }
