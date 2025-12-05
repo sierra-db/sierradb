@@ -58,7 +58,7 @@ polonius-the-crab = "0.5"
 proptest = "1.9"
 rand = "0.9"
 rayon = "1.11"
-redis = "0.32"
+redis = "1.0"
 redis-protocol = { version = "6.0", features = [
   "std",
   "resp3",
