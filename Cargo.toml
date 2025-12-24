@@ -67,7 +67,7 @@ redis-protocol = { version = "6.0", features = [
 serde = "1.0"
 smallvec = "1.15"
 strum = { version = "0.27", features = ["derive"] }
-tempfile = "3.23"
+tempfile = "3.24"
 tokio = "1.48"
 tokio-util = "0.7"
 thiserror = "2.0"
