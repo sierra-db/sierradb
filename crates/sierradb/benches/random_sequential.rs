@@ -95,8 +95,8 @@ fn benchmark_writes(c: &mut Criterion) {
 
     group.bench_function("Append event", |b| {
         let file = NamedTempFile::new().unwrap();
-        let mut writer =
-            BucketSegmentWriter::open(file.path(), 1024 * 1024, true).expect("Failed to open writer");
+        let mut writer = BucketSegmentWriter::open(file.path(), 1024 * 1024, true)
+            .expect("Failed to open writer");
         b.iter(|| {
             let event_id = Uuid::new_v4();
             let partition_key = Uuid::new_v4();
@@ -126,8 +126,8 @@ fn benchmark_writes(c: &mut Criterion) {
 
     group.bench_function("Append commit", |b| {
         let file = NamedTempFile::new().unwrap();
-        let mut writer =
-            BucketSegmentWriter::open(file.path(), 1024 * 1024, true).expect("Failed to open writer");
+        let mut writer = BucketSegmentWriter::open(file.path(), 1024 * 1024, true)
+            .expect("Failed to open writer");
         b.iter(|| {
             let transaction_id = Uuid::new_v4();
 
