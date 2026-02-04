@@ -3535,7 +3535,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "seglog"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "crc32fast",
  "criterion",
@@ -3650,7 +3650,7 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "sierradb"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arc-swap",
  "bincode",
@@ -3682,7 +3682,7 @@ dependencies = [
 
 [[package]]
 name = "sierradb-client"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ciborium",
  "futures-util",
@@ -3697,7 +3697,7 @@ dependencies = [
 
 [[package]]
 name = "sierradb-cluster"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arrayvec",
  "bincode",
@@ -3736,7 +3736,7 @@ dependencies = [
 
 [[package]]
 name = "sierradb-protocol"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "strum",
@@ -3744,7 +3744,7 @@ dependencies = [
 
 [[package]]
 name = "sierradb-server"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytes",
  "clap",
@@ -3770,7 +3770,7 @@ dependencies = [
 
 [[package]]
 name = "sierradb-topology"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arrayvec",
  "bincode",

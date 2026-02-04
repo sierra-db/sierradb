@@ -11,14 +11,14 @@ homepage = "https://github.com/tqwewe/sierradb"
 keywords = ["database", "event-sourcing", "distributed", "redis", "event-store"]
 license = "Apache-2.0"
 repository = "https://github.com/tqwewe/sierradb"
-version = "0.2.0"
+version = "0.2.1"
 
 [workspace.dependencies]
 seglog = { path = "crates/seglog" }
-sierradb = { path = "crates/sierradb", version = "0.2.0" }
-sierradb-cluster = { path = "crates/sierradb-cluster", version = "0.2.0" }
-sierradb-protocol = { path = "crates/sierradb-protocol", version = "0.2.0" }
-sierradb-topology = { path = "crates/sierradb-topology", version = "0.2.0" }
+sierradb = { path = "crates/sierradb", version = "0.2.1" }
+sierradb-cluster = { path = "crates/sierradb-cluster", version = "0.2.1" }
+sierradb-protocol = { path = "crates/sierradb-protocol", version = "0.2.1" }
+sierradb-topology = { path = "crates/sierradb-topology", version = "0.2.1" }
 
 arc-swap = "1.7"
 arrayvec = "0.7"
