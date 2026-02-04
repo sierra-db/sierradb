@@ -133,7 +133,7 @@ mod tests {
     fn test_write_and_read_segment_header() {
         let path = temp_file_path();
 
-        BucketSegmentWriter::create(&path, 62, 256 * 1024).unwrap();
+        BucketSegmentWriter::create(&path, 62, 256 * 1024, true).unwrap();
 
         let reader = BucketSegmentReader::open(&path, None).unwrap();
         let read_header = reader.read_header().unwrap();
@@ -162,7 +162,7 @@ mod tests {
         let flushed_offset;
 
         {
-            let mut writer = BucketSegmentWriter::create(&path, 0, 256 * 1024 * 5).unwrap();
+            let mut writer = BucketSegmentWriter::create(&path, 0, 256 * 1024 * 5, true).unwrap();
 
             for i in 0..10_000 {
                 if i % 5 == 0 {

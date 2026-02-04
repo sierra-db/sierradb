@@ -117,6 +117,7 @@ pub struct ReplicationConfig {
 #[derive(Debug, Deserialize)]
 pub struct SegmentConfig {
     pub size_bytes: usize,
+    pub compression: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -194,6 +195,7 @@ impl AppConfig {
             .set_default("replication.buffer_timeout_ms", 8000)?
             .set_default("replication.catchup_timeout_ms", 2000)?
             .set_default("segment.size_bytes", 256 * 1024 * 1024)?
+            .set_default("segment.compression", true)?
             .set_default("sync.interval_ms", 5)?
             .set_default("sync.max_batch_size", 50)?
             .set_default("sync.min_bytes", 4096)?;
@@ -569,6 +571,7 @@ impl fmt::Display for AppConfig {
         writeln!(f, "replication.factor = {}", self.replication.factor)?;
 
         writeln!(f, "segment.size_bytes = {}", self.segment.size_bytes)?;
+        writeln!(f, "segment.compression = {}", self.segment.compression)?;
 
         writeln!(f, "sync.interval_ms = {}", self.sync.interval_ms)?;
         writeln!(

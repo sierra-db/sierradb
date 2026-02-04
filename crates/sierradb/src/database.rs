@@ -367,6 +367,7 @@ pub struct DatabaseBuilder {
     max_batch_size: usize,
     min_sync_bytes: usize,
     cache_capacity_bytes: usize,
+    compression: bool,
 }
 
 impl DatabaseBuilder {
@@ -386,6 +387,7 @@ impl DatabaseBuilder {
             max_batch_size: 50,
             min_sync_bytes: 4096,
             cache_capacity_bytes: 256 * 1024 * 1024,
+            compression: true,
         }
     }
 
@@ -458,6 +460,7 @@ impl DatabaseBuilder {
             self.sync_idle_interval,
             self.max_batch_size,
             self.min_sync_bytes,
+            self.compression,
             &reader_pool,
             &thread_pool,
         )?;
@@ -674,6 +677,11 @@ impl DatabaseBuilder {
 
     pub fn cache_capacity_bytes(&mut self, bytes: usize) -> &mut Self {
         self.cache_capacity_bytes = bytes;
+        self
+    }
+
+    pub fn compression(&mut self, enabled: bool) -> &mut Self {
+        self.compression = enabled;
         self
     }
 }

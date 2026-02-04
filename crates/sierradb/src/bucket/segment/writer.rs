@@ -21,10 +21,13 @@ impl BucketSegmentWriter {
         path: impl AsRef<Path>,
         bucket_id: BucketId,
         segment_size: usize,
+        compression: bool,
     ) -> Result<Self, WriteError> {
         let mut writer =
             seglog::write::Writer::create(path, segment_size, SEGMENT_HEADER_SIZE as u64)?;
-        writer.enable_compression();
+        if compression {
+            writer.enable_compression();
+        }
 
         let header_bytes =
             bincode::encode_to_vec(BucketSegmentHeader::new(bucket_id)?, BINCODE_CONFIG)?;
@@ -35,10 +38,16 @@ impl BucketSegmentWriter {
     }
 
     /// Opens a segment for writing.
-    pub fn open(path: impl AsRef<Path>, segment_size: usize) -> Result<Self, WriteError> {
+    pub fn open(
+        path: impl AsRef<Path>,
+        segment_size: usize,
+        compression: bool,
+    ) -> Result<Self, WriteError> {
         let mut writer =
             seglog::write::Writer::open(path, segment_size, SEGMENT_HEADER_SIZE as u64)?;
-        writer.enable_compression();
+        if compression {
+            writer.enable_compression();
+        }
 
         BucketSegmentHeader::load_from_file(writer.file())?.validate()?;
 
@@ -49,6 +58,7 @@ impl BucketSegmentWriter {
         bucket_id: BucketId,
         dir: impl AsRef<Path>,
         segment_size: usize,
+        compression: bool,
     ) -> Result<(BucketSegmentId, Self), WriteError> {
         let dir = dir.as_ref();
         let bucket_dir = dir.join("buckets").join(format!("{bucket_id:05}"));
@@ -94,7 +104,8 @@ impl BucketSegmentWriter {
                 .join(format!("{segment_id:010}"))
                 .join(SegmentKind::Events.file_name());
 
-            Self::open(events_path, segment_size).map(|writer| (bucket_segment_id, writer))
+            Self::open(events_path, segment_size, compression)
+                .map(|writer| (bucket_segment_id, writer))
         } else {
             // Create a new segment with ID 0
             let bucket_segment_id = BucketSegmentId::new(bucket_id, 0);
@@ -104,7 +115,7 @@ impl BucketSegmentWriter {
             fs::create_dir_all(&segment_dir)?;
 
             let events_path = segment_dir.join(SegmentKind::Events.file_name());
-            Self::create(events_path, bucket_id, segment_size)
+            Self::create(events_path, bucket_id, segment_size, compression)
                 .map(|writer| (bucket_segment_id, writer))
         }
     }

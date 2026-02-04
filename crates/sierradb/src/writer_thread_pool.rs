@@ -70,6 +70,7 @@ impl WriterThreadPool {
         sync_idle_interval: Duration,
         max_batch_size: usize,
         min_sync_bytes: usize,
+        compression: bool,
         reader_pool: &ReaderThreadPool,
         thread_pool: &Arc<ThreadPool>,
     ) -> Result<Self, WriteError> {
@@ -94,6 +95,7 @@ impl WriterThreadPool {
                 sync_interval,
                 max_batch_size,
                 min_sync_bytes,
+                compression,
                 reader_pool,
                 thread_pool,
                 &has_recent_activity,
@@ -292,6 +294,7 @@ impl Worker {
         sync_interval: Duration,
         max_batch_size: usize,
         min_sync_bytes: usize,
+        compression: bool,
         reader_pool: &ReaderThreadPool,
         thread_pool: &Arc<ThreadPool>,
         has_recent_activity: &Arc<AtomicBool>,
@@ -301,7 +304,7 @@ impl Worker {
         for &bucket_id in bucket_ids.iter() {
             if bucket_id_to_thread_id(bucket_id, bucket_ids, num_threads) == Some(thread_id) {
                 let (bucket_segment_id, writer) =
-                    BucketSegmentWriter::latest(bucket_id, &dir, segment_size)?;
+                    BucketSegmentWriter::latest(bucket_id, &dir, segment_size, compression)?;
                 let mut reader = BucketSegmentReader::open(
                     SegmentKind::Events.get_path(&dir, bucket_segment_id),
                     Some(writer.flushed_offset()),
@@ -346,6 +349,7 @@ impl Worker {
                     reader_pool: reader_pool.clone(),
                     bucket_segment_id,
                     segment_size,
+                    compression,
                     writer,
                     next_partition_sequences: HashMap::new(),
                     index_segment_id: Arc::new(AtomicU32::new(bucket_segment_id.segment_id)),
@@ -524,6 +528,7 @@ struct WriterSet {
     reader_pool: ReaderThreadPool,
     bucket_segment_id: BucketSegmentId,
     segment_size: usize,
+    compression: bool,
     writer: BucketSegmentWriter,
     next_partition_sequences: HashMap<PartitionId, u64>,
     index_segment_id: Arc<AtomicU32>,
@@ -692,6 +697,7 @@ impl WriterSet {
             SegmentKind::Events.get_path(&self.dir, self.bucket_segment_id),
             self.bucket_segment_id.bucket_id,
             self.segment_size,
+            self.compression,
         )?;
         let old_reader = mem::replace(
             &mut self.reader,
@@ -1275,7 +1281,7 @@ mod tests {
         let reader_pool = ReaderThreadPool::new(reader_threads, &[0, 1, 2, 3], segment_size);
 
         let (bucket_segment_id, writer) =
-            BucketSegmentWriter::latest(bucket_id, &dir, segment_size).unwrap();
+            BucketSegmentWriter::latest(bucket_id, &dir, segment_size, true).unwrap();
         let mut reader = BucketSegmentReader::open(
             SegmentKind::Events.get_path(&dir, bucket_segment_id),
             Some(writer.flushed_offset()),
@@ -1325,6 +1331,7 @@ mod tests {
             reader_pool: reader_pool.clone(),
             bucket_segment_id,
             segment_size,
+            compression: true,
             writer,
             bytes_since_sync: 0,
             next_partition_sequences: HashMap::new(),
