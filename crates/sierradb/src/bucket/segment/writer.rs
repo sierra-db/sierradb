@@ -22,7 +22,9 @@ impl BucketSegmentWriter {
         bucket_id: BucketId,
         segment_size: usize,
     ) -> Result<Self, WriteError> {
-        let writer = seglog::write::Writer::create(path, segment_size, SEGMENT_HEADER_SIZE as u64)?;
+        let mut writer =
+            seglog::write::Writer::create(path, segment_size, SEGMENT_HEADER_SIZE as u64)?;
+        writer.enable_compression();
 
         let header_bytes =
             bincode::encode_to_vec(BucketSegmentHeader::new(bucket_id)?, BINCODE_CONFIG)?;
@@ -34,7 +36,10 @@ impl BucketSegmentWriter {
 
     /// Opens a segment for writing.
     pub fn open(path: impl AsRef<Path>, segment_size: usize) -> Result<Self, WriteError> {
-        let writer = seglog::write::Writer::open(path, segment_size, SEGMENT_HEADER_SIZE as u64)?;
+        let mut writer =
+            seglog::write::Writer::open(path, segment_size, SEGMENT_HEADER_SIZE as u64)?;
+        writer.enable_compression();
+
         BucketSegmentHeader::load_from_file(writer.file())?.validate()?;
 
         Ok(BucketSegmentWriter { writer })
