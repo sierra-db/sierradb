@@ -131,7 +131,7 @@ impl ConfirmationActor {
         for event in events_to_broadcast {
             match self.broadcast_tx.send(event) {
                 Ok(0) | Err(_) => break, // No subscribers or channel closed
-                Ok(_) => {} // Successfully broadcast
+                Ok(_) => {}              // Successfully broadcast
             }
         }
 
@@ -189,7 +189,6 @@ impl Message<UpdateConfirmationWithBroadcast> for ConfirmationActor {
         }
 
         let highest_confirmed_seq = watermark - 1;
-
 
         if *next_to_broadcast <= highest_confirmed_seq {
             let broadcast_from = *next_to_broadcast;
@@ -263,7 +262,9 @@ impl Message<TriggerBroadcast> for ConfirmationActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         // For each partition, check if there are confirmed events that haven't been broadcast
-        let watermarks: Vec<_> = self.manager.get_watermarks()
+        let watermarks: Vec<_> = self
+            .manager
+            .get_watermarks()
             .into_iter()
             .map(|(pid, wm)| (pid, wm.get()))
             .collect();
@@ -288,7 +289,8 @@ impl Message<TriggerBroadcast> for ConfirmationActor {
                     .read_partition(partition_id, broadcast_from, IterDirection::Forward)
                     .await
                 {
-                    'outer: while let Ok(Some(commits)) = iter.next_batch(DEFAULT_BATCH_SIZE).await {
+                    'outer: while let Ok(Some(commits)) = iter.next_batch(DEFAULT_BATCH_SIZE).await
+                    {
                         for commit in commits {
                             for event in commit {
                                 if event.partition_sequence >= broadcast_from

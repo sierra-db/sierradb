@@ -1,5 +1,5 @@
 use crate::{
-    CRC32C_SIZE, COMPRESSION_FLAG, LEN_SIZE, LENGTH_MASK, RECORD_HEAD_SIZE, calculate_crc32c,
+    COMPRESSION_FLAG, CRC32C_SIZE, LEN_SIZE, LENGTH_MASK, RECORD_HEAD_SIZE, calculate_crc32c,
     read::{ReadError, is_truncation_marker},
 };
 
