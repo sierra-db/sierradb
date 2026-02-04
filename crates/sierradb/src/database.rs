@@ -69,14 +69,58 @@ impl Database {
     pub async fn set_confirmations(
         &self,
         partition_id: PartitionId,
-        offsets: SmallVec<[u64; 4]>,
+        mut offsets: SmallVec<[u64; 4]>,
         transaction_id: Uuid,
         confirmation_count: u8,
-    ) -> Result<(), WriteError> {
+    ) -> Result<(), ReadError> {
         let bucket_id = partition_id % self.total_buckets;
-        self.writer_pool
-            .set_confirmations(bucket_id, offsets, transaction_id, confirmation_count)
-            .await
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.reader_pool.spawn(move |with_readers| {
+            with_readers(move |readers| {
+                let Some(segments) = readers.get_mut(&bucket_id) else {
+                    let _ = reply_tx.send(Err(ReadError::BucketIdNotFound { bucket_id }));
+                    return;
+                };
+
+                let mut errors = Vec::new();
+
+                for reader_set in segments.values_mut().rev() {
+                    offsets.retain(|offset| {
+                        match reader_set.reader.set_confirmations(
+                            *offset,
+                            &transaction_id,
+                            confirmation_count,
+                        ) {
+                            Ok(false) => true,
+                            Ok(true) => false,
+                            Err(err) => {
+                                errors.push(err);
+                                false
+                            }
+                        }
+                    });
+                    if offsets.is_empty() {
+                        break;
+                    }
+                }
+
+                for offset in offsets {
+                    errors.push(ReadError::TransactionIdNotFoundAtOffset {
+                        transaction_id,
+                        offset,
+                    });
+                }
+
+                if !errors.is_empty() {
+                    let _ = reply_tx.send(Err(ReadError::SetConfirmations { errors }));
+                } else {
+                    let _ = reply_tx.send(Ok(()));
+                }
+            })
+        });
+
+        reply_rx.await?
     }
 
     pub async fn read_event(

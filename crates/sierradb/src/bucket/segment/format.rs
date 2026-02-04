@@ -10,11 +10,7 @@ use bincode::{
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{
-    StreamId,
-    bucket::{PartitionId, segment::calculate_confirmation_count_crc32c},
-    error::ReadError,
-};
+use crate::{MAX_REPLICATION_FACTOR, StreamId, bucket::PartitionId, error::ConfirmationCountError};
 
 #[derive(Debug, Encode, Decode)]
 pub struct RecordKindTimestamp(u64);
@@ -55,64 +51,78 @@ impl RecordKindTimestamp {
     }
 }
 
+#[derive(Debug)]
+pub struct ConfirmationCount(u8);
+
+impl ConfirmationCount {
+    pub fn new(confirmation_count: u8) -> Result<Self, ConfirmationCountError> {
+        if confirmation_count > MAX_REPLICATION_FACTOR as u8 {
+            return Err(ConfirmationCountError::ExceedsMaxReplicationFactor);
+        }
+
+        Ok(ConfirmationCount(confirmation_count))
+    }
+
+    pub fn get(&self) -> u8 {
+        self.0
+    }
+
+    pub fn to_byte(&self) -> u8 {
+        (self.0 << 4) | self.0 // Duplicates the lower 4 bits to the upper 4 bits for redundancy
+    }
+
+    pub fn from_byte(byte: u8) -> Result<Self, ConfirmationCountError> {
+        let upper = byte >> 4;
+        let lower = byte & 0x0F;
+
+        if upper != lower {
+            return Err(ConfirmationCountError::RedundancyCheck { upper, lower });
+        }
+
+        ConfirmationCount::new(upper)
+    }
+}
+
+impl Encode for ConfirmationCount {
+    fn encode<E: Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {
+        debug_assert!(self.0 <= MAX_REPLICATION_FACTOR as u8);
+        self.to_byte().encode(encoder) // Duplicates the lower 4 bits to the upper 4 bits for redundancy
+    }
+}
+
+impl<C> Decode<C> for ConfirmationCount {
+    fn decode<D: Decoder<Context = C>>(decoder: &mut D) -> Result<Self, DecodeError> {
+        let byte = u8::decode(decoder)?;
+        ConfirmationCount::from_byte(byte).map_err(|err| DecodeError::OtherString(err.to_string()))
+    }
+}
+
 #[derive(Debug, Encode, Decode)]
 pub struct RecordHeader {
     pub timestamp: RecordKindTimestamp,
     pub transaction_id: [u8; 16],
-    pub confirmation_count: u8,
-    pub confirmation_count_crc32c: u32,
 }
 
 impl RecordHeader {
-    pub fn new(
-        timestamp: RecordKindTimestamp,
-        transaction_id: Uuid,
-        confirmation_count: u8,
-    ) -> Self {
-        let confirmation_count_crc32c =
-            calculate_confirmation_count_crc32c(&transaction_id, confirmation_count);
+    pub fn new(timestamp: RecordKindTimestamp, transaction_id: Uuid) -> Self {
         RecordHeader {
             timestamp,
             transaction_id: transaction_id.into_bytes(),
-            confirmation_count,
-            confirmation_count_crc32c,
         }
     }
 
-    pub fn new_event(
-        timestamp: u64,
-        transaction_id: Uuid,
-        confirmation_count: u8,
-    ) -> Result<Self, InvalidTimestamp> {
+    pub fn new_event(timestamp: u64, transaction_id: Uuid) -> Result<Self, InvalidTimestamp> {
         Ok(Self::new(
             RecordKindTimestamp::new(RecordKind::Event, timestamp)?,
             transaction_id,
-            confirmation_count,
         ))
     }
 
-    pub fn new_commit(
-        timestamp: u64,
-        transaction_id: Uuid,
-        confirmation_count: u8,
-    ) -> Result<Self, InvalidTimestamp> {
+    pub fn new_commit(timestamp: u64, transaction_id: Uuid) -> Result<Self, InvalidTimestamp> {
         Ok(Self::new(
             RecordKindTimestamp::new(RecordKind::Commit, timestamp)?,
             transaction_id,
-            confirmation_count,
         ))
-    }
-
-    pub fn validate(&self, offset: u64) -> Result<(), ReadError> {
-        let new_confirmation_count_crc32c = calculate_confirmation_count_crc32c(
-            &Uuid::from_bytes(self.transaction_id),
-            self.confirmation_count,
-        );
-        if self.confirmation_count_crc32c != new_confirmation_count_crc32c {
-            return Err(ReadError::ConfirmationCountCrc32cMismatch { offset });
-        }
-
-        Ok(())
     }
 }
 
@@ -229,3 +239,46 @@ impl<C> Decode<C> for LongBytes {
 }
 
 impl_borrow_decode!(LongBytes);
+
+#[cfg(test)]
+mod tests {
+    use crate::bucket::segment::BINCODE_CONFIG;
+
+    use super::*;
+
+    #[test]
+    fn test_confirmation_count_encode() {
+        let tests = [
+            (0b0000_1100, 0b1100_1100),
+            (0b0000_1010, 0b1010_1010),
+            (0b0000_1001, 0b1001_1001),
+            (0b0000_1000, 0b1000_1000),
+        ];
+        for (raw, expected) in tests {
+            let confirmation_count = ConfirmationCount::new(raw).unwrap();
+            assert_eq!(confirmation_count.to_byte(), expected);
+
+            let bytes = bincode::encode_to_vec(&confirmation_count, BINCODE_CONFIG).unwrap();
+            assert_eq!(bytes, [expected]);
+        }
+    }
+
+    #[test]
+    fn test_confirmation_count_decode() {
+        let tests = [
+            (0b1100_1100, 0b0000_1100),
+            (0b1010_1010, 0b0000_1010),
+            (0b1001_1001, 0b0000_1001),
+            (0b1000_1000, 0b0000_1000),
+        ];
+        for (encoded, expected) in tests {
+            let confirmation_count = ConfirmationCount::from_byte(encoded).unwrap();
+            assert_eq!(confirmation_count.get(), expected);
+
+            let (confirmation_count, _) =
+                bincode::decode_from_slice::<ConfirmationCount, _>(&[encoded], BINCODE_CONFIG)
+                    .unwrap();
+            assert_eq!(confirmation_count.get(), expected);
+        }
+    }
+}

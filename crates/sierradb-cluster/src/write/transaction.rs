@@ -89,15 +89,18 @@ pub fn spawn(
                         config.circuit_breaker.record_success();
 
                         // Continue with watermark update and replica confirmations
-                        let event_partition_sequences: SmallVec<[u64; 4]> =
+                        // Convert partition sequences to 1-indexed versions for the confirmation system
+                        // The confirmation system uses version = partition_sequence + 1 internally
+                        let confirmation_versions: SmallVec<[u64; 4]> =
                             (append.first_partition_sequence..=append.last_partition_sequence)
+                                .map(|seq| seq + 1)
                                 .collect();
 
                         let _ = config
                             .confirmation_ref
                             .tell(UpdateConfirmationWithBroadcast {
                                 partition_id,
-                                versions: event_partition_sequences.clone(),
+                                versions: confirmation_versions.clone(),
                                 confirmation_count,
                                 partition_sequences: (
                                     append.first_partition_sequence,
@@ -123,7 +126,7 @@ pub fn spawn(
                                     partition_id,
                                     transaction_id,
                                     event_ids: event_ids.clone(),
-                                    event_partition_sequences: event_partition_sequences.clone(),
+                                    confirmation_versions: confirmation_versions.clone(),
                                     confirmation_count,
                                 })
                                 .send()
@@ -145,8 +148,7 @@ pub fn spawn(
                                         partition_id,
                                         transaction_id,
                                         event_ids: event_ids.clone(),
-                                        event_partition_sequences: event_partition_sequences
-                                            .clone(),
+                                        confirmation_versions: confirmation_versions.clone(),
                                         confirmation_count,
                                     })
                                     .send()
@@ -339,7 +341,7 @@ pub async fn set_confirmations_with_retry(
     offsets: SmallVec<[u64; 4]>,
     transaction_id: Uuid,
     confirmation_count: u8,
-) -> Result<(), sierradb::error::WriteError> {
+) -> Result<(), sierradb::error::ReadError> {
     const MAX_ATTEMPTS: u32 = 5;
     const BASE_DELAY: Duration = Duration::from_millis(100);
     const MAX_DELAY: Duration = Duration::from_secs(5);

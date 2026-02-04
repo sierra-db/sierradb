@@ -10,7 +10,6 @@ use std::{fs, mem};
 use bincode::config::{Fixint, LittleEndian, NoLimit};
 use bincode::{Decode, Encode};
 use seglog::RECORD_HEAD_SIZE;
-use tracing::trace;
 use uuid::Uuid;
 
 pub use self::format::{
@@ -23,7 +22,7 @@ pub use self::reader::{
     EventRecord, Record, SegmentBlock, SegmentBlockIter,
 };
 pub use self::writer::BucketSegmentWriter;
-use crate::error::{InvalidHeaderError, ReadError, WriteError};
+use crate::error::{InvalidHeaderError, ReadError};
 
 const BINCODE_CONFIG: bincode::config::Configuration<LittleEndian, Fixint, NoLimit> =
     bincode::config::legacy();
@@ -41,11 +40,12 @@ pub const SEGMENT_HEADER_SIZE: usize =
     MAGIC_BYTES_SIZE + VERSION_SIZE + BUCKET_ID_SIZE + CREATED_AT_SIZE + PADDING_SIZE;
 
 // Record sizes
-pub const RECORD_HEADER_SIZE: usize = RECORD_HEAD_SIZE // seglog head size (len + crc32c)
+pub const CONFIRMATION_HEADER_SIZE: usize = mem::size_of::<u8>(); // Confirmation count encoded
+const RECORD_HEADER_SIZE: usize = RECORD_HEAD_SIZE // seglog head size (len + crc32c)
+    + CONFIRMATION_HEADER_SIZE
     + mem::size_of::<u64>() // Timestamp nanoseconds
-    + mem::size_of::<Uuid>() // Transaction ID
-    + mem::size_of::<u8>() // Confirmation count
-    + mem::size_of::<u32>(); // Confirmation count CRC32C hash
+    + mem::size_of::<Uuid>(); // Transaction ID
+
 pub const EVENT_HEADER_SIZE: usize = RECORD_HEADER_SIZE
     + mem::size_of::<Uuid>() // Event ID
     + mem::size_of::<Uuid>() // Partition key
@@ -104,43 +104,6 @@ impl BucketSegmentHeader {
 
         Ok(())
     }
-}
-
-#[must_use]
-fn calculate_confirmation_count_crc32c(transaction_id: &Uuid, confirmation_count: u8) -> u32 {
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(transaction_id.as_bytes());
-    hasher.update(&confirmation_count.to_le_bytes());
-    let hash = hasher.finalize();
-
-    trace!(
-        %transaction_id,
-        confirmation_count,
-        hash,
-        "calculating confirmation count crc32c"
-    );
-
-    hash
-}
-
-fn set_confirmations(
-    file: &fs::File,
-    mut offset: u64,
-    transaction_id: &Uuid,
-    confirmation_count: u8,
-) -> Result<(), WriteError> {
-    offset += RECORD_HEAD_SIZE as u64 + 8 + 16; // timestamp + transaction id
-
-    let confirmation_count_crc32c =
-        calculate_confirmation_count_crc32c(transaction_id, confirmation_count);
-
-    let mut buf = [0; mem::size_of::<u8>() + mem::size_of::<u32>()];
-    buf[0] = confirmation_count;
-    buf[1..5].copy_from_slice(&confirmation_count_crc32c.to_le_bytes());
-
-    file.write_all_at(&buf, offset)?;
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -204,15 +167,19 @@ mod tests {
             for i in 0..10_000 {
                 if i % 5 == 0 {
                     let (offset, _) = writer
-                        .append_commit(&RawCommit {
-                            header: RecordHeader::new_commit(timestamp, transaction_id, 1).unwrap(),
-                            event_count: 1,
-                        })
+                        .append_commit(
+                            1,
+                            &RawCommit {
+                                header: RecordHeader::new_commit(timestamp, transaction_id)
+                                    .unwrap(),
+                                event_count: 1,
+                            },
+                        )
                         .unwrap();
                     offsets.push((1u8, offset));
                 } else {
                     let append = RawEvent {
-                        header: RecordHeader::new_event(timestamp, transaction_id, 1).unwrap(),
+                        header: RecordHeader::new_event(timestamp, transaction_id).unwrap(),
                         event_id: event_id.into_bytes(),
                         partition_key: partition_key.into_bytes(),
                         partition_id,
@@ -223,7 +190,7 @@ mod tests {
                         metadata: LongBytes(metadata.to_vec()),
                         payload: LongBytes(payload.to_vec()),
                     };
-                    let (offset, _) = writer.append_event(&append).unwrap();
+                    let (offset, _) = writer.append_event(1, &append).unwrap();
                     offsets.push((0u8, offset));
                 }
             }
