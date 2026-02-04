@@ -10,7 +10,7 @@ use smallvec::{SmallVec, smallvec};
 use tracing::warn;
 use uuid::Uuid;
 
-use super::{BINCODE_CONFIG, BucketSegmentHeader, COMMIT_SIZE, EVENT_HEADER_SIZE};
+use super::{BINCODE_CONFIG, BucketSegmentHeader, COMMIT_SIZE};
 use crate::StreamId;
 use crate::bucket::PartitionId;
 use crate::bucket::segment::format::{ConfirmationCount, RawCommit, RawEvent};
@@ -94,7 +94,7 @@ impl SegmentBlock {
 
     pub fn read_record(&self, start_offset: u64) -> Result<Option<Record>, ReadError> {
         let offset = (start_offset - self.offset) as usize;
-        let ([confirmation_count_byte], bytes, _) =
+        let ([confirmation_count_byte], bytes, record_len) =
             seglog::parse::parse_record::<CONFIRMATION_HEADER_SIZE>(&self.block, offset)?;
 
         let confirmation_count = ConfirmationCount::from_byte(confirmation_count_byte)?;
@@ -123,6 +123,7 @@ impl SegmentBlock {
                 start_offset,
                 confirmation_count.get(),
                 record,
+                record_len as u64,
             ));
             Ok(Some(event))
         }
@@ -477,6 +478,7 @@ impl BucketSegmentReader {
         };
 
         let confirmation_count = ConfirmationCount::from_byte(record.header[0])?;
+        let record_len = record.len as u64;
 
         let bytes = record.data;
         if bytes.len() < mem::size_of::<u64>() {
@@ -503,6 +505,7 @@ impl BucketSegmentReader {
                 start_offset,
                 confirmation_count.get(),
                 record,
+                record_len,
             ));
             Ok(Some(event))
         }
@@ -704,13 +707,7 @@ impl EventRecord {
         uuid_to_partition_hash(self.partition_key) % num_partitions
     }
 
-    fn from_raw(offset: u64, confirmation_count: u8, record: RawEvent) -> Self {
-        let size = EVENT_HEADER_SIZE as u64
-            + record.stream_id.len() as u64
-            + record.event_name.len() as u64
-            + record.metadata.len() as u64
-            + record.payload.len() as u64;
-
+    fn from_raw(offset: u64, confirmation_count: u8, record: RawEvent, size: u64) -> Self {
         EventRecord {
             offset,
             event_id: Uuid::from_bytes(record.event_id),
