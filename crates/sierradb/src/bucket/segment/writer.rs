@@ -3,17 +3,16 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use seglog::FlushedOffset;
-use uuid::Uuid;
 
 use super::BucketSegmentHeader;
-use crate::bucket::segment::format::{RawCommit, RawEvent};
-use crate::bucket::segment::{BINCODE_CONFIG, SEGMENT_HEADER_SIZE};
+use crate::bucket::segment::format::{ConfirmationCount, RawCommit, RawEvent};
+use crate::bucket::segment::{BINCODE_CONFIG, CONFIRMATION_HEADER_SIZE, SEGMENT_HEADER_SIZE};
 use crate::bucket::{BucketId, BucketSegmentId, SegmentId, SegmentKind};
 use crate::error::WriteError;
 
 #[derive(Debug)]
 pub struct BucketSegmentWriter {
-    writer: seglog::write::Writer,
+    writer: seglog::write::Writer<CONFIRMATION_HEADER_SIZE>,
 }
 
 impl BucketSegmentWriter {
@@ -115,37 +114,31 @@ impl BucketSegmentWriter {
     }
 
     /// Appends an event to the end of the segment.
-    pub fn append_event(&mut self, event: &RawEvent) -> Result<(u64, usize), WriteError> {
+    pub fn append_event(
+        &mut self,
+        confirmation_count: u8,
+        event: &RawEvent,
+    ) -> Result<(u64, usize), WriteError> {
         let bytes = bincode::encode_to_vec(event, BINCODE_CONFIG)?;
-        let (offset, len) = self.writer.append(&bytes)?;
+        let (offset, len) = self.writer.append(
+            &[ConfirmationCount::new(confirmation_count)?.to_byte()],
+            &bytes,
+        )?;
         Ok((offset, len))
     }
 
     /// Appends a commit to the end of the segment.
-    pub fn append_commit(&mut self, commit: &RawCommit) -> Result<(u64, usize), WriteError> {
-        let bytes = bincode::encode_to_vec(commit, BINCODE_CONFIG)?;
-        let (offset, len) = self.writer.append(&bytes)?;
-        Ok((offset, len))
-    }
-
-    pub fn set_confirmations(
-        &self,
-        offset: u64,
-        transaction_id: &Uuid,
+    pub fn append_commit(
+        &mut self,
         confirmation_count: u8,
-    ) -> Result<(), WriteError> {
-        if offset > self.writer.write_offset() {
-            return Err(WriteError::OffsetExceedsFileSize {
-                offset,
-                size: self.writer.write_offset(),
-            });
-        }
-        super::set_confirmations(
-            self.writer.file(),
-            offset,
-            transaction_id,
-            confirmation_count,
-        )
+        commit: &RawCommit,
+    ) -> Result<(u64, usize), WriteError> {
+        let bytes = bincode::encode_to_vec(commit, BINCODE_CONFIG)?;
+        let (offset, len) = self.writer.append(
+            &[ConfirmationCount::new(confirmation_count)?.to_byte()],
+            &bytes,
+        )?;
+        Ok((offset, len))
     }
 
     pub fn write_offset(&self) -> u64 {

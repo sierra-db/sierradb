@@ -31,7 +31,7 @@ fn setup_test_file() -> (BucketSegmentWriter, Vec<u64>) {
         let payload = b"Some event data";
 
         let event = RawEvent {
-            header: RecordHeader::new_event(0, transaction_id, 0).unwrap(),
+            header: RecordHeader::new_event(0, transaction_id).unwrap(),
             event_id: event_id.into_bytes(),
             partition_key: partition_key.into_bytes(),
             partition_id: 0,
@@ -42,7 +42,9 @@ fn setup_test_file() -> (BucketSegmentWriter, Vec<u64>) {
             metadata: LongBytes(metadata.to_vec()),
             payload: LongBytes(payload.to_vec()),
         };
-        let (offset, _) = writer.append_event(&event).expect("Failed to write event");
+        let (offset, _) = writer
+            .append_event(0, &event)
+            .expect("Failed to write event");
         offsets.push(offset);
     }
 
@@ -105,7 +107,7 @@ fn benchmark_writes(c: &mut Criterion) {
             let payload = b"Some event data";
 
             let event = RawEvent {
-                header: RecordHeader::new_event(0, transaction_id, 0).unwrap(),
+                header: RecordHeader::new_event(0, transaction_id).unwrap(),
                 event_id: event_id.into_bytes(),
                 partition_key: partition_key.into_bytes(),
                 partition_id: 0,
@@ -116,7 +118,9 @@ fn benchmark_writes(c: &mut Criterion) {
                 metadata: LongBytes(metadata.to_vec()),
                 payload: LongBytes(payload.to_vec()),
             };
-            writer.append_event(&event).expect("Failed to write event");
+            writer
+                .append_event(0, &event)
+                .expect("Failed to write event");
         });
     });
 
@@ -128,10 +132,13 @@ fn benchmark_writes(c: &mut Criterion) {
             let transaction_id = Uuid::new_v4();
 
             writer
-                .append_commit(&RawCommit {
-                    header: RecordHeader::new_commit(0, transaction_id, 0).unwrap(),
-                    event_count: 0,
-                })
+                .append_commit(
+                    0,
+                    &RawCommit {
+                        header: RecordHeader::new_commit(0, transaction_id).unwrap(),
+                        event_count: 0,
+                    },
+                )
                 .expect("Failed to write commit");
         });
     });

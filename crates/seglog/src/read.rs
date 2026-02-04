@@ -435,9 +435,57 @@ impl<const H: usize> Reader<H> {
     /// portion on disk is left untouched.
     ///
     /// This is safe to use even with compressed records since the data is not modified.
-    pub fn replace_header(&mut self, offset: u64, new_header: &[u8; H]) -> Result<(), ReadError> {
+    pub fn replace_header(&mut self, offset: u64, new_header: [u8; H]) -> Result<(), ReadError> {
+        self.replace_header_with(offset, |_| Some(new_header))?;
+        Ok(())
+    }
+
+    /// Conditionally replaces the header portion of a record at the given offset.
+    ///
+    /// This method reads the full record and passes it to the closure `f`. The closure
+    /// can inspect the current record state (header, data, compression status, etc.) and
+    /// decide whether to replace the header by returning `Some([u8; H])` or skip the
+    /// replacement by returning `None`.
+    ///
+    /// If the closure returns `Some(new_header)`, this method calculates a new CRC with
+    /// the new header and writes back only the CRC and header bytes. The data portion on
+    /// disk is left untouched.
+    ///
+    /// This is safe to use even with compressed records since the data is not modified.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use seglog::read::Reader;
+    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let temp = std::path::Path::new("segment.log");
+    /// let mut reader = Reader::<8>::open(temp, None)?;
+    ///
+    /// // Conditionally increment a counter in the header
+    /// reader.replace_header_with(0, |record| {
+    ///     let current_header: [u8; 8] = record.header.to_vec().try_into().ok()?;
+    ///     let counter = u64::from_le_bytes(current_header);
+    ///
+    ///     // Only update if counter is less than 100
+    ///     if counter < 100 {
+    ///         Some((counter + 1).to_le_bytes())
+    ///     } else {
+    ///         None // Skip replacement
+    ///     }
+    /// })?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn replace_header_with<F>(&mut self, offset: u64, f: F) -> Result<bool, ReadError>
+    where
+        F: FnOnce(&Record<'_, H>) -> Option<[u8; H]>,
+    {
         // Read the full record to validate it exists and is readable
         let record = self.read_record(offset, ReadHint::Random)?;
+
+        let Some(new_header) = f(&record) else {
+            return Ok(false);
+        };
 
         // Calculate payload_len from the record's len field
         let payload_len = record.len - RECORD_HEAD_SIZE;
@@ -454,12 +502,12 @@ impl<const H: usize> Reader<H> {
         let data_on_disk = record.compressed_data.as_ref().unwrap_or(&record.data);
 
         // Calculate new CRC over new_header + data_on_disk
-        let new_crc = calculate_crc32c(&length_bytes, new_header, data_on_disk);
+        let new_crc = calculate_crc32c(&length_bytes, &new_header, data_on_disk);
 
         // Write CRC + header (leave data untouched)
         let mut write_buf = Vec::with_capacity(CRC32C_SIZE + H);
         write_buf.extend_from_slice(&new_crc.to_le_bytes());
-        write_buf.extend_from_slice(new_header);
+        write_buf.extend_from_slice(&new_header);
 
         self.file
             .write_all_at(&write_buf, offset + LEN_SIZE as u64)?;
@@ -475,7 +523,7 @@ impl<const H: usize> Reader<H> {
         // Sync to ensure durability
         self.file.sync_data()?;
 
-        Ok(())
+        Ok(true)
     }
 
     /// Closes the reader.

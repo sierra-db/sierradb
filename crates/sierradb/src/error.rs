@@ -10,12 +10,12 @@ use thiserror::Error;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-use crate::StreamId;
 use crate::bucket::segment::InvalidTimestamp;
 use crate::bucket::{
     BucketId, BucketSegmentId, PartitionId, event_index, partition_index, stream_index,
 };
 use crate::database::{CurrentVersion, ExpectedVersion};
+use crate::{MAX_REPLICATION_FACTOR, StreamId};
 
 /// Errors which can occur in background threads.
 #[derive(Debug, Error)]
@@ -63,10 +63,18 @@ pub enum DatabaseError {
 
 #[derive(Debug, Error)]
 pub enum ReadError {
-    #[error("confirmation count crc32c hash mismatch")]
-    ConfirmationCountCrc32cMismatch { offset: u64 },
     #[error("no reply from the reader thread")]
     NoThreadReply,
+    #[error("bucket id {bucket_id} not found")]
+    BucketIdNotFound { bucket_id: BucketId },
+    #[error("transaction id {transaction_id} not found at offset {offset} in any segment files")]
+    TransactionIdNotFoundAtOffset { transaction_id: Uuid, offset: u64 },
+    #[error(
+        "failed to set confirmations: {}", errors.iter().map(|err| err.to_string()).collect::<Vec<_>>().join(", ")
+    )]
+    SetConfirmations { errors: Vec<ReadError> },
+    #[error(transparent)]
+    ConfirmationCount(#[from] ConfirmationCountError),
     #[error(transparent)]
     InvalidHeader(#[from] InvalidHeaderError),
     #[error(transparent)]
@@ -128,6 +136,8 @@ pub enum WriteError {
     },
     #[error("no reply from the writer thread")]
     NoThreadReply,
+    #[error(transparent)]
+    ConfirmationCount(#[from] ConfirmationCountError),
     #[error(transparent)]
     Encode(#[from] bincode::error::EncodeError),
     #[error(transparent)]
@@ -271,6 +281,14 @@ pub enum StreamIdError {
     InvalidLength { input: String, len: usize },
     #[error("stream id cannot contain null bytes")]
     ContainsNullByte,
+}
+
+#[derive(Clone, Debug, Error)]
+pub enum ConfirmationCountError {
+    #[error("confirmation count exceeds max replication factor of {MAX_REPLICATION_FACTOR}")]
+    ExceedsMaxReplicationFactor,
+    #[error("confirmation count redundancy check failed: found {upper} and {lower}")]
+    RedundancyCheck { upper: u8, lower: u8 },
 }
 
 impl From<oneshot::error::RecvError> for ReadError {

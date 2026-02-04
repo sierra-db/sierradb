@@ -13,10 +13,10 @@ use uuid::Uuid;
 use super::{BINCODE_CONFIG, BucketSegmentHeader, COMMIT_SIZE, EVENT_HEADER_SIZE};
 use crate::StreamId;
 use crate::bucket::PartitionId;
-use crate::bucket::segment::SEGMENT_HEADER_SIZE;
-use crate::bucket::segment::format::{RawCommit, RawEvent};
+use crate::bucket::segment::format::{ConfirmationCount, RawCommit, RawEvent};
+use crate::bucket::segment::{CONFIRMATION_HEADER_SIZE, RecordKindTimestamp, SEGMENT_HEADER_SIZE};
 use crate::cache::BLOCK_SIZE;
-use crate::error::{ReadError, WriteError};
+use crate::error::ReadError;
 use crate::id::{get_uuid_flag, uuid_to_partition_hash};
 
 #[derive(Clone)]
@@ -94,7 +94,10 @@ impl SegmentBlock {
 
     pub fn read_record(&self, start_offset: u64) -> Result<Option<Record>, ReadError> {
         let offset = (start_offset - self.offset) as usize;
-        let (bytes, _) = seglog::parse::parse_record(&self.block, offset)?;
+        let ([confirmation_count_byte], bytes, _) =
+            seglog::parse::parse_record::<CONFIRMATION_HEADER_SIZE>(&self.block, offset)?;
+
+        let confirmation_count = ConfirmationCount::from_byte(confirmation_count_byte)?;
 
         if bytes.len() < mem::size_of::<u64>() {
             return Err(io::Error::new(
@@ -107,14 +110,20 @@ impl SegmentBlock {
         let is_commit = u64::from_le_bytes(bytes[..8].try_into().unwrap()) & (1u64 << 63) != 0;
 
         if is_commit {
-            let (record, _) = bincode::decode_from_slice::<RawCommit, _>(bytes, BINCODE_CONFIG)?;
-            record.header.validate(start_offset)?;
-            let commit = Record::Commit(CommitRecord::from_raw(start_offset, record));
+            let (record, _) = bincode::decode_from_slice::<RawCommit, _>(&bytes, BINCODE_CONFIG)?;
+            let commit = Record::Commit(CommitRecord::from_raw(
+                start_offset,
+                confirmation_count.get(),
+                record,
+            ));
             Ok(Some(commit))
         } else {
-            let (record, _) = bincode::decode_from_slice::<RawEvent, _>(bytes, BINCODE_CONFIG)?;
-            record.header.validate(start_offset)?;
-            let event = Record::Event(EventRecord::from_raw(start_offset, record));
+            let (record, _) = bincode::decode_from_slice::<RawEvent, _>(&bytes, BINCODE_CONFIG)?;
+            let event = Record::Event(EventRecord::from_raw(
+                start_offset,
+                confirmation_count.get(),
+                record,
+            ));
             Ok(Some(event))
         }
     }
@@ -317,7 +326,7 @@ impl DoubleEndedIterator for CommittedEventsIntoIter {
 }
 
 pub struct BucketSegmentReader {
-    reader: seglog::read::Reader,
+    reader: seglog::read::Reader<CONFIRMATION_HEADER_SIZE>,
 }
 
 impl BucketSegmentReader {
@@ -342,17 +351,30 @@ impl BucketSegmentReader {
     }
 
     pub fn set_confirmations(
-        &self,
+        &mut self,
         offset: u64,
         transaction_id: &Uuid,
         confirmation_count: u8,
-    ) -> Result<(), WriteError> {
-        super::set_confirmations(
-            self.reader.file(),
-            offset,
-            transaction_id,
-            confirmation_count,
-        )
+    ) -> Result<bool, ReadError> {
+        let confirmation_count_byte = ConfirmationCount::new(confirmation_count)?.to_byte();
+        let found = self.reader.replace_header_with(offset, |record| {
+            let transaction_id_offset = mem::size_of::<RecordKindTimestamp>();
+            if record.data.len() < transaction_id_offset + 16 {
+                warn!("not enough data to read transaction id");
+            }
+            if &Uuid::from_bytes(
+                record.data[transaction_id_offset..transaction_id_offset + 16]
+                    .try_into()
+                    .unwrap(),
+            ) != transaction_id
+            {
+                return None;
+            }
+
+            Some([confirmation_count_byte])
+        })?;
+
+        Ok(found)
     }
 
     pub fn read_committed_events(
@@ -448,12 +470,15 @@ impl BucketSegmentReader {
         start_offset: u64,
         hint: ReadHint,
     ) -> Result<Option<Record>, ReadError> {
-        let bytes = match self.reader.read_record(start_offset, hint) {
-            Ok(bytes) => bytes,
+        let record = match self.reader.read_record(start_offset, hint) {
+            Ok(record) => record,
             Err(seglog::read::ReadError::OutOfBounds { .. }) => return Ok(None),
             Err(err) => return Err(err.into()),
         };
 
+        let confirmation_count = ConfirmationCount::from_byte(record.header[0])?;
+
+        let bytes = record.data;
         if bytes.len() < mem::size_of::<u64>() {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -466,13 +491,19 @@ impl BucketSegmentReader {
 
         if is_commit {
             let (record, _) = bincode::decode_from_slice::<RawCommit, _>(&bytes, BINCODE_CONFIG)?;
-            record.header.validate(start_offset)?;
-            let commit = Record::Commit(CommitRecord::from_raw(start_offset, record));
+            let commit = Record::Commit(CommitRecord::from_raw(
+                start_offset,
+                confirmation_count.get(),
+                record,
+            ));
             Ok(Some(commit))
         } else {
             let (record, _) = bincode::decode_from_slice::<RawEvent, _>(&bytes, BINCODE_CONFIG)?;
-            record.header.validate(start_offset)?;
-            let event = Record::Event(EventRecord::from_raw(start_offset, record));
+            let event = Record::Event(EventRecord::from_raw(
+                start_offset,
+                confirmation_count.get(),
+                record,
+            ));
             Ok(Some(event))
         }
     }
@@ -673,7 +704,7 @@ impl EventRecord {
         uuid_to_partition_hash(self.partition_key) % num_partitions
     }
 
-    fn from_raw(offset: u64, record: RawEvent) -> Self {
+    fn from_raw(offset: u64, confirmation_count: u8, record: RawEvent) -> Self {
         let size = EVENT_HEADER_SIZE as u64
             + record.stream_id.len() as u64
             + record.event_name.len() as u64
@@ -689,7 +720,7 @@ impl EventRecord {
             partition_sequence: record.partition_sequence,
             stream_version: record.stream_version,
             timestamp: record.header.timestamp.timestamp(),
-            confirmation_count: record.header.confirmation_count,
+            confirmation_count,
             stream_id: record.stream_id,
             event_name: record.event_name.into_inner(),
             metadata: record.metadata.into_inner(),
@@ -709,12 +740,12 @@ pub struct CommitRecord {
 }
 
 impl CommitRecord {
-    fn from_raw(offset: u64, raw: RawCommit) -> Self {
+    fn from_raw(offset: u64, confirmation_count: u8, raw: RawCommit) -> Self {
         CommitRecord {
             offset,
             transaction_id: Uuid::from_bytes(raw.header.transaction_id),
             timestamp: raw.header.timestamp.timestamp(),
-            confirmation_count: raw.header.confirmation_count,
+            confirmation_count,
             event_count: raw.event_count,
         }
     }

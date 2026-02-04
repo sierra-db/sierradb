@@ -253,10 +253,7 @@ pub fn calculate_crc32c(len_bytes: &[u8; 4], header: &[u8], data: &[u8]) -> u32 
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        read::ReadError,
-        write::WriteError,
-    };
+    use crate::{read::ReadError, write::WriteError};
 
     use super::*;
     use read::{ReadHint, Reader};
@@ -1167,7 +1164,8 @@ mod tests {
     #[test]
     fn test_append_with_header_h8() {
         let temp = temp_path();
-        let mut writer = Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         let header = [1u8, 2, 3, 4, 5, 6, 7, 8];
         let data = b"hello world";
@@ -1194,7 +1192,8 @@ mod tests {
     #[test]
     fn test_append_with_header_h16() {
         let temp = temp_path();
-        let mut writer = Writer::<16>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<16>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         let header = [0xAAu8; 16];
         let data = b"test data";
@@ -1219,7 +1218,8 @@ mod tests {
     #[test]
     fn test_append_with_header_h32() {
         let temp = temp_path();
-        let mut writer = Writer::<32>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<32>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         let header = [0x42u8; 32];
         let data = b"larger header test";
@@ -1244,7 +1244,8 @@ mod tests {
     #[test]
     fn test_append_multiple_records_with_headers() {
         let temp = temp_path();
-        let mut writer = Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         let records = vec![
             ([1u8, 0, 0, 0, 0, 0, 0, 0], b"first".as_slice()),
@@ -1279,7 +1280,8 @@ mod tests {
     #[test]
     fn test_header_preserved_in_record() {
         let temp = temp_path();
-        let mut writer = Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         // Use distinct header bytes to ensure they're preserved
         let header = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
@@ -1304,7 +1306,8 @@ mod tests {
     #[test]
     fn test_iter_with_headers() {
         let temp = temp_path();
-        let mut writer = Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         let records = vec![
             ([10u8, 0, 0, 0, 0, 0, 0, 0], b"first".as_slice()),
@@ -1344,7 +1347,8 @@ mod tests {
     #[test]
     fn test_random_and_sequential_read_with_headers() {
         let temp = temp_path();
-        let mut writer = Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         let header = [0xFFu8; 8];
         let data = b"test both read hints";
@@ -1374,18 +1378,22 @@ mod tests {
     #[test]
     fn test_writer_open_with_headers() {
         let temp = temp_path();
-        let mut writer = Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         let header1 = [1u8; 8];
         let header2 = [2u8; 8];
         writer.append(&header1, b"first").expect("failed to append");
-        writer.append(&header2, b"second").expect("failed to append");
+        writer
+            .append(&header2, b"second")
+            .expect("failed to append");
         let expected_offset = writer.write_offset();
         writer.sync().expect("failed to sync");
         drop(writer);
 
         // Reopen and verify recovery
-        let mut writer = Writer::<8>::open(&temp, SEGMENT_SIZE, 0).expect("failed to reopen writer");
+        let mut writer =
+            Writer::<8>::open(&temp, SEGMENT_SIZE, 0).expect("failed to reopen writer");
         assert_eq!(writer.write_offset(), expected_offset);
 
         // Append another record
@@ -1399,13 +1407,22 @@ mod tests {
         let mut reader = Reader::<8>::open(&temp, Some(flushed)).expect("failed to open reader");
         let mut iter = reader.iter(0);
 
-        let r1 = iter.next_record().expect("failed to read").expect("no record");
+        let r1 = iter
+            .next_record()
+            .expect("failed to read")
+            .expect("no record");
         assert_eq!(&*r1.header, &header1);
 
-        let r2 = iter.next_record().expect("failed to read").expect("no record");
+        let r2 = iter
+            .next_record()
+            .expect("failed to read")
+            .expect("no record");
         assert_eq!(&*r2.header, &header2);
 
-        let r3 = iter.next_record().expect("failed to read").expect("no record");
+        let r3 = iter
+            .next_record()
+            .expect("failed to read")
+            .expect("no record");
         assert_eq!(&*r3.header, &header3);
     }
 
@@ -1414,7 +1431,8 @@ mod tests {
     #[test]
     fn test_compression_disabled_by_default() {
         let temp = temp_path();
-        let mut writer = Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         // Write data >= MIN_COMPRESSION_SIZE but compression is not enabled
         let data = vec![0x42u8; MIN_COMPRESSION_SIZE];
@@ -1437,7 +1455,8 @@ mod tests {
     #[test]
     fn test_enable_disable_compression() {
         let temp = temp_path();
-        let mut writer = Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         let data = vec![0xAAu8; MIN_COMPRESSION_SIZE];
 
@@ -1481,7 +1500,8 @@ mod tests {
     #[test]
     fn test_compression_large_data() {
         let temp = temp_path();
-        let mut writer = Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
         writer.enable_compression();
 
         // Data >= MIN_COMPRESSION_SIZE should be compressed
@@ -1506,7 +1526,8 @@ mod tests {
     #[test]
     fn test_no_compression_small_data() {
         let temp = temp_path();
-        let mut writer = Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
         writer.enable_compression();
 
         // Data < MIN_COMPRESSION_SIZE should not be compressed
@@ -1530,7 +1551,8 @@ mod tests {
     #[test]
     fn test_no_compression_when_disabled() {
         let temp = temp_path();
-        let mut writer = Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
         // Compression is disabled by default
 
         // Large data but compression disabled
@@ -1554,11 +1576,14 @@ mod tests {
     #[test]
     fn test_read_compressed_record_random() {
         let temp = temp_path();
-        let mut writer = Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
         writer.enable_compression();
 
         let original_data = vec![0x55u8; 300];
-        writer.append(&[], &original_data).expect("failed to append");
+        writer
+            .append(&[], &original_data)
+            .expect("failed to append");
 
         writer.sync().expect("failed to sync");
         let flushed = writer.flushed_offset();
@@ -1577,11 +1602,14 @@ mod tests {
     #[test]
     fn test_read_compressed_record_sequential() {
         let temp = temp_path();
-        let mut writer = Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
         writer.enable_compression();
 
         let original_data = vec![0x77u8; 300];
-        writer.append(&[], &original_data).expect("failed to append");
+        writer
+            .append(&[], &original_data)
+            .expect("failed to append");
 
         writer.sync().expect("failed to sync");
         let flushed = writer.flushed_offset();
@@ -1600,11 +1628,14 @@ mod tests {
     #[test]
     fn test_compressed_record_has_compressed_data_field() {
         let temp = temp_path();
-        let mut writer = Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
         writer.enable_compression();
 
         let original_data = vec![0xBBu8; 256];
-        writer.append(&[], &original_data).expect("failed to append");
+        writer
+            .append(&[], &original_data)
+            .expect("failed to append");
 
         writer.sync().expect("failed to sync");
         let flushed = writer.flushed_offset();
@@ -1630,14 +1661,11 @@ mod tests {
     #[test]
     fn test_iter_compressed_records() {
         let temp = temp_path();
-        let mut writer = Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
         writer.enable_compression();
 
-        let records = vec![
-            vec![0x11u8; 200],
-            vec![0x22u8; 250],
-            vec![0x33u8; 300],
-        ];
+        let records = vec![vec![0x11u8; 200], vec![0x22u8; 250], vec![0x33u8; 300]];
 
         for data in &records {
             writer.append(&[], data).expect("failed to append");
@@ -1669,7 +1697,8 @@ mod tests {
     #[test]
     fn test_mixed_compressed_uncompressed() {
         let temp = temp_path();
-        let mut writer = Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         let small_data = vec![0xAAu8; 50]; // Too small to compress
         let large_data = vec![0xBBu8; 200]; // Large enough to compress
@@ -1715,7 +1744,8 @@ mod tests {
     #[test]
     fn test_compression_with_headers_h8() {
         let temp = temp_path();
-        let mut writer = Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
         writer.enable_compression();
 
         let header = [1u8, 2, 3, 4, 5, 6, 7, 8];
@@ -1742,7 +1772,8 @@ mod tests {
     #[test]
     fn test_compression_header_never_compressed() {
         let temp = temp_path();
-        let mut writer = Writer::<16>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<16>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
         writer.enable_compression();
 
         // Header with distinct pattern
@@ -1775,7 +1806,8 @@ mod tests {
     #[test]
     fn test_compression_exactly_128_bytes() {
         let temp = temp_path();
-        let mut writer = Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
         writer.enable_compression();
 
         // Exactly at MIN_COMPRESSION_SIZE threshold
@@ -1799,7 +1831,8 @@ mod tests {
     #[test]
     fn test_compression_127_bytes() {
         let temp = temp_path();
-        let mut writer = Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
         writer.enable_compression();
 
         // One byte below MIN_COMPRESSION_SIZE threshold
@@ -1823,7 +1856,8 @@ mod tests {
     #[test]
     fn test_compression_large_1mb_data() {
         let temp = temp_path();
-        let mut writer = Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
         writer.enable_compression();
 
         // Very large compressible data (1MB of repeated bytes)
@@ -1853,7 +1887,8 @@ mod tests {
     #[test]
     fn test_writer_open_compressed_segment() {
         let temp = temp_path();
-        let mut writer = Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
         writer.enable_compression();
 
         let data1 = vec![0xF1u8; 200];
@@ -1865,7 +1900,8 @@ mod tests {
         drop(writer);
 
         // Reopen the segment with compressed records
-        let mut writer = Writer::<0>::open(&temp, SEGMENT_SIZE, 0).expect("failed to reopen writer");
+        let mut writer =
+            Writer::<0>::open(&temp, SEGMENT_SIZE, 0).expect("failed to reopen writer");
         assert_eq!(writer.write_offset(), expected_offset);
 
         // Append another compressed record
@@ -1880,15 +1916,24 @@ mod tests {
         let mut reader = Reader::<0>::open(&temp, Some(flushed)).expect("failed to open reader");
         let mut iter = reader.iter(0);
 
-        let r1 = iter.next_record().expect("failed to read").expect("no record");
+        let r1 = iter
+            .next_record()
+            .expect("failed to read")
+            .expect("no record");
         assert!(r1.compressed_data.is_some());
         assert_eq!(&*r1.data, &data1);
 
-        let r2 = iter.next_record().expect("failed to read").expect("no record");
+        let r2 = iter
+            .next_record()
+            .expect("failed to read")
+            .expect("no record");
         assert!(r2.compressed_data.is_some());
         assert_eq!(&*r2.data, &data2);
 
-        let r3 = iter.next_record().expect("failed to read").expect("no record");
+        let r3 = iter
+            .next_record()
+            .expect("failed to read")
+            .expect("no record");
         assert!(r3.compressed_data.is_some());
         assert_eq!(&*r3.data, &data3);
     }
@@ -1898,7 +1943,8 @@ mod tests {
     #[test]
     fn test_replace_header_h0_simple() {
         let temp = temp_path();
-        let mut writer = Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         let data = b"test data for header replacement";
         writer.append(&[], data).expect("failed to append");
@@ -1910,7 +1956,9 @@ mod tests {
         let mut reader = Reader::<0>::open(&temp, Some(flushed)).expect("failed to open reader");
 
         // Replace empty header with another empty header (should work)
-        reader.replace_header(0, &[]).expect("failed to replace header");
+        reader
+            .replace_header(0, [])
+            .expect("failed to replace header");
 
         // Verify record is still readable
         let record = reader
@@ -1923,11 +1971,14 @@ mod tests {
     #[test]
     fn test_replace_header_h8() {
         let temp = temp_path();
-        let mut writer = Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         let original_header = [1u8, 2, 3, 4, 5, 6, 7, 8];
         let data = b"test data for header replacement";
-        writer.append(&original_header, data).expect("failed to append");
+        writer
+            .append(&original_header, data)
+            .expect("failed to append");
 
         writer.sync().expect("failed to sync");
         let flushed = writer.flushed_offset();
@@ -1938,7 +1989,7 @@ mod tests {
         // Replace with new header
         let new_header = [10u8, 20, 30, 40, 50, 60, 70, 80];
         reader
-            .replace_header(0, &new_header)
+            .replace_header(0, new_header)
             .expect("failed to replace header");
 
         // Verify new header is in place
@@ -1952,11 +2003,14 @@ mod tests {
     #[test]
     fn test_replace_header_h16() {
         let temp = temp_path();
-        let mut writer = Writer::<16>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<16>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         let original_header = [0xAAu8; 16];
         let data = b"data with 16-byte header";
-        writer.append(&original_header, data).expect("failed to append");
+        writer
+            .append(&original_header, data)
+            .expect("failed to append");
 
         writer.sync().expect("failed to sync");
         let flushed = writer.flushed_offset();
@@ -1967,7 +2021,7 @@ mod tests {
         // Replace header
         let new_header = [0xBBu8; 16];
         reader
-            .replace_header(0, &new_header)
+            .replace_header(0, new_header)
             .expect("failed to replace header");
 
         // Verify replacement
@@ -1981,11 +2035,14 @@ mod tests {
     #[test]
     fn test_replace_header_updates_crc() {
         let temp = temp_path();
-        let mut writer = Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         let original_header = [1u8; 8];
         let data = b"test crc update";
-        writer.append(&original_header, data).expect("failed to append");
+        writer
+            .append(&original_header, data)
+            .expect("failed to append");
 
         writer.sync().expect("failed to sync");
         let flushed = writer.flushed_offset();
@@ -1996,7 +2053,7 @@ mod tests {
         // Replace header
         let new_header = [2u8; 8];
         reader
-            .replace_header(0, &new_header)
+            .replace_header(0, new_header)
             .expect("failed to replace header");
 
         // CRC should be updated - record should be readable without CRC error
@@ -2010,11 +2067,14 @@ mod tests {
     #[test]
     fn test_replace_header_preserves_data() {
         let temp = temp_path();
-        let mut writer = Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         let original_header = [0x11u8; 8];
         let data = b"this data should remain unchanged";
-        writer.append(&original_header, data).expect("failed to append");
+        writer
+            .append(&original_header, data)
+            .expect("failed to append");
 
         writer.sync().expect("failed to sync");
         let flushed = writer.flushed_offset();
@@ -2031,7 +2091,7 @@ mod tests {
         // Replace header
         let new_header = [0x22u8; 8];
         reader
-            .replace_header(0, &new_header)
+            .replace_header(0, new_header)
             .expect("failed to replace header");
 
         // Verify data is unchanged
@@ -2045,12 +2105,15 @@ mod tests {
     #[test]
     fn test_replace_header_on_compressed_record() {
         let temp = temp_path();
-        let mut writer = Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
         writer.enable_compression();
 
         let original_header = [0xAAu8; 8];
         let data = vec![0x42u8; 256]; // Large enough to compress
-        writer.append(&original_header, &data).expect("failed to append");
+        writer
+            .append(&original_header, &data)
+            .expect("failed to append");
 
         writer.sync().expect("failed to sync");
         let flushed = writer.flushed_offset();
@@ -2067,7 +2130,7 @@ mod tests {
         // Replace header
         let new_header = [0xBBu8; 8];
         reader
-            .replace_header(0, &new_header)
+            .replace_header(0, new_header)
             .expect("failed to replace header on compressed record");
 
         // Verify replacement worked
@@ -2082,12 +2145,15 @@ mod tests {
     #[test]
     fn test_replace_header_preserves_compression() {
         let temp = temp_path();
-        let mut writer = Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
         writer.enable_compression();
 
         let original_header = [1u8; 8];
         let data = vec![0xCCu8; 300];
-        writer.append(&original_header, &data).expect("failed to append");
+        writer
+            .append(&original_header, &data)
+            .expect("failed to append");
 
         writer.sync().expect("failed to sync");
         let flushed = writer.flushed_offset();
@@ -2104,7 +2170,7 @@ mod tests {
         // Replace header
         let new_header = [2u8; 8];
         reader
-            .replace_header(0, &new_header)
+            .replace_header(0, new_header)
             .expect("failed to replace header");
 
         // Get compressed data after replacement
@@ -2122,11 +2188,14 @@ mod tests {
     #[test]
     fn test_replaced_header_readable_random() {
         let temp = temp_path();
-        let mut writer = Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         let original_header = [0xFFu8; 8];
         let data = b"readable after replacement";
-        writer.append(&original_header, data).expect("failed to append");
+        writer
+            .append(&original_header, data)
+            .expect("failed to append");
 
         writer.sync().expect("failed to sync");
         let flushed = writer.flushed_offset();
@@ -2136,7 +2205,7 @@ mod tests {
 
         let new_header = [0x00u8; 8];
         reader
-            .replace_header(0, &new_header)
+            .replace_header(0, new_header)
             .expect("failed to replace header");
 
         // Read with Random hint
@@ -2150,11 +2219,14 @@ mod tests {
     #[test]
     fn test_replaced_header_readable_sequential() {
         let temp = temp_path();
-        let mut writer = Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         let original_header = [0x11u8; 8];
         let data = b"sequential read after replacement";
-        writer.append(&original_header, data).expect("failed to append");
+        writer
+            .append(&original_header, data)
+            .expect("failed to append");
 
         writer.sync().expect("failed to sync");
         let flushed = writer.flushed_offset();
@@ -2164,7 +2236,7 @@ mod tests {
 
         let new_header = [0x22u8; 8];
         reader
-            .replace_header(0, &new_header)
+            .replace_header(0, new_header)
             .expect("failed to replace header");
 
         // Read with Sequential hint
@@ -2178,11 +2250,14 @@ mod tests {
     #[test]
     fn test_replace_header_multiple_times() {
         let temp = temp_path();
-        let mut writer = Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         let original_header = [1u8; 8];
         let data = b"replace multiple times";
-        writer.append(&original_header, data).expect("failed to append");
+        writer
+            .append(&original_header, data)
+            .expect("failed to append");
 
         writer.sync().expect("failed to sync");
         let flushed = writer.flushed_offset();
@@ -2194,7 +2269,7 @@ mod tests {
         for i in 2u8..10u8 {
             let new_header = [i; 8];
             reader
-                .replace_header(0, &new_header)
+                .replace_header(0, new_header)
                 .expect("failed to replace header");
 
             let record = reader
@@ -2208,21 +2283,25 @@ mod tests {
     #[test]
     fn test_replace_header_survives_reopen() {
         let temp = temp_path();
-        let mut writer = Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         let original_header = [0xAAu8; 8];
         let data = b"persistence test";
-        writer.append(&original_header, data).expect("failed to append");
+        writer
+            .append(&original_header, data)
+            .expect("failed to append");
 
         writer.sync().expect("failed to sync");
         let flushed = writer.flushed_offset();
         drop(writer);
 
         // Open reader and replace header
-        let mut reader = Reader::<8>::open(&temp, Some(flushed.clone())).expect("failed to open reader");
+        let mut reader =
+            Reader::<8>::open(&temp, Some(flushed.clone())).expect("failed to open reader");
         let new_header = [0xBBu8; 8];
         reader
-            .replace_header(0, &new_header)
+            .replace_header(0, new_header)
             .expect("failed to replace header");
         drop(reader);
 
@@ -2238,7 +2317,8 @@ mod tests {
     #[test]
     fn test_replace_header_invalid_offset() {
         let temp = temp_path();
-        let mut writer = Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
 
         let header = [1u8; 8];
         let data = b"test data";
@@ -2252,7 +2332,7 @@ mod tests {
 
         // Try to replace header at non-existent offset
         let new_header = [2u8; 8];
-        let result = reader.replace_header(9999, &new_header);
+        let result = reader.replace_header(9999, new_header);
         assert!(result.is_err());
     }
 
@@ -2267,7 +2347,7 @@ mod tests {
 
         // Try to replace header beyond flushed offset
         let new_header = [1u8; 8];
-        let result = reader.replace_header(0, &new_header);
+        let result = reader.replace_header(0, new_header);
         assert!(result.is_err());
     }
 
@@ -2276,12 +2356,15 @@ mod tests {
     #[test]
     fn test_headers_compression_replace_all_together() {
         let temp = temp_path();
-        let mut writer = Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
         writer.enable_compression();
 
         let original_header = [0x11u8; 8];
         let data = vec![0x99u8; 256]; // Compressible data
-        writer.append(&original_header, &data).expect("failed to append");
+        writer
+            .append(&original_header, &data)
+            .expect("failed to append");
 
         writer.sync().expect("failed to sync");
         let flushed = writer.flushed_offset();
@@ -2300,7 +2383,7 @@ mod tests {
         // Replace header on compressed record
         let new_header = [0x22u8; 8];
         reader
-            .replace_header(0, &new_header)
+            .replace_header(0, new_header)
             .expect("failed to replace header");
 
         // Verify all three features work together
@@ -2315,7 +2398,8 @@ mod tests {
     #[test]
     fn test_concurrent_read_with_headers_and_compression() {
         let temp = temp_path();
-        let mut writer = Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<8>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
         writer.enable_compression();
 
         let header = [0xABu8; 8];
@@ -2325,8 +2409,10 @@ mod tests {
         let flushed = writer.flushed_offset();
 
         // Create multiple readers
-        let mut reader1 = Reader::<8>::open(&temp, Some(flushed.clone())).expect("failed to open reader1");
-        let mut reader2 = Reader::<8>::open(&temp, Some(flushed.clone())).expect("failed to open reader2");
+        let mut reader1 =
+            Reader::<8>::open(&temp, Some(flushed.clone())).expect("failed to open reader1");
+        let mut reader2 =
+            Reader::<8>::open(&temp, Some(flushed.clone())).expect("failed to open reader2");
 
         // Both readers should be able to read the compressed record
         let r1 = reader1
@@ -2348,7 +2434,8 @@ mod tests {
     #[test]
     fn test_compression_ratio_verification() {
         let temp = temp_path();
-        let mut writer = Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
+        let mut writer =
+            Writer::<0>::create(&temp, SEGMENT_SIZE, 0).expect("failed to create writer");
         writer.enable_compression();
 
         // Highly compressible data (1000 repeated bytes)

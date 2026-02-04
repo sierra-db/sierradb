@@ -28,7 +28,9 @@ fn bench_writer_append_small(c: &mut Criterion) {
                 Writer::create(&path, SEGMENT_SIZE, 0).expect("failed to create writer");
 
             for _ in 0..1000 {
-                writer.append(black_box(&data)).expect("failed to append");
+                writer
+                    .append(&[], black_box(&data))
+                    .expect("failed to append");
             }
         });
     });
@@ -47,7 +49,9 @@ fn bench_writer_append_medium(c: &mut Criterion) {
                 Writer::create(&path, SEGMENT_SIZE, 0).expect("failed to create writer");
 
             for _ in 0..100 {
-                writer.append(black_box(&data)).expect("failed to append");
+                writer
+                    .append(&[], black_box(&data))
+                    .expect("failed to append");
             }
         });
     });
@@ -66,7 +70,9 @@ fn bench_writer_append_large(c: &mut Criterion) {
                 Writer::create(&path, SEGMENT_SIZE, 0).expect("failed to create writer");
 
             for _ in 0..10 {
-                writer.append(black_box(&data)).expect("failed to append");
+                writer
+                    .append(&[], black_box(&data))
+                    .expect("failed to append");
             }
         });
     });
@@ -86,7 +92,7 @@ fn bench_writer_sync(c: &mut Criterion) {
                 // Write some data
                 let data = vec![0u8; 1024];
                 for _ in 0..100 {
-                    writer.append(&data).expect("failed to append");
+                    writer.append(&[], &data).expect("failed to append");
                 }
 
                 (_dir, writer)
@@ -111,7 +117,9 @@ fn bench_writer_throughput(c: &mut Criterion) {
                 Writer::create(&path, SEGMENT_SIZE, 0).expect("failed to create writer");
 
             for _ in 0..1000 {
-                writer.append(black_box(&data)).expect("failed to append");
+                writer
+                    .append(&[], black_box(&data))
+                    .expect("failed to append");
             }
             writer.sync().expect("failed to sync");
         });
@@ -130,7 +138,7 @@ fn bench_reader_sequential(c: &mut Criterion) {
     let data = vec![0u8; 4096]; // 4 KB
 
     for _ in 0..1000 {
-        writer.append(&data).expect("failed to append");
+        writer.append(&[], &data).expect("failed to append");
     }
     writer.sync().expect("failed to sync");
     let flushed = writer.flushed_offset();
@@ -140,13 +148,13 @@ fn bench_reader_sequential(c: &mut Criterion) {
     group.bench_function("iterate_all_records", |b| {
         b.iter(|| {
             let mut reader =
-                Reader::open(&path, Some(flushed.clone())).expect("failed to open reader");
+                Reader::<0>::open(&path, Some(flushed.clone())).expect("failed to open reader");
             let mut iter = reader.iter(0);
             let mut count = 0;
 
             while let Some(result) = iter.next_record().transpose() {
-                let (_, data) = result.expect("failed to read");
-                black_box(&data);
+                let record = result.expect("failed to read");
+                black_box(&record);
                 count += 1;
             }
 
@@ -166,7 +174,7 @@ fn bench_reader_random(c: &mut Criterion) {
 
     let mut offsets = Vec::new();
     for _ in 0..1000 {
-        let (offset, _) = writer.append(&data).expect("failed to append");
+        let (offset, _) = writer.append(&[], &data).expect("failed to append");
         offsets.push(offset);
     }
     writer.sync().expect("failed to sync");
@@ -176,7 +184,7 @@ fn bench_reader_random(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(data.len() as u64));
     group.bench_function("random_reads", |b| {
         b.iter_with_setup(
-            || Reader::open(&path, Some(flushed.clone())).expect("failed to open reader"),
+            || Reader::<0>::open(&path, Some(flushed.clone())).expect("failed to open reader"),
             |mut reader| {
                 for offset in &offsets {
                     let data = reader
@@ -200,7 +208,7 @@ fn bench_reader_sequential_hint(c: &mut Criterion) {
 
     let mut offsets = Vec::new();
     for _ in 0..1000 {
-        let (offset, _) = writer.append(&data).expect("failed to append");
+        let (offset, _) = writer.append(&[], &data).expect("failed to append");
         offsets.push(offset);
     }
     writer.sync().expect("failed to sync");
@@ -210,7 +218,7 @@ fn bench_reader_sequential_hint(c: &mut Criterion) {
     group.throughput(Throughput::Bytes((data.len() * 1000) as u64));
     group.bench_function("sequential_hint_reads", |b| {
         b.iter_with_setup(
-            || Reader::open(&path, Some(flushed.clone())).expect("failed to open reader"),
+            || Reader::<0>::open(&path, Some(flushed.clone())).expect("failed to open reader"),
             |mut reader| {
                 for offset in &offsets {
                     let data = reader
@@ -230,10 +238,10 @@ fn bench_read_small_records(c: &mut Criterion) {
 
     // Prepare segment
     let (_dir, path) = create_temp_segment();
-    let mut writer = Writer::create(&path, SEGMENT_SIZE, 0).expect("failed to create writer");
+    let mut writer = Writer::<0>::create(&path, SEGMENT_SIZE, 0).expect("failed to create writer");
 
     for _ in 0..1000 {
-        writer.append(&data).expect("failed to append");
+        writer.append(&[], &data).expect("failed to append");
     }
     writer.sync().expect("failed to sync");
     let flushed = writer.flushed_offset();
@@ -243,12 +251,12 @@ fn bench_read_small_records(c: &mut Criterion) {
     group.bench_function("1kb_records", |b| {
         b.iter(|| {
             let mut reader =
-                Reader::open(&path, Some(flushed.clone())).expect("failed to open reader");
+                Reader::<0>::open(&path, Some(flushed.clone())).expect("failed to open reader");
             let mut iter = reader.iter(0);
 
             while let Some(result) = iter.next_record().transpose() {
-                let (_, data) = result.expect("failed to read");
-                black_box(&data);
+                let record = result.expect("failed to read");
+                black_box(&record);
             }
         });
     });
@@ -264,7 +272,7 @@ fn bench_read_large_records(c: &mut Criterion) {
     let mut writer = Writer::create(&path, SEGMENT_SIZE, 0).expect("failed to create writer");
 
     for _ in 0..10 {
-        writer.append(&data).expect("failed to append");
+        writer.append(&[], &data).expect("failed to append");
     }
     writer.sync().expect("failed to sync");
     let flushed = writer.flushed_offset();
@@ -274,12 +282,12 @@ fn bench_read_large_records(c: &mut Criterion) {
     group.bench_function("1mb_records", |b| {
         b.iter(|| {
             let mut reader =
-                Reader::open(&path, Some(flushed.clone())).expect("failed to open reader");
+                Reader::<0>::open(&path, Some(flushed.clone())).expect("failed to open reader");
             let mut iter = reader.iter(0);
 
             while let Some(result) = iter.next_record().transpose() {
-                let (_, data) = result.expect("failed to read");
-                black_box(&data);
+                let record = result.expect("failed to read");
+                black_box(&record);
             }
         });
     });
@@ -292,10 +300,10 @@ fn bench_read_throughput(c: &mut Criterion) {
 
     // Prepare segment
     let (_dir, path) = create_temp_segment();
-    let mut writer = Writer::create(&path, SEGMENT_SIZE, 0).expect("failed to create writer");
+    let mut writer = Writer::<0>::create(&path, SEGMENT_SIZE, 0).expect("failed to create writer");
 
     for _ in 0..10000 {
-        writer.append(&data).expect("failed to append");
+        writer.append(&[], &data).expect("failed to append");
     }
     writer.sync().expect("failed to sync");
     let flushed = writer.flushed_offset();
@@ -305,12 +313,12 @@ fn bench_read_throughput(c: &mut Criterion) {
     group.bench_function("sequential_reads", |b| {
         b.iter(|| {
             let mut reader =
-                Reader::open(&path, Some(flushed.clone())).expect("failed to open reader");
+                Reader::<0>::open(&path, Some(flushed.clone())).expect("failed to open reader");
             let mut iter = reader.iter(0);
 
             while let Some(result) = iter.next_record().transpose() {
-                let (_, data) = result.expect("failed to read");
-                black_box(&data);
+                let record = result.expect("failed to read");
+                black_box(&record);
             }
         });
     });
@@ -329,7 +337,7 @@ fn bench_iter_vs_random(c: &mut Criterion) {
 
     let mut offsets = Vec::new();
     for _ in 0..1000 {
-        let (offset, _) = writer.append(&data).expect("failed to append");
+        let (offset, _) = writer.append(&[], &data).expect("failed to append");
         offsets.push(offset);
     }
     writer.sync().expect("failed to sync");
@@ -341,19 +349,19 @@ fn bench_iter_vs_random(c: &mut Criterion) {
     group.bench_function("iterator", |b| {
         b.iter(|| {
             let mut reader =
-                Reader::open(&path, Some(flushed.clone())).expect("failed to open reader");
+                Reader::<0>::open(&path, Some(flushed.clone())).expect("failed to open reader");
             let mut iter = reader.iter(0);
 
             while let Some(result) = iter.next_record().transpose() {
-                let (_, data) = result.expect("failed to read");
-                black_box(&data);
+                let record = result.expect("failed to read");
+                black_box(&record);
             }
         });
     });
 
     group.bench_function("random_reads", |b| {
         b.iter_with_setup(
-            || Reader::open(&path, Some(flushed.clone())).expect("failed to open reader"),
+            || Reader::<0>::open(&path, Some(flushed.clone())).expect("failed to open reader"),
             |mut reader| {
                 for offset in &offsets {
                     let data = reader
@@ -387,12 +395,14 @@ fn bench_record_size_comparison(c: &mut Criterion) {
             b.iter_with_setup(
                 || {
                     let (_dir, path) = create_temp_segment();
-                    let writer =
-                        Writer::create(&path, SEGMENT_SIZE, 0).expect("failed to create writer");
+                    let writer = Writer::<0>::create(&path, SEGMENT_SIZE, 0)
+                        .expect("failed to create writer");
                     (_dir, path, writer)
                 },
                 |(_dir, _path, mut writer)| {
-                    writer.append(black_box(data)).expect("failed to append");
+                    writer
+                        .append(&[], black_box(data))
+                        .expect("failed to append");
                 },
             );
         });
@@ -403,10 +413,11 @@ fn bench_record_size_comparison(c: &mut Criterion) {
                     let (_dir, path) = create_temp_segment();
                     let mut writer =
                         Writer::create(&path, SEGMENT_SIZE, 0).expect("failed to create writer");
-                    writer.append(data).expect("failed to append");
+                    writer.append(&[], data).expect("failed to append");
                     writer.sync().expect("failed to sync");
                     let flushed = writer.flushed_offset();
-                    let reader = Reader::open(&path, Some(flushed)).expect("failed to open reader");
+                    let reader =
+                        Reader::<0>::open(&path, Some(flushed)).expect("failed to open reader");
                     (_dir, reader)
                 },
                 |(_dir, mut reader)| {

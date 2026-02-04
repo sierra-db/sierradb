@@ -209,37 +209,6 @@ impl WriterThreadPool {
         Ok(full_append.append)
     }
 
-    /// Marks an event/events as confirmed by `confirmation_count` partitions,
-    /// meeting quorum.
-    pub async fn set_confirmations(
-        &self,
-        bucket_id: BucketId,
-        offsets: SmallVec<[u64; 4]>,
-        transaction_id: Uuid,
-        confirmation_count: u8,
-    ) -> Result<(), WriteError> {
-        let target_thread = bucket_id_to_thread_id(bucket_id, &self.bucket_ids, self.num_threads)
-            .ok_or(WriteError::BucketWriterNotFound)?;
-
-        let sender = self
-            .senders
-            .get(target_thread as usize)
-            .ok_or(WriteError::BucketWriterNotFound)?;
-
-        let (reply_tx, reply_rx) = oneshot::channel();
-        sender
-            .send(WriteRequest::SetConfirmations {
-                bucket_id,
-                offsets,
-                transaction_id,
-                confirmation_count,
-                reply_tx,
-            })
-            .await
-            .map_err(|_| WriteError::WriterThreadNotRunning { bucket_id })?;
-        reply_rx.await.map_err(|_| WriteError::NoThreadReply)?
-    }
-
     pub async fn shutdown(&self) {
         let mut futs: FuturesUnordered<_> = self
             .senders
@@ -302,13 +271,6 @@ enum WriteRequest {
         bucket_id: BucketId,
         batch: Box<Transaction>,
         reply_tx: oneshot::Sender<Result<FullAppendResult, WriteError>>,
-    },
-    SetConfirmations {
-        bucket_id: BucketId,
-        offsets: SmallVec<[u64; 4]>,
-        transaction_id: Uuid,
-        confirmation_count: u8,
-        reply_tx: oneshot::Sender<Result<(), WriteError>>,
     },
     FlushPoll,
     Shutdown,
@@ -416,21 +378,6 @@ impl Worker {
                     reply_tx,
                 } => {
                     self.handle_append_events(bucket_id, *batch, reply_tx);
-                }
-                WriteRequest::SetConfirmations {
-                    bucket_id,
-                    offsets,
-                    transaction_id,
-                    confirmation_count,
-                    reply_tx,
-                } => {
-                    self.handle_set_confirmations(
-                        bucket_id,
-                        offsets,
-                        transaction_id,
-                        confirmation_count,
-                        reply_tx,
-                    );
                 }
                 WriteRequest::FlushPoll => {
                     self.handle_flush_poll();
@@ -544,37 +491,6 @@ impl Worker {
         }));
     }
 
-    fn handle_set_confirmations(
-        &mut self,
-        bucket_id: BucketId,
-        offsets: SmallVec<[u64; 4]>,
-        transaction_id: Uuid,
-        confirmation_count: u8,
-        reply_tx: oneshot::Sender<Result<(), WriteError>>,
-    ) {
-        let Some(writer_set) = self.writers.get_mut(&bucket_id) else {
-            error!(
-                "thread {} received a request for bucket {bucket_id} that isn't assigned here",
-                self.thread_id
-            );
-            let _ = reply_tx.send(Err(WriteError::BucketWriterNotFound));
-            return;
-        };
-
-        for offset in offsets {
-            let res =
-                writer_set
-                    .writer
-                    .set_confirmations(offset, &transaction_id, confirmation_count);
-            if let Err(err) = res {
-                let _ = reply_tx.send(Err(err));
-                return;
-            }
-        }
-
-        let _ = reply_tx.send(Ok(()));
-    }
-
     fn handle_flush_poll(&mut self) {
         for writer_set in self.writers.values_mut() {
             writer_set.sync_if_necessary();
@@ -649,11 +565,7 @@ impl WriterSet {
             let stream_version = stream_version.next();
             stream_versions.insert(event.stream_id.clone(), stream_version);
             let append = RawEvent {
-                header: RecordHeader::new_event(
-                    event.timestamp,
-                    req.transaction_id,
-                    req.confirmation_count,
-                )?,
+                header: RecordHeader::new_event(event.timestamp, req.transaction_id)?,
                 event_id: event.event_id.into_bytes(),
                 partition_key: req.partition_key.into_bytes(),
                 partition_id: req.partition_id,
@@ -664,7 +576,7 @@ impl WriterSet {
                 metadata: LongBytes(event.metadata),
                 payload: LongBytes(event.payload),
             };
-            let (offset, len) = self.writer.append_event(&append)?;
+            let (offset, len) = self.writer.append_event(req.confirmation_count, &append)?;
             offsets.push(offset);
             self.bytes_since_sync += len;
             // We need to guarantee:
@@ -688,20 +600,20 @@ impl WriterSet {
                 .duration_since(UNIX_EPOCH)
                 .map_err(|_| WriteError::BadSystemTime)?
                 .as_nanos() as u64;
-            let (_, len) = self.writer.append_commit(&RawCommit {
-                header: RecordHeader::new_commit(
-                    timestamp,
-                    req.transaction_id,
-                    req.confirmation_count,
-                )?,
-                event_count: event_count as u32,
-            })?;
+            let (_, len) = self.writer.append_commit(
+                req.confirmation_count,
+                &RawCommit {
+                    header: RecordHeader::new_commit(timestamp, req.transaction_id)?,
+                    event_count: event_count as u32,
+                },
+            )?;
             self.bytes_since_sync += len;
         }
 
         self.next_partition_sequences
             .insert(req.partition_id, next_partition_sequence);
         self.pending_indexes.extend(new_pending_indexes);
+        self.unflushed_events += event_count as u32;
 
         self.writer.flush_writer()?;
         self.sync_if_necessary();

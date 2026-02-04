@@ -316,14 +316,17 @@ impl PartitionReplicatorActor {
                     .progress_to(append.last_partition_sequence + 1);
 
                 // Buffer events for potential broadcast when confirmed
-                let event_partition_sequences: SmallVec<[u64; 4]> =
-                    (append.first_partition_sequence..=append.last_partition_sequence).collect();
+                // Convert partition sequences to 1-indexed versions for the confirmation system
+                let confirmation_versions: SmallVec<[u64; 4]> = (append.first_partition_sequence
+                    ..=append.last_partition_sequence)
+                    .map(|seq| seq + 1)
+                    .collect();
 
                 let _ = self
                     .confirmation_ref
                     .tell(UpdateConfirmationWithBroadcast {
                         partition_id: self.partition_id,
-                        versions: event_partition_sequences,
+                        versions: confirmation_versions,
                         confirmation_count,
                         partition_sequences: (
                             append.first_partition_sequence,

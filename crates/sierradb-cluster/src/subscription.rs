@@ -427,7 +427,9 @@ impl Subscription {
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    self.broadcast_rx = self.broadcast_rx.resubscribe();
+                    // Don't resubscribe! That would lose buffered messages.
+                    // Just re-read history to catch up on any events we missed
+                    // while the channel was lagging.
                     self.read_history(&mut matcher).await?;
                 }
             }

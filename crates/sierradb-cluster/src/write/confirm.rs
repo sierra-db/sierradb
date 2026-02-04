@@ -16,7 +16,8 @@ pub struct ConfirmTransaction {
     pub partition_id: PartitionId,
     pub transaction_id: Uuid,
     pub event_ids: SmallVec<[Uuid; 4]>,
-    pub event_partition_sequences: SmallVec<[u64; 4]>,
+    /// 1-indexed confirmation versions (partition_sequence + 1)
+    pub confirmation_versions: SmallVec<[u64; 4]>,
     pub confirmation_count: u8,
 }
 
@@ -52,12 +53,14 @@ impl Message<ConfirmTransaction> for ClusterActor {
                     }
 
                     // Validate partition sequences match expected
-                    for (event, expected_version) in
-                        events.iter().zip(msg.event_partition_sequences.iter())
+                    // (confirmation_versions are 1-indexed, so subtract 1 to get partition sequence)
+                    for (event, confirmation_version) in
+                        events.iter().zip(msg.confirmation_versions.iter())
                     {
-                        if event.partition_sequence != *expected_version {
+                        let expected_partition_sequence = confirmation_version - 1;
+                        if event.partition_sequence != expected_partition_sequence {
                             return Err(ConfirmTransactionError::PartitionSequenceMismatch {
-                                expected: *expected_version,
+                                expected: expected_partition_sequence,
                                 actual: event.partition_sequence,
                             });
                         }
@@ -96,7 +99,7 @@ impl Message<ConfirmTransaction> for ClusterActor {
                     let _ = confirmation_ref
                         .tell(UpdateConfirmation {
                             partition_id: msg.partition_id,
-                            versions: msg.event_partition_sequences.clone(),
+                            versions: msg.confirmation_versions.clone(),
                             confirmation_count: msg.confirmation_count,
                         })
                         .await;
