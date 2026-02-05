@@ -2,8 +2,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::{io, mem};
 
-use futures::FutureExt;
-use futures::future::BoxFuture;
 use seglog::read::ReadHint;
 use tokio::sync::oneshot;
 use tracing::{debug, warn};
@@ -172,16 +170,26 @@ impl SegmentIter {
         Ok(true)
     }
 
-    fn read_from_cache<'a>(
+    async fn read_from_cache<'a>(
         &'a mut self,
         offsets_index: &'a mut usize,
         commits: &'a mut Vec<CommittedEvents>,
         limit: usize,
-    ) -> BoxFuture<'a, Result<usize, ReadError>> {
-        async move {
-            let mut appended = 0;
+    ) -> Result<usize, ReadError> {
+        let mut appended = 0;
+
+        // Use iteration instead of recursion to avoid stack overflow when
+        // reading across many cache blocks (256MB segments / 64KB blocks = ~4096 blocks)
+        loop {
+            let mut should_hydrate: Option<u64> = None;
+            let mut clear_block = false;
+
             if let Some(block) = &self.block {
-                debug!("offsets_index = {offsets_index}, offsets_len = {}, next_offset = {:?}", self.offsets.len(), self.offsets.get(*offsets_index));
+                debug!(
+                    "offsets_index = {offsets_index}, offsets_len = {}, next_offset = {:?}",
+                    self.offsets.len(),
+                    self.offsets.get(*offsets_index)
+                );
                 while *offsets_index < self.offsets.len() {
                     let offset = self.offsets[*offsets_index];
                     let commit = match block.read_committed_events(offset) {
@@ -193,15 +201,14 @@ impl SegmentIter {
                         Err(ReadError::Reader(seglog::read::ReadError::OutOfBounds { .. })) => {
                             let next_segment_block_offset = block.next_segment_block_offset();
                             if offset >= next_segment_block_offset {
-                                // Preload the next cache block and read from cache again
-                                self.hydrate_block(block.next_segment_block_offset())
-                                    .await?;
-                                return self.read_from_cache(offsets_index, commits, limit).await.map(|n| appended + n);
+                                // Preload the next cache block and continue iterating
+                                should_hydrate = Some(next_segment_block_offset);
                             } else {
-                                debug!("offset {offset} is before the next segment block offset {next_segment_block_offset}");
-                                self.block = None;
+                                debug!(
+                                    "offset {offset} is before the next segment block offset {next_segment_block_offset}"
+                                );
+                                clear_block = true;
                             }
-
                             break;
                         }
                         Err(err) => return Err(err),
@@ -216,16 +223,27 @@ impl SegmentIter {
                     }
                 }
             } else if let Some(next_offset) = self.offsets.get(*offsets_index) {
-                self.hydrate_block(*next_offset).await?;
+                should_hydrate = Some(*next_offset);
+            }
+
+            // Borrow of block has ended, we can now mutate self
+            if clear_block {
+                self.block = None;
+            }
+
+            if let Some(offset) = should_hydrate {
+                self.hydrate_block(offset).await?;
                 if self.block.is_some() {
-                    // We got a new block, lets try from cache again
-                    return self.read_from_cache(offsets_index, commits, limit).await.map(|n| appended + n);
+                    // Successfully hydrated a new block, continue reading
+                    continue;
                 }
             }
 
-            Ok(appended)
+            // No more work to do
+            break;
         }
-        .boxed()
+
+        Ok(appended)
     }
 
     fn read_from_pool(
