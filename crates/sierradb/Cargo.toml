@@ -21,6 +21,7 @@ boomphf = { workspace = true, features = ["serde"] }
 crc32fast.workspace = true
 futures.workspace = true
 libc.workspace = true
+metrics.workspace = true
 moka = { workspace = true, features = ["sync"] }
 nix = { workspace = true, features = ["fs"] }
 num_cpus.workspace = true
