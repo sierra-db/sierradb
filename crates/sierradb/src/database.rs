@@ -1745,7 +1745,9 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(DatabaseError::Metadata(MetadataError::TotalBucketsMismatch { .. }))
+                Err(DatabaseError::Metadata(
+                    MetadataError::TotalBucketsMismatch { .. }
+                ))
             ),
             "expected TotalBucketsMismatch error"
         );
@@ -1775,7 +1777,9 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(DatabaseError::Metadata(MetadataError::SegmentSizeMismatch { .. }))
+                Err(DatabaseError::Metadata(
+                    MetadataError::SegmentSizeMismatch { .. }
+                ))
             ),
             "expected SegmentSizeMismatch error"
         );
