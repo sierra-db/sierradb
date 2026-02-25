@@ -3669,6 +3669,7 @@ dependencies = [
  "rayon",
  "seglog",
  "serde",
+ "serde_json",
  "sierradb-protocol",
  "smallvec",
  "tempfile",

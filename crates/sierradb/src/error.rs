@@ -58,7 +58,29 @@ pub enum DatabaseError {
     #[error(transparent)]
     ThreadPool(#[from] ThreadPoolBuildError),
     #[error(transparent)]
+    Metadata(#[from] MetadataError),
+    #[error(transparent)]
     Io(#[from] io::Error),
+}
+
+#[derive(Debug, Error)]
+pub enum MetadataError {
+    #[error("unsupported metadata version: {actual} (supported: 1)")]
+    UnsupportedVersion { actual: u16 },
+    #[error(
+        "total_buckets mismatch: database was created with {expected}, but builder has {actual}. \
+        changing total_buckets would route partitions to wrong buckets"
+    )]
+    TotalBucketsMismatch { expected: u16, actual: u16 },
+    #[error(
+        "segment_size_bytes mismatch: database was created with {expected}, but builder has {actual}. \
+        changing segment_size_bytes would corrupt bloom filter indexes"
+    )]
+    SegmentSizeMismatch { expected: usize, actual: usize },
+    #[error("failed to parse metadata file: {0}")]
+    Parse(#[from] serde_json::Error),
+    #[error("failed to read/write metadata file: {0}")]
+    Io(io::Error),
 }
 
 #[derive(Debug, Error)]
