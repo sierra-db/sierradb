@@ -28,6 +28,7 @@ polonius-the-crab.workspace = true
 rand.workspace = true
 rayon.workspace = true
 serde = { workspace = true, features = ["derive", "rc"] }
+serde_json.workspace = true
 smallvec = { workspace = true, features = ["serde"] }
 thiserror.workspace = true
 thread-priority.workspace = true

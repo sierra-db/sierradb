@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, HashMap};
+use std::io::{BufReader, BufWriter};
 use std::ops::{self, RangeBounds};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs, process};
 
 use libc::{RLIMIT_NOFILE, getrlimit, rlimit, setrlimit};
@@ -24,8 +25,8 @@ use crate::bucket::stream_index::{ClosedStreamIndex, StreamIndexRecord};
 use crate::bucket::{BucketId, BucketSegmentId, PartitionId, SegmentId};
 use crate::cache::BLOCK_SIZE;
 use crate::error::{
-    DatabaseError, EventValidationError, PartitionIndexError, ReadError, StreamIndexError,
-    ThreadPoolError, WriteError,
+    DatabaseError, EventValidationError, MetadataError, PartitionIndexError, ReadError,
+    StreamIndexError, ThreadPoolError, WriteError,
 };
 use crate::id::{set_uuid_flag, uuid_to_partition_hash, validate_event_id};
 use crate::reader_thread_pool::ReaderThreadPool;
@@ -356,6 +357,72 @@ impl Database {
     }
 }
 
+const META_FILENAME: &str = "meta.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DatabaseMeta {
+    version: u16,
+    created_at: u64,
+    total_buckets: u16,
+    segment_size_bytes: usize,
+}
+
+impl DatabaseMeta {
+    const CURRENT_VERSION: u16 = 1;
+
+    fn new(total_buckets: u16, segment_size_bytes: usize) -> Self {
+        let created_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+
+        DatabaseMeta {
+            version: Self::CURRENT_VERSION,
+            created_at,
+            total_buckets,
+            segment_size_bytes,
+        }
+    }
+
+    fn load(path: &Path) -> Result<Self, MetadataError> {
+        let file = fs::File::open(path).map_err(MetadataError::Io)?;
+        let reader = BufReader::new(file);
+        let meta: DatabaseMeta = serde_json::from_reader(reader)?;
+        Ok(meta)
+    }
+
+    fn save(&self, path: &Path) -> Result<(), MetadataError> {
+        let file = fs::File::create(path).map_err(MetadataError::Io)?;
+        let writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(writer, self)?;
+        Ok(())
+    }
+
+    fn validate(&self, builder: &DatabaseBuilder) -> Result<(), MetadataError> {
+        if self.version > Self::CURRENT_VERSION {
+            return Err(MetadataError::UnsupportedVersion {
+                actual: self.version,
+            });
+        }
+
+        if self.total_buckets != builder.total_buckets {
+            return Err(MetadataError::TotalBucketsMismatch {
+                expected: self.total_buckets,
+                actual: builder.total_buckets,
+            });
+        }
+
+        if self.segment_size_bytes != builder.segment_size_bytes {
+            return Err(MetadataError::SegmentSizeMismatch {
+                expected: self.segment_size_bytes,
+                actual: builder.segment_size_bytes,
+            });
+        }
+
+        Ok(())
+    }
+}
+
 pub struct DatabaseBuilder {
     segment_size_bytes: usize,
     bucket_ids: Arc<[BucketId]>,
@@ -420,6 +487,16 @@ impl DatabaseBuilder {
         let buckets_dir = dir.join("buckets");
         if !buckets_dir.exists() {
             fs::create_dir_all(&buckets_dir)?;
+        }
+
+        // Load or create metadata file
+        let meta_path = dir.join(META_FILENAME);
+        if meta_path.exists() {
+            let meta = DatabaseMeta::load(&meta_path)?;
+            meta.validate(self)?;
+        } else {
+            let meta = DatabaseMeta::new(self.total_buckets, self.segment_size_bytes);
+            meta.save(&meta_path)?;
         }
 
         // Update rlimit, so we don't get an error about too many open files
@@ -1615,5 +1692,96 @@ mod tests {
 
         version += 2;
         assert_eq!(version, CurrentVersion::Current(2));
+    }
+
+    #[test]
+    fn test_metadata_created_on_new_database() {
+        let temp_dir = tempdir().expect("failed to create temp directory");
+
+        let _db = DatabaseBuilder::new()
+            .total_buckets(4)
+            .bucket_ids_from_range(0..4)
+            .segment_size_bytes(256 * 1024 * 1024)
+            .open(temp_dir.path())
+            .expect("failed to open database");
+
+        let meta_path = temp_dir.path().join("meta.json");
+        assert!(meta_path.exists(), "meta.json should be created");
+
+        let meta = DatabaseMeta::load(&meta_path).expect("failed to load meta.json");
+        assert_eq!(meta.version, 1);
+        assert_eq!(meta.total_buckets, 4);
+        assert_eq!(meta.segment_size_bytes, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_metadata_validated_on_reopen() {
+        let temp_dir = tempdir().expect("failed to create temp directory");
+
+        // Create database with specific settings
+        let _db = DatabaseBuilder::new()
+            .total_buckets(4)
+            .bucket_ids_from_range(0..4)
+            .open(temp_dir.path())
+            .expect("failed to open database");
+
+        drop(_db);
+
+        // Reopen with same settings - should work
+        let _db = DatabaseBuilder::new()
+            .total_buckets(4)
+            .bucket_ids_from_range(0..4)
+            .open(temp_dir.path())
+            .expect("failed to reopen database with same settings");
+
+        drop(_db);
+
+        // Reopen with different total_buckets - should fail
+        let result = DatabaseBuilder::new()
+            .total_buckets(8)
+            .bucket_ids_from_range(0..8)
+            .open(temp_dir.path());
+
+        assert!(
+            matches!(
+                result,
+                Err(DatabaseError::Metadata(
+                    MetadataError::TotalBucketsMismatch { .. }
+                ))
+            ),
+            "expected TotalBucketsMismatch error"
+        );
+    }
+
+    #[test]
+    fn test_metadata_segment_size_mismatch() {
+        let temp_dir = tempdir().expect("failed to create temp directory");
+
+        // Create database with specific segment size
+        let _db = DatabaseBuilder::new()
+            .total_buckets(4)
+            .bucket_ids_from_range(0..4)
+            .segment_size_bytes(256 * 1024 * 1024)
+            .open(temp_dir.path())
+            .expect("failed to open database");
+
+        drop(_db);
+
+        // Reopen with different segment_size_bytes - should fail
+        let result = DatabaseBuilder::new()
+            .total_buckets(4)
+            .bucket_ids_from_range(0..4)
+            .segment_size_bytes(512 * 1024 * 1024)
+            .open(temp_dir.path());
+
+        assert!(
+            matches!(
+                result,
+                Err(DatabaseError::Metadata(
+                    MetadataError::SegmentSizeMismatch { .. }
+                ))
+            ),
+            "expected SegmentSizeMismatch error"
+        );
     }
 }
