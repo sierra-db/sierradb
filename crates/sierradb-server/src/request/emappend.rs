@@ -36,15 +36,16 @@ use crate::server::Conn;
 ///   - `event_name`: Name/type of the event
 ///   - `event_id` (optional): UUID for the event (auto-generated if not
 ///     provided)
-///   - `expected_version` (optional): Expected stream version (number, "any",
-///     "exists", "empty")
+///   - `expected_version`: Expected stream version (`empty` for new streams, or
+///     version number). By default, `any` and `exists` are rejected unless
+///     `append.strict_versioning` is disabled.
 ///   - `timestamp` (optional): Event timestamp in milliseconds
 ///   - `payload` (optional): Event payload data
 ///   - `metadata` (optional): Event metadata
 ///
 /// # Example
 /// ```text
-/// EMAPPEND 550e8400-e29b-41d4-a716-446655440000 stream1 EventA PAYLOAD '{"data":"value1"}' stream2 EventB PAYLOAD '{"data":"value2"}'
+/// EMAPPEND 550e8400-e29b-41d4-a716-446655440000 stream1 EventA EXPECTED_VERSION empty PAYLOAD '{"data":"value1"}' stream2 EventB EXPECTED_VERSION 0 PAYLOAD '{"data":"value2"}'
 /// ```
 ///
 /// **Note:** All events are appended atomically in a single transaction.

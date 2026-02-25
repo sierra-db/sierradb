@@ -33,14 +33,16 @@ use crate::server::Conn;
 /// - `event_name`: Name/type of the event
 /// - `event_id` (optional): UUID for the event (auto-generated if not provided)
 /// - `partition_key` (optional): UUID to determine event partitioning
-/// - `expected_version` (optional): Expected stream version (number, "any",
-///   "exists", "empty")
+/// - `expected_version`: Expected stream version (`empty` for new streams, or
+///   version number). By default, `any` and `exists` are rejected unless
+///   `append.strict_versioning` is disabled.
+/// - `timestamp` (optional): Event timestamp in milliseconds
 /// - `payload` (optional): Event payload data
 /// - `metadata` (optional): Event metadata
 ///
 /// # Example
 /// ```text
-/// EAPPEND my-stream UserCreated PAYLOAD '{"name":"john"}' METADATA '{"source":"api"}'
+/// EAPPEND my-stream UserCreated EXPECTED_VERSION empty PAYLOAD '{"name":"john"}' METADATA '{"source":"api"}'
 /// ```
 #[derive(Clone, Debug, Default)]
 pub struct EAppend {

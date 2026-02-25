@@ -22,9 +22,9 @@ docker run -p 9090:9090 tqwewe/sierradb
 redis-cli -p 9090
 
 # Append some events to a user stream
-EAPPEND user-123 UserRegistered PAYLOAD '{"email":"alice@example.com","name":"Alice"}'
-EAPPEND user-123 EmailVerified PAYLOAD '{"timestamp":"2024-10-18T10:30:00Z"}'
-EAPPEND user-123 ProfileUpdated PAYLOAD '{"bio":"Software engineer"}'
+EAPPEND user-123 UserRegistered EXPECTED_VERSION empty PAYLOAD '{"email":"alice@example.com","name":"Alice"}'
+EAPPEND user-123 EmailVerified EXPECTED_VERSION 0 PAYLOAD '{"timestamp":"2024-10-18T10:30:00Z"}'
+EAPPEND user-123 ProfileUpdated EXPECTED_VERSION 1 PAYLOAD '{"bio":"Software engineer"}'
 
 # Read all events from the stream
 ESCAN user-123 - +
@@ -58,7 +58,7 @@ sierradb --dir ./data --client-address 0.0.0.0:9090
 redis-cli -p 9090
 
 # Append events to streams
-EAPPEND orders order-456 OrderCreated PAYLOAD '{"total":99.99,"items":["laptop"]}'
+EAPPEND order-456 OrderCreated EXPECTED_VERSION empty PAYLOAD '{"total":99.99,"items":["laptop"]}'
 
 # Read events back
 ESCAN orders - + COUNT 100
@@ -77,8 +77,9 @@ import redis
 # Connect to SierraDB
 client = redis.Redis(host='localhost', port=9090, protocol=3)
 
-# Append an event
-result = client.execute_command('EAPPEND', 'user-123', 'UserCreated', 
+# Append an event (use 'empty' for new streams, or a version number for existing ones)
+result = client.execute_command('EAPPEND', 'user-123', 'UserCreated',
+                               'EXPECTED_VERSION', 'empty',
                                'PAYLOAD', '{"name":"John","email":"john@example.com"}')
 
 # Read events from stream
@@ -152,10 +153,13 @@ Perfect for building:
 SierraDB offers extensive configuration options. Key settings include:
 
 ```toml
+[append]
+strict_versioning = true     # Require explicit EXPECTED_VERSION (empty or number)
+
 [bucket]
 count = 4                    # Number of buckets
 
-[partition] 
+[partition]
 count = 32                   # Number of partitions (8 per bucket by default)
 
 [segment]
@@ -184,7 +188,9 @@ SierraDB implements a comprehensive set of RESP3 commands for event operations:
 ### Core Event Operations
 
 #### `EAPPEND` - Append Event to Stream
-Append an event to a stream with optional expected version control.
+Append an event to a stream with expected version control.
+
+**Note:** By default, `EXPECTED_VERSION` must be `empty` (for new streams) or a specific version number. To allow `any` or `exists`, set `append.strict_versioning = false` in your configuration.
 
 **Syntax:**
 ```
@@ -196,15 +202,15 @@ EAPPEND <stream_id> <event_name> [EVENT_ID <event_id>] [PARTITION_KEY <partition
 - `event_name` - Name/type of the event  
 - `event_id` (optional) - UUID for the event (auto-generated if not provided)
 - `partition_key` (optional) - UUID to determine event partitioning
-- `expected_version` (optional) - Expected stream version (number, "any", "exists", "empty")
+- `expected_version` - Expected stream version (`empty` for new streams, or version number)
 - `timestamp` (optional) - Event timestamp in milliseconds
 - `payload` (optional) - Event payload data
 - `metadata` (optional) - Event metadata
 
 **Examples:**
 ```
-EAPPEND my-stream UserCreated PAYLOAD '{"name":"john"}' METADATA '{"source":"api"}'
-EAPPEND orders OrderPlaced EVENT_ID 550e8400-e29b-41d4-a716-446655440000 EXPECTED_VERSION empty
+EAPPEND my-stream UserCreated EXPECTED_VERSION empty PAYLOAD '{"name":"john"}' METADATA '{"source":"api"}'
+EAPPEND orders OrderPlaced EXPECTED_VERSION 5 PAYLOAD '{"order_id":"12345"}'
 ```
 
 #### `EMAPPEND` - Multi-Stream Transactional Append
@@ -221,7 +227,7 @@ EMAPPEND <partition_key> <stream_id1> <event_name1> [EVENT_ID <event_id1>] [EXPE
 
 **Examples:**
 ```
-EMAPPEND 550e8400-e29b-41d4-a716-446655440000 stream1 EventA PAYLOAD '{"data":"value1"}' stream2 EventB PAYLOAD '{"data":"value2"}'
+EMAPPEND 550e8400-e29b-41d4-a716-446655440000 stream1 EventA EXPECTED_VERSION empty PAYLOAD '{"data":"value1"}' stream2 EventB EXPECTED_VERSION 3 PAYLOAD '{"data":"value2"}'
 ```
 
 **Note:** All events succeed or fail together as a single atomic transaction.
@@ -496,7 +502,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         vec![NewEvent {
             event_id: Uuid::new_v4(),
             stream_id,
-            stream_version: ExpectedVersion::Any,
+            stream_version: ExpectedVersion::Empty,
             event_name: "UserCreated".into(),
             timestamp,
             payload: br#"{"name":"john"}"#.to_vec(),
