@@ -56,8 +56,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # Publish in dependency order with delays for crates.io indexing
+      # Each step allows "already uploaded" errors for idempotent re-runs
       - name: Publish seglog
-        run: cargo publish -p seglog --registry crates-io
+        run: |
+          cargo publish -p seglog --registry crates-io 2>&1 | tee /tmp/publish.log || {
+            if grep -q "already uploaded" /tmp/publish.log; then
+              echo "seglog already published, skipping"
+            else
+              cat /tmp/publish.log && exit 1
+            fi
+          }
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -65,7 +73,14 @@ jobs:
         run: sleep 30
 
       - name: Publish sierradb-protocol
-        run: cargo publish -p sierradb-protocol --registry crates-io
+        run: |
+          cargo publish -p sierradb-protocol --registry crates-io 2>&1 | tee /tmp/publish.log || {
+            if grep -q "already uploaded" /tmp/publish.log; then
+              echo "sierradb-protocol already published, skipping"
+            else
+              cat /tmp/publish.log && exit 1
+            fi
+          }
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -73,7 +88,14 @@ jobs:
         run: sleep 30
 
       - name: Publish sierradb
-        run: cargo publish -p sierradb --registry crates-io
+        run: |
+          cargo publish -p sierradb --registry crates-io 2>&1 | tee /tmp/publish.log || {
+            if grep -q "already uploaded" /tmp/publish.log; then
+              echo "sierradb already published, skipping"
+            else
+              cat /tmp/publish.log && exit 1
+            fi
+          }
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -81,7 +103,14 @@ jobs:
         run: sleep 30
 
       - name: Publish sierradb-topology
-        run: cargo publish -p sierradb-topology --registry crates-io
+        run: |
+          cargo publish -p sierradb-topology --registry crates-io 2>&1 | tee /tmp/publish.log || {
+            if grep -q "already uploaded" /tmp/publish.log; then
+              echo "sierradb-topology already published, skipping"
+            else
+              cat /tmp/publish.log && exit 1
+            fi
+          }
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -89,7 +118,14 @@ jobs:
         run: sleep 30
 
       - name: Publish sierradb-cluster
-        run: cargo publish -p sierradb-cluster --registry crates-io
+        run: |
+          cargo publish -p sierradb-cluster --registry crates-io 2>&1 | tee /tmp/publish.log || {
+            if grep -q "already uploaded" /tmp/publish.log; then
+              echo "sierradb-cluster already published, skipping"
+            else
+              cat /tmp/publish.log && exit 1
+            fi
+          }
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -97,7 +133,14 @@ jobs:
         run: sleep 30
 
       - name: Publish sierradb-client
-        run: cargo publish -p sierradb-client --registry crates-io
+        run: |
+          cargo publish -p sierradb-client --registry crates-io 2>&1 | tee /tmp/publish.log || {
+            if grep -q "already uploaded" /tmp/publish.log; then
+              echo "sierradb-client already published, skipping"
+            else
+              cat /tmp/publish.log && exit 1
+            fi
+          }
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -105,7 +148,14 @@ jobs:
         run: sleep 30
 
       - name: Publish sierradb-server
-        run: cargo publish -p sierradb-server --registry crates-io
+        run: |
+          cargo publish -p sierradb-server --registry crates-io 2>&1 | tee /tmp/publish.log || {
+            if grep -q "already uploaded" /tmp/publish.log; then
+              echo "sierradb-server already published, skipping"
+            else
+              cat /tmp/publish.log && exit 1
+            fi
+          }
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
