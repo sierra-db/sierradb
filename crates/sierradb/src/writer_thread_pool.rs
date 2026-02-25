@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt, TryFutureExt};
 use rayon::ThreadPool;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use thread_priority::ThreadBuilderExt;
@@ -80,26 +81,36 @@ impl WriterThreadPool {
             "number of buckets cannot be less than number of threads"
         );
 
-        let mut senders = Vec::with_capacity(num_threads as usize);
-        let mut indexes = HashMap::new();
         let has_recent_activity = Arc::new(AtomicBool::new(false));
 
         let dir = dir.into();
-        for thread_id in 0..num_threads {
-            let worker = Worker::new(
-                dir.clone(),
-                segment_size,
-                thread_id,
-                &bucket_ids,
-                num_threads,
-                sync_interval,
-                max_batch_size,
-                min_sync_bytes,
-                compression,
-                reader_pool,
-                thread_pool,
-                &has_recent_activity,
-            )?;
+
+        // Create all workers in parallel
+        let workers: Vec<_> = (0..num_threads)
+            .into_par_iter()
+            .map(|thread_id| {
+                Worker::new(
+                    dir.clone(),
+                    segment_size,
+                    thread_id,
+                    &bucket_ids,
+                    num_threads,
+                    sync_interval,
+                    max_batch_size,
+                    min_sync_bytes,
+                    compression,
+                    reader_pool,
+                    thread_pool,
+                    &has_recent_activity,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Spawn threads sequentially
+        let mut senders = Vec::with_capacity(num_threads as usize);
+        let mut indexes = HashMap::new();
+
+        for worker in workers {
             for (bucket_id, writer_set) in &worker.writers {
                 indexes.insert(
                     *bucket_id,
@@ -115,7 +126,7 @@ impl WriterThreadPool {
             );
             senders.push(tx);
             thread::Builder::new()
-                .name(format!("writer-{thread_id}"))
+                .name(format!("writer-{}", worker.thread_id))
                 .spawn_with_priority(
                     thread_priority::ThreadPriority::Crossplatform(62.try_into().unwrap()),
                     |_| worker.run(rx),
