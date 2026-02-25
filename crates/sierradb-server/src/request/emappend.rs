@@ -183,6 +183,19 @@ impl HandleRequest for EMAppend {
     type Ok = EMAppendResp;
 
     async fn handle_request(self, conn: &mut Conn) -> Result<Option<Self::Ok>, Self::Error> {
+        if conn.strict_versioning {
+            for event in &self.events {
+                if !event.expected_version.is_strict_allowed() {
+                    return Err(ErrorCode::InvalidArg
+                        .with_message(format!(
+                            "strict versioning mode rejects EXPECTED_VERSION {}",
+                            event.expected_version
+                        ))
+                        .to_string());
+                }
+            }
+        }
+
         let partition_hash = uuid_to_partition_hash(self.partition_key);
         let partition_id = partition_hash % conn.num_partitions;
         let now = SystemTime::now()

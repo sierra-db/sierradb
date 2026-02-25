@@ -75,6 +75,12 @@ impl ExpectedVersion {
     pub fn is_satisfied_by(self, current: CurrentVersion) -> bool {
         matches!(self.gap_from(current), VersionGap::None)
     }
+
+    /// Returns true if this version is allowed in strict concurrency mode.
+    /// Only `Empty` and `Exact(_)` are allowed; `Any` and `Exists` are rejected.
+    pub fn is_strict_allowed(&self) -> bool {
+        matches!(self, ExpectedVersion::Empty | ExpectedVersion::Exact(_))
+    }
 }
 
 impl fmt::Display for ExpectedVersion {

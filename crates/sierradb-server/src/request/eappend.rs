@@ -175,6 +175,15 @@ impl HandleRequest for EAppend {
     type Ok = EAppendResp;
 
     async fn handle_request(self, conn: &mut Conn) -> Result<Option<Self::Ok>, Self::Error> {
+        if conn.strict_versioning && !self.expected_version.is_strict_allowed() {
+            return Err(ErrorCode::InvalidArg
+                .with_message(format!(
+                    "strict versioning mode rejects EXPECTED_VERSION {}",
+                    self.expected_version
+                ))
+                .to_string());
+        }
+
         let partition_key = self
             .partition_key
             .unwrap_or_else(|| Uuid::new_v5(&NAMESPACE_PARTITION_KEY, self.stream_id.as_bytes()));
