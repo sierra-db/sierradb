@@ -14,7 +14,7 @@ repository = "https://github.com/tqwewe/sierradb"
 version = "0.2.2"
 
 [workspace.dependencies]
-seglog = { path = "crates/seglog" }
+seglog = { path = "crates/seglog", version = "0.2.2" }
 sierradb = { path = "crates/sierradb", version = "0.2.2" }
 sierradb-cluster = { path = "crates/sierradb-cluster", version = "0.2.2" }
 sierradb-protocol = { path = "crates/sierradb-protocol", version = "0.2.2" }
