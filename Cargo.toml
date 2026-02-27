@@ -20,7 +20,7 @@ sierradb-cluster = { path = "crates/sierradb-cluster", version = "0.2.2" }
 sierradb-protocol = { path = "crates/sierradb-protocol", version = "0.2.2" }
 sierradb-topology = { path = "crates/sierradb-topology", version = "0.2.2" }
 
-arc-swap = "1.7"
+arc-swap = "1.8"
 arrayvec = "0.7"
 arbitrary = { version = "1.4", features = ["derive"] }
 bloomfilter = "3.0"
