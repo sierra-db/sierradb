@@ -427,6 +427,7 @@ pub struct DatabaseBuilder {
     segment_size_bytes: usize,
     bucket_ids: Arc<[BucketId]>,
     total_buckets: u16,
+    total_buckets_explicit: bool,
     reader_threads: u16,
     writer_threads: Option<u16>,
     sync_interval: Duration,
@@ -447,6 +448,7 @@ impl DatabaseBuilder {
             segment_size_bytes: 256 * 1024 * 1024,
             bucket_ids: Arc::from((0..total_buckets).collect::<Vec<_>>()),
             total_buckets,
+            total_buckets_explicit: false,
             reader_threads,
             writer_threads: None,
             sync_interval: Duration::from_millis(5),
@@ -464,6 +466,16 @@ impl DatabaseBuilder {
             "bucket ids length cannot exceed total number of buckets ({})",
             self.total_buckets
         );
+
+        // Validate that all bucket_ids are within the valid range
+        for &bucket_id in self.bucket_ids.iter() {
+            assert!(
+                bucket_id < self.total_buckets,
+                "bucket id {bucket_id} is >= total_buckets ({}). \
+                partition routing uses `partition_id % total_buckets`, so bucket ids must be in range 0..total_buckets",
+                self.total_buckets
+            );
+        }
 
         let writer_threads = self
             .writer_threads
@@ -699,6 +711,7 @@ impl DatabaseBuilder {
 
     pub fn total_buckets(&mut self, total_buckets: u16) -> &mut Self {
         self.total_buckets = total_buckets;
+        self.total_buckets_explicit = true;
         self
     }
 
@@ -710,7 +723,7 @@ impl DatabaseBuilder {
     pub fn bucket_ids_from_range(&mut self, range: impl RangeBounds<BucketId>) -> &mut Self {
         let min = match range.start_bound() {
             ops::Bound::Included(min) => *min,
-            ops::Bound::Excluded(min) => min.checked_sub(1).unwrap(),
+            ops::Bound::Excluded(min) => min.checked_add(1).unwrap(),
             ops::Bound::Unbounded => panic!("unbounded range not supported"),
         };
         let max = match range.end_bound() {
@@ -718,6 +731,16 @@ impl DatabaseBuilder {
             ops::Bound::Excluded(max) => max.checked_sub(1).unwrap(),
             ops::Bound::Unbounded => panic!("unbounded range not supported"),
         };
+
+        // When the range starts at 0 and total_buckets wasn't explicitly set,
+        // infer total_buckets from the range. This handles the common single-node case
+        // where all buckets are managed locally.
+        // For multi-node setups where bucket_ids is a subset, total_buckets should be set
+        // explicitly before calling this method, which will prevent this inference.
+        if min == 0 && !self.total_buckets_explicit {
+            self.total_buckets = max + 1;
+        }
+
         let bucket_ids = Arc::from((min..=max).collect::<Vec<_>>());
         self.bucket_ids(bucket_ids)
     }
@@ -1783,5 +1806,57 @@ mod tests {
             ),
             "expected SegmentSizeMismatch error"
         );
+    }
+
+    #[test]
+    fn test_bucket_ids_from_range_infers_total_buckets() {
+        // When range starts at 0, total_buckets should be inferred
+        let mut builder = DatabaseBuilder::new();
+        builder.bucket_ids_from_range(0..4);
+        assert_eq!(builder.total_buckets, 4);
+        assert_eq!(builder.bucket_ids.as_ref(), &[0, 1, 2, 3]);
+
+        // Inclusive range should also work
+        let mut builder = DatabaseBuilder::new();
+        builder.bucket_ids_from_range(0..=7);
+        assert_eq!(builder.total_buckets, 8);
+        assert_eq!(builder.bucket_ids.as_ref(), &[0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn test_bucket_ids_from_range_does_not_infer_for_subset() {
+        // When range doesn't start at 0, total_buckets should NOT be inferred
+        // This is the multi-node case where each node manages a subset of buckets
+        let mut builder = DatabaseBuilder::new();
+        let original_total = builder.total_buckets;
+        builder.bucket_ids_from_range(2..4);
+        assert_eq!(builder.total_buckets, original_total); // unchanged
+        assert_eq!(builder.bucket_ids.as_ref(), &[2, 3]);
+    }
+
+    #[test]
+    fn test_explicit_total_buckets_with_subset() {
+        // Multi-node case: explicitly set total_buckets, then set a subset of bucket_ids
+        let temp_dir = tempdir().expect("failed to create temp directory");
+
+        let db = DatabaseBuilder::new()
+            .total_buckets(8)
+            .bucket_ids_from_range(0..4) // This node manages buckets 0-3 of 8 total
+            .open(temp_dir.path())
+            .expect("failed to open database");
+
+        assert_eq!(db.total_buckets(), 8);
+    }
+
+    #[test]
+    #[should_panic(expected = "bucket id 4 is >= total_buckets")]
+    fn test_bucket_id_validation_catches_invalid_ids() {
+        let temp_dir = tempdir().expect("failed to create temp directory");
+
+        // Set total_buckets to 4, but try to use bucket_ids that are >= 4
+        let _ = DatabaseBuilder::new()
+            .total_buckets(4)
+            .bucket_ids(vec![0, 1, 4, 5]) // 4 and 5 are invalid
+            .open(temp_dir.path());
     }
 }
