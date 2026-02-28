@@ -26,6 +26,7 @@ pub struct Server {
     caches: Arc<HashMap<BucketId, Arc<SegmentBlockCache>>>,
     num_partitions: u16,
     cache_capacity_bytes: usize,
+    strict_versioning: bool,
     shutdown: CancellationToken,
     conns: JoinSet<io::Result<()>>,
 }
@@ -36,6 +37,7 @@ impl Server {
         caches: Arc<HashMap<BucketId, Arc<SegmentBlockCache>>>,
         num_partitions: u16,
         cache_capacity_bytes: usize,
+        strict_versioning: bool,
         shutdown: CancellationToken,
     ) -> Self {
         Server {
@@ -43,6 +45,7 @@ impl Server {
             caches,
             num_partitions,
             cache_capacity_bytes,
+            strict_versioning,
             shutdown,
             conns: JoinSet::new(),
         }
@@ -60,6 +63,7 @@ impl Server {
                             let caches = self.caches.clone();
                             let num_partitions = self.num_partitions;
                             let cache_capacity_bytes = self.cache_capacity_bytes;
+                            let strict_versioning = self.strict_versioning;
                             let shutdown = self.shutdown.clone();
                             self.conns.spawn(async move {
                                 let res = Conn::new(
@@ -67,6 +71,7 @@ impl Server {
                                     caches,
                                     num_partitions,
                                     cache_capacity_bytes,
+                                    strict_versioning,
                                     stream,
                                     shutdown,
                                 )
@@ -94,6 +99,7 @@ pub struct Conn {
     pub caches: Arc<HashMap<BucketId, Arc<SegmentBlockCache>>>,
     pub num_partitions: u16,
     pub cache_capacity_bytes: usize,
+    pub strict_versioning: bool,
     pub stream: TcpStream,
     pub shutdown: CancellationToken,
     pub read: BytesMut,
@@ -111,6 +117,7 @@ impl Conn {
         caches: Arc<HashMap<BucketId, Arc<SegmentBlockCache>>>,
         num_partitions: u16,
         cache_capacity_bytes: usize,
+        strict_versioning: bool,
         stream: TcpStream,
         shutdown: CancellationToken,
     ) -> Self {
@@ -122,6 +129,7 @@ impl Conn {
             caches,
             num_partitions,
             cache_capacity_bytes,
+            strict_versioning,
             stream,
             shutdown,
             read,
