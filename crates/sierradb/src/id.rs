@@ -1,6 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rand::Rng;
+use rand::prelude::*;
 use uuid::{Uuid, uuid};
 
 use crate::bucket::{BucketId, PartitionHash, PartitionId};
