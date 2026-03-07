@@ -143,11 +143,14 @@ impl SubscriptionManager {
 
         let subscription_id = match response {
             Value::SimpleString(id_str) => Uuid::parse_str(&id_str).map_err(|_| {
-                RedisError::from((redis::ErrorKind::TypeError, "Invalid UUID in response"))
+                RedisError::from((
+                    redis::ErrorKind::UnexpectedReturnType,
+                    "Invalid UUID in response",
+                ))
             })?,
             _ => {
                 return Err(RedisError::from((
-                    redis::ErrorKind::TypeError,
+                    redis::ErrorKind::UnexpectedReturnType,
                     "Expected subscription ID",
                 )));
             }
@@ -362,11 +365,14 @@ impl SubscriptionManager {
 
         let subscription_id = match response {
             Value::SimpleString(id_str) => Uuid::parse_str(&id_str).map_err(|_| {
-                RedisError::from((redis::ErrorKind::TypeError, "Invalid UUID in response"))
+                RedisError::from((
+                    redis::ErrorKind::UnexpectedReturnType,
+                    "Invalid UUID in response",
+                ))
             })?,
             _ => {
                 return Err(RedisError::from((
-                    redis::ErrorKind::TypeError,
+                    redis::ErrorKind::UnexpectedReturnType,
                     "Expected subscription ID",
                 )));
             }
@@ -437,11 +443,14 @@ impl SubscriptionManager {
 
         let subscription_id = match response {
             Value::SimpleString(id_str) => Uuid::parse_str(&id_str).map_err(|_| {
-                RedisError::from((redis::ErrorKind::TypeError, "Invalid UUID in response"))
+                RedisError::from((
+                    redis::ErrorKind::UnexpectedReturnType,
+                    "Invalid UUID in response",
+                ))
             })?,
             _ => {
                 return Err(RedisError::from((
-                    redis::ErrorKind::TypeError,
+                    redis::ErrorKind::UnexpectedReturnType,
                     "Expected subscription ID",
                 )));
             }
@@ -509,11 +518,14 @@ impl SubscriptionManager {
 
         let subscription_id = match response {
             Value::SimpleString(id_str) => Uuid::parse_str(&id_str).map_err(|_| {
-                RedisError::from((redis::ErrorKind::TypeError, "Invalid UUID in response"))
+                RedisError::from((
+                    redis::ErrorKind::UnexpectedReturnType,
+                    "Invalid UUID in response",
+                ))
             })?,
             _ => {
                 return Err(RedisError::from((
-                    redis::ErrorKind::TypeError,
+                    redis::ErrorKind::UnexpectedReturnType,
                     "Expected subscription ID",
                 )));
             }
@@ -583,11 +595,14 @@ impl SubscriptionManager {
 
         let subscription_id = match response {
             Value::SimpleString(id_str) => Uuid::parse_str(&id_str).map_err(|_| {
-                RedisError::from((redis::ErrorKind::TypeError, "Invalid UUID in response"))
+                RedisError::from((
+                    redis::ErrorKind::UnexpectedReturnType,
+                    "Invalid UUID in response",
+                ))
             })?,
             _ => {
                 return Err(RedisError::from((
-                    redis::ErrorKind::TypeError,
+                    redis::ErrorKind::UnexpectedReturnType,
                     "Expected subscription ID",
                 )));
             }
@@ -618,11 +633,14 @@ impl SubscriptionManager {
 
         let subscription_id = match response {
             Value::SimpleString(id_str) => Uuid::parse_str(&id_str).map_err(|_| {
-                RedisError::from((redis::ErrorKind::TypeError, "Invalid UUID in response"))
+                RedisError::from((
+                    redis::ErrorKind::UnexpectedReturnType,
+                    "Invalid UUID in response",
+                ))
             })?,
             _ => {
                 return Err(RedisError::from((
-                    redis::ErrorKind::TypeError,
+                    redis::ErrorKind::UnexpectedReturnType,
                     "Expected subscription ID",
                 )));
             }
@@ -744,11 +762,14 @@ impl SubscriptionManager {
 
         let subscription_id = match response {
             Value::SimpleString(id_str) => Uuid::parse_str(&id_str).map_err(|_| {
-                RedisError::from((redis::ErrorKind::TypeError, "Invalid UUID in response"))
+                RedisError::from((
+                    redis::ErrorKind::UnexpectedReturnType,
+                    "Invalid UUID in response",
+                ))
             })?,
             _ => {
                 return Err(RedisError::from((
-                    redis::ErrorKind::TypeError,
+                    redis::ErrorKind::UnexpectedReturnType,
                     "Expected subscription ID",
                 )));
             }
@@ -771,24 +792,33 @@ impl SubscriptionManagerInner {
 
         match kind {
             PushKind::Message => {
+                let mut data_iter = data.into_iter();
+                let subscription_id = data_iter.next().ok_or_else(|| {
+                    RedisError::from((
+                        redis::ErrorKind::UnexpectedReturnType,
+                        "Missing subscription ID",
+                    ))
+                })?;
+                let cursor = data_iter.next().ok_or_else(|| {
+                    RedisError::from((redis::ErrorKind::UnexpectedReturnType, "Missing cursor"))
+                })?;
+                let event = data_iter.next().ok_or_else(|| {
+                    RedisError::from((redis::ErrorKind::UnexpectedReturnType, "Missing event"))
+                })?;
                 // Message format: data = [subscription_id, cursor, event]
-                match data.as_slice() {
-                    [
-                        Value::SimpleString(subscription_id_str),
-                        Value::Int(cursor),
-                        event_value,
-                    ] => {
+                match (subscription_id, cursor, event) {
+                    (Value::SimpleString(subscription_id_str), Value::Int(cursor), event_value) => {
                         let subscription_id =
-                            Uuid::parse_str(subscription_id_str).map_err(|_| {
+                            Uuid::parse_str(&subscription_id_str).map_err(|_| {
                                 RedisError::from((
-                                    redis::ErrorKind::TypeError,
+                                    redis::ErrorKind::UnexpectedReturnType,
                                     "Invalid subscription ID",
                                 ))
                             })?;
 
                         if let Some(sender) = self.subscriptions.get(&subscription_id) {
                             let event = Event::from_redis_value(event_value)?;
-                            let cursor = *cursor as u64;
+                            let cursor = cursor as u64;
                             let message = SierraMessage::Event { event, cursor };
 
                             if sender.send(message).is_err() {
@@ -799,7 +829,7 @@ impl SubscriptionManagerInner {
                     }
                     _ => {
                         return Err(RedisError::from((
-                            redis::ErrorKind::TypeError,
+                            redis::ErrorKind::UnexpectedReturnType,
                             "Unexpected message format",
                         )));
                     }
@@ -812,7 +842,7 @@ impl SubscriptionManagerInner {
                         let subscription_id =
                             Uuid::parse_str(subscription_id_str).map_err(|_| {
                                 RedisError::from((
-                                    redis::ErrorKind::TypeError,
+                                    redis::ErrorKind::UnexpectedReturnType,
                                     "Invalid subscription ID",
                                 ))
                             })?;
@@ -830,7 +860,7 @@ impl SubscriptionManagerInner {
                     }
                     _ => {
                         return Err(RedisError::from((
-                            redis::ErrorKind::TypeError,
+                            redis::ErrorKind::UnexpectedReturnType,
                             "Unexpected subscribe format",
                         )));
                     }
@@ -839,7 +869,7 @@ impl SubscriptionManagerInner {
             PushKind::Disconnection => {}
             kind => {
                 return Err(RedisError::from((
-                    redis::ErrorKind::TypeError,
+                    redis::ErrorKind::UnexpectedReturnType,
                     "Unknown push kind",
                     kind.to_string(),
                 )));
