@@ -53,6 +53,7 @@ pub struct Args {
 
 #[derive(Debug, Deserialize)]
 pub struct AppConfig {
+    pub append: AppendConfig,
     pub bucket: BucketConfig,
     pub cache: CacheConfig,
     pub dir: PathBuf,
@@ -67,6 +68,11 @@ pub struct AppConfig {
     pub threads: Threads,
 
     pub nodes: Option<Vec<Value>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AppendConfig {
+    pub strict_versioning: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -182,6 +188,7 @@ impl AppConfig {
         let overrides = builder.build_cloned()?;
 
         builder = builder
+            .set_default("append.strict_versioning", true)?
             .set_default("bucket.count", 4)?
             .set_default("cache.capacity_bytes", 256 * 1024 * 1024)?
             .set_default("heartbeat.interval_ms", 1000)?
@@ -502,6 +509,12 @@ impl AppConfig {
 
 impl fmt::Display for AppConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "append.strict_versioning = {}",
+            self.append.strict_versioning
+        )?;
+
         writeln!(f, "bucket.count = {}", self.bucket.count)?;
         match &self.bucket.ids {
             Some(ids) => writeln!(

@@ -18,7 +18,10 @@ implement_commands! {
     ///
     /// # Example
     /// ```ignore
+    /// use sierradb_protocol::ExpectedVersion;
+    ///
     /// let options = EAppendOptions::new()
+    ///     .expected_version(ExpectedVersion::Empty)
     ///     .payload(br#"{"name":"john"}"#)
     ///     .metadata(br#"{"source":"api"}"#);
     /// conn.eappend("my-stream", "UserCreated", options)?;
@@ -38,9 +41,15 @@ implement_commands! {
     ///
     /// # Example
     /// ```ignore
+    /// use sierradb_protocol::ExpectedVersion;
+    ///
     /// let events = [
-    ///     EMAppendEvent::new("stream1", "EventA").payload(br#"{"data":"value1"}"#),
-    ///     EMAppendEvent::new("stream2", "EventB").payload(br#"{"data":"value2"}"#),
+    ///     EMAppendEvent::new("stream1", "EventA")
+    ///         .expected_version(ExpectedVersion::Empty)
+    ///         .payload(br#"{"data":"value1"}"#),
+    ///     EMAppendEvent::new("stream2", "EventB")
+    ///         .expected_version(ExpectedVersion::Exact(0))
+    ///         .payload(br#"{"data":"value2"}"#),
     /// ];
     /// conn.emappend(partition_key, &events)?;
     /// ```

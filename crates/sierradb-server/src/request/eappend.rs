@@ -33,14 +33,16 @@ use crate::server::Conn;
 /// - `event_name`: Name/type of the event
 /// - `event_id` (optional): UUID for the event (auto-generated if not provided)
 /// - `partition_key` (optional): UUID to determine event partitioning
-/// - `expected_version` (optional): Expected stream version (number, "any",
-///   "exists", "empty")
+/// - `expected_version`: Expected stream version (`empty` for new streams, or
+///   version number). By default, `any` and `exists` are rejected unless
+///   `append.strict_versioning` is disabled.
+/// - `timestamp` (optional): Event timestamp in milliseconds
 /// - `payload` (optional): Event payload data
 /// - `metadata` (optional): Event metadata
 ///
 /// # Example
 /// ```text
-/// EAPPEND my-stream UserCreated PAYLOAD '{"name":"john"}' METADATA '{"source":"api"}'
+/// EAPPEND my-stream UserCreated EXPECTED_VERSION empty PAYLOAD '{"name":"john"}' METADATA '{"source":"api"}'
 /// ```
 #[derive(Clone, Debug, Default)]
 pub struct EAppend {
@@ -175,6 +177,15 @@ impl HandleRequest for EAppend {
     type Ok = EAppendResp;
 
     async fn handle_request(self, conn: &mut Conn) -> Result<Option<Self::Ok>, Self::Error> {
+        if conn.strict_versioning && !self.expected_version.is_strict_allowed() {
+            return Err(ErrorCode::InvalidArg
+                .with_message(format!(
+                    "strict versioning mode rejects EXPECTED_VERSION {}",
+                    self.expected_version
+                ))
+                .to_string());
+        }
+
         let partition_key = self
             .partition_key
             .unwrap_or_else(|| Uuid::new_v5(&NAMESPACE_PARTITION_KEY, self.stream_id.as_bytes()));

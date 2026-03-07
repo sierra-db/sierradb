@@ -5,6 +5,7 @@ use sierradb_client::{
     AsyncTypedCommands, EAppendOptions, EMAppendEvent, SierraAsyncClientExt, SierraMessage,
     stream_partition_key,
 };
+use sierradb_protocol::ExpectedVersion;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -44,6 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Test EAPPEND command
     println!("📝 Testing EAPPEND command...");
     let append_options = EAppendOptions::new()
+        .expected_version(ExpectedVersion::Empty)
         .payload(br#"{"user_id": 123, "action": "login"}"#)
         .metadata(br#"{"source": "web_app", "ip": "192.168.1.1"}"#);
 
@@ -67,8 +69,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Test EMAPPEND command
     println!("📝 Testing EMAPPEND command...");
     let events = [
-        EMAppendEvent::new("test-stream-1", "EventA").payload(br#"{"data": "value1"}"#),
-        EMAppendEvent::new("test-stream-2", "EventB").payload(br#"{"data": "value2"}"#),
+        EMAppendEvent::new("test-stream-1", "EventA")
+            .expected_version(ExpectedVersion::Empty)
+            .payload(br#"{"data": "value1"}"#),
+        EMAppendEvent::new("test-stream-2", "EventB")
+            .expected_version(ExpectedVersion::Empty)
+            .payload(br#"{"data": "value2"}"#),
     ];
 
     match conn.emappend(test_partition_key, &events).await {
@@ -245,10 +251,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Add some more events to trigger subscription messages
     println!("\n📝 Adding more events to trigger subscriptions...");
     for i in 0..3 {
-        let options =
-            EAppendOptions::new().payload(format!(r#"{{"test_event": {i}}}"#).into_bytes());
+        let options = EAppendOptions::new()
+            .expected_version(ExpectedVersion::Empty)
+            .payload(format!(r#"{{"test_event": {i}}}"#).into_bytes());
         let _ = conn
-            .eappend(format!("test-stream-{i}"), "TestEvent", options)
+            .eappend(format!("sub-test-stream-{i}"), "TestEvent", options)
             .await;
     }
 

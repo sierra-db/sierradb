@@ -4,6 +4,9 @@ dir = "db"
 mdns = false
 replication_factor = 3
 
+[append]
+strict_versioning = true
+
 [bucket]
 count = 64
 # ids = [0, 1, 2, ...]

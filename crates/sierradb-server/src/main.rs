@@ -103,6 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 caches,
                 config.partition.count,
                 config.cache.capacity_bytes,
+                config.append.strict_versioning,
                 shutdown,
             )
             .listen(client_addr)
