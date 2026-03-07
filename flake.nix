@@ -7,14 +7,12 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    zjstatus.url = "github:dj95/zjstatus";
   };
 
   outputs =
     {
       nixpkgs,
       rust-overlay,
-      zjstatus,
       ...
     }:
     let
@@ -59,12 +57,9 @@
             redis
             pkg-config
             openssl.dev
-            zjstatus.packages.${system}.default
           ];
 
-          zjHook = ''
-            export ZJSTATUS_PATH="${zjstatus.packages.${system}.default}/bin/zjstatus.wasm"
-            ln -sf ${zjstatus.packages.${system}.default}/bin/zjstatus.wasm ./zjstatus.wasm
+          hook = ''
             ulimit -n 4096
           '';
         in
@@ -82,7 +77,7 @@
                   ];
                 })
               ]);
-            shellHook = zjHook;
+            shellHook = hook;
           };
 
           fuzz = pkgs.mkShell {
@@ -99,7 +94,7 @@
                 })
                 cargo-fuzz
               ]);
-            shellHook = zjHook;
+            shellHook = hook;
           };
         }
       );
