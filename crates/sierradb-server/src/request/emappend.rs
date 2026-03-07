@@ -220,9 +220,9 @@ impl HandleRequest for EMAppend {
                 })
             })
             .collect::<Result<_, String>>()?;
-        let event_ids_timestamps: SmallVec<[_; 4]> = events
+        let event_ids_timestamps_streams: SmallVec<[_; 4]> = events
             .iter()
-            .map(|event| (event.event_id, event.timestamp))
+            .map(|event| (event.event_id, event.timestamp, event.stream_id.clone()))
             .collect();
 
         let transaction = Transaction::new(self.partition_key, partition_id, events)
@@ -234,19 +234,24 @@ impl HandleRequest for EMAppend {
             .await
             .map_redis_err()?;
 
-        let stream_versions = result.stream_versions.into_iter();
-        let events = event_ids_timestamps
+        let mut stream_current_version = result.stream_versions;
+        let mut events: Vec<EventInfo> = event_ids_timestamps_streams
             .into_iter()
-            .zip(stream_versions)
-            .map(
-                |((event_id, timestamp), (stream_id, stream_version))| EventInfo {
+            .rev()
+            .map(|(event_id, timestamp, stream_id)| {
+                let version = stream_current_version.get_mut(&stream_id).unwrap();
+                let stream_version = *version;
+                *version -= 1;
+                EventInfo {
                     event_id,
                     stream_id,
                     stream_version,
                     timestamp,
-                },
-            )
+                }
+            })
             .collect();
+
+        events.reverse();
 
         Ok(Some(EMAppendResp {
             partition_key: self.partition_key,
